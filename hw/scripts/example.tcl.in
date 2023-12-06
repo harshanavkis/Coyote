@@ -101,6 +101,19 @@ switch $cfg(example) {
         add_files "$hw_dir/hdl/operators/examples/md5"  
     }
 
+    "nw" {
+        puts "NW example."
+
+        # Add source files
+        add_files "$hw_dir/hdl/operators/examples/nw"
+        
+        # Execute scripts, e.g. for IP generation
+        if {[file exists $hw_dir/hdl/operators/examples/nw/ip.tcl]} {
+            puts "Execute script: ip.tcl"
+            source $hw_dir/hdl/operators/examples/nw/ip.tcl
+        }
+    }
+
     "io_switch_ndp" {
         puts "IO switch example."
 
