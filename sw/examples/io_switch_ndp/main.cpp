@@ -13,8 +13,8 @@
 
 using namespace fpga;
 
-constexpr auto const ddefSize = 64;
-constexpr auto const odefSize = 64;
+constexpr auto const ddefSize = 4096;
+constexpr auto const odefSize = 4096;
 
 int main(int argc, char *argv[])
 {
@@ -48,12 +48,12 @@ int main(int argc, char *argv[])
     std::cout << "fMem before:" << *((uint64_t *)fMem) << std::endl;
 
     /* Using host memory */
-    cproc.ioSwDbg();
-    cproc.ioSwitch(IODevs::HOST_MEM);
-    cproc.ioSwDbg();
-    cproc.invoke({CoyoteOper::TRANSFER, (void *)dMem, o_data_size});
-    std::cout << "In host mem: dMem after:" << *((uint64_t *)dMem) << std::endl;
-    std::cout << "In host mem: fMem after:" << *((uint64_t *)fMem) << std::endl;
+    // cproc.ioSwDbg();
+    // cproc.ioSwitch(IODevs::HOST_MEM);
+    // cproc.ioSwDbg();
+    // cproc.invoke({CoyoteOper::TRANSFER, (void *)dMem, o_data_size});
+    // std::cout << "In host mem: dMem after:" << *((uint64_t *)dMem) << std::endl;
+    // std::cout << "In host mem: fMem after:" << *((uint64_t *)fMem) << std::endl;
 
     /*****************************************************************************/
 
@@ -94,9 +94,9 @@ int main(int argc, char *argv[])
 
     cproc.printDebug();
 
-    cproc.ioSwDbg();
-    cproc.ioSwitch(IODevs::HOST_MEM);
-    cproc.ioSwDbg();
-    cproc.invoke({CoyoteOper::TRANSFER, (void *)dMem, o_data_size});
-    std::cout << "In host mem: dMem after:" << *((uint64_t *)dMem) << std::endl;
+    // cproc.ioSwDbg();
+    // cproc.ioSwitch(IODevs::HOST_MEM);
+    // cproc.ioSwDbg();
+    // cproc.invoke({CoyoteOper::TRANSFER, (void *)dMem, o_data_size});
+    // std::cout << "In host mem: dMem after:" << *((uint64_t *)dMem) << std::endl;
 }
