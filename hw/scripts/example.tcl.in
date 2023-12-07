@@ -114,6 +114,19 @@ switch $cfg(example) {
         }
     }
 
+    "matmul" {
+        puts "Matmul example."
+
+        # Add source files
+        add_files "$hw_dir/hdl/operators/examples/matmul"
+        
+        # Execute scripts, e.g. for IP generation
+        if {[file exists $hw_dir/hdl/operators/examples/matmul/ip.tcl]} {
+            puts "Execute script: ip.tcl"
+            source $hw_dir/hdl/operators/examples/matmul/ip.tcl
+        }
+    }
+
     "io_switch_ndp" {
         puts "IO switch example."
 
