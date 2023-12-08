@@ -104,6 +104,20 @@ switch $cfg(example) {
         }
     }
 
+    "io_switch_ndp" {
+        puts "IO switch example."
+
+        # Add source files
+        add_files "$hw_dir/hdl/operators/examples/io_switch_ndp"
+    }
+
+    "io_switch_tcp" {
+        puts "IO switch example w/ TCP."
+
+        # Add source files
+        add_files "$hw_dir/hdl/operators/examples/io_switch_tcp"
+    }
+
     default {
         puts "No example chosen"
     }
