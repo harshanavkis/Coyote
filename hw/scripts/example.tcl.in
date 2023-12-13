@@ -127,6 +127,13 @@ switch $cfg(example) {
         }
     }
 
+    "bram_app" {
+        puts "BRAM access example."
+
+        # Add source files
+        add_files "$hw_dir/hdl/operators/examples/bram_app"
+    }
+
     "io_switch_ndp" {
         puts "IO switch example."
 
