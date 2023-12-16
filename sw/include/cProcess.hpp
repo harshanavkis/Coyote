@@ -217,6 +217,10 @@ public:
 
 	IODevs userInIOSwtch(uint8_t user_req);
 
+	fCnfg getFcnfg();
+
+	int32_t getIOctlFD();
+
 	/**
 	 * @brief Debug
 	 * 

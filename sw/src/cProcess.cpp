@@ -890,6 +890,16 @@ void cProcess::ioSwDbg() {
 		<< _mm256_extract_epi64(cnfg_reg_avx[static_cast<uint32_t>(CnfgAvxRegs::IO_SWITCH_REG)], 0x0) << std::endl;
 }
 
+fCnfg cProcess::getFcnfg()
+{
+	return fcnfg;
+}
+
+int32_t cProcess::getIOctlFD()
+{
+	return fd;
+}
+
 IODevs cProcess::userInIOSwtch(uint8_t user_req)
 {
 	IODevs io_dev;
