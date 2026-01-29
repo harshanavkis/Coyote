@@ -3,7 +3,7 @@
 sudo rmmod coyote_driver
 # sudo bash sw/util/hot_reset.sh "e1:00.0"
 
-echo 1 | sudo tee /sys/bus/pci/devices/0000:e1:00.0/remove
+echo 1 | sudo tee /sys/bus/pci/devices/0000:c1:00.0/remove
 
 echo 1 | sudo tee /sys/bus/pci/rescan
 
