@@ -2,9 +2,13 @@
 #include <chrono>
 #include <thread>
 #include <iostream>
+#include <unistd.h>
+#include <getopt.h>
 #include <boost/program_options.hpp>
 
 #include "cThread.hpp"
+#include "message.hpp"
+#include "rdma_server.hpp"
 
 // Constants
 #define CLOCK_PERIOD_NS 4
@@ -25,6 +29,56 @@ enum class JigsawRegisters: uint32_t {
     COYOTE_PID_REG = 7,
     COYOTE_DMA_TX_LEN_REG = 8
 };
+
+static struct disagg_regions_rdma *regions; 
+
+void print_help(char **argv)
+{
+    printf("usage: %s\n", argv[0]);
+    printf("\t--localAddress [IP address of local interface]           or -a\n");
+    printf("\t--localPort [Local port to use]                          or -p\n");
+}
+
+void setup(int argc, char **argv)
+{
+    /** Setup RDMA **/
+	int op, ret;
+	char *localAddr = NULL;
+	char *localPort = NULL;
+
+	/*** Read command line arguments ***/
+	struct option long_opts[] = {
+		{ "localAddress", 1, NULL, 'a' },
+		{ "localPort", 1, NULL, 'p' },
+		{ NULL, 0, NULL, 0 }
+	};
+
+	while ((op = getopt_long(argc, argv, "a:p:", long_opts, NULL)) != -1) {
+		switch (op) {
+			case 'a':
+				localAddr = optarg;
+				break;
+			case 'p':
+				localPort = optarg;
+				break;
+			default:
+                print_help(argv);
+				exit(EXIT_FAILURE);
+		}
+	}
+
+	if (!localAddr || !localPort) {
+		printf("Both IP address and port have to be specified\n");
+        print_help(argv);
+		exit(EXIT_FAILURE);
+	}
+
+	regions = init_rdma(localAddr, localPort);
+	if (regions == NULL) {
+        fprintf(stderr, "init_rdma failed\n");
+		exit(EXIT_FAILURE);
+    }
+}
 
 // Note, how the Coyote thread is passed by reference; to avoid creating a copy of 
 // the thread object which can lead to undefined behaviour and bugs. 
@@ -73,7 +127,48 @@ void run_bench(
     benchmark_run();
 }
 
-int main(int argc, char *argv[]) {
+int main(int argc, char *argv[])
+{
+    struct msg *recv_msg = NULL;
+    struct msg *send_msg = NULL;
+
+    setup(argc, argv);
+
+    send_msg = static_cast<msg *>(regions->send_buf);
+
+    while(1) {
+        recv_msg = static_cast<msg *>(rdma_recv());
+
+        if (recv_msg == NULL)
+            return EXIT_FAILURE;
+
+        if (recv_msg->type != 0) {
+            fprintf(stderr, "Received wrong message type\n");
+            return EXIT_FAILURE;
+        }
+
+        if (recv_msg->direction == 0) {
+            memset(regions->dma_buf, 'a', recv_msg->size);
+            if (rdma_write(regions->raddr, recv_msg->size) != 0) {
+                fprintf(stderr, "rdam_write failed\n");
+                return EXIT_FAILURE;
+            }
+        } else {
+            if (rdma_read(regions->raddr, recv_msg->size) != 0) {
+                fprintf(stderr, "rdam_read failed\n");
+                return EXIT_FAILURE;
+            }
+        }
+
+        send_msg->type = 1;
+        if (rdma_send(send_msg, sizeof(*send_msg)) != 0) {
+            fprintf(stderr, "rdma_send failed\n");
+            return EXIT_FAILURE;
+        }
+
+    }
+
+    /*
     // Create Coyote thread and allocate memory for the transfer
     coyote::cThread coyote_thread(DEFAULT_VFPGA_ID, getpid());
     int* mem =  (int *) coyote_thread.getMem({coyote::CoyoteAllocType::HPF, 4*1024*1024});
@@ -83,6 +178,7 @@ int main(int argc, char *argv[]) {
     HEADER("JIGSAW BASELINE");
     
     run_bench(coyote_thread, mem);
+    */
 
     return EXIT_SUCCESS;
 }
