@@ -9,7 +9,7 @@
 
 #define NUM_RECV_BUFS 8
 #define BUFS_SIZE 92
-#define DMA_SIZE 4096
+#define DMA_SIZE (1024*64) 
 
 struct disagg_regions_rdma *init_rdma(const char *serverIP, const char *port);
 

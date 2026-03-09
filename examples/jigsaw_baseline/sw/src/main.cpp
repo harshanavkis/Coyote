@@ -80,51 +80,32 @@ void setup(int argc, char **argv)
     }
 }
 
-// Note, how the Coyote thread is passed by reference; to avoid creating a copy of 
-// the thread object which can lead to undefined behaviour and bugs. 
-void run_bench(
-    coyote::cThread &coyote_thread, int *mem
-) {
-    // Single iteration of transfers (reads or writes)
-    auto benchmark_run = [&]() {
-        // Set the required registers from SW
-        coyote_thread.setCSR(reinterpret_cast<uint64_t>(mem), static_cast<uint32_t>(JigsawRegisters::DMA_SRC_ADDR_REG));
-        coyote_thread.setCSR(reinterpret_cast<uint64_t>(mem), static_cast<uint32_t>(JigsawRegisters::DMA_DST_ADDR_REG));
-        coyote_thread.setCSR(static_cast<uint64_t>(32768), static_cast<uint32_t>(JigsawRegisters::DMA_LEN_REG));
-        coyote_thread.setCSR(coyote_thread.getCtid(), static_cast<uint32_t>(JigsawRegisters::COYOTE_PID_REG));
+void device_d2h(coyote::cThread &coyote_thread, void *dst, size_t size)
+{
+    coyote_thread.setCSR(reinterpret_cast<uint64_t>(dst), static_cast<uint32_t>(JigsawRegisters::DMA_DST_ADDR_REG));
+    coyote_thread.setCSR(static_cast<uint64_t>(size), static_cast<uint32_t>(JigsawRegisters::DMA_LEN_REG));
+    coyote_thread.setCSR(coyote_thread.getCtid(), static_cast<uint32_t>(JigsawRegisters::COYOTE_PID_REG));
 
-        // Start DMA transfer
-        coyote_thread.setCSR(static_cast<uint64_t>(3), static_cast<uint32_t>(JigsawRegisters::DMA_CMD_REG));
+    // Start DMA transfer
+    coyote_thread.setCSR(static_cast<uint64_t>(3), static_cast<uint32_t>(JigsawRegisters::DMA_CMD_REG));
 
-        // coyote_thread.setCSR(1, static_cast<uint32_t>(JigsawRegisters::DMA_STATUS_REG));
-        // coyote_thread.setCSR(2, static_cast<uint32_t>(JigsawRegisters::START_COMPUTATION_REG));
-        // coyote_thread.setCSR(100, static_cast<uint32_t>(JigsawRegisters::CYCLES_PER_COMPUTATION_REG));
+    while (coyote_thread.getCSR(static_cast<uint32_t>(JigsawRegisters::DMA_STATUS_REG)) != 1) {
+        std::this_thread::sleep_for(std::chrono::nanoseconds(CLOCK_PERIOD_NS));
+    }
+}
 
-        // std:: cout << "DMA_CMD_REG: " << coyote_thread.getCSR(static_cast<uint32_t>(JigsawRegisters::DMA_CMD_REG)) << std::endl;
-        // std:: cout << "DMA_STATUS_REG: " << coyote_thread.getCSR(static_cast<uint32_t>(JigsawRegisters::DMA_STATUS_REG)) << std::endl;
-        // std:: cout << "DMA_SRC_ADDR_REG: " << coyote_thread.getCSR(static_cast<uint32_t>(JigsawRegisters::DMA_SRC_ADDR_REG)) << std::endl;
-        // std:: cout << "DMA_DST_ADDR_REG: " << coyote_thread.getCSR(static_cast<uint32_t>(JigsawRegisters::DMA_DST_ADDR_REG)) << std::endl;
-        // std:: cout << "DMA_LEN_REG: " << coyote_thread.getCSR(static_cast<uint32_t>(JigsawRegisters::DMA_LEN_REG)) << std::endl;
-        // std:: cout << "START_COMPUTATION_REG: " << coyote_thread.getCSR(static_cast<uint32_t>(JigsawRegisters::START_COMPUTATION_REG)) << std::endl;
-        // std:: cout << "CYCLES_PER_COMPUTATION_REG: " << coyote_thread.getCSR(static_cast<uint32_t>(JigsawRegisters::CYCLES_PER_COMPUTATION_REG)) << std::endl;
-        // std:: cout << "COYOTE_PID_REG: " << coyote_thread.getCSR(static_cast<uint32_t>(JigsawRegisters::COYOTE_PID_REG)) << std::endl;
+void device_h2d(coyote::cThread &coyote_thread, void *src, size_t size)
+{
+    coyote_thread.setCSR(reinterpret_cast<uint64_t>(src), static_cast<uint32_t>(JigsawRegisters::DMA_SRC_ADDR_REG));
+    coyote_thread.setCSR(static_cast<uint64_t>(size), static_cast<uint32_t>(JigsawRegisters::DMA_LEN_REG));
+    coyote_thread.setCSR(coyote_thread.getCtid(), static_cast<uint32_t>(JigsawRegisters::COYOTE_PID_REG));
 
-        // Wait for DMA transfer to complete
-        while (coyote_thread.getCSR(static_cast<uint32_t>(JigsawRegisters::DMA_STATUS_REG)) != 1) {
-            std::this_thread::sleep_for(std::chrono::nanoseconds(CLOCK_PERIOD_NS));
-        }
+    // Start DMA transfer
+    coyote_thread.setCSR(static_cast<uint64_t>(1), static_cast<uint32_t>(JigsawRegisters::DMA_CMD_REG));
 
-        std:: cout << "DMA_STATUS_REG: " << coyote_thread.getCSR(static_cast<uint32_t>(JigsawRegisters::DMA_STATUS_REG)) << std::endl;
-        std:: cout << "DMA_CMD_REG: " << coyote_thread.getCSR(static_cast<uint32_t>(JigsawRegisters::DMA_CMD_REG)) << std::endl;
-        std:: cout << "COYOTE_DMA_TX_LEN_REG: " << coyote_thread.getCSR(static_cast<uint32_t>(JigsawRegisters::COYOTE_DMA_TX_LEN_REG)) << std::endl;
-
-        unsigned char* ptr = (unsigned char*)mem;
-        for (int i = 0; i < 64; i++) {
-            printf("%02x ", ptr[i]);
-        }
-    };
-
-    benchmark_run();
+    while (coyote_thread.getCSR(static_cast<uint32_t>(JigsawRegisters::DMA_STATUS_REG)) != 1) {
+        std::this_thread::sleep_for(std::chrono::nanoseconds(CLOCK_PERIOD_NS));
+    }
 }
 
 int main(int argc, char *argv[])
@@ -133,6 +114,11 @@ int main(int argc, char *argv[])
     struct msg *send_msg = NULL;
 
     setup(argc, argv);
+
+    // Create Coyote thread and allocate memory for the transfer
+    coyote::cThread coyote_thread(DEFAULT_VFPGA_ID, getpid());
+
+    coyote_thread.userMap(reinterpret_cast<char *>(regions->dma_buf), DMA_SIZE);
 
     send_msg = static_cast<msg *>(regions->send_buf);
 
@@ -148,16 +134,17 @@ int main(int argc, char *argv[])
         }
 
         if (recv_msg->direction == 0) {
-            memset(regions->dma_buf, 'a', recv_msg->size);
-            if (rdma_write(regions->raddr, recv_msg->size) != 0) {
+            device_d2h(coyote_thread, regions->dma_buf, recv_msg->size);
+            if (rdma_write(regions->raddr, recv_msg->size) < 0) {
                 fprintf(stderr, "rdam_write failed\n");
                 return EXIT_FAILURE;
             }
         } else {
-            if (rdma_read(regions->raddr, recv_msg->size) != 0) {
+            if (rdma_read(regions->raddr, recv_msg->size) < 0) {
                 fprintf(stderr, "rdam_read failed\n");
                 return EXIT_FAILURE;
             }
+            device_h2d(coyote_thread, regions->dma_buf, recv_msg->size);
         }
 
         send_msg->type = 1;
@@ -167,18 +154,6 @@ int main(int argc, char *argv[])
         }
 
     }
-
-    /*
-    // Create Coyote thread and allocate memory for the transfer
-    coyote::cThread coyote_thread(DEFAULT_VFPGA_ID, getpid());
-    int* mem =  (int *) coyote_thread.getMem({coyote::CoyoteAllocType::HPF, 4*1024*1024});
-    if (!mem) { throw std::runtime_error("Could not allocate memory; exiting..."); }
-
-    // Benchmark sweep
-    HEADER("JIGSAW BASELINE");
-    
-    run_bench(coyote_thread, mem);
-    */
 
     return EXIT_SUCCESS;
 }
