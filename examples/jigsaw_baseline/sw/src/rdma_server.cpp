@@ -351,7 +351,7 @@ init_rdma(const char *serverIP, const char *port)
 	// Second message is the meta information (i.e. rkey) about the shmem DMA region
 	regions_rdma.rkey = *(uint32_t *)recv_msg;
 
-	printf("raddr: 0x%x, rkey: 0x%x\n", regions_rdma.raddr, regions_rdma.rkey);
+	printf("raddr: %p, rkey: 0x%x\n", (void *)regions_rdma.raddr, regions_rdma.rkey);
 
 	return &regions_rdma;
 
