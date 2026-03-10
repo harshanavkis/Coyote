@@ -28,7 +28,7 @@
 // ---------------------------------------------------------------------------
 #define CLOCK_PERIOD_NS      4
 #define DEFAULT_VFPGA_ID     0
-#define RDMA_BUFFER_SIZE     (16 * 1024)   // 16 KiB — enough for MMIO scaffolding
+#define RDMA_BUFFER_SIZE     (1024 * 1024)  // 1 MiB
 
 // ---------------------------------------------------------------------------
 // AXI-Lite register map — jigsaw_hc_axi_ctrl_parser
@@ -142,7 +142,7 @@ static void run_test(coyote::cThread &ct, void *mem) {
     std::cout << std::endl;
 
     // --- DMA test (H2D read, 1 KiB) ---
-    uint64_t xfer = 1024;
+    uint64_t xfer = 524288;
     std::cout << "=== DMA Test (H2D Read, " << xfer << " B) ===" << std::endl;
 
     uint64_t dma_src = mem_addr + 4096;
@@ -163,17 +163,17 @@ static void run_test(coyote::cThread &ct, void *mem) {
     write_mmio(ct, mem, static_cast<uint64_t>(DevReg::DMA_CMD), 1);
     std::cout << "  Started DMA (CMD=1)" << std::endl;
 
-    // int polls = 0;
+    int polls = 0;
     uint64_t status = 0;
-    // while (((status = read_mmio(ct, mem, static_cast<uint64_t>(DevReg::DMA_STATUS))) & 0x1) != 1) {
-    //     if (polls % 1000 == 0) {
-    //         std::cout << "  Polling DMA status... count=" << polls << " val=" << status << std::endl;
-    //     }
-    //     polls++;
-    //     std::this_thread::sleep_for(std::chrono::microseconds(1));
-    // }
-    // std::cout << "  DMA Completed!" << std::endl;
-    std::this_thread::sleep_for(std::chrono::seconds(5));
+    while (((status = read_mmio(ct, mem, static_cast<uint64_t>(DevReg::DMA_STATUS))) & 0x1) != 1) {
+        if (polls % 1000 == 0) {
+            std::cout << "  Polling DMA status... count=" << polls << " val=" << status << std::endl;
+        }
+        polls++;
+        std::this_thread::sleep_for(std::chrono::microseconds(1));
+    }
+    std::cout << "  DMA Completed!" << std::endl;
+    // std::this_thread::sleep_for(std::chrono::seconds(5));
 
     status = read_mmio(ct, mem, static_cast<uint64_t>(DevReg::DMA_STATUS));
     std::cout << "  DMA Status   = " << status << std::endl;

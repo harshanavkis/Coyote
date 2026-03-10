@@ -95,7 +95,8 @@ module payload_to_dma #(
                 else
                     next_state = SEND_PAYLOAD;
             RECEIVE_PAYLOAD:
-                if (payload_to_dma_in_tlast && (dma_d2h_count + KEEP_WIDTH >= dma_len))
+                // Use byte count instead of tlast (tlast fires per PMTU fragment)
+                if (payload_to_dma_in_tvalid && (dma_d2h_count + KEEP_WIDTH >= dma_len))
                     next_state = IDLE;
                 else
                     next_state = RECEIVE_PAYLOAD;
@@ -177,9 +178,10 @@ module payload_to_dma #(
             end
             RECEIVE_PAYLOAD: begin
                 // On read completion, set the status of DMA register so that it can be polled by the CPU
-                dma_status_valid = payload_to_dma_in_tlast == 1'b1;
-                dma_status = payload_to_dma_in_tlast == 1'b1;
-                dma_tx_length_valid = payload_to_dma_in_tlast && payload_to_dma_in_tvalid;
+                // Use byte count instead of tlast (tlast fires per PMTU fragment)
+                dma_status_valid = payload_to_dma_in_tvalid && (dma_d2h_count + KEEP_WIDTH >= dma_len);
+                dma_status = payload_to_dma_in_tvalid && (dma_d2h_count + KEEP_WIDTH >= dma_len);
+                dma_tx_length_valid = payload_to_dma_in_tvalid && (dma_d2h_count + KEEP_WIDTH >= dma_len);
                 dma_tx_length = dma_d2h_count + KEEP_WIDTH;
 
                 // TODO: payload_to_dma_in_tdata also contains the header, this must be stripped off

@@ -130,11 +130,25 @@ module txn_generator #(
 
     reg state, state_next;
 
+    // Beat counter for DMA reply: tracks remaining bytes
+    reg [63:0] dma_reply_remaining;
+
     always @(posedge aclk) begin
-        if (aresetn == 1'b0)
+        if (aresetn == 1'b0) begin
             state <= IDLE;
-        else
+            dma_reply_remaining <= 64'b0;
+        end else begin
             state <= state_next;
+
+            // Load counter when first beat of DMA reply (op=2) is accepted
+            if (state == IDLE && txn_generator_in_tvalid && txn_generator_in_tready && dev_op == 8'd2) begin
+                dma_reply_remaining <= dma_len;
+            end
+            // Decrement on each handshake during DMA_ACTIVE
+            else if (state == DMA_ACTIVE && txn_generator_in_tvalid && txn_generator_in_tready) begin
+                dma_reply_remaining <= dma_reply_remaining - KEEP_WIDTH;
+            end
+        end
     end
 
     // State transition logic
@@ -146,15 +160,17 @@ module txn_generator #(
                 // Only transition to DMA_ACTIVE for op=2 (DMA reply)
                 // MMIO (op=0, op=1) is single-beat, handled without state change
                 if (txn_generator_in_tvalid && txn_generator_in_tready) begin
-                    if (dev_op == 8'd2 && !txn_generator_in_tlast)
+                    if (dev_op == 8'd2 && dma_len > KEEP_WIDTH)
                         state_next = DMA_ACTIVE;
                     // For MMIO (op=0, op=1), stay in IDLE since it's single-beat
+                    // For tiny DMA replies (dma_len <= KEEP_WIDTH), also stay in IDLE
                 end
             end
             
             DMA_ACTIVE: begin
-                // DMA can be multi-beat, wait for tlast
-                if (txn_generator_in_tvalid && txn_generator_in_tready && txn_generator_in_tlast)
+                // DMA can be multi-beat, use beat counter instead of tlast
+                // (tlast fires per PMTU fragment)
+                if (txn_generator_in_tvalid && txn_generator_in_tready && dma_reply_remaining <= KEEP_WIDTH)
                     state_next = IDLE;
             end
             
