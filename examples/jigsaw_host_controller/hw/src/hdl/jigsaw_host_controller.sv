@@ -99,17 +99,32 @@ localparam DMA_WR = 2'b10;
 // Register mmio_ctrl to ensure proper synchronization and known reset value
 reg mmio_ctrl_reg;
 
+// Beat counter for DMA Write: tracks remaining bytes to receive from network
+reg [63:0] dma_wr_remaining;
+
 always @(posedge aclk) begin
     if (!aresetn) begin
         mmio_state_cur <= MMIO_IDLE;
         dma_wr_state_cur <= DMA_IDLE;
         dma_rd_state_cur <= DMA_IDLE;
         mmio_ctrl_reg <= 1'b0;
+        dma_wr_remaining <= 64'b0;
     end else begin
         mmio_state_cur <= mmio_state_next;
         dma_wr_state_cur <= dma_wr_state_next;
         dma_rd_state_cur <= dma_rd_state_next;
         mmio_ctrl_reg <= mmio_ctrl;
+
+        // Load dma_wr_remaining when header beat (opcode=1) is accepted
+        if (dma_wr_state_cur == DMA_IDLE && network_in_tvalid && host_out_tready &&
+            mmio_state_cur == MMIO_IDLE && !mmio_ctrl_reg &&
+            network_in_tdata[OP_POS +: OP_WIDTH] == 8'd1) begin
+            dma_wr_remaining <= network_in_tdata[LEN_POS +: LEN_WIDTH];
+        end
+        // Decrement on each payload beat handshake in DMA_WR state
+        else if (dma_wr_state_cur == DMA_WR && network_in_tvalid && host_out_tready) begin
+            dma_wr_remaining <= dma_wr_remaining - KEEP_WIDTH;
+        end
     end
 end
 
@@ -231,7 +246,8 @@ always @(*) begin
                 host_out_tvalid = 1'b1;
                 host_out_tdata = network_in_tdata;
                 host_out_tkeep = network_in_tkeep;
-                if (network_in_tlast) begin
+                // Use beat count instead of tlast (tlast fires per PMTU fragment)
+                if (dma_wr_remaining <= KEEP_WIDTH) begin
                     dma_wr_state_next = DMA_IDLE;
                     host_out_tlast = 1'b1;
                 end
