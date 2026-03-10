@@ -1,0 +1,27 @@
+# CMake configuration
+cmake_minimum_required(VERSION 3.5)
+project(example_07_perf_fpga)
+
+set(CYT_DIR ${CMAKE_SOURCE_DIR}/../../../)
+set(CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH} ${CYT_DIR}/cmake)
+find_package(CoyoteSW REQUIRED)
+
+message("*** Coyote Example 7: Data Movement Initiated by the FPGA [Software] ***")
+
+# Directory containing the executable(s) to be compiled
+set(TARGET_DIR "${CMAKE_SOURCE_DIR}/src/")
+
+# Create build targets and link against required libraries
+set(EXEC test)
+add_executable(${EXEC} ${TARGET_DIR}/main.cpp ${TARGET_DIR}/rdma_server.cpp)
+target_link_libraries(${EXEC} PUBLIC Coyote)
+target_link_directories(${EXEC} PUBLIC /usr/local/lib)
+
+target_include_directories(${EXEC} PRIVATE
+    ${IBVERBS_INCLUDE_DIRS}
+    ${RDMACM_INCLUDE_DIRS}
+)
+
+#target_link_libraries(${EXEC} PUBLIC ${IBVERBS_LINK_LIBRARIES} ${RDMACM_LINK_LIBRARIES})
+target_link_options(${EXEC} PUBLIC -libverbs -lrdmacm)
+target_compile_options(${EXEC} PUBLIC -libverbs -lrdmacm)
