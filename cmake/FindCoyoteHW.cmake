@@ -351,8 +351,8 @@ macro(validation_checks_hw)
         ## DDR and HBM support
         ## ! u280 has both DDR and HBM, HBM enabled by def, if DDR is required add u280 in DDR_DEV and remove it from HBM_DEV
         ##
-        set(DDR_DEV "u250")
-        set(HBM_DEV "u55c" "u280")
+        set(DDR_DEV "u250" "u280")
+        set(HBM_DEV "u55c")
 
         list(FIND DDR_DEV ${FDEV_NAME} TMP_DEV)
         if(NOT TMP_DEV EQUAL -1)

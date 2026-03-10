@@ -154,7 +154,8 @@ target_include_directories(Coyote PUBLIC ${CYT_INCLUDE_PATH})
 target_link_directories(Coyote PUBLIC /usr/local/lib)
 
 # Additional libraries
-find_package(Boost COMPONENTS program_options REQUIRED)
+find_package(Boost REQUIRED COMPONENTS program_options system thread)
+target_include_directories(Coyote PUBLIC ${Boost_INCLUDE_DIRS})
 target_link_libraries(Coyote PUBLIC ${Boost_LIBRARIES})
 
 # Additional flags, depending on AVX or GPU support
