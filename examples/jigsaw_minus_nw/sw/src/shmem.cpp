@@ -11,9 +11,10 @@
 #include <cstdint>
 
 #include "shmem.hpp"
-#include "mmio_handler.hpp"
 
 #include "cThread.hpp"
+
+#define CONFIG_DISAGG_DEBUG_MMIO
 
 static void *shmem = NULL;
 static volatile uint8_t *read_doorbell = NULL;
@@ -92,8 +93,6 @@ static int ivshmem_mmio_region_read(void *buf) {
     memcpy(&type, reinterpret_cast<char *>(shmem) + MMIO_REGION_OFFSET, 1);
     memcpy(buf, reinterpret_cast<char *>(shmem) + MMIO_REGION_OFFSET + 1, sizeof(struct mmio_message_header));
 
-    __atomic_store_n(write_doorbell, 0, __ATOMIC_RELEASE);
-
     return 0;
 }
 
@@ -112,6 +111,35 @@ static int ivshmem_mmio_region_write(void *buf, size_t count) {
     return 0;
 }
 
+void mmio_read(coyote::cThread &coyote_thread) {
+    // Clear read status
+    coyote_thread.setCSR(0, static_cast<uint32_t>(JigsawHostControlRegisters::MMIO_READ_STATUS_REG));
+
+    // Trigger MMIO
+    coyote_thread.setCSR(1, static_cast<uint32_t>(JigsawHostControlRegisters::MMIO_CTRL_REG));
+
+    // Poll for completion
+    while (coyote_thread.getCSR(static_cast<uint32_t>(JigsawHostControlRegisters::MMIO_READ_STATUS_REG)) != 1) {
+        std::this_thread::sleep_for(std::chrono::nanoseconds(CLOCK_PERIOD_NS));
+    }
+
+    __atomic_store_n(read_doorbell, 1, __ATOMIC_RELEASE);
+}
+
+void mmio_write(coyote::cThread &coyote_thread) {
+    // Clear write status
+    coyote_thread.setCSR(0, static_cast<uint32_t>(JigsawHostControlRegisters::MMIO_WRITE_STATUS_REG));
+
+    // Trigger MMIO
+    coyote_thread.setCSR(1, static_cast<uint32_t>(JigsawHostControlRegisters::MMIO_CTRL_REG));
+
+    // Poll for completion
+    while (coyote_thread.getCSR(static_cast<uint32_t>(JigsawHostControlRegisters::MMIO_WRITE_STATUS_REG)) != 1) {
+        std::this_thread::sleep_for(std::chrono::nanoseconds(CLOCK_PERIOD_NS));
+    }
+};
+
+
 void *run_shmem_app(coyote::cThread &coyote_thread) {
 
     printf("connection.c: In shmem app\n");
@@ -122,6 +150,8 @@ void *run_shmem_app(coyote::cThread &coyote_thread) {
     loff_t offset;
 
     while (1) {
+        __atomic_store_n(write_doorbell, 0, __ATOMIC_RELEASE);
+
         mmio_message_header header;
         if (ivshmem_mmio_region_read(&header) != 0) {
             perror("Failed to read message");
@@ -137,21 +167,13 @@ void *run_shmem_app(coyote::cThread &coyote_thread) {
 
             case OP_READ:
 
-                offset = header.address;
-                edu_mmio_read(coyote_thread, data, offset);
+                mmio_read(coyote_thread);
 
-                if (ivshmem_mmio_region_write(data, sizeof(data)) != 0) {
-                    perror("Failed to write response");
-                    continue;
-                }
                 continue;
 
             case OP_WRITE:
 
-                memcpy(data, &header.value, sizeof(header.value));
-
-                offset = header.address;
-                edu_mmio_write(coyote_thread, data, offset);
+                mmio_write(coyote_thread);
 
                 continue;
 
