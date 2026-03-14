@@ -50,6 +50,10 @@ module jigsaw_host_controller #(
     output logic [63:0] sq_addr_read,
     output logic [63:0] sq_len_read,
 
+    // Submission queue ready signals (backpressure from Datamover)
+    input  logic sq_ready_write,
+    input  logic sq_ready_read,
+
     // Host side MMIO vaddr
     input logic [63:0] mmio_vaddr,
 
@@ -117,7 +121,7 @@ always @(posedge aclk) begin
 
         // Load dma_wr_remaining when header beat (opcode=1) is accepted
         if (dma_wr_state_cur == DMA_IDLE && network_in_tvalid && host_out_tready &&
-            mmio_state_cur == MMIO_IDLE && !mmio_ctrl_reg &&
+            mmio_state_cur == MMIO_IDLE && !mmio_ctrl_reg && sq_ready_write &&
             network_in_tdata[OP_POS +: OP_WIDTH] == 8'd1) begin
             dma_wr_remaining <= network_in_tdata[LEN_POS +: LEN_WIDTH];
         end
@@ -214,17 +218,18 @@ always @(*) begin
             if (network_in_tvalid && host_out_tready && mmio_state_cur == MMIO_IDLE && !mmio_ctrl_reg) begin
                 if (network_in_tdata[OP_POS +: OP_WIDTH] == 8'd1) begin
                     // D2H DMA: First beat is header only (op + addr + len)
-                    // payload_to_dma sends header and payload in separate beats
-                    // Capture header info but don't send data from this beat
-                    dma_wr_state_next = DMA_WR;
-                    sq_valid_write = 1'b1;
-                    sq_dir_write = 1'b1;
-                    sq_addr_write = network_in_tdata[ADDR_POS +: ADDR_WIDTH];
-                    sq_len_write = network_in_tdata[LEN_POS +: LEN_WIDTH];
-                    
-                    // Don't send data from header beat - wait for payload beats
-                    // This beat is consumed (network_in_tready will be high)
-                    // but we don't output anything to host_out
+                    // Only transition and issue SQ command when Datamover SQ is ready
+                    if (sq_ready_write) begin
+                        dma_wr_state_next = DMA_WR;
+                        sq_valid_write = 1'b1;
+                        sq_dir_write = 1'b1;
+                        sq_addr_write = network_in_tdata[ADDR_POS +: ADDR_WIDTH];
+                        sq_len_write = network_in_tdata[LEN_POS +: LEN_WIDTH];
+
+                        // Don't send data from header beat - wait for payload beats
+                        // This beat is consumed (network_in_tready will be high)
+                        // but we don't output anything to host_out
+                    end
                 end else if (network_in_tdata[OP_POS +: OP_WIDTH] == 8'd2) begin
                     // This is a MMIO Response from network_in
                     sq_valid_write = 1'b1;
@@ -277,8 +282,8 @@ always @(*) begin
                         rdma_wr_valid = 1'b1;
                         rdma_wr_len = 64 + network_in_tdata[LEN_POS +: LEN_WIDTH];
 
-                        // Only transition state and issue SQ request if ready
-                        if (network_out_tready) begin
+                        // Only transition state and issue SQ request if both network_out and SQ are ready
+                        if (network_out_tready && sq_ready_read) begin
                             dma_rd_state_next = DMA_RD;
                             sq_valid_read = 1'b1;
                             sq_dir_read = 1'b0;
@@ -331,8 +336,9 @@ always_comb begin
             network_in_tready = 1'b0;
         end else begin
             case (network_in_tdata[OP_POS +: OP_WIDTH])
-                8'd0:    network_in_tready = network_out_tready; // DMA Read needs network_out
-                8'd1, 8'd2: network_in_tready = host_out_tready; // DMA Write / MMIO Resp need host_out
+                8'd0:    network_in_tready = network_out_tready && sq_ready_read; // DMA Read needs network_out and sq_ready_read
+                8'd1:    network_in_tready = host_out_tready && sq_ready_write;   // DMA Write needs host_out and sq_ready_write
+                8'd2:    network_in_tready = host_out_tready;                     // MMIO Resp needs host_out
                 default: network_in_tready = 1'b0;
             endcase
         end

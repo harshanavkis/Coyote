@@ -36,6 +36,8 @@ axisr_reg inst_reg_out (.aclk(aclk), .aresetn(aresetn), .s_axis(axis_out_int), .
 (* mark_debug = "true" *) logic sq_dir_read;
 (* mark_debug = "true" *) logic [VADDR_BITS-1:0] sq_addr_read;
 (* mark_debug = "true" *) logic [LEN_BITS-1:0] sq_len_read;
+(* mark_debug = "true" *) logic sq_ready_write;
+(* mark_debug = "true" *) logic sq_ready_read;
 
 // RDMA submission signals
 (* mark_debug = "true" *) logic rdma_wr_valid;
@@ -109,6 +111,9 @@ jigsaw_host_controller #(
     .sq_addr_read(sq_addr_read),
     .sq_len_read(sq_len_read),
 
+    .sq_ready_write(sq_ready_write),
+    .sq_ready_read(sq_ready_read),
+
     // MMIO control
     .mmio_vaddr(mmio_vaddr),
     .mmio_ctrl(mmio_ctrl),
@@ -124,6 +129,9 @@ jigsaw_host_controller #(
 // ============================================================================
 // SQ submission logic
 // ============================================================================
+assign sq_ready_write = sq_wr.ready;
+assign sq_ready_read  = sq_rd.ready;
+
 always_comb begin
     // ----- Local DMA READ -----
     sq_rd.data          = 0;
