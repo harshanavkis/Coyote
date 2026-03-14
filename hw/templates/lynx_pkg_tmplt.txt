@@ -286,7 +286,7 @@ package lynxTypes;
     localparam integer RDMA_MSN_BITS = 24;
     localparam integer RDMA_SNDRM_BITS = 8;
     localparam integer RDMA_N_RD_OUTSTANDING = 8;
-    localparam integer RDMA_N_WR_OUTSTANDING = 16;
+    localparam integer RDMA_N_WR_OUTSTANDING = 64;
     localparam integer RDMA_MAX_SINGLE_READ = 32 * 1024;
     localparam integer RDMA_MODE_PARSE = 0;
     localparam integer RDMA_MODE_RAW = 1;

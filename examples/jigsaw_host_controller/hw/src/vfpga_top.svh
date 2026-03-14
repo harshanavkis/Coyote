@@ -103,11 +103,13 @@ jigsaw_host_controller #(
     .sq_dir_write(sq_dir_write),
     .sq_addr_write(sq_addr_write),
     .sq_len_write(sq_len_write),
+    .sq_ready_write(sq_wr.ready),
 
     .sq_valid_read(sq_valid_read),
     .sq_dir_read(sq_dir_read),
     .sq_addr_read(sq_addr_read),
     .sq_len_read(sq_len_read),
+    .sq_ready_read(sq_rd.ready),
 
     // MMIO control
     .mmio_vaddr(mmio_vaddr),
