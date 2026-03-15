@@ -63,7 +63,8 @@ module jigsaw_host_controller #(
 
     // RDMA submission outputs (separate from local DMA SQ)
     output logic rdma_wr_valid,
-    output logic [LEN_BITS-1:0] rdma_wr_len
+    output logic [LEN_BITS-1:0] rdma_wr_len,
+    input  logic rdma_wr_ready
 );
 
 localparam OP_POS = 0;
@@ -266,7 +267,7 @@ always @(*) begin
             // Only check for DMA Read when:
             // - DMA Write is NOT active (to prevent race with payload beats)
             // - MMIO is not active AND not pending (mmio_ctrl_reg) to prevent overlap
-            if (network_in_tvalid && sq_ready_read && mmio_state_cur == MMIO_IDLE && !mmio_ctrl_reg && dma_wr_state_cur == DMA_IDLE) begin
+            if (network_in_tvalid && sq_ready_read && rdma_wr_ready && network_out_tready && mmio_state_cur == MMIO_IDLE && !mmio_ctrl_reg && dma_wr_state_cur == DMA_IDLE) begin
                 if (network_in_tdata[OP_POS +: OP_WIDTH] == 8'd0) begin
                     if (!sq_valid_read) begin // Arbitration: Prioritize MMIO over DMA Read for SQ access
                         // Fix for combinatorial loop: Valid/Data generation should NOT depend on Ready
@@ -281,14 +282,12 @@ always @(*) begin
                         rdma_wr_valid = 1'b1;
                         rdma_wr_len = 64 + network_in_tdata[LEN_POS +: LEN_WIDTH];
 
-                        // Only transition state and issue SQ request if ready
-                        if (network_out_tready) begin
-                            dma_rd_state_next = DMA_RD;
-                            sq_valid_read = 1'b1;
-                            sq_dir_read = 1'b0;
-                            sq_addr_read = network_in_tdata[ADDR_POS +: ADDR_WIDTH];
-                            sq_len_read = network_in_tdata[LEN_POS +: LEN_WIDTH];
-                        end
+                        // We already checked network_out_tready and rdma_wr_ready above
+                        dma_rd_state_next = DMA_RD;
+                        sq_valid_read = 1'b1;
+                        sq_dir_read = 1'b0;
+                        sq_addr_read = network_in_tdata[ADDR_POS +: ADDR_WIDTH];
+                        sq_len_read = network_in_tdata[LEN_POS +: LEN_WIDTH];
                     end
                 end
             end
@@ -335,7 +334,7 @@ always_comb begin
             network_in_tready = 1'b0;
         end else begin
             case (network_in_tdata[OP_POS +: OP_WIDTH])
-                8'd0:    network_in_tready = network_out_tready && sq_ready_read; // DMA Read needs network_out
+                8'd0:    network_in_tready = network_out_tready && sq_ready_read && rdma_wr_ready; // DMA Read needs network_out + local SQ + RoCE SQ
                 8'd1, 8'd2: network_in_tready = host_out_tready && sq_ready_write; // DMA Write / MMIO Resp need host_out
                 default: network_in_tready = 1'b0;
             endcase
