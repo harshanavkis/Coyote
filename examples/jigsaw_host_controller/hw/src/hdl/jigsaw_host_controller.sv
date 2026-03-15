@@ -61,7 +61,8 @@ module jigsaw_host_controller #(
 
     // RDMA submission outputs (separate from local DMA SQ)
     output logic rdma_wr_valid,
-    output logic [LEN_BITS-1:0] rdma_wr_len
+    output logic [LEN_BITS-1:0] rdma_wr_len,
+    input  logic rdma_wr_ready
 );
 
 localparam OP_POS = 0;
@@ -99,6 +100,12 @@ localparam DMA_WR = 2'b10;
 // Register mmio_ctrl to ensure proper synchronization and known reset value
 reg mmio_ctrl_reg;
 
+// cmd_fired registers: track whether the RDMA command has been successfully
+// submitted to the SQ for the current transaction, preventing duplicate submissions
+// when the data stream stalls and rdma_wr_valid would otherwise stay high.
+reg mmio_cmd_fired;    // Set when RDMA cmd is fired in MMIO_ACTIVE state
+reg dma_rd_cmd_fired;  // Set when RDMA cmd is fired in DMA_IDLE (DMA read) state
+
 // Beat counter for DMA Write: tracks remaining bytes to receive from network
 reg [63:0] dma_wr_remaining;
 
@@ -109,6 +116,8 @@ always @(posedge aclk) begin
         dma_rd_state_cur <= DMA_IDLE;
         mmio_ctrl_reg <= 1'b0;
         dma_wr_remaining <= 64'b0;
+        mmio_cmd_fired <= 1'b0;
+        dma_rd_cmd_fired <= 1'b0;
     end else begin
         mmio_state_cur <= mmio_state_next;
         dma_wr_state_cur <= dma_wr_state_next;
@@ -124,6 +133,28 @@ always @(posedge aclk) begin
         // Decrement on each payload beat handshake in DMA_WR state
         else if (dma_wr_state_cur == DMA_WR && network_in_tvalid && host_out_tready) begin
             dma_wr_remaining <= dma_wr_remaining - KEEP_WIDTH;
+        end
+
+        // mmio_cmd_fired: track RDMA command submission in MMIO_ACTIVE state.
+        // State transition clear takes explicit priority over handshake set.
+        if (mmio_state_cur == MMIO_ACTIVE) begin
+            if (mmio_state_next == MMIO_IDLE)
+                mmio_cmd_fired <= 1'b0;  // Clear when transitioning out (explicit priority)
+            else if (rdma_wr_valid && rdma_wr_ready)
+                mmio_cmd_fired <= 1'b1;
+        end else begin
+            mmio_cmd_fired <= 1'b0;
+        end
+
+        // dma_rd_cmd_fired: track RDMA command submission in DMA_IDLE (DMA read) state.
+        // State transition clear takes explicit priority over handshake set.
+        if (dma_rd_state_cur == DMA_IDLE) begin
+            if (dma_rd_state_next == DMA_RD)
+                dma_rd_cmd_fired <= 1'b0;  // Clear when transitioning out (explicit priority)
+            else if (mmio_state_cur == MMIO_IDLE && rdma_wr_valid && rdma_wr_ready)
+                dma_rd_cmd_fired <= 1'b1;
+        end else begin
+            dma_rd_cmd_fired <= 1'b0;
         end
     end
 end
@@ -187,14 +218,14 @@ always @(*) begin
                     // Since we do not have a payload for read
                     network_out_tkeep = {KEEP_WIDTH{1'b1}};
                     // RDMA WRITE submission for MMIO read request
-                    rdma_wr_valid = 1'b1;
+                    rdma_wr_valid = !mmio_cmd_fired;
                     rdma_wr_len = 64; // 64 bytes
                     mmio_state_next = MMIO_IDLE;
                 end else if (host_in_tdata[OP_POS +: OP_WIDTH] == 8'd1) begin
                     network_out_tdata = {{(AXI_DATA_BITS - 200){1'b0}}, host_in_tdata[199:0]};
                     network_out_tkeep = {KEEP_WIDTH{1'b1}};
                     // RDMA WRITE submission for MMIO write request
-                    rdma_wr_valid = 1'b1;
+                    rdma_wr_valid = !mmio_cmd_fired;
                     rdma_wr_len = 64; // 64 bytes
                     mmio_state_next = MMIO_IDLE;
                     mmio_write_done = network_out_tready;
@@ -274,7 +305,7 @@ always @(*) begin
                         network_out_tkeep = {{KEEP_WIDTH}{1'b1}};
                         // RDMA WRITE submission for DMA read ACK + upcoming data
                         // Total length = 64 (ACK beat) + payload length
-                        rdma_wr_valid = 1'b1;
+                        rdma_wr_valid = !dma_rd_cmd_fired;
                         rdma_wr_len = 64 + network_in_tdata[LEN_POS +: LEN_WIDTH];
 
                         // Only transition state and issue SQ request if ready

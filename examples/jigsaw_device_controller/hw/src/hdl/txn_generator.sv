@@ -24,7 +24,8 @@ module txn_generator #(
 
     // RDMA submission outputs: asserted on the first beat of each outgoing packet
     output wire rdma_wr_valid,
-    output wire [63:0] rdma_wr_len
+    output wire [63:0] rdma_wr_len,
+    input  wire rdma_wr_ready
 );
 
     /*
@@ -308,19 +309,29 @@ module txn_generator #(
     // RDMA submission logic: track packet boundaries and generate
     // rdma_wr_valid on the first beat of each outgoing packet.
     reg packet_active;
+    reg cmd_fired;  // Tracks whether the RDMA command has been submitted for the current packet
 
     always @(posedge aclk) begin
         if (!aresetn) begin
             packet_active <= 1'b0;
-        end else if (txn_generator_out_tvalid && txn_generator_out_tready) begin
-            if (txn_generator_out_tlast)
+            cmd_fired <= 1'b0;
+        end else begin
+            // Update packet_active and cmd_fired based on priority:
+            // - Clear on tlast takes priority over set (for single-beat packets)
+            if (txn_generator_out_tvalid && txn_generator_out_tready && txn_generator_out_tlast) begin
                 packet_active <= 1'b0;  // Packet finished
-            else
-                packet_active <= 1'b1;  // Mid-packet
+                cmd_fired <= 1'b0;      // Clear for next packet (explicit priority over set)
+            end else begin
+                if (txn_generator_out_tvalid && txn_generator_out_tready)
+                    packet_active <= 1'b1;  // Mid-packet
+                if (rdma_wr_valid && rdma_wr_ready)
+                    cmd_fired <= 1'b1;  // Command accepted
+            end
         end
     end
 
-    // rdma_wr_valid: asserted on the first beat of each outgoing packet
+    // rdma_wr_valid: asserted on the first beat of each outgoing packet,
+    // held high for exactly one cycle (until cmd_fired is set by rdma_wr_ready).
     wire first_beat = txn_generator_out_tvalid && !packet_active;
 
     // rdma_wr_len: total packet length in bytes
@@ -328,7 +339,7 @@ module txn_generator #(
     wire [63:0] rdma_pkt_len = mmio_read_valid ? 64'd64 :
                                (dma_direction ? (64'd64 + dma_len) : 64'd64);
 
-    assign rdma_wr_valid = first_beat;
+    assign rdma_wr_valid = first_beat && !cmd_fired;
     assign rdma_wr_len = rdma_pkt_len;
 
 endmodule

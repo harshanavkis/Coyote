@@ -51,7 +51,8 @@ txn_generator inst_txn_generator (
 
     // RDMA submission signals
     .rdma_wr_valid(rdma_wr_valid),
-    .rdma_wr_len(rdma_wr_len)
+    .rdma_wr_len(rdma_wr_len),
+    .rdma_wr_ready(sq_wr.ready)
 );
 
 // ============================================================================
