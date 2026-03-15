@@ -118,7 +118,11 @@ jigsaw_host_controller #(
 
     // RDMA submission
     .rdma_wr_valid(rdma_wr_valid),
-    .rdma_wr_len(rdma_wr_len)
+    .rdma_wr_len(rdma_wr_len),
+
+    // SQ ready signals for atomic flow control
+    .rdma_wr_ready(sq_wr.ready),
+    .sq_ready_read(sq_rd.ready)
 );
 
 // ============================================================================

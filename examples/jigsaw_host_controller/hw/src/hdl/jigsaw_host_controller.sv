@@ -61,7 +61,11 @@ module jigsaw_host_controller #(
 
     // RDMA submission outputs (separate from local DMA SQ)
     output logic rdma_wr_valid,
-    output logic [LEN_BITS-1:0] rdma_wr_len
+    output logic [LEN_BITS-1:0] rdma_wr_len,
+
+    // Submission queue ready signals for atomic flow control
+    input logic rdma_wr_ready,
+    input logic sq_ready_read
 );
 
 localparam OP_POS = 0;
@@ -116,14 +120,18 @@ always @(posedge aclk) begin
         mmio_ctrl_reg <= mmio_ctrl;
 
         // Load dma_wr_remaining when header beat (opcode=1) is accepted
-        if (dma_wr_state_cur == DMA_IDLE && network_in_tvalid && host_out_tready &&
+        if (dma_wr_state_cur == DMA_IDLE && network_in_tvalid && host_out_tready && rdma_wr_ready &&
             mmio_state_cur == MMIO_IDLE && !mmio_ctrl_reg &&
             network_in_tdata[OP_POS +: OP_WIDTH] == 8'd1) begin
             dma_wr_remaining <= network_in_tdata[LEN_POS +: LEN_WIDTH];
         end
         // Decrement on each payload beat handshake in DMA_WR state
         else if (dma_wr_state_cur == DMA_WR && network_in_tvalid && host_out_tready) begin
-            dma_wr_remaining <= dma_wr_remaining - KEEP_WIDTH;
+            // Prevent underflow
+            if (dma_wr_remaining >= KEEP_WIDTH)
+                dma_wr_remaining <= dma_wr_remaining - KEEP_WIDTH;
+            else
+                dma_wr_remaining <= 0;
         end
     end
 end
@@ -211,7 +219,8 @@ always @(*) begin
     case (dma_wr_state_cur)
         DMA_IDLE: begin
             // Check MMIO is not active AND not pending (mmio_ctrl_reg) to prevent race
-            if (network_in_tvalid && host_out_tready && mmio_state_cur == MMIO_IDLE && !mmio_ctrl_reg) begin
+            // Also gate on rdma_wr_ready to ensure write SQ is ready before accepting header
+            if (network_in_tvalid && host_out_tready && rdma_wr_ready && mmio_state_cur == MMIO_IDLE && !mmio_ctrl_reg) begin
                 if (network_in_tdata[OP_POS +: OP_WIDTH] == 8'd1) begin
                     // D2H DMA: First beat is header only (op + addr + len)
                     // payload_to_dma sends header and payload in separate beats
@@ -241,15 +250,17 @@ always @(*) begin
             end
         end
         DMA_WR: begin
-            // Pass through payload beats directly to host_out
-            if (network_in_tvalid && host_out_tready) begin
-                host_out_tvalid = 1'b1;
-                host_out_tdata = network_in_tdata;
-                host_out_tkeep = network_in_tkeep;
-                // Use beat count instead of tlast (tlast fires per PMTU fragment)
-                if (dma_wr_remaining <= KEEP_WIDTH) begin
+            // Correct AXI Stream passthrough: tvalid must not depend on tready
+            host_out_tvalid = network_in_tvalid;
+            host_out_tdata = network_in_tdata;
+            host_out_tkeep = network_in_tkeep;
+            // Only assert tlast when we are on the final beat. The dma_wr_remaining > 0
+            // check ensures we don't use a stale 0 from a previous run.
+            if (dma_wr_remaining > 0 && dma_wr_remaining <= KEEP_WIDTH) begin
+                host_out_tlast = 1'b1;
+                // Only transition state when the final beat is actually accepted
+                if (network_in_tvalid && host_out_tready) begin
                     dma_wr_state_next = DMA_IDLE;
-                    host_out_tlast = 1'b1;
                 end
             end
         end
@@ -260,12 +271,14 @@ always @(*) begin
     case (dma_rd_state_cur)
         DMA_IDLE: begin
             // Only check for DMA Read when:
+            // - All required resources are ready (sq_ready_read, rdma_wr_ready, network_out_tready)
             // - DMA Write is NOT active (to prevent race with payload beats)
             // - MMIO is not active AND not pending (mmio_ctrl_reg) to prevent overlap
-            if (network_in_tvalid && mmio_state_cur == MMIO_IDLE && !mmio_ctrl_reg && dma_wr_state_cur == DMA_IDLE) begin
+            // Gate everything atomically so state, SQ, and network output all happen together
+            if (network_in_tvalid && sq_ready_read && rdma_wr_ready && network_out_tready &&
+                mmio_state_cur == MMIO_IDLE && !mmio_ctrl_reg && dma_wr_state_cur == DMA_IDLE) begin
                 if (network_in_tdata[OP_POS +: OP_WIDTH] == 8'd0) begin
                     if (!sq_valid_read) begin // Arbitration: Prioritize MMIO over DMA Read for SQ access
-                        // Fix for combinatorial loop: Valid/Data generation should NOT depend on Ready
                         // TODO: This wastes 63 bytes per transaction, we should probably use
                         // and axis_arb_mux: https://github.com/alexforencich/verilog-axis/blob/master/rtl/axis_arb_mux.v.
                         // This is because partial tkeep can only be used when tlast is high.
@@ -277,14 +290,11 @@ always @(*) begin
                         rdma_wr_valid = 1'b1;
                         rdma_wr_len = 64 + network_in_tdata[LEN_POS +: LEN_WIDTH];
 
-                        // Only transition state and issue SQ request if ready
-                        if (network_out_tready) begin
-                            dma_rd_state_next = DMA_RD;
-                            sq_valid_read = 1'b1;
-                            sq_dir_read = 1'b0;
-                            sq_addr_read = network_in_tdata[ADDR_POS +: ADDR_WIDTH];
-                            sq_len_read = network_in_tdata[LEN_POS +: LEN_WIDTH];
-                        end
+                        dma_rd_state_next = DMA_RD;
+                        sq_valid_read = 1'b1;
+                        sq_dir_read = 1'b0;
+                        sq_addr_read = network_in_tdata[ADDR_POS +: ADDR_WIDTH];
+                        sq_len_read = network_in_tdata[LEN_POS +: LEN_WIDTH];
                     end
                 end
             end
@@ -331,8 +341,10 @@ always_comb begin
             network_in_tready = 1'b0;
         end else begin
             case (network_in_tdata[OP_POS +: OP_WIDTH])
-                8'd0:    network_in_tready = network_out_tready; // DMA Read needs network_out
-                8'd1, 8'd2: network_in_tready = host_out_tready; // DMA Write / MMIO Resp need host_out
+                // Gate Read completely behind local SQ, RoCE SQ, and network_out
+                8'd0:    network_in_tready = network_out_tready && sq_ready_read && rdma_wr_ready;
+                // Gate Write completely behind write SQ and Host Stream
+                8'd1, 8'd2: network_in_tready = host_out_tready && rdma_wr_ready;
                 default: network_in_tready = 1'b0;
             endcase
         end
