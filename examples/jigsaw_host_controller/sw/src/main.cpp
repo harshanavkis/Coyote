@@ -142,12 +142,18 @@ static void run_test(coyote::cThread &ct, void *mem) {
     std::cout << std::endl;
 
     // --- DMA test (H2D read, 1 KiB) ---
-    uint64_t xfer = 524288;
+    uint64_t xfer = 16*1024;
     std::cout << "=== DMA Test (H2D Read, " << xfer << " B) ===" << std::endl;
 
-    uint64_t dma_src = mem_addr + 4096;
-    write_mmio(ct, mem, static_cast<uint64_t>(DevReg::DMA_SRC_ADDR), dma_src);
-    std::cout << "  Set DMA SRC  = 0x" << std::hex << dma_src << std::dec << std::endl;
+    uint64_t dma_dst = mem_addr + 4096;
+    write_mmio(ct, mem, static_cast<uint64_t>(DevReg::DMA_DST_ADDR), dma_dst);
+    std::cout << "  Set DMA DST  = 0x" << std::hex << dma_dst << std::dec << std::endl;
+
+    v = read_mmio(ct, mem, static_cast<uint64_t>(DevReg::DMA_DST_ADDR));
+    std::cout << "  Read DMA DST = 0x" << std::hex << v << std::dec << std::endl;
+
+    write_mmio(ct, mem, static_cast<uint64_t>(DevReg::DMA_SRC_ADDR), dma_dst);
+    std::cout << "  Set DMA SRC  = 0x" << std::hex << dma_dst << std::dec << std::endl;
 
     v = read_mmio(ct, mem, static_cast<uint64_t>(DevReg::DMA_SRC_ADDR));
     std::cout << "  Read DMA SRC = 0x" << std::hex << v << std::dec << std::endl;
@@ -160,8 +166,8 @@ static void run_test(coyote::cThread &ct, void *mem) {
 
     write_mmio(ct, mem, static_cast<uint64_t>(DevReg::DMA_STATUS), 0);
 
-    write_mmio(ct, mem, static_cast<uint64_t>(DevReg::DMA_CMD), 1);
-    std::cout << "  Started DMA (CMD=1)" << std::endl;
+    write_mmio(ct, mem, static_cast<uint64_t>(DevReg::DMA_CMD), 3);
+    std::cout << "  Started DMA (CMD=3)" << std::endl;
 
     int polls = 0;
     uint64_t status = 0;
@@ -234,12 +240,15 @@ int main(int argc, char *argv[]) {
     // Sync with device before starting
     ct.connSync(true);
 
-    // Run tests
-    std::cout << "=== RUN 1 ===" << std::endl;
-    run_test(ct, mem);
+    int* jigsaw_mem =  (int *) ct.getMem({coyote::CoyoteAllocType::HPF, 1024*1024});
+    if (!jigsaw_mem) { throw std::runtime_error("Could not allocate memory; exiting..."); }
 
-    std::cout << "=== RUN 2 ===" << std::endl;
-    run_test(ct, mem);
+    // Run tests
+    for (int i = 0; i < 10; i++) {
+        std::cout << "=== RUN " << i << " ===" << std::endl;
+        run_test(ct, jigsaw_mem);
+        std::this_thread::sleep_for(std::chrono::seconds(5));
+    }
 
     // Sync with device after finishing
     ct.connSync(true);

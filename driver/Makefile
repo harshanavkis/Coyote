@@ -54,7 +54,8 @@ coyote_driver-objs += src/vfpga/vfpga_uisr.o
 
 # Location of the Linux kernel header files, we will be building within the context of the kernel's Makefile (the flag -C sets the context)
 # This gives us access to all the Linux kernel functionality, typically implemented in <linux/*.h> and <asm/*.h>
-KERNELDIR ?= /lib/modules/$(shell uname -r)/build
+#KERNELDIR ?= /nix/store/83wasx6wh3idjgkdjmk7b1w2w1v620gb-linux-6.9-dev/lib/modules/6.9.0-rc7/build
+KERNELDIR ?= /home/harshanavkis/doctor-cluster-config/result-dev/lib/modules/6.9.0-rc7/build
 
 BUILD_DIR := $(shell pwd)/build
 EXTRA_CFLAGS += -std=gnu11 -Wno-declaration-after-statement -I$(PWD)/include -I$(PWD)/include/reconfig -I$(PWD)/include/vfpga -I$(PWD)/include/platform 
