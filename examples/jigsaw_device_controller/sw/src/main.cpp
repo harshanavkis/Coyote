@@ -25,7 +25,7 @@
 // Constants
 // ---------------------------------------------------------------------------
 #define DEFAULT_VFPGA_ID     0
-#define RDMA_BUFFER_SIZE     (1024 * 1024)  // 1 MiB
+#define RDMA_BUFFER_SIZE     (2048 * 1024)  // 1 MiB
 
 // ---------------------------------------------------------------------------
 // AXI-Lite register map — jigsaw_dc_axi_ctrl_parser

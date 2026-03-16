@@ -136,6 +136,9 @@ always_comb begin
     sq_rd.valid         = sq_valid_read;
     cq_rd.ready         = 1'b1;
 
+    sq_wr.data.rdma     = 1'b0;
+    sq_wr.data.actv     = 1'b0;
+
     // ----- RDMA WRITE or Local DMA WRITE -----
     sq_wr.data          = 0;
     if (rdma_wr_valid) begin
@@ -150,6 +153,8 @@ always_comb begin
         sq_wr.data.mode     = 1'b0;            // RDMA_MODE_PARSE
         sq_wr.data.dest     = 0;               // axi channel 0
         sq_wr.valid         = 1'b1;
+        sq_wr.data.rdma     = 1'b1;
+        sq_wr.data.actv     = 1'b1;
     end else begin
         // Local DMA WRITE
         sq_wr.data.last     = 1'b1;

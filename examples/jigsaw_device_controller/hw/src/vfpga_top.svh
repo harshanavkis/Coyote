@@ -66,6 +66,8 @@ always_comb begin
     cq_rd.ready = 1'b1;
 
     sq_wr.data          = 0;
+    sq_wr.data.rdma     = 1'b0;
+    sq_wr.data.actv     = 1'b0;
     if (rdma_wr_valid) begin
         // RDMA WRITE — auto-fragmented by rdma_req_parser
         sq_wr.data.last     = 1'b1;
@@ -78,6 +80,8 @@ always_comb begin
         sq_wr.data.mode     = 1'b0;            // RDMA_MODE_PARSE
         sq_wr.data.dest     = 0;               // axi channel 0
         sq_wr.valid         = 1'b1;
+        sq_wr.data.rdma     = 1'b1;
+        sq_wr.data.actv     = 1'b1;
     end else begin
         sq_wr.valid         = 1'b0;
     end

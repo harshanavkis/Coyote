@@ -28,7 +28,7 @@
 // ---------------------------------------------------------------------------
 #define CLOCK_PERIOD_NS      4
 #define DEFAULT_VFPGA_ID     0
-#define RDMA_BUFFER_SIZE     (1024 * 1024)  // 1 MiB
+#define RDMA_BUFFER_SIZE     (2048 * 1024)  // 1 MiB
 
 // ---------------------------------------------------------------------------
 // AXI-Lite register map — jigsaw_hc_axi_ctrl_parser
@@ -142,7 +142,7 @@ static void run_test(coyote::cThread &ct, void *mem) {
     std::cout << std::endl;
 
     // --- DMA test (H2D read, 1 KiB) ---
-    uint64_t xfer = 16*1024;
+    uint64_t xfer = 1024*1024;
     std::cout << "=== DMA Test (H2D Read, " << xfer << " B) ===" << std::endl;
 
     uint64_t dma_dst = mem_addr + 4096;
@@ -166,8 +166,8 @@ static void run_test(coyote::cThread &ct, void *mem) {
 
     write_mmio(ct, mem, static_cast<uint64_t>(DevReg::DMA_STATUS), 0);
 
-    write_mmio(ct, mem, static_cast<uint64_t>(DevReg::DMA_CMD), 3);
-    std::cout << "  Started DMA (CMD=3)" << std::endl;
+    write_mmio(ct, mem, static_cast<uint64_t>(DevReg::DMA_CMD), 1);
+    std::cout << "  Started DMA (CMD=1)" << std::endl;
 
     int polls = 0;
     uint64_t status = 0;
