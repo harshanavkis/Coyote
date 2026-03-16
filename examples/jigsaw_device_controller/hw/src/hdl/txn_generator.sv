@@ -324,9 +324,11 @@ module txn_generator #(
     wire first_beat = txn_generator_out_tvalid && !packet_active;
 
     // rdma_wr_len: total packet length in bytes
-    // - MMIO response: 9 bytes (72 bits)
+    // Note: dma_direction is cleared by clear_dma_start before SEND_HEADER,
+    // so we read the opcode from the actual output data (which uses the latched h2d).
+    wire [7:0] out_opcode = txn_generator_out_tdata[OP_POS +: OP_WIDTH];
     wire [63:0] rdma_pkt_len = mmio_read_valid ? 64'd64 :
-                               (dma_direction ? (64'd64 + dma_len) : 64'd64);
+                               (out_opcode == 8'd1 ? (64'd64 + dma_len) : 64'd64);
 
     assign rdma_wr_valid = first_beat;
     assign rdma_wr_len = rdma_pkt_len;
