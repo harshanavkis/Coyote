@@ -1,7 +1,7 @@
 #ifndef SHMEM_HPP
 #define SHMEM_HPP
 
-#include "cThread.hpp" // cThread class
+#include <coyote/cThread.hpp> // cThread class
 
 /* FPGA macros */
 // Constants

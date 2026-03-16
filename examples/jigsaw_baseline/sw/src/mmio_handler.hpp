@@ -3,7 +3,7 @@
 
 #include <cstdint>
 
-#include "cThread.hpp"
+#include <coyote/cThread.hpp>
 
 // Registers, corresponding to registers defined the vFPGA
 enum class JigsawRegisters: uint32_t {

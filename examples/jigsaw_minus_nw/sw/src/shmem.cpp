@@ -12,7 +12,7 @@
 
 #include "shmem.hpp"
 
-#include "cThread.hpp"
+#include <coyote/cThread.hpp>
 
 #define CONFIG_DISAGG_DEBUG_MMIO
 

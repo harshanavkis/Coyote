@@ -19,7 +19,7 @@
 #include <iostream>
 #include <string>
 
-#include "cThread.hpp"
+#include <coyote/cThread.hpp>
 
 // ---------------------------------------------------------------------------
 // Constants

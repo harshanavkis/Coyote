@@ -21,7 +21,7 @@
 
 #include <boost/program_options.hpp>
 
-#include "cThread.hpp"
+#include <coyote/cThread.hpp>
 
 // ---------------------------------------------------------------------------
 // Constants

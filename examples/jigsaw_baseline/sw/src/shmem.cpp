@@ -13,7 +13,7 @@
 #include "shmem.hpp"
 #include "mmio_handler.hpp"
 
-#include "cThread.hpp"
+#include <coyote/cThread.hpp>
 
 static void *shmem = NULL;
 static volatile uint8_t *read_doorbell = NULL;

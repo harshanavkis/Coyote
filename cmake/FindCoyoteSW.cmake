@@ -45,4 +45,4 @@ message(WARNING "FindCoyoteSW is deprecated. Instead, you can choose one of two 
   "       target_include_directories(<project> PRIVATE \$\{COYOTE_INCLUDE_DIRS\})\n"
 )
 
-add_subdirectory(${CYT_DIR}/sw)
+add_subdirectory(${CYT_DIR}/sw ${CMAKE_BINARY_DIR}/coyote_sw)
