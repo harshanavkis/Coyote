@@ -166,8 +166,8 @@ static void run_test(coyote::cThread &ct, void *mem) {
 
     write_mmio(ct, mem, static_cast<uint64_t>(DevReg::DMA_STATUS), 0);
 
-    write_mmio(ct, mem, static_cast<uint64_t>(DevReg::DMA_CMD), 1);
-    std::cout << "  Started DMA (CMD=1)" << std::endl;
+    write_mmio(ct, mem, static_cast<uint64_t>(DevReg::DMA_CMD), 3);
+    std::cout << "  Started DMA (CMD=3)" << std::endl;
 
     int polls = 0;
     uint64_t status = 0;
@@ -240,13 +240,37 @@ int main(int argc, char *argv[]) {
     // Sync with device before starting
     ct.connSync(true);
 
-    int* jigsaw_mem =  (int *) ct.getMem({coyote::CoyoteAllocType::HPF, 1024*1024});
+    int* jigsaw_mem =  (int *) ct.getMem({coyote::CoyoteAllocType::HPF, 2 * 1024 * 1024});
     if (!jigsaw_mem) { throw std::runtime_error("Could not allocate memory; exiting..."); }
+
+    const uint64_t xfer = 1024 * 1024;
+    const uint64_t dma_offset = 4096;
 
     // Run tests
     for (int i = 0; i < 10; i++) {
         std::cout << "=== RUN " << i << " ===" << std::endl;
         run_test(ct, jigsaw_mem);
+
+        // Check if all bits in the memory region are set to 1
+        bool all_ones = true;
+        unsigned char *check_ptr = reinterpret_cast<unsigned char *>(jigsaw_mem) + dma_offset;
+        for (uint64_t j = 0; j < xfer; j++) {
+            if (check_ptr[j] != 0xFF) {
+                all_ones = false;
+                std::cout << "  ERROR: Memory mismatch at offset " << j << ": expected 0xFF, got 0x" 
+                          << std::hex << (int)check_ptr[j] << std::dec << std::endl;
+                break;
+            }
+        }
+
+        if (all_ones) {
+            std::cout << "  SUCCESS: All bits in the memory region are set to 1." << std::endl;
+        }
+
+        // Clear memory afterwards
+        std::memset(check_ptr, 0, xfer);
+        std::cout << "  Memory region cleared." << std::endl;
+
         std::this_thread::sleep_for(std::chrono::seconds(5));
     }
 
