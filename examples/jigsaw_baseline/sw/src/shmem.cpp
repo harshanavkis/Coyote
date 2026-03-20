@@ -90,12 +90,9 @@ static void wait_for_read_doorbell_clear()
 
 static int ivshmem_mmio_region_read(void *buf)
 {
-    uint8_t type;
-
     wait_for_write_doorbell_set();
 
-    memcpy(&type, reinterpret_cast<char *>(shmem) + MMIO_REGION_OFFSET, 1);
-    memcpy(buf, reinterpret_cast<char *>(shmem) + MMIO_REGION_OFFSET + 1, sizeof(struct mmio_message_header));
+    memcpy(buf, reinterpret_cast<char *>(shmem) + MMIO_REGION_OFFSET, sizeof(struct mmio_message_header));
 
     __atomic_store_n(write_doorbell, 0, __ATOMIC_RELEASE);
 
@@ -104,14 +101,9 @@ static int ivshmem_mmio_region_read(void *buf)
 
 static int ivshmem_mmio_region_write(void *buf, size_t count)
 {
-
-    // Op-type can only be OP_READ
-    uint8_t type = OP_READ;
-
     wait_for_read_doorbell_clear();
 
-    memcpy(reinterpret_cast<char *>(shmem) + MMIO_REGION_OFFSET, &type, 1);
-    memcpy(reinterpret_cast<char *>(shmem) + MMIO_REGION_OFFSET + 1, buf, count);
+    memcpy(reinterpret_cast<char *>(shmem) + MMIO_REGION_OFFSET, buf, count);
 
     __atomic_store_n(read_doorbell, 1, __ATOMIC_RELEASE);
 
@@ -120,12 +112,9 @@ static int ivshmem_mmio_region_write(void *buf, size_t count)
 
 void *run_shmem_app(coyote::cThread &coyote_thread)
 {
-
-    printf("connection.c: In shmem app\n");
-
     printf("SHMEM application started. Waiting for messages...\n");
 
-    char data[8];
+    char data[9];
     loff_t offset;
 
     while (1) {
@@ -145,7 +134,8 @@ void *run_shmem_app(coyote::cThread &coyote_thread)
             case OP_READ:
 
                 offset = header.address;
-                edu_mmio_read(coyote_thread, data, offset);
+                edu_mmio_read(coyote_thread, data + 1, offset);
+                data[0] = OP_READ;
 
                 if (ivshmem_mmio_region_write(data, sizeof(data)) != 0) {
                     perror("Failed to write response");
