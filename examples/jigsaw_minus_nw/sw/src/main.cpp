@@ -38,7 +38,7 @@ int main(int argc, char *argv[]) {
 
     coyote::cThread coyote_thread(DEFAULT_VFPGA_ID, getpid());
 
-    coyote_thread.userMap(reinterpret_cast<char *>(shmem) + DMA_REGION_OFFSET, DMA_SIZE);
+    coyote_thread.userMap(reinterpret_cast<char *>(shmem), SHMEM_SIZE);
 
     // Benchmark sweep
     HEADER("JIGSAW BASELINE");
