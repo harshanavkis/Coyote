@@ -110,6 +110,17 @@ static int ivshmem_mmio_region_write(void *buf, size_t count)
     return 0;
 }
 
+static int ivshmem_write(void *buf, size_t count, size_t offset)
+{
+    wait_for_read_doorbell_clear();
+
+    memcpy(reinterpret_cast<char *>(shmem) + offset, buf, count);
+
+    __atomic_store_n(read_doorbell, 1, __ATOMIC_RELEASE);
+
+    return 0;
+}
+
 void *run_shmem_app(coyote::cThread &coyote_thread)
 {
     printf("SHMEM application started. Waiting for messages...\n");
@@ -137,7 +148,7 @@ void *run_shmem_app(coyote::cThread &coyote_thread)
                 edu_mmio_read(coyote_thread, data + 1, offset);
                 data[0] = OP_READ;
 
-                if (ivshmem_mmio_region_write(data, sizeof(data)) != 0) {
+                if (ivshmem_mmio(data, sizeof(data)) != 0) {
                     perror("Failed to write response");
                     continue;
                 }
