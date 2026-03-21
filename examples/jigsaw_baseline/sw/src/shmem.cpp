@@ -148,7 +148,7 @@ void *run_shmem_app(coyote::cThread &coyote_thread)
                 edu_mmio_read(coyote_thread, data + 1, offset);
                 data[0] = OP_READ;
 
-                if (ivshmem_mmio(data, sizeof(data)) != 0) {
+                if (ivshmem_write(data, sizeof(data)) != 0) {
                     perror("Failed to write response");
                     continue;
                 }
