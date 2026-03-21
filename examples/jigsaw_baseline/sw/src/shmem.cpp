@@ -125,7 +125,7 @@ void *run_shmem_app(coyote::cThread &coyote_thread)
 {
     printf("SHMEM application started. Waiting for messages...\n");
 
-    char data[9];
+    char data[8];
     loff_t offset;
 
     while (1) {
@@ -145,10 +145,9 @@ void *run_shmem_app(coyote::cThread &coyote_thread)
             case OP_READ:
 
                 offset = header.address;
-                edu_mmio_read(coyote_thread, data + 1, offset);
-                data[0] = OP_READ;
+                edu_mmio_read(coyote_thread, data, offset);
 
-                if (ivshmem_write(data, sizeof(data)) != 0) {
+                if (ivshmem_write(data, sizeof(data), 16) != 0) {
                     perror("Failed to write response");
                     continue;
                 }
