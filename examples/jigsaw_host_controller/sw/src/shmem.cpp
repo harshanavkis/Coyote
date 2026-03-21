@@ -12,7 +12,7 @@
 
 #include "shmem.hpp"
 
-#include "cThread.hpp"
+#include <coyote/cThread.hpp>
 
 #define CONFIG_DISAGG_DEBUG_MMIO
 
@@ -86,25 +86,19 @@ static void wait_for_read_doorbell_clear() {
 }
 
 static int ivshmem_mmio_region_read(void *buf) {
-    uint8_t type;
 
     wait_for_write_doorbell_set();
 
-    memcpy(&type, reinterpret_cast<char *>(shmem) + MMIO_REGION_OFFSET, 1);
-    memcpy(buf, reinterpret_cast<char *>(shmem) + MMIO_REGION_OFFSET + 1, sizeof(struct mmio_message_header));
+    memcpy(buf, reinterpret_cast<char *>(shmem) + MMIO_REGION_OFFSET, sizeof(struct mmio_message_header));
 
     return 0;
 }
 
 static int ivshmem_mmio_region_write(void *buf, size_t count) {
 
-    // Op-type can only be OP_READ
-    uint8_t type = OP_READ;
-
     wait_for_read_doorbell_clear();
 
-    memcpy(reinterpret_cast<char *>(shmem) + MMIO_REGION_OFFSET, &type, 1);
-    memcpy(reinterpret_cast<char *>(shmem) + MMIO_REGION_OFFSET + 1, buf, count);
+    memcpy(reinterpret_cast<char *>(shmem) + MMIO_REGION_OFFSET, buf, count);
 
     __atomic_store_n(read_doorbell, 1, __ATOMIC_RELEASE);
 
@@ -146,7 +140,6 @@ void *run_shmem_app(coyote::cThread &coyote_thread) {
 
     printf("SHMEM application started. Waiting for messages...\n");
 
-    char data[8];
     loff_t offset;
 
     while (1) {
