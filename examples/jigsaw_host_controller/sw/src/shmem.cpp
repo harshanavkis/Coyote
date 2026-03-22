@@ -11,16 +11,16 @@
 #include <cstdint>
 
 #include "shmem.hpp"
-#include "mmio_handler.hpp"
 
 #include <coyote/cThread.hpp>
+
+#define CONFIG_DISAGG_DEBUG_MMIO
 
 static void *shmem = NULL;
 static volatile uint8_t *read_doorbell = NULL;
 static volatile uint8_t *write_doorbell = NULL;
 
-static int create_or_open_shmem_file()
-{
+static int create_or_open_shmem_file() {
     int fd = open(SHMEM_FILE, O_RDWR | O_CREAT, 0666);
     if (fd < 0) {
         perror("Failed to open or create shared memory file");
@@ -48,8 +48,7 @@ static int create_or_open_shmem_file()
     return fd;
 }
 
-void *init_shared_memory()
-{
+void *init_shared_memory() {
     int fd = create_or_open_shmem_file();
     if (fd < 0) {
         return nullptr;
@@ -78,29 +77,25 @@ void *init_shared_memory()
     return shmem;
 }
 
-static void wait_for_write_doorbell_set()
-{
+static void wait_for_write_doorbell_set() {
     while (__atomic_load_n(write_doorbell, __ATOMIC_ACQUIRE) == 0) { }
 }
 
-static void wait_for_read_doorbell_clear()
-{
+static void wait_for_read_doorbell_clear() {
     while (__atomic_load_n(read_doorbell, __ATOMIC_ACQUIRE) != 0) { }
 }
 
-static int ivshmem_mmio_region_read(void *buf)
-{
+static int ivshmem_mmio_region_read(void *buf) {
+
     wait_for_write_doorbell_set();
 
     memcpy(buf, reinterpret_cast<char *>(shmem) + MMIO_REGION_OFFSET, sizeof(struct mmio_message_header));
 
-    __atomic_store_n(write_doorbell, 0, __ATOMIC_RELEASE);
-
     return 0;
 }
 
-static int ivshmem_mmio_region_write(void *buf, size_t count)
-{
+static int ivshmem_mmio_region_write(void *buf, size_t count) {
+
     wait_for_read_doorbell_clear();
 
     memcpy(reinterpret_cast<char *>(shmem) + MMIO_REGION_OFFSET, buf, count);
@@ -110,25 +105,46 @@ static int ivshmem_mmio_region_write(void *buf, size_t count)
     return 0;
 }
 
-static int ivshmem_write(void *buf, size_t count, size_t offset)
-{
-    wait_for_read_doorbell_clear();
+void mmio_read(coyote::cThread &coyote_thread) {
+    // Clear read status
+    coyote_thread.setCSR(0, static_cast<uint32_t>(HCReg::MMIO_READ_STATUS));
 
-    memcpy(reinterpret_cast<char *>(shmem) + offset, buf, count);
+    // Trigger MMIO
+    coyote_thread.setCSR(1, static_cast<uint32_t>(HCReg::MMIO_CTRL));
+
+    // Poll for completion
+    while (coyote_thread.getCSR(static_cast<uint32_t>(HCReg::MMIO_READ_STATUS)) != 1) {
+        std::this_thread::sleep_for(std::chrono::nanoseconds(CLOCK_PERIOD_NS));
+    }
 
     __atomic_store_n(read_doorbell, 1, __ATOMIC_RELEASE);
-
-    return 0;
 }
 
-void *run_shmem_app(coyote::cThread &coyote_thread)
-{
+void mmio_write(coyote::cThread &coyote_thread) {
+    // Clear write status
+    coyote_thread.setCSR(0, static_cast<uint32_t>(HCReg::MMIO_WRITE_STATUS));
+
+    // Trigger MMIO
+    coyote_thread.setCSR(1, static_cast<uint32_t>(HCReg::MMIO_CTRL));
+
+    // Poll for completion
+    while (coyote_thread.getCSR(static_cast<uint32_t>(HCReg::MMIO_WRITE_STATUS)) != 1) {
+        std::this_thread::sleep_for(std::chrono::nanoseconds(CLOCK_PERIOD_NS));
+    }
+};
+
+
+void *run_shmem_app(coyote::cThread &coyote_thread) {
+
+    printf("connection.c: In shmem app\n");
+
     printf("SHMEM application started. Waiting for messages...\n");
 
-    char data[8];
     loff_t offset;
 
     while (1) {
+        __atomic_store_n(write_doorbell, 0, __ATOMIC_RELEASE);
+
         mmio_message_header header;
         if (ivshmem_mmio_region_read(&header) != 0) {
             perror("Failed to read message");
@@ -144,21 +160,13 @@ void *run_shmem_app(coyote::cThread &coyote_thread)
 
             case OP_READ:
 
-                offset = header.address;
-                edu_mmio_read(coyote_thread, data, offset);
+                mmio_read(coyote_thread);
 
-                if (ivshmem_write(data, sizeof(data), 16) != 0) {
-                    perror("Failed to write response");
-                    continue;
-                }
                 continue;
 
             case OP_WRITE:
 
-                memcpy(data, &header.value, sizeof(header.value));
-
-                offset = header.address;
-                edu_mmio_write(coyote_thread, data, offset);
+                mmio_write(coyote_thread);
 
                 continue;
 

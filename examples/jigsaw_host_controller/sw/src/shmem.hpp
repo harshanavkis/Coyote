@@ -1,7 +1,28 @@
 #ifndef SHMEM_HPP
 #define SHMEM_HPP
 
-#include <coyote/cThread.hpp> // cThread class
+#include <coyote/cThread.hpp>
+
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+#define CLOCK_PERIOD_NS      4
+#define DEFAULT_VFPGA_ID     0
+#define RDMA_BUFFER_SIZE     (1024 * 1024)  // 1 MiB
+
+
+// ---------------------------------------------------------------------------
+// AXI-Lite register map — jigsaw_hc_axi_ctrl_parser
+// ---------------------------------------------------------------------------
+enum class HCReg : uint32_t {
+    MMIO_VADDR          = 0,
+    MMIO_CTRL           = 1,
+    MMIO_WRITE_STATUS   = 2,
+    MMIO_READ_STATUS    = 3,
+    COYOTE_PID          = 4,
+    REMOTE_VADDR        = 5,
+};
+
 
 /* Some macros for the shared memory and its structure 
  */
