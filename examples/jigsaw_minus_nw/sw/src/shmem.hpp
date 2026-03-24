@@ -26,7 +26,7 @@ enum class JigsawHostControlRegisters : uint32_t {
  */
 
 #define SHMEM_FILE "/dev/shm/ivshmem"  // Adjust this path as needed
-#define SHMEM_SIZE (1 << 20)  // 1 MB, adjust as needed
+#define SHMEM_SIZE (1 << 21)  // 2 MB, adjust as needed
 #define READ_DOORBELL_OFFSET 0
 #define WRITE_DOORBELL_OFFSET 1
 #define DOORBELL_SIZE 1  // 1 byte for each doorbell
