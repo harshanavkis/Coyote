@@ -38,6 +38,11 @@ axisr_reg inst_reg_out (.aclk(aclk), .aresetn(aresetn), .s_axis(axis_out_int), .
 (* mark_debug = "true" *) logic mmio_write_done;
 (* mark_debug = "true" *) logic mmio_read_done;
 (* mark_debug = "true" *) logic [PID_BITS-1:0] coyote_pid;
+(* mark_debug = "true" *) logic [7:0] mmio_op;
+(* mark_debug = "true" *) logic [63:0] mmio_addr;
+(* mark_debug = "true" *) logic [63:0] mmio_data;
+(* mark_debug = "true" *) logic [63:0] mmio_read_data_in;
+(* mark_debug = "true" *) logic mmio_read_data_in_valid;
 
 // SQ signals
 (* mark_debug = "true" *) logic sq_valid_write;
@@ -72,7 +77,12 @@ jigsaw_minus_nw_axi_ctrl_parser inst_axi_ctrl_parser (
     .mmio_clear(mmio_clear),
     .mmio_write_done(mmio_write_done),
     .mmio_read_done(mmio_read_done),
-    .coyote_pid(coyote_pid)
+    .coyote_pid(coyote_pid),
+    .mmio_op(mmio_op),
+    .mmio_addr(mmio_addr),
+    .mmio_data(mmio_data),
+    .mmio_read_data_in(mmio_read_data_in),
+    .mmio_read_data_in_valid(mmio_read_data_in_valid)
 );
 
 jigsaw_host_controller #(
@@ -128,7 +138,14 @@ jigsaw_host_controller #(
     .mmio_ctrl(mmio_ctrl),
     .mmio_clear(mmio_clear),
     .mmio_write_done(mmio_write_done),
-    .mmio_read_done(mmio_read_done)
+    .mmio_read_done(mmio_read_done),
+    
+    // Direct MMIO payload
+    .mmio_op(mmio_op),
+    .mmio_addr(mmio_addr),
+    .mmio_data(mmio_data),
+    .mmio_read_data_in(mmio_read_data_in),
+    .mmio_read_data_in_valid(mmio_read_data_in_valid)
 );
 
 txn_generator inst_txn_generator (

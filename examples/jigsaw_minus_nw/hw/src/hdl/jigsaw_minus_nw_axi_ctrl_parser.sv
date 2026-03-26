@@ -15,6 +15,11 @@ import lynxTypes::*;
  * @param[in] mmio_write_done: write done signal for MMIO write request
  * @param[in] mmio_read_done: read done signal for MMIO read response
  * @param[out] coyote_pid: PID of the Coyote process on the host
+ * @param[out] mmio_op: Opcode for MMIO
+ * @param[out] mmio_addr: Address for MMIO
+ * @param[out] mmio_data: Data payload for MMIO write
+ * @param[in] mmio_read_data_in: Data payload for MMIO read response
+ * @param[in] mmio_read_data_in_valid: Data payload valid for MMIO read response
  */
 module jigsaw_minus_nw_axi_ctrl_parser (
   input  logic                        aclk,
@@ -27,13 +32,18 @@ module jigsaw_minus_nw_axi_ctrl_parser (
   input logic mmio_clear,
   input logic mmio_write_done,
   input logic mmio_read_done,
-  output logic [PID_BITS - 1:0] coyote_pid
+  output logic [PID_BITS - 1:0] coyote_pid,
+  output logic [7:0] mmio_op,
+  output logic [63:0] mmio_addr,
+  output logic [63:0] mmio_data,
+  input logic [63:0] mmio_read_data_in,
+  input logic mmio_read_data_in_valid
 );
 
 /////////////////////////////////////
 //          CONSTANTS             //
 ///////////////////////////////////
-localparam integer N_REGS = 5;
+localparam integer N_REGS = 9;
 localparam integer ADDR_MSB = $clog2(N_REGS);
 localparam integer ADDR_LSB = $clog2(AXIL_DATA_BITS/8);
 localparam integer AXI_ADDR_BITS = ADDR_LSB + ADDR_MSB;
@@ -71,6 +81,14 @@ localparam MMIO_WRITE_STATUS_REG = 2;
 localparam MMIO_READ_STATUS_REG = 3;
 // 4 (RW) - Store PID for coyote
 localparam COYOTE_PID_REG = 4;
+// 5 (RW) - Store MMIO Opcode (0: Read, 1: Write)
+localparam MMIO_OP_REG = 5;
+// 6 (RW) - Store MMIO Address parameter
+localparam MMIO_ADDR_REG = 6;
+// 7 (RW) - Store MMIO Data payload
+localparam MMIO_DATA_REG = 7;
+// 8 (RW) - Store MMIO read data payload
+localparam MMIO_READ_DATA_REG = 8;
 
 /////////////////////////////////////
 //         WRITE PROCESS          //
@@ -116,6 +134,30 @@ always_ff @(posedge aclk) begin
               ctrl_reg[COYOTE_PID_REG][(i*8)+:8] <= axi_ctrl.wdata[(i*8)+:8];
             end
           end
+        MMIO_OP_REG:     // MMIO Opcode
+          for (int i = 0; i < (AXIL_DATA_BITS/8); i++) begin
+            if(axi_ctrl.wstrb[i]) begin
+              ctrl_reg[MMIO_OP_REG][(i*8)+:8] <= axi_ctrl.wdata[(i*8)+:8];
+            end
+          end
+        MMIO_ADDR_REG:   // MMIO Address
+          for (int i = 0; i < (AXIL_DATA_BITS/8); i++) begin
+            if(axi_ctrl.wstrb[i]) begin
+              ctrl_reg[MMIO_ADDR_REG][(i*8)+:8] <= axi_ctrl.wdata[(i*8)+:8];
+            end
+          end
+        MMIO_DATA_REG:   // MMIO Data
+          for (int i = 0; i < (AXIL_DATA_BITS/8); i++) begin
+            if(axi_ctrl.wstrb[i]) begin
+              ctrl_reg[MMIO_DATA_REG][(i*8)+:8] <= axi_ctrl.wdata[(i*8)+:8];
+            end
+          end
+        MMIO_READ_DATA_REG: // MMIO Read Data (Host can write but HW overwrites)
+          for (int i = 0; i < (AXIL_DATA_BITS/8); i++) begin
+            if(axi_ctrl.wstrb[i]) begin
+              ctrl_reg[MMIO_READ_DATA_REG][(i*8)+:8] <= axi_ctrl.wdata[(i*8)+:8];
+            end
+          end
         default: ;
       endcase
     end
@@ -131,6 +173,10 @@ always_ff @(posedge aclk) begin
 
     if (mmio_read_done) begin
       ctrl_reg[MMIO_READ_STATUS_REG] <= 1;
+    end
+
+    if (mmio_read_data_in_valid) begin
+      ctrl_reg[MMIO_READ_DATA_REG] <= mmio_read_data_in;
     end
   end
 end
@@ -160,6 +206,14 @@ always_ff @(posedge aclk) begin
           axi_rdata <= ctrl_reg[MMIO_READ_STATUS_REG];
         COYOTE_PID_REG:   // Coyote PID register
           axi_rdata <= ctrl_reg[COYOTE_PID_REG];
+        MMIO_OP_REG:      // MMIO Opcode register
+          axi_rdata <= ctrl_reg[MMIO_OP_REG];
+        MMIO_ADDR_REG:    // MMIO Address register
+          axi_rdata <= ctrl_reg[MMIO_ADDR_REG];
+        MMIO_DATA_REG:    // MMIO Data register  
+          axi_rdata <= ctrl_reg[MMIO_DATA_REG];
+        MMIO_READ_DATA_REG: // MMIO Read Data register
+          axi_rdata <= ctrl_reg[MMIO_READ_DATA_REG];
         default: ;
       endcase
     end
@@ -173,6 +227,9 @@ always_comb begin
   mmio_vaddr = ctrl_reg[MMIO_VADDR_REG];
   mmio_ctrl = ctrl_reg[MMIO_CTRL_REG][0];
   coyote_pid = ctrl_reg[COYOTE_PID_REG];
+  mmio_op = ctrl_reg[MMIO_OP_REG][7:0];
+  mmio_addr = ctrl_reg[MMIO_ADDR_REG][63:0];
+  mmio_data = ctrl_reg[MMIO_DATA_REG][63:0];
 end
 
 /////////////////////////////////////

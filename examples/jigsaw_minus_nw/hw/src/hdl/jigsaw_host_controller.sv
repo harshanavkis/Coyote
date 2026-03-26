@@ -57,7 +57,14 @@ module jigsaw_host_controller #(
     input logic mmio_ctrl,
     output logic mmio_clear,
     output logic mmio_write_done,
-    output logic mmio_read_done
+    output logic mmio_read_done,
+
+    // MMIO Direct Payload
+    input logic [7:0] mmio_op,
+    input logic [63:0] mmio_addr,
+    input logic [63:0] mmio_data,
+    output logic [63:0] mmio_read_data_in,
+    output logic mmio_read_data_in_valid
 );
 
 localparam OP_POS = 0;
@@ -142,6 +149,8 @@ always @(*) begin
 
     mmio_write_done = 1'b0;
     mmio_read_done = 1'b0;
+    mmio_read_data_in = 64'b0;
+    mmio_read_data_in_valid = 1'b0;
 
     // MMIO State Machine
     case (mmio_state_cur)
@@ -149,31 +158,26 @@ always @(*) begin
             if (mmio_ctrl_reg && dma_rd_state_cur == DMA_IDLE && dma_wr_state_cur == DMA_IDLE) begin
                 mmio_state_next = MMIO_ACTIVE;
                 mmio_clear = 1'b1;
-                sq_valid_read = 1'b1;
-                sq_dir_read = 1'b0;
-                sq_addr_read = mmio_vaddr + 64'd24;
-                sq_len_read = 64'd25;
             end
         end
         MMIO_ACTIVE: begin
-            if (host_in_tvalid && host_in_tlast) begin
-                // Only when both tvalid and tlast since we can send partial tkeep only in this case
-                network_out_tvalid = host_in_tvalid;
-                network_out_tlast = host_in_tlast;
-                if (host_in_tdata[OP_POS +: OP_WIDTH] == 8'd0) begin
-                    network_out_tdata = {{(AXI_DATA_BITS - 136){1'b0}}, host_in_tdata[135:0]};
-                    // Since we do not have a payload for read, we send smaller tkeep
-                    network_out_tkeep = {{(KEEP_WIDTH - 17){1'b0}}, 17'h1FFFF};
-                    mmio_state_next = MMIO_IDLE;
-                end else if (host_in_tdata[OP_POS +: OP_WIDTH] == 8'd1) begin
-                    network_out_tdata = {{(AXI_DATA_BITS - 200){1'b0}}, host_in_tdata[199:0]};
-                    network_out_tkeep = {{(KEEP_WIDTH - 25){1'b0}}, 25'h1FFFFFF};
-                    mmio_state_next = MMIO_IDLE;
-                    mmio_write_done = network_out_tready;
-                end else begin
-                    // Wrong MMIO OP
-                    mmio_state_next = MMIO_IDLE;
-                end
+            network_out_tvalid = 1'b1;
+            network_out_tlast = 1'b1;
+            if (mmio_op == 8'd0) begin
+                network_out_tdata = {{(AXI_DATA_BITS - 136){1'b0}}, 64'd0, mmio_addr, mmio_op};
+                // Since we do not have a payload for read, we send smaller tkeep
+                network_out_tkeep = {{(KEEP_WIDTH - 17){1'b0}}, 17'h1FFFF};
+                
+                if (network_out_tready) mmio_state_next = MMIO_IDLE;
+            end else if (mmio_op == 8'd1) begin
+                network_out_tdata = {{(AXI_DATA_BITS - 200){1'b0}}, mmio_data, 64'd0, mmio_addr, mmio_op};
+                network_out_tkeep = {{(KEEP_WIDTH - 25){1'b0}}, 25'h1FFFFFF};
+                mmio_write_done = network_out_tready;
+                
+                if (network_out_tready) mmio_state_next = MMIO_IDLE;
+            end else begin
+                // Wrong MMIO OP
+                mmio_state_next = MMIO_IDLE;
             end
         end
         default: mmio_state_next = MMIO_IDLE;
@@ -182,33 +186,24 @@ always @(*) begin
     // DMA Write State Machine
     case (dma_wr_state_cur)
         DMA_IDLE: begin
-            // Check MMIO is not active AND not pending (mmio_ctrl_reg) to prevent race
-            if (network_in_tvalid && host_out_tready && mmio_state_cur == MMIO_IDLE && !mmio_ctrl_reg) begin
-                if (network_in_tdata[OP_POS +: OP_WIDTH] == 8'd1) begin
+            if (network_in_tvalid) begin
+                if (network_in_tdata[OP_POS +: OP_WIDTH] == 8'd2) begin
+                    // MMIO Response: Route to AXI-Lite register immediately (decoupled)
+                    mmio_read_data_in = network_in_tdata[ADDR_POS +: ADDR_WIDTH];
+                    mmio_read_data_in_valid = 1'b1;
+                    mmio_read_done = 1'b1;
+                end else if (host_out_tready && mmio_state_cur == MMIO_IDLE && !mmio_ctrl_reg) begin
+                    // DMA Write / Header trigger
+                    if (network_in_tdata[OP_POS +: OP_WIDTH] == 8'd1) begin
                     // D2H DMA: First beat is header only (op + addr + len)
                     // payload_to_dma sends header and payload in separate beats
                     // Capture header info but don't send data from this beat
-                    dma_wr_state_next = DMA_WR;
-                    sq_valid_write = 1'b1;
-                    sq_dir_write = 1'b1;
-                    sq_addr_write = network_in_tdata[ADDR_POS +: ADDR_WIDTH];
-                    sq_len_write = network_in_tdata[LEN_POS +: LEN_WIDTH];
-                    
-                    // Don't send data from header beat - wait for payload beats
-                    // This beat is consumed (network_in_tready will be high)
-                    // but we don't output anything to host_out
-                end else if (network_in_tdata[OP_POS +: OP_WIDTH] == 8'd2) begin
-                    // This is a MMIO Response from network_in
-                    sq_valid_write = 1'b1;
-                    sq_dir_write = 1'b0;
-                    sq_addr_write = mmio_vaddr + 64'd16;
-                    sq_len_write = 64'd8;
-
-                    host_out_tdata = {{(AXI_DATA_BITS - ADDR_WIDTH){1'b0}}, network_in_tdata[ADDR_POS +: ADDR_WIDTH]};
-                    host_out_tkeep = {{(KEEP_WIDTH - 8){1'b0}}, 8'hFF};
-                    host_out_tvalid = network_in_tvalid;
-                    host_out_tlast = network_in_tlast;
-                    mmio_read_done = host_out_tready;
+                        dma_wr_state_next = DMA_WR;
+                        sq_valid_write = 1'b1;
+                        sq_dir_write = 1'b1;
+                        sq_addr_write = network_in_tdata[ADDR_POS +: ADDR_WIDTH];
+                        sq_len_write = network_in_tdata[LEN_POS +: LEN_WIDTH];
+                    end
                 end
             end
         end
@@ -284,7 +279,7 @@ end
 always_comb begin
     // host_in_tready: Only ready if we are in a state that uses host_in 
     // AND the network_out is ready to take it.
-    host_in_tready = (mmio_state_cur == MMIO_ACTIVE || dma_rd_state_cur == DMA_RD) && network_out_tready;
+    host_in_tready = (dma_rd_state_cur == DMA_RD) && network_out_tready;
 
     // network_in_tready: This is the most critical one.
     // It must check which output is needed based on the opcode.
@@ -293,13 +288,16 @@ always_comb begin
         network_in_tready = host_out_tready;
     end else if (dma_wr_state_cur == DMA_IDLE && dma_rd_state_cur == DMA_IDLE) begin
         // We are in IDLE, looking for a new command
-        // Block if MMIO is active OR pending (mmio_ctrl_reg) to prevent overlap
-        if (mmio_state_cur != MMIO_IDLE || mmio_ctrl_reg) begin
+        if (network_in_tdata[OP_POS +: OP_WIDTH] == 8'd2) begin
+            // MMIO Response is direct to reg and ALWAYS decoupled from guards
+            network_in_tready = 1'b1;
+        end else if (mmio_state_cur != MMIO_IDLE || mmio_ctrl_reg) begin
+            // Other commands (DMA Read/Write) are blocked if MMIO is pending/active
             network_in_tready = 1'b0;
         end else begin
             case (network_in_tdata[OP_POS +: OP_WIDTH])
                 8'd0:    network_in_tready = network_out_tready; // DMA Read needs network_out
-                8'd1, 8'd2: network_in_tready = host_out_tready; // DMA Write / MMIO Resp need host_out
+                8'd1:    network_in_tready = host_out_tready;    // DMA Write needs host_out
                 default: network_in_tready = 1'b0;
             endcase
         end

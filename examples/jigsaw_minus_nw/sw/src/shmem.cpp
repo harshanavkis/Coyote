@@ -105,9 +105,13 @@ static int ivshmem_mmio_region_write(void *buf, size_t count) {
     return 0;
 }
 
-void mmio_read(coyote::cThread &coyote_thread) {
+void mmio_read(coyote::cThread &coyote_thread, uint64_t addr) {
     // Clear read status
     coyote_thread.setCSR(0, static_cast<uint32_t>(JigsawHostControlRegisters::MMIO_READ_STATUS_REG));
+
+    // Write parameters to new AXI-Lite registers
+    coyote_thread.setCSR(0, static_cast<uint32_t>(JigsawHostControlRegisters::MMIO_OP_REG));
+    coyote_thread.setCSR(addr, static_cast<uint32_t>(JigsawHostControlRegisters::MMIO_ADDR_REG));
 
     // Trigger MMIO
     coyote_thread.setCSR(1, static_cast<uint32_t>(JigsawHostControlRegisters::MMIO_CTRL_REG));
@@ -117,12 +121,21 @@ void mmio_read(coyote::cThread &coyote_thread) {
         std::this_thread::sleep_for(std::chrono::nanoseconds(CLOCK_PERIOD_NS));
     }
 
+    // Read result from AXI-Lite register and write to shmem + 16 (where guest expects it)
+    uint64_t data = coyote_thread.getCSR(static_cast<uint32_t>(JigsawHostControlRegisters::MMIO_READ_DATA_REG));
+    *(uint64_t *)((char *)shmem + 16) = data;
+
     __atomic_store_n(read_doorbell, 1, __ATOMIC_RELEASE);
 }
 
-void mmio_write(coyote::cThread &coyote_thread) {
+void mmio_write(coyote::cThread &coyote_thread, uint64_t addr, uint64_t data) {
     // Clear write status
     coyote_thread.setCSR(0, static_cast<uint32_t>(JigsawHostControlRegisters::MMIO_WRITE_STATUS_REG));
+
+    // Write parameters to new AXI-Lite registers
+    coyote_thread.setCSR(1, static_cast<uint32_t>(JigsawHostControlRegisters::MMIO_OP_REG));
+    coyote_thread.setCSR(addr, static_cast<uint32_t>(JigsawHostControlRegisters::MMIO_ADDR_REG));
+    coyote_thread.setCSR(data, static_cast<uint32_t>(JigsawHostControlRegisters::MMIO_DATA_REG));
 
     // Trigger MMIO
     coyote_thread.setCSR(1, static_cast<uint32_t>(JigsawHostControlRegisters::MMIO_CTRL_REG));
@@ -160,13 +173,13 @@ void *run_shmem_app(coyote::cThread &coyote_thread) {
 
             case OP_READ:
 
-                mmio_read(coyote_thread);
+                mmio_read(coyote_thread, header.address);
 
                 continue;
 
             case OP_WRITE:
 
-                mmio_write(coyote_thread);
+                mmio_write(coyote_thread, header.address, header.value);
 
                 continue;
 

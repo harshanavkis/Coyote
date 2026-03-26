@@ -17,7 +17,11 @@ enum class JigsawHostControlRegisters : uint32_t {
     MMIO_CTRL_REG = 1,
     MMIO_WRITE_STATUS_REG = 2,
     MMIO_READ_STATUS_REG = 3,
-    COYOTE_PID_REG = 4
+    COYOTE_PID_REG = 4,
+    MMIO_OP_REG = 5,
+    MMIO_ADDR_REG = 6,
+    MMIO_DATA_REG = 7,
+    MMIO_READ_DATA_REG = 8
 };
 
 
