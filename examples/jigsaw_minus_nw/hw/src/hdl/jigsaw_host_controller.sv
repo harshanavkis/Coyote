@@ -192,8 +192,8 @@ always @(*) begin
                     mmio_read_data_in = network_in_tdata[ADDR_POS +: ADDR_WIDTH];
                     mmio_read_data_in_valid = 1'b1;
                     mmio_read_done = 1'b1;
-                end else if (host_out_tready && mmio_state_cur == MMIO_IDLE && !mmio_ctrl_reg) begin
-                    // DMA Write / Header trigger
+                end else if (host_out_tready) begin
+                    // DMA Write / Header trigger - Decoupled from MMIO guards
                     if (network_in_tdata[OP_POS +: OP_WIDTH] == 8'd1) begin
                     // D2H DMA: First beat is header only (op + addr + len)
                     // payload_to_dma sends header and payload in separate beats
@@ -227,8 +227,7 @@ always @(*) begin
         DMA_IDLE: begin
             // Only check for DMA Read when:
             // - DMA Write is NOT active (to prevent race with payload beats)
-            // - MMIO is not active AND not pending (mmio_ctrl_reg) to prevent overlap
-            if (network_in_tvalid && mmio_state_cur == MMIO_IDLE && !mmio_ctrl_reg && dma_wr_state_cur == DMA_IDLE) begin
+            if (network_in_tvalid && dma_wr_state_cur == DMA_IDLE) begin
                 if (network_in_tdata[OP_POS +: OP_WIDTH] == 8'd0) begin
                     if (!sq_valid_read) begin // Arbitration: Prioritize MMIO over DMA Read for SQ access
                         // Fix for combinatorial loop: Valid/Data generation should NOT depend on Ready
@@ -289,12 +288,10 @@ always_comb begin
     end else if (dma_wr_state_cur == DMA_IDLE && dma_rd_state_cur == DMA_IDLE) begin
         // We are in IDLE, looking for a new command
         if (network_in_tdata[OP_POS +: OP_WIDTH] == 8'd2) begin
-            // MMIO Response is direct to reg and ALWAYS decoupled from guards
+            // MMIO Response is direct to reg and ALWAYS decoupled
             network_in_tready = 1'b1;
-        end else if (mmio_state_cur != MMIO_IDLE || mmio_ctrl_reg) begin
-            // Other commands (DMA Read/Write) are blocked if MMIO is pending/active
-            network_in_tready = 1'b0;
         end else begin
+            // All other commands (DMA Read/Write) are now decoupled from MMIO state
             case (network_in_tdata[OP_POS +: OP_WIDTH])
                 8'd0:    network_in_tready = network_out_tready; // DMA Read needs network_out
                 8'd1:    network_in_tready = host_out_tready;    // DMA Write needs host_out
