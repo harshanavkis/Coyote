@@ -21,6 +21,10 @@ enum class HCReg : uint32_t {
     MMIO_READ_STATUS    = 3,
     COYOTE_PID          = 4,
     REMOTE_VADDR        = 5,
+    MMIO_OP             = 6,
+    MMIO_ADDR           = 7,
+    MMIO_DATA           = 8,
+    MMIO_READ_DATA      = 9
 };
 
 

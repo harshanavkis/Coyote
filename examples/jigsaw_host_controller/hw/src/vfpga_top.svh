@@ -26,6 +26,11 @@ axisr_reg inst_reg_out (.aclk(aclk), .aresetn(aresetn), .s_axis(axis_out_int), .
 (* mark_debug = "true" *) logic mmio_read_done;
 (* mark_debug = "true" *) logic [PID_BITS-1:0] coyote_pid;
 (* mark_debug = "true" *) logic [VADDR_BITS-1:0] remote_vaddr;
+(* mark_debug = "true" *) logic [7:0] mmio_op;
+(* mark_debug = "true" *) logic [63:0] mmio_addr;
+(* mark_debug = "true" *) logic [63:0] mmio_data;
+(* mark_debug = "true" *) logic [63:0] mmio_read_data_in;
+(* mark_debug = "true" *) logic mmio_read_data_in_valid;
 
 // Local DMA SQ signals
 (* mark_debug = "true" *) logic sq_valid_write;
@@ -54,7 +59,12 @@ jigsaw_hc_axi_ctrl_parser inst_axi_ctrl_parser (
     .mmio_write_done(mmio_write_done),
     .mmio_read_done(mmio_read_done),
     .coyote_pid(coyote_pid),
-    .remote_vaddr(remote_vaddr)
+    .remote_vaddr(remote_vaddr),
+    .mmio_op(mmio_op),
+    .mmio_addr(mmio_addr),
+    .mmio_data(mmio_data),
+    .mmio_read_data_in(mmio_read_data_in),
+    .mmio_read_data_in_valid(mmio_read_data_in_valid)
 );
 
 // ============================================================================
@@ -115,6 +125,12 @@ jigsaw_host_controller #(
     .mmio_clear(mmio_clear),
     .mmio_write_done(mmio_write_done),
     .mmio_read_done(mmio_read_done),
+
+    .mmio_op(mmio_op),
+    .mmio_addr(mmio_addr),
+    .mmio_data(mmio_data),
+    .mmio_read_data_in(mmio_read_data_in),
+    .mmio_read_data_in_valid(mmio_read_data_in_valid),
 
     // RDMA submission
     .rdma_wr_valid(rdma_wr_valid),

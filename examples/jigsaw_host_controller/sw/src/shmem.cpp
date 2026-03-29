@@ -20,42 +20,52 @@ static void *shmem = NULL;
 static volatile uint8_t *read_doorbell = NULL;
 static volatile uint8_t *write_doorbell = NULL;
 
-static int create_or_open_shmem_file() {
+static int create_or_open_shmem_file()
+{
     int fd = open(SHMEM_FILE, O_RDWR | O_CREAT, 0666);
-    if (fd < 0) {
+    if (fd < 0)
+    {
         perror("Failed to open or create shared memory file");
         return -1;
     }
 
     struct stat st;
-    if (fstat(fd, &st) < 0) {
+    if (fstat(fd, &st) < 0)
+    {
         perror("Failed to get file status");
         close(fd);
         return -1;
     }
 
-    if (st.st_size != SHMEM_SIZE) {
-        if (ftruncate(fd, SHMEM_SIZE) < 0) {
+    if (st.st_size != SHMEM_SIZE)
+    {
+        if (ftruncate(fd, SHMEM_SIZE) < 0)
+        {
             perror("Failed to set file size");
             close(fd);
             return -1;
         }
         printf("Created shared memory file with size %d bytes\n", SHMEM_SIZE);
-    } else {
+    }
+    else
+    {
         printf("Opened existing shared memory file with correct size\n");
     }
 
     return fd;
 }
 
-void *init_shared_memory() {
+void *init_shared_memory()
+{
     int fd = create_or_open_shmem_file();
-    if (fd < 0) {
+    if (fd < 0)
+    {
         return nullptr;
     }
 
     shmem = mmap(NULL, SHMEM_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-    if (shmem == MAP_FAILED) {
+    if (shmem == MAP_FAILED)
+    {
         perror("Failed to mmap shared memory");
         close(fd);
         return nullptr;
@@ -77,15 +87,22 @@ void *init_shared_memory() {
     return shmem;
 }
 
-static void wait_for_write_doorbell_set() {
-    while (__atomic_load_n(write_doorbell, __ATOMIC_ACQUIRE) == 0) { }
+static void wait_for_write_doorbell_set()
+{
+    while (__atomic_load_n(write_doorbell, __ATOMIC_ACQUIRE) == 0)
+    {
+    }
 }
 
-static void wait_for_read_doorbell_clear() {
-    while (__atomic_load_n(read_doorbell, __ATOMIC_ACQUIRE) != 0) { }
+static void wait_for_read_doorbell_clear()
+{
+    while (__atomic_load_n(read_doorbell, __ATOMIC_ACQUIRE) != 0)
+    {
+    }
 }
 
-static int ivshmem_mmio_region_read(void *buf) {
+static int ivshmem_mmio_region_read(void *buf)
+{
 
     wait_for_write_doorbell_set();
 
@@ -94,7 +111,8 @@ static int ivshmem_mmio_region_read(void *buf) {
     return 0;
 }
 
-static int ivshmem_mmio_region_write(void *buf, size_t count) {
+static int ivshmem_mmio_region_write(void *buf, size_t count)
+{
 
     wait_for_read_doorbell_clear();
 
@@ -105,36 +123,81 @@ static int ivshmem_mmio_region_write(void *buf, size_t count) {
     return 0;
 }
 
-void mmio_read(coyote::cThread &coyote_thread) {
+void mmio_read(coyote::cThread &coyote_thread, uint64_t addr)
+{
     // Clear read status
     coyote_thread.setCSR(0, static_cast<uint32_t>(HCReg::MMIO_READ_STATUS));
+
+    while (coyote_thread.getCSR(static_cast<uint32_t>(HCReg::MMIO_READ_STATUS)) != 0)
+    {
+        std::this_thread::sleep_for(std::chrono::nanoseconds(CLOCK_PERIOD_NS));
+    }
+
+    while (coyote_thread.getCSR(static_cast<uint32_t>(HCReg::MMIO_CTRL)) != 0)
+    {
+        std::this_thread::sleep_for(std::chrono::nanoseconds(CLOCK_PERIOD_NS));
+    }
+
+    // Phase 1: Set MMIO parameters directly via AXI-Lite registers
+    coyote_thread.setCSR(0, static_cast<uint32_t>(HCReg::MMIO_OP)); // 0 = Read
+    coyote_thread.setCSR(addr, static_cast<uint32_t>(HCReg::MMIO_ADDR));
+
+    // Flush posted CSR writes before issuing MMIO_CTRL trigger.
+    // (void)coyote_thread.getCSR(static_cast<uint32_t>(HCReg::MMIO_OP));
+    // (void)coyote_thread.getCSR(static_cast<uint32_t>(HCReg::MMIO_ADDR));
 
     // Trigger MMIO
     coyote_thread.setCSR(1, static_cast<uint32_t>(HCReg::MMIO_CTRL));
 
-    // Poll for completion
-    while (coyote_thread.getCSR(static_cast<uint32_t>(HCReg::MMIO_READ_STATUS)) != 1) {
+    while (coyote_thread.getCSR(static_cast<uint32_t>(HCReg::MMIO_READ_STATUS)) != 1)
+    {
         std::this_thread::sleep_for(std::chrono::nanoseconds(CLOCK_PERIOD_NS));
     }
+
+    // Phase 2: Read response from AXI-Lite register and write to shmem + 16
+    uint64_t data = coyote_thread.getCSR(static_cast<uint32_t>(HCReg::MMIO_READ_DATA));
+    *(uint64_t *)((char *)shmem + 16) = data;
 
     __atomic_store_n(read_doorbell, 1, __ATOMIC_RELEASE);
 }
 
-void mmio_write(coyote::cThread &coyote_thread) {
+void mmio_write(coyote::cThread &coyote_thread, uint64_t addr, uint64_t data)
+{
     // Clear write status
     coyote_thread.setCSR(0, static_cast<uint32_t>(HCReg::MMIO_WRITE_STATUS));
+
+    while (coyote_thread.getCSR(static_cast<uint32_t>(HCReg::MMIO_WRITE_STATUS)) != 0)
+    {
+        std::this_thread::sleep_for(std::chrono::nanoseconds(CLOCK_PERIOD_NS));
+    }
+
+    while (coyote_thread.getCSR(static_cast<uint32_t>(HCReg::MMIO_CTRL)) != 0)
+    {
+        std::this_thread::sleep_for(std::chrono::nanoseconds(CLOCK_PERIOD_NS));
+    }
+
+    // Phase 1: Set MMIO parameters directly via AXI-Lite registers
+    coyote_thread.setCSR(1, static_cast<uint32_t>(HCReg::MMIO_OP)); // 1 = Write
+    coyote_thread.setCSR(addr, static_cast<uint32_t>(HCReg::MMIO_ADDR));
+    coyote_thread.setCSR(data, static_cast<uint32_t>(HCReg::MMIO_DATA));
+
+    // Flush posted CSR writes before issuing MMIO_CTRL trigger.
+    // (void)coyote_thread.getCSR(static_cast<uint32_t>(HCReg::MMIO_OP));
+    // (void)coyote_thread.getCSR(static_cast<uint32_t>(HCReg::MMIO_ADDR));
+    // (void)coyote_thread.getCSR(static_cast<uint32_t>(HCReg::MMIO_DATA));
 
     // Trigger MMIO
     coyote_thread.setCSR(1, static_cast<uint32_t>(HCReg::MMIO_CTRL));
 
     // Poll for completion
-    while (coyote_thread.getCSR(static_cast<uint32_t>(HCReg::MMIO_WRITE_STATUS)) != 1) {
+    while (coyote_thread.getCSR(static_cast<uint32_t>(HCReg::MMIO_WRITE_STATUS)) != 1)
+    {
         std::this_thread::sleep_for(std::chrono::nanoseconds(CLOCK_PERIOD_NS));
     }
 };
 
-
-void *run_shmem_app(coyote::cThread &coyote_thread) {
+void *run_shmem_app(coyote::cThread &coyote_thread)
+{
 
     printf("connection.c: In shmem app\n");
 
@@ -142,37 +205,40 @@ void *run_shmem_app(coyote::cThread &coyote_thread) {
 
     loff_t offset;
 
-    while (1) {
+    while (1)
+    {
         __atomic_store_n(write_doorbell, 0, __ATOMIC_RELEASE);
 
         mmio_message_header header;
-        if (ivshmem_mmio_region_read(&header) != 0) {
+        if (ivshmem_mmio_region_read(&header) != 0)
+        {
             perror("Failed to read message");
             continue;
         }
 
 #ifdef CONFIG_DISAGG_DEBUG_MMIO
         printf("Received message: operation=%u, address=0x%lx, length=%u\n",
-                header.operation, header.address, header.length);
+               header.operation, header.address, header.length);
 #endif
 
-        switch (header.operation) {
+        switch (header.operation)
+        {
 
-            case OP_READ:
+        case OP_READ:
 
-                mmio_read(coyote_thread);
+            mmio_read(coyote_thread, header.address);
 
-                continue;
+            continue;
 
-            case OP_WRITE:
+        case OP_WRITE:
 
-                mmio_write(coyote_thread);
+            mmio_write(coyote_thread, header.address, header.value);
 
-                continue;
+            continue;
 
-            default:
-                fprintf(stderr, "Unknown operation: %d\n", header.operation);
-                continue;
+        default:
+            fprintf(stderr, "Unknown operation: %d\n", header.operation);
+            continue;
         }
 
         printf("Response sent. Waiting for next message...\n");
@@ -180,4 +246,3 @@ void *run_shmem_app(coyote::cThread &coyote_thread) {
 
     munmap(shmem, SHMEM_SIZE);
 }
-
