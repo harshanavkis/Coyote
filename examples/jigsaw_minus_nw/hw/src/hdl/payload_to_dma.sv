@@ -163,23 +163,25 @@ module payload_to_dma #(
             SEND_PAYLOAD: begin
                 // TODO: for D2H we should maybe send tlast after SEND_HEADER and SEND_PAYLOAD, instead of sending for each
                 // TODO: Check if we need to use payload_to_dma_out_tready while triggering payload_to_dma_out_tvalid
-                payload_to_dma_out_tdata = {AXI_DATA_BITS{1'b0}};
+                payload_to_dma_out_tdata = {AXI_DATA_BITS{1'b1}};
                 payload_to_dma_out_tkeep = {KEEP_WIDTH{1'b1}};
                 // Gate output by MMIO not being active - prevent overlapping tvalid
                 payload_to_dma_out_tvalid = !mmio_output_active;
                 payload_to_dma_out_tlast = (dma_d2h_count + KEEP_WIDTH >= dma_len);
 
                 // On write completion, set the status of DMA register so that it can be polled by the CPU
-                dma_status_valid = (dma_d2h_count + KEEP_WIDTH >= dma_len);
-                dma_status = (dma_d2h_count + KEEP_WIDTH >= dma_len);
-                dma_tx_length_valid = (dma_d2h_count + KEEP_WIDTH >= dma_len);
+                // IMPORTANT: We must wait for downstream tready before asserting status, 
+                // so we don't declare completion prematurely before the host controller accepts the final block!
+                dma_status_valid = (payload_to_dma_out_tready && (dma_d2h_count + KEEP_WIDTH >= dma_len));
+                dma_status = (payload_to_dma_out_tready && (dma_d2h_count + KEEP_WIDTH >= dma_len));
+                dma_tx_length_valid = (payload_to_dma_out_tready && (dma_d2h_count + KEEP_WIDTH >= dma_len));
                 dma_tx_length = dma_d2h_count + KEEP_WIDTH;
             end
             RECEIVE_PAYLOAD: begin
                 // On read completion, set the status of DMA register so that it can be polled by the CPU
-                dma_status_valid = payload_to_dma_in_tlast == 1'b1;
-                dma_status = payload_to_dma_in_tlast == 1'b1;
-                dma_tx_length_valid = payload_to_dma_in_tlast && payload_to_dma_in_tvalid;
+                dma_status_valid = (payload_to_dma_in_tlast == 1'b1) && (dma_d2h_count + KEEP_WIDTH >= dma_len);
+                dma_status = (payload_to_dma_in_tlast == 1'b1) && (dma_d2h_count + KEEP_WIDTH >= dma_len);
+                dma_tx_length_valid = (payload_to_dma_in_tlast == 1'b1) && (dma_d2h_count + KEEP_WIDTH >= dma_len);
                 dma_tx_length = dma_d2h_count + KEEP_WIDTH;
 
                 // TODO: payload_to_dma_in_tdata also contains the header, this must be stripped off

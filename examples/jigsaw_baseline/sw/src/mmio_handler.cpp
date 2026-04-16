@@ -29,6 +29,9 @@ void edu_mmio_read(coyote::cThread &coyote_thread, char *data, uint64_t offset)
         case static_cast<uint32_t>(JigsawRegisters::START_COMPUTATION_REG):
             val = coyote_thread.getCSR(static_cast<uint32_t>(JigsawRegisters::START_COMPUTATION_REG));
             break;
+        case static_cast<uint32_t>(JigsawRegisters::CYCLES_PER_COMPUTATION_REG):
+            val = coyote_thread.getCSR(static_cast<uint32_t>(JigsawRegisters::CYCLES_PER_COMPUTATION_REG));
+            break;
         default:
             val = 0;
             break;
@@ -66,6 +69,9 @@ void edu_mmio_write(coyote::cThread &coyote_thread, char *data, uint64_t offset)
             break;
         case static_cast<uint32_t>(JigsawRegisters::START_COMPUTATION_REG):
             coyote_thread.setCSR(val, static_cast<uint32_t>(JigsawRegisters::START_COMPUTATION_REG));
+            break;
+        case static_cast<uint32_t>(JigsawRegisters::CYCLES_PER_COMPUTATION_REG):
+            coyote_thread.setCSR(val, static_cast<uint32_t>(JigsawRegisters::CYCLES_PER_COMPUTATION_REG));
             break;
         default:
             break;

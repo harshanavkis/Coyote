@@ -31,8 +31,10 @@ axisr_reg inst_reg_in  (.aclk(aclk), .aresetn(aresetn), .s_axis(axis_host_recv[0
 AXI4SR axis_out_int (.*);
 axisr_reg inst_reg_out (.aclk(aclk), .aresetn(aresetn), .s_axis(axis_out_int), .m_axis(axis_host_send[0]));
 
-logic dma_start;
-logic dma_direction;
+// --- Signal declarations ---
+// AXI ctrl parser → DMA signals (SW-driven path)
+logic sw_dma_start;
+logic sw_dma_direction;
 logic [VADDR_BITS-1:0] dma_src_addr;
 logic [VADDR_BITS-1:0] dma_dst_addr;
 logic [LEN_BITS-1:0] dma_len;
@@ -43,6 +45,19 @@ logic computation_status;
 logic computation_status_valid;
 logic clear_dma_start;
 
+// Computation engine signals
+logic start_computation;
+logic [63:0] cycles_per_computation;
+logic comp_dma_start;
+logic comp_dma_direction;
+logic computation_active;
+logic clear_computation_start;
+
+// Muxed DMA control (computation engine overrides SW when active)
+logic dma_start;
+logic dma_direction;
+
+// Coyote DMA interface
 logic coyote_dma_d2h;
 logic [VADDR_BITS-1:0] coyote_dma_addr;
 logic [LEN_BITS-1:0] coyote_dma_len;
@@ -50,12 +65,25 @@ logic coyote_dma_req;
 logic coyote_dma_tx_valid;
 logic [LEN_BITS-1:0] coyote_dma_tx_len;
 
+// --- Mux: computation engine overrides SW DMA control when active ---
+always_comb begin
+    if (computation_active) begin
+        dma_start     = comp_dma_start;
+        dma_direction = comp_dma_direction;
+    end else begin
+        dma_start     = sw_dma_start;
+        dma_direction = sw_dma_direction;
+    end
+end
+
+// --- Module instantiations ---
+
 jigsaw_baseline_axi_ctrl_parser inst_axi_ctrl_parser (
     .aclk(aclk),
     .aresetn(aresetn),
     .axi_ctrl(axi_ctrl),
-    .dma_start(dma_start),
-    .dma_direction(dma_direction),
+    .dma_start(sw_dma_start),
+    .dma_direction(sw_dma_direction),
     .dma_src_addr(dma_src_addr),
     .dma_dst_addr(dma_dst_addr),
     .dma_len(dma_len),
@@ -66,7 +94,25 @@ jigsaw_baseline_axi_ctrl_parser inst_axi_ctrl_parser (
     .computation_status_valid(computation_status_valid),
     .clear_dma_start(clear_dma_start),
     .coyote_dma_tx_len_valid(coyote_dma_tx_valid),
-    .coyote_dma_tx_len(coyote_dma_tx_len)
+    .coyote_dma_tx_len(coyote_dma_tx_len),
+    .start_computation(start_computation),
+    .cycles_per_computation(cycles_per_computation),
+    .clear_computation_start(clear_computation_start)
+);
+
+computation_engine inst_computation_engine (
+    .aclk(aclk),
+    .aresetn(aresetn),
+    .start_computation(start_computation),
+    .cycles_per_computation(cycles_per_computation),
+    .dma_status(dma_status),
+    .dma_status_valid(dma_status_valid),
+    .comp_dma_start(comp_dma_start),
+    .comp_dma_direction(comp_dma_direction),
+    .computation_active(computation_active),
+    .computation_status(computation_status),
+    .computation_status_valid(computation_status_valid),
+    .clear_computation_start(clear_computation_start)
 );
 
 dma_engine inst_dma_engine (

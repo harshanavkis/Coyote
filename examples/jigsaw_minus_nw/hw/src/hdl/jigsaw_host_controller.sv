@@ -186,36 +186,48 @@ always @(*) begin
     // DMA Write State Machine
     case (dma_wr_state_cur)
         DMA_IDLE: begin
-            if (network_in_tvalid) begin
-                if (network_in_tdata[OP_POS +: OP_WIDTH] == 8'd2) begin
-                    // MMIO Response: Route to AXI-Lite register immediately (decoupled)
-                    mmio_read_data_in = network_in_tdata[ADDR_POS +: ADDR_WIDTH];
-                    mmio_read_data_in_valid = 1'b1;
-                    mmio_read_done = 1'b1;
-                end else if (host_out_tready) begin
-                    // DMA Write / Header trigger - Decoupled from MMIO guards
-                    if (network_in_tdata[OP_POS +: OP_WIDTH] == 8'd1) begin
-                    // D2H DMA: First beat is header only (op + addr + len)
-                    // payload_to_dma sends header and payload in separate beats
-                    // Capture header info but don't send data from this beat
+            if (network_in_tvalid && dma_wr_state_cur == DMA_IDLE) begin
+                if (network_in_tdata[OP_POS +: OP_WIDTH] == 8'd0) begin
+                    if (!sq_valid_read) begin
+                        network_out_tvalid = 1'b1;
+                        network_out_tdata = {{(AXI_DATA_BITS - 8){1'b0}}, {8'd2}};
+                        network_out_tkeep = {{KEEP_WIDTH}{1'b1}};
+                        if (network_out_tready) begin
+                            dma_rd_state_next = DMA_RD;
+                            sq_valid_read = 1'b1;
+                            sq_dir_read = 1'b0;
+                            sq_addr_read = network_in_tdata[ADDR_POS +: ADDR_WIDTH];
+                            sq_len_read = network_in_tdata[LEN_POS +: LEN_WIDTH];
+                        end
+                    end
+                end else if (network_in_tdata[OP_POS +: OP_WIDTH] == 8'd1) begin
+                    // DMA Write Header
+                    if (host_out_tready) begin
                         dma_wr_state_next = DMA_WR;
                         sq_valid_write = 1'b1;
                         sq_dir_write = 1'b1;
                         sq_addr_write = network_in_tdata[ADDR_POS +: ADDR_WIDTH];
                         sq_len_write = network_in_tdata[LEN_POS +: LEN_WIDTH];
                     end
+                end else if (network_in_tdata[OP_POS +: OP_WIDTH] == 8'd2) begin
+                    // MMIO Response
+                    mmio_read_data_in = network_in_tdata[ADDR_POS +: ADDR_WIDTH];
+                    mmio_read_data_in_valid = 1'b1;
+                    mmio_read_done = 1'b1;
                 end
             end
         end
         DMA_WR: begin
             // Pass through payload beats directly to host_out
-            if (network_in_tvalid && host_out_tready) begin
+            if (network_in_tvalid) begin
                 host_out_tvalid = 1'b1;
                 host_out_tdata = network_in_tdata;
                 host_out_tkeep = network_in_tkeep;
                 if (network_in_tlast) begin
-                    dma_wr_state_next = DMA_IDLE;
                     host_out_tlast = 1'b1;
+                    if (host_out_tready) begin
+                        dma_wr_state_next = DMA_IDLE;
+                    end
                 end
             end
         end

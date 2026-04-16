@@ -105,8 +105,9 @@ module txn_generator #(
     wire payload_to_dma_out_tlast;
     wire payload_to_dma_out_tuser;
 
-    wire dma_start;
-    wire dma_direction;
+    // SW-driven DMA signals (from payload_to_mmio register bank)
+    wire sw_dma_start;
+    wire sw_dma_direction;
     wire [63:0] dma_src_addr;
     wire [63:0] dma_dst_addr;
     wire [63:0] dma_len;
@@ -117,6 +118,22 @@ module txn_generator #(
 
     wire [63:0] dma_tx_len;
     wire dma_tx_len_valid;
+
+    // Computation engine signals
+    wire start_computation;
+    wire [63:0] cycles_per_computation;
+    wire comp_dma_start;
+    wire comp_dma_direction;
+    wire computation_active;
+    wire computation_status;
+    wire computation_status_valid;
+    wire clear_computation_start;
+
+    // Muxed DMA control (computation engine overrides SW when active)
+    wire dma_start;
+    wire dma_direction;
+    assign dma_start     = computation_active ? comp_dma_start     : sw_dma_start;
+    assign dma_direction = computation_active ? comp_dma_direction : sw_dma_direction;
 
     // State machine to track multi-beat transactions
     // MMIO is single-beat, so no state needed for it
@@ -232,18 +249,37 @@ module txn_generator #(
         .read_data_valid(mmio_read_valid),
         .read_data_ready(txn_generator_out_tready & ~dma_output_active),  // Block MMIO output when DMA is in output state
         .dma_output_active(dma_output_active),  // Prevent MMIO from asserting read_data_valid while DMA is outputting
-        .dma_start(dma_start),
-        .dma_direction(dma_direction),
+        .dma_start(sw_dma_start),
+        .dma_direction(sw_dma_direction),
         .dma_src_addr(dma_src_addr),
         .dma_dst_addr(dma_dst_addr),
         .dma_len(dma_len),
         .dma_status(dma_status),
         .dma_status_valid(dma_status_valid),
-        .computation_status(1'b0),
-        .computation_status_valid(1'b0),
+        .computation_status(computation_status),
+        .computation_status_valid(computation_status_valid),
         .clear_dma_start(clear_dma_start),
         .dma_tx_len(dma_tx_len),
-        .dma_tx_len_valid(dma_tx_len_valid)
+        .dma_tx_len_valid(dma_tx_len_valid),
+        .start_computation(start_computation),
+        .cycles_per_computation(cycles_per_computation),
+        .clear_computation_start(clear_computation_start)
+    );
+
+    // Computation engine: orchestrates H2D → compute → D2H pipeline
+    computation_engine inst_computation_engine (
+        .aclk(aclk),
+        .aresetn(aresetn),
+        .start_computation(start_computation),
+        .cycles_per_computation(cycles_per_computation),
+        .dma_status(dma_status),
+        .dma_status_valid(dma_status_valid),
+        .comp_dma_start(comp_dma_start),
+        .comp_dma_direction(comp_dma_direction),
+        .computation_active(computation_active),
+        .computation_status(computation_status),
+        .computation_status_valid(computation_status_valid),
+        .clear_computation_start(clear_computation_start)
     );
 
     // DMA module

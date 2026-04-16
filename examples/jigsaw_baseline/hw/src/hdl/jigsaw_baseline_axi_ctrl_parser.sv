@@ -16,9 +16,12 @@ import lynxTypes::*;
  * @param[out] dma_len: length of the DMA transfer in bytes
  * @param[in] dma_status: status of the DMA transfer
  * @param[in] dma_status_valid
- * @param[in] computation_status
- * @param[in] computation_status_valid
+ * @param[in] computation_status: set by computation engine when done
+ * @param[in] computation_status_valid: pulse when computation status is valid
  * @param[in] clear_dma_start
+ * @param[out] start_computation: driven from START_COMPUTATION_REG
+ * @param[out] cycles_per_computation: driven from CYCLES_PER_COMPUTATION_REG
+ * @param[in] clear_computation_start: auto-clear START_COMPUTATION_REG
  */
 module jigsaw_baseline_axi_ctrl_parser (
   input  logic                        aclk,
@@ -38,7 +41,10 @@ module jigsaw_baseline_axi_ctrl_parser (
   input logic computation_status_valid,
   input logic clear_dma_start,
   input logic coyote_dma_tx_len_valid,
-  input logic [63:0] coyote_dma_tx_len
+  input logic [63:0] coyote_dma_tx_len,
+  output logic start_computation,
+  output logic [63:0] cycles_per_computation,
+  input logic clear_computation_start
 );
 
 /////////////////////////////////////
@@ -109,9 +115,19 @@ always_ff @(posedge aclk) begin
         ctrl_reg[DMA_STATUS_REG][0] <= dma_status;
     end
 
+    // Latch computation status when valid (bit 1 of DMA_STATUS_REG)
+    if (computation_status_valid) begin
+        ctrl_reg[DMA_STATUS_REG][1] <= computation_status;
+    end
+
     // Latch Coyote DMA transfer length when valid
     if (coyote_dma_tx_len_valid) begin
         ctrl_reg[COYOTE_DMA_TX_LEN_REG] <= coyote_dma_tx_len;
+    end
+
+    // Auto-clear START_COMPUTATION_REG when computation engine starts
+    if (clear_computation_start) begin
+      ctrl_reg[START_COMPUTATION_REG] <= 0;
     end
 
     if (clear_dma_start) begin
@@ -221,6 +237,8 @@ always_comb begin
   dma_dst_addr = ctrl_reg[DMA_DST_ADDR_REG];
   dma_len = ctrl_reg[DMA_LEN_REG];
   coyote_pid = ctrl_reg[COYOTE_PID_REG];
+  start_computation = ctrl_reg[START_COMPUTATION_REG][0];
+  cycles_per_computation = ctrl_reg[CYCLES_PER_COMPUTATION_REG];
 end
 
 /////////////////////////////////////
