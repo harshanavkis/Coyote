@@ -33,7 +33,8 @@ module jigsaw_baseline_axi_ctrl_parser (
   output logic dma_direction,
   output logic [VADDR_BITS-1:0] dma_src_addr,
   output logic [VADDR_BITS-1:0] dma_dst_addr,
-  output logic [LEN_BITS-1:0] dma_len,
+  output logic [LEN_BITS-1:0] dma_h2d_len,
+  output logic [LEN_BITS-1:0] dma_d2h_len,
   output logic [PID_BITS-1:0] coyote_pid,
   input logic dma_status,
   input logic dma_status_valid,
@@ -50,7 +51,7 @@ module jigsaw_baseline_axi_ctrl_parser (
 /////////////////////////////////////
 //          CONSTANTS             //
 ///////////////////////////////////
-localparam integer N_REGS = 9;
+localparam integer N_REGS = 10;
 localparam integer ADDR_MSB = $clog2(N_REGS);
 localparam integer ADDR_LSB = $clog2(AXIL_DATA_BITS/8);
 localparam integer AXI_ADDR_BITS = ADDR_LSB + ADDR_MSB;
@@ -86,8 +87,8 @@ localparam DMA_CMD_REG = 0;
 localparam DMA_SRC_ADDR_REG = 1;
 //  2 (RW) - DMA destination address
 localparam DMA_DST_ADDR_REG = 2;
-//  3 (RW) - DMA length
-localparam DMA_LEN_REG = 3;
+//  3 (RW) - DMA H2D length
+localparam DMA_H2D_LEN_REG = 3;
 //  4 (RW) - DMA status register: 0th bit for DMA completion, 1st bit for computation completion
 localparam DMA_STATUS_REG = 4;
 //  5 (RW) - Start computation
@@ -98,6 +99,8 @@ localparam CYCLES_PER_COMPUTATION_REG = 6;
 localparam COYOTE_PID_REG = 7;
 //  8 (RW) - Coyote specific: DMA transfer length
 localparam COYOTE_DMA_TX_LEN_REG = 8;
+//  9 (RW) - DMA D2H length
+localparam DMA_D2H_LEN_REG = 9;
 
 /////////////////////////////////////
 //         WRITE PROCESS          //
@@ -131,7 +134,7 @@ always_ff @(posedge aclk) begin
     end
 
     if (clear_dma_start) begin
-      ctrl_reg[DMA_CMD_REG] <= 0;
+      ctrl_reg[DMA_CMD_REG][0] <= 1'b0;
     end else if(ctrl_reg_wren) begin
       case (axi_awaddr[ADDR_LSB+:ADDR_MSB])
         DMA_CMD_REG:     // DMA command register
@@ -152,10 +155,10 @@ always_ff @(posedge aclk) begin
               ctrl_reg[DMA_DST_ADDR_REG][(i*8)+:8] <= axi_ctrl.wdata[(i*8)+:8];
             end
           end
-        DMA_LEN_REG:      // DMA length
+        DMA_H2D_LEN_REG:      // DMA H2D length
           for (int i = 0; i < (AXIL_DATA_BITS/8); i++) begin
             if(axi_ctrl.wstrb[i]) begin
-              ctrl_reg[DMA_LEN_REG][(i*8)+:8] <= axi_ctrl.wdata[(i*8)+:8];
+              ctrl_reg[DMA_H2D_LEN_REG][(i*8)+:8] <= axi_ctrl.wdata[(i*8)+:8];
             end
           end
         DMA_STATUS_REG:   // DMA status register
@@ -180,6 +183,12 @@ always_ff @(posedge aclk) begin
           for (int i = 0; i < (AXIL_DATA_BITS/8); i++) begin
             if(axi_ctrl.wstrb[i]) begin
               ctrl_reg[COYOTE_PID_REG][(i*8)+:8] <= axi_ctrl.wdata[(i*8)+:8];
+            end
+          end
+        DMA_D2H_LEN_REG:      // DMA D2H length
+          for (int i = 0; i < (AXIL_DATA_BITS/8); i++) begin
+            if(axi_ctrl.wstrb[i]) begin
+              ctrl_reg[DMA_D2H_LEN_REG][(i*8)+:8] <= axi_ctrl.wdata[(i*8)+:8];
             end
           end
         default: ;
@@ -209,8 +218,8 @@ always_ff @(posedge aclk) begin
           axi_rdata <= ctrl_reg[DMA_SRC_ADDR_REG];
         DMA_DST_ADDR_REG:  // DMA destination address register
           axi_rdata <= ctrl_reg[DMA_DST_ADDR_REG];
-        DMA_LEN_REG:  // DMA length register
-          axi_rdata <= ctrl_reg[DMA_LEN_REG];
+        DMA_H2D_LEN_REG:  // DMA H2D length register
+          axi_rdata <= ctrl_reg[DMA_H2D_LEN_REG];
         DMA_STATUS_REG:   // DMA status register
           axi_rdata <= ctrl_reg[DMA_STATUS_REG];
         START_COMPUTATION_REG:  // Start computation register
@@ -221,6 +230,8 @@ always_ff @(posedge aclk) begin
           axi_rdata <= ctrl_reg[COYOTE_PID_REG];
         COYOTE_DMA_TX_LEN_REG:  // Coyote specific: DMA transfer length register
           axi_rdata <= ctrl_reg[COYOTE_DMA_TX_LEN_REG];
+        DMA_D2H_LEN_REG:  // DMA D2H length register
+          axi_rdata <= ctrl_reg[DMA_D2H_LEN_REG];
         default: ;
       endcase
     end
@@ -235,7 +246,8 @@ always_comb begin
   dma_direction = ctrl_reg[DMA_CMD_REG][1];
   dma_src_addr = ctrl_reg[DMA_SRC_ADDR_REG];
   dma_dst_addr = ctrl_reg[DMA_DST_ADDR_REG];
-  dma_len = ctrl_reg[DMA_LEN_REG];
+  dma_h2d_len = ctrl_reg[DMA_H2D_LEN_REG];
+  dma_d2h_len = ctrl_reg[DMA_D2H_LEN_REG];
   coyote_pid = ctrl_reg[COYOTE_PID_REG];
   start_computation = ctrl_reg[START_COMPUTATION_REG][0];
   cycles_per_computation = ctrl_reg[CYCLES_PER_COMPUTATION_REG];

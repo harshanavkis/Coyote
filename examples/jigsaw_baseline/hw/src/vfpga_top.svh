@@ -37,6 +37,8 @@ logic sw_dma_start;
 logic sw_dma_direction;
 logic [VADDR_BITS-1:0] dma_src_addr;
 logic [VADDR_BITS-1:0] dma_dst_addr;
+logic [LEN_BITS-1:0] dma_h2d_len;
+logic [LEN_BITS-1:0] dma_d2h_len;
 logic [LEN_BITS-1:0] dma_len;
 logic [PID_BITS-1:0] coyote_pid;
 logic dma_status;
@@ -74,6 +76,9 @@ always_comb begin
         dma_start     = sw_dma_start;
         dma_direction = sw_dma_direction;
     end
+    
+    // Select length based on direction
+    dma_len = dma_direction ? dma_d2h_len : dma_h2d_len;
 end
 
 // --- Module instantiations ---
@@ -86,7 +91,8 @@ jigsaw_baseline_axi_ctrl_parser inst_axi_ctrl_parser (
     .dma_direction(sw_dma_direction),
     .dma_src_addr(dma_src_addr),
     .dma_dst_addr(dma_dst_addr),
-    .dma_len(dma_len),
+    .dma_h2d_len(dma_h2d_len),
+    .dma_d2h_len(dma_d2h_len),
     .coyote_pid(coyote_pid),
     .dma_status(dma_status),
     .dma_status_valid(dma_status_valid),
