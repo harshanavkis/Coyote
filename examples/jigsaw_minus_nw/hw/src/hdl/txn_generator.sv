@@ -110,6 +110,8 @@ module txn_generator #(
     wire sw_dma_direction;
     wire [63:0] dma_src_addr;
     wire [63:0] dma_dst_addr;
+    wire [63:0] dma_h2d_len;
+    wire [63:0] dma_d2h_len;
     wire [63:0] dma_len;
     wire dma_status;
     wire dma_status_valid;
@@ -134,6 +136,7 @@ module txn_generator #(
     wire dma_direction;
     assign dma_start     = computation_active ? comp_dma_start     : sw_dma_start;
     assign dma_direction = computation_active ? comp_dma_direction : sw_dma_direction;
+    assign dma_len       = dma_direction      ? dma_d2h_len        : dma_h2d_len;
 
     // State machine to track multi-beat transactions
     // MMIO is single-beat, so no state needed for it
@@ -253,7 +256,8 @@ module txn_generator #(
         .dma_direction(sw_dma_direction),
         .dma_src_addr(dma_src_addr),
         .dma_dst_addr(dma_dst_addr),
-        .dma_len(dma_len),
+        .dma_h2d_len(dma_h2d_len),
+        .dma_d2h_len(dma_d2h_len),
         .dma_status(dma_status),
         .dma_status_valid(dma_status_valid),
         .computation_status(computation_status),
@@ -282,6 +286,9 @@ module txn_generator #(
         .clear_computation_start(clear_computation_start)
     );
 
+    // Gated MMIO valid: only allow MMIO to take the bus when DMA is not outputting
+    wire mmio_out_active = mmio_read_valid & ~dma_output_active;
+
     // DMA module
     payload_to_dma payload_to_dma (
         .aclk(aclk),
@@ -294,7 +301,7 @@ module txn_generator #(
         .dma_status(dma_status),
         .dma_status_valid(dma_status_valid),
         .clear_dma_start(clear_dma_start),
-        .mmio_output_active(mmio_read_valid),  // Gate DMA output when MMIO response is active
+        .mmio_output_active(mmio_out_active),  // Use gated signal to avoid deadlock
         .dma_output_active(dma_output_active), // DMA wants to output (in SEND_HEADER or SEND_PAYLOAD)
         .payload_to_dma_in_tdata(dma_fifo_out_tdata),
         .payload_to_dma_in_tkeep(dma_fifo_out_tkeep),
@@ -312,13 +319,13 @@ module txn_generator #(
         .dma_tx_length_valid(dma_tx_len_valid)
     );
 
-    // Output mux: MMIO takes priority
-    assign txn_generator_out_tdata = mmio_read_valid ? {{(AXI_DATA_BITS-72){1'b0}}, mmio_read_data} : payload_to_dma_out_tdata;
-    assign txn_generator_out_tkeep = mmio_read_valid ? {{(KEEP_WIDTH-9){1'b0}}, 9'h1FF} : payload_to_dma_out_tkeep;
-    assign txn_generator_out_tvalid = mmio_read_valid | payload_to_dma_out_tvalid;
-    assign txn_generator_out_tlast = mmio_read_valid ? 1'b1 : payload_to_dma_out_tlast;
-    assign txn_generator_out_tuser = mmio_read_valid ? 1'b0 : payload_to_dma_out_tuser;
+    // Output mux: MMIO takes priority but ONLY when DMA is not active
+    assign txn_generator_out_tdata = mmio_out_active ? {{(AXI_DATA_BITS-72){1'b0}}, mmio_read_data} : payload_to_dma_out_tdata;
+    assign txn_generator_out_tkeep = mmio_out_active ? {KEEP_WIDTH{1'b1}} : payload_to_dma_out_tkeep;
+    assign txn_generator_out_tvalid = mmio_out_active | payload_to_dma_out_tvalid;
+    assign txn_generator_out_tlast = mmio_out_active ? 1'b1 : payload_to_dma_out_tlast;
+    assign txn_generator_out_tuser = mmio_out_active ? 1'b0 : payload_to_dma_out_tuser;
 
-    assign payload_to_dma_out_tready = txn_generator_out_tready & ~mmio_read_valid;
+    assign payload_to_dma_out_tready = txn_generator_out_tready & ~mmio_out_active;
 
 endmodule

@@ -15,7 +15,8 @@ module payload_to_mmio (
     output reg dma_direction,
     output reg [63:0] dma_src_addr,
     output reg [63:0] dma_dst_addr,
-    output reg [63:0] dma_len,
+    output reg [63:0] dma_h2d_len,
+    output reg [63:0] dma_d2h_len,
     input wire dma_status,
     input wire dma_status_valid,
     input wire computation_status,
@@ -29,7 +30,7 @@ module payload_to_mmio (
 );
 
 // Constants
-localparam NUM_REGS = 8;
+localparam NUM_REGS = 9;
 
 // Register map:
 //  0 (RW) - DMA command register is bitwise OR of the following:
@@ -40,8 +41,8 @@ localparam DMA_CMD_REG = 0;
 localparam DMA_SRC_ADDR_REG = 1;
 //  2 (RW) - DMA destination address
 localparam DMA_DST_ADDR_REG = 2;
-//  3 (RW) - DMA length
-localparam DMA_LEN_REG = 3;
+//  3 (RW) - DMA H2D length
+localparam DMA_H2D_LEN_REG = 3;
 //  4 (RW) - DMA status register: 0th bit for DMA completion, 1st bit for computation completion
 localparam DMA_STATUS_REG = 4;
 //  5 (RW) - Start computation
@@ -50,6 +51,8 @@ localparam START_COMPUTATION_REG = 5;
 localparam CYCLES_PER_COMPUTATION_REG = 6;
 //  7 (RW) - DMA transfer length
 localparam DMA_TX_LEN_REG = 7;
+//  8 (RW) - DMA D2H length
+localparam DMA_D2H_LEN_REG = 8;
 
 // Internal registers
 reg [63:0] slv_reg [0:NUM_REGS-1];
@@ -65,7 +68,8 @@ assign dma_start = slv_reg[DMA_CMD_REG][0];
 assign dma_direction = slv_reg[DMA_CMD_REG][1];
 assign dma_src_addr = slv_reg[DMA_SRC_ADDR_REG];
 assign dma_dst_addr = slv_reg[DMA_DST_ADDR_REG];
-assign dma_len = slv_reg[DMA_LEN_REG];
+assign dma_h2d_len = slv_reg[DMA_H2D_LEN_REG];
+assign dma_d2h_len = slv_reg[DMA_D2H_LEN_REG];
 assign start_computation = slv_reg[START_COMPUTATION_REG][0];
 assign cycles_per_computation = slv_reg[CYCLES_PER_COMPUTATION_REG];
 
@@ -95,9 +99,9 @@ always @(posedge aclk) begin
             slv_reg[DMA_STATUS_REG][1] <= computation_status;
         end
 
-        // Clear command register when clear_dma_start is asserted
+        // Clear command register bit 0 when clear_dma_start is asserted
         if (clear_dma_start) begin
-            slv_reg[DMA_CMD_REG] <= 64'b0;
+            slv_reg[DMA_CMD_REG][0] <= 1'b0;
         end
 
         // Auto-clear START_COMPUTATION_REG when computation engine starts
@@ -126,11 +130,12 @@ always @(posedge aclk) begin
                     64'h0:  read_data <= {slv_reg[DMA_CMD_REG], {8'd2}};
                     64'h8:  read_data <= {slv_reg[DMA_SRC_ADDR_REG], {8'd2}};
                     64'h10: read_data <= {slv_reg[DMA_DST_ADDR_REG], {8'd2}};
-                    64'h18: read_data <= {slv_reg[DMA_LEN_REG], {8'd2}};
+                    64'h18: read_data <= {slv_reg[DMA_H2D_LEN_REG], {8'd2}};
                     64'h20: read_data <= {slv_reg[DMA_STATUS_REG], {8'd2}};
                     64'h28: read_data <= {slv_reg[START_COMPUTATION_REG], {8'd2}};
                     64'h30: read_data <= {slv_reg[CYCLES_PER_COMPUTATION_REG], {8'd2}};
                     64'h38: read_data <= {slv_reg[DMA_TX_LEN_REG], {8'd2}};
+                    64'h40: read_data <= {slv_reg[DMA_D2H_LEN_REG], {8'd2}};
                     default: read_data <= 72'b0;
                 endcase
                 read_data_valid <= 1'b1;
@@ -141,11 +146,12 @@ always @(posedge aclk) begin
                 64'h0:  read_data_pending <= {slv_reg[DMA_CMD_REG], {8'd2}};
                 64'h8:  read_data_pending <= {slv_reg[DMA_SRC_ADDR_REG], {8'd2}};
                 64'h10: read_data_pending <= {slv_reg[DMA_DST_ADDR_REG], {8'd2}};
-                64'h18: read_data_pending <= {slv_reg[DMA_LEN_REG], {8'd2}};
+                64'h18: read_data_pending <= {slv_reg[DMA_H2D_LEN_REG], {8'd2}};
                 64'h20: read_data_pending <= {slv_reg[DMA_STATUS_REG], {8'd2}};
                 64'h28: read_data_pending <= {slv_reg[START_COMPUTATION_REG], {8'd2}};
                 64'h30: read_data_pending <= {slv_reg[CYCLES_PER_COMPUTATION_REG], {8'd2}};
                 64'h38: read_data_pending <= {slv_reg[DMA_TX_LEN_REG], {8'd2}};
+                64'h40: read_data_pending <= {slv_reg[DMA_D2H_LEN_REG], {8'd2}};
                 default: read_data_pending <= 72'b0;
             endcase
             read_data_pending_valid <= 1'b1;
@@ -157,10 +163,11 @@ always @(posedge aclk) begin
                 64'h0:  slv_reg[DMA_CMD_REG] <= payload_data;
                 64'h8:  slv_reg[DMA_SRC_ADDR_REG] <= payload_data;
                 64'h10: slv_reg[DMA_DST_ADDR_REG] <= payload_data;
-                64'h18: slv_reg[DMA_LEN_REG] <= payload_data;
+                64'h18: slv_reg[DMA_H2D_LEN_REG] <= payload_data;
                 64'h20: slv_reg[DMA_STATUS_REG] <= payload_data;
                 64'h28: slv_reg[START_COMPUTATION_REG] <= payload_data;
                 64'h30: slv_reg[CYCLES_PER_COMPUTATION_REG] <= payload_data;
+                64'h40: slv_reg[DMA_D2H_LEN_REG] <= payload_data;
                 default: ; // Ignore writes to invalid addresses
             endcase
         end
