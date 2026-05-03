@@ -24,7 +24,11 @@ module txn_generator #(
 
     // RDMA submission outputs: asserted on the first beat of each outgoing packet
     output wire rdma_wr_valid,
-    output wire [63:0] rdma_wr_len
+    output wire [63:0] rdma_wr_len,
+    input  wire sq_wr_ready,
+
+    // Debug counters exported to top-level mark_debug signals and local device CSRs.
+    output wire [23:0][63:0] debug_counters
 );
 
     /*
@@ -62,10 +66,11 @@ module txn_generator #(
     +-------------------------------------------+-------------------------+-------------------------------+
     
     Signals used:
-        - mmio_read_valid (mmio_output_active): MMIO has response to send
+        - mmio_reg_tvalid/mmio_read_valid: MMIO request/response is pending
         - dma_output_active: DMA is in SEND_HEADER or SEND_PAYLOAD state
-        - read_data_ready: gated by ~dma_output_active (blocks MMIO when DMA outputting)
-        - payload_to_dma_out_tvalid: gated by ~mmio_output_active (blocks DMA when MMIO outputting)
+        - read_data_ready: fires only when the MMIO response beat is accepted
+        - payload_to_dma launch: held off while MMIO is pending, but an
+          already-launched DMA packet drains without MMIO interruption
     */
 
     localparam OP_POS = 0;
@@ -109,8 +114,9 @@ module txn_generator #(
     wire payload_to_dma_out_tlast;
     wire payload_to_dma_out_tuser;
 
-    wire dma_start;
-    wire dma_direction;
+    // SW-driven DMA signals (from payload_to_mmio register bank)
+    wire sw_dma_start;
+    wire sw_dma_direction;
     wire [63:0] dma_src_addr;
     wire [63:0] dma_dst_addr;
     wire [63:0] dma_len;
@@ -121,6 +127,30 @@ module txn_generator #(
 
     wire [63:0] dma_tx_len;
     wire dma_tx_len_valid;
+    wire mmio_read_fire;
+    logic [23:0][63:0] debug_counter_reg;
+    logic dma_start_q;
+    logic start_computation_q;
+
+    // Computation engine signals
+    wire start_computation;
+    wire [63:0] cycles_per_computation;
+    wire comp_dma_start;
+    wire comp_dma_direction;
+    wire computation_active;
+    wire computation_status;
+    wire computation_status_valid;
+    wire clear_computation_start;
+
+    // Muxed DMA control (computation engine overrides SW when active)
+    wire dma_start;
+    wire dma_direction;
+    assign dma_start     = computation_active ? comp_dma_start     : sw_dma_start;
+    assign dma_direction = computation_active ? comp_dma_direction : sw_dma_direction;
+    assign debug_counters = debug_counter_reg;
+
+    wire dma_start_pulse = dma_start && !dma_start_q;
+    wire start_computation_pulse = start_computation && !start_computation_q;
 
     // State machine to track multi-beat transactions
     // MMIO is single-beat, so no state needed for it
@@ -130,7 +160,8 @@ module txn_generator #(
 
     reg state, state_next;
 
-    // Beat counter for DMA reply: tracks remaining bytes
+    // Beat counter for DMA reply payload: the op=2 header beat is consumed here
+    // and not forwarded into payload_to_dma.
     reg [63:0] dma_reply_remaining;
 
     always @(posedge aclk) begin
@@ -140,11 +171,11 @@ module txn_generator #(
         end else begin
             state <= state_next;
 
-            // Load counter when first beat of DMA reply (op=2) is accepted
+            // Load payload counter when the DMA reply header (op=2) is accepted.
             if (state == IDLE && txn_generator_in_tvalid && txn_generator_in_tready && dev_op == 8'd2) begin
                 dma_reply_remaining <= dma_len;
             end
-            // Decrement on each handshake during DMA_ACTIVE
+            // Decrement on each payload handshake during DMA_ACTIVE.
             else if (state == DMA_ACTIVE && txn_generator_in_tvalid && txn_generator_in_tready) begin
                 dma_reply_remaining <= dma_reply_remaining - KEEP_WIDTH;
             end
@@ -157,13 +188,13 @@ module txn_generator #(
         
         case (state)
             IDLE: begin
-                // Only transition to DMA_ACTIVE for op=2 (DMA reply)
+                // Consume the op=2 DMA reply header, then receive dma_len bytes
+                // of payload in DMA_ACTIVE.
                 // MMIO (op=0, op=1) is single-beat, handled without state change
                 if (txn_generator_in_tvalid && txn_generator_in_tready) begin
-                    if (dev_op == 8'd2 && dma_len > KEEP_WIDTH)
+                    if (dev_op == 8'd2 && dma_len != 64'd0)
                         state_next = DMA_ACTIVE;
                     // For MMIO (op=0, op=1), stay in IDLE since it's single-beat
-                    // For tiny DMA replies (dma_len <= KEEP_WIDTH), also stay in IDLE
                 end
             end
             
@@ -180,10 +211,12 @@ module txn_generator #(
 
     // Route to MMIO or DMA based on current state
     // MMIO: only when IDLE AND opcode is 0 or 1
-    // DMA: when IDLE with op=2, or in DMA_ACTIVE state (for subsequent beats)
+    // DMA: the op=2 header is consumed locally; only subsequent payload beats
+    // are forwarded to payload_to_dma.
     wire route_to_mmio = (state == IDLE && (dev_op == 8'd0 || dev_op == 8'd1));
-    wire route_to_dma = (state == IDLE && dev_op == 8'd2) || 
-                        (state == DMA_ACTIVE);
+    wire route_to_dma_reply_header = (state == IDLE && dev_op == 8'd2);
+    wire route_to_dma = (state == DMA_ACTIVE);
+    wire mmio_input_fire = route_to_mmio && txn_generator_in_tvalid && txn_generator_in_tready;
 
     // MMIO path: Direct register (single beat only)
     wire mmio_can_accept = !mmio_reg_tvalid;
@@ -196,7 +229,7 @@ module txn_generator #(
             mmio_reg_tlast <= 1'b0;
             mmio_reg_tuser <= 1'b0;
         end else begin
-            if (route_to_mmio && txn_generator_in_tvalid && mmio_can_accept) begin
+            if (mmio_input_fire) begin
                 mmio_reg_tdata <= txn_generator_in_tdata;
                 mmio_reg_tkeep <= txn_generator_in_tkeep;
                 mmio_reg_tvalid <= 1'b1;
@@ -216,7 +249,8 @@ module txn_generator #(
     assign dma_fifo_in_tuser = txn_generator_in_tuser;
 
     // Input ready based on current routing
-    assign txn_generator_in_tready = (route_to_mmio && mmio_can_accept) || 
+    assign txn_generator_in_tready = (route_to_mmio && mmio_can_accept && !clear_dma_start) ||
+                                      route_to_dma_reply_header ||
                                       (route_to_dma && dma_fifo_in_tready);
 
     // DMA FIFO instantiation
@@ -250,20 +284,39 @@ module txn_generator #(
         .payload_ready(mmio_ready),
         .read_data(mmio_read_data),
         .read_data_valid(mmio_read_valid),
-        .read_data_ready(txn_generator_out_tready & ~dma_output_active),  // Block MMIO output when DMA is in output state
+        .read_data_ready(mmio_read_fire),       // Read response was accepted by the output stream
         .dma_output_active(dma_output_active),  // Prevent MMIO from asserting read_data_valid while DMA is outputting
-        .dma_start(dma_start),
-        .dma_direction(dma_direction),
+        .dma_start(sw_dma_start),
+        .dma_direction(sw_dma_direction),
         .dma_src_addr(dma_src_addr),
         .dma_dst_addr(dma_dst_addr),
         .dma_len(dma_len),
         .dma_status(dma_status),
         .dma_status_valid(dma_status_valid),
-        .computation_status(1'b0),
-        .computation_status_valid(1'b0),
+        .computation_status(computation_status),
+        .computation_status_valid(computation_status_valid),
         .clear_dma_start(clear_dma_start),
         .dma_tx_len(dma_tx_len),
-        .dma_tx_len_valid(dma_tx_len_valid)
+        .dma_tx_len_valid(dma_tx_len_valid),
+        .start_computation(start_computation),
+        .cycles_per_computation(cycles_per_computation),
+        .clear_computation_start(clear_computation_start)
+    );
+
+    // Computation engine: orchestrates H2D → compute → D2H pipeline
+    computation_engine inst_computation_engine (
+        .aclk(aclk),
+        .aresetn(aresetn),
+        .start_computation(start_computation),
+        .cycles_per_computation(cycles_per_computation),
+        .dma_status(dma_status),
+        .dma_status_valid(dma_status_valid),
+        .comp_dma_start(comp_dma_start),
+        .comp_dma_direction(comp_dma_direction),
+        .computation_active(computation_active),
+        .computation_status(computation_status),
+        .computation_status_valid(computation_status_valid),
+        .clear_computation_start(clear_computation_start)
     );
 
     // DMA module
@@ -278,7 +331,7 @@ module txn_generator #(
         .dma_status(dma_status),
         .dma_status_valid(dma_status_valid),
         .clear_dma_start(clear_dma_start),
-        .mmio_output_active(mmio_read_valid),  // Gate DMA output when MMIO response is active
+        .mmio_output_active(mmio_input_fire || mmio_reg_tvalid || mmio_read_valid),
         .dma_output_active(dma_output_active), // DMA wants to output (in SEND_HEADER or SEND_PAYLOAD)
         .payload_to_dma_in_tdata(dma_fifo_out_tdata),
         .payload_to_dma_in_tkeep(dma_fifo_out_tkeep),
@@ -296,41 +349,146 @@ module txn_generator #(
         .dma_tx_length_valid(dma_tx_len_valid)
     );
 
-    // Output mux: MMIO takes priority
-    assign txn_generator_out_tdata = mmio_read_valid ? {{(AXI_DATA_BITS-72){1'b0}}, mmio_read_data} : payload_to_dma_out_tdata;
-    assign txn_generator_out_tkeep = mmio_read_valid ? {KEEP_WIDTH{1'b1}} : payload_to_dma_out_tkeep;
-    assign txn_generator_out_tvalid = mmio_read_valid | payload_to_dma_out_tvalid;
-    assign txn_generator_out_tlast = mmio_read_valid ? 1'b1 : payload_to_dma_out_tlast;
-    assign txn_generator_out_tuser = mmio_read_valid ? 1'b0 : payload_to_dma_out_tuser;
-
-    assign payload_to_dma_out_tready = txn_generator_out_tready & ~mmio_read_valid;
-
-    // RDMA submission logic: track packet boundaries and generate
-    // rdma_wr_valid on the first beat of each outgoing packet.
+    // RDMA submission logic: submit metadata once, before the first data beat
+    // of each outgoing packet is allowed to leave.
     reg packet_active;
+    reg packet_meta_sent;
+    reg packet_source_valid;
+    reg packet_source_mmio;
+
+    wire candidate_select_mmio = mmio_read_valid && !dma_output_active;
+    wire candidate_out_valid = candidate_select_mmio ? mmio_read_valid : payload_to_dma_out_tvalid;
+    wire select_mmio = packet_source_valid ? packet_source_mmio : candidate_select_mmio;
+    wire selected_out_valid = select_mmio ? mmio_read_valid : payload_to_dma_out_tvalid;
+    wire first_beat_pending = selected_out_valid && !packet_active;
+    wire meta_fire = first_beat_pending && !packet_meta_sent && sq_wr_ready;
+    wire first_beat_can_send = !first_beat_pending || packet_meta_sent || meta_fire;
+    wire out_fire = txn_generator_out_tvalid && txn_generator_out_tready;
+
+    // Output mux: active DMA output takes priority; MMIO polls wait behind it.
+    assign txn_generator_out_tdata = select_mmio ? {{(AXI_DATA_BITS-72){1'b0}}, mmio_read_data} : payload_to_dma_out_tdata;
+    assign txn_generator_out_tkeep = select_mmio ? {KEEP_WIDTH{1'b1}} : payload_to_dma_out_tkeep;
+    assign txn_generator_out_tvalid = selected_out_valid && first_beat_can_send;
+    assign txn_generator_out_tlast = select_mmio ? 1'b1 : payload_to_dma_out_tlast;
+    assign txn_generator_out_tuser = select_mmio ? 1'b0 : payload_to_dma_out_tuser;
+
+    assign payload_to_dma_out_tready = txn_generator_out_tready & ~select_mmio & first_beat_can_send;
+    assign mmio_read_fire = select_mmio && txn_generator_out_tvalid && txn_generator_out_tready;
 
     always @(posedge aclk) begin
         if (!aresetn) begin
             packet_active <= 1'b0;
-        end else if (txn_generator_out_tvalid && txn_generator_out_tready) begin
-            if (txn_generator_out_tlast)
-                packet_active <= 1'b0;  // Packet finished
-            else
-                packet_active <= 1'b1;  // Mid-packet
+            packet_meta_sent <= 1'b0;
+            packet_source_valid <= 1'b0;
+            packet_source_mmio <= 1'b0;
+        end else begin
+            if (!packet_source_valid && candidate_out_valid) begin
+                packet_source_valid <= 1'b1;
+                packet_source_mmio <= candidate_select_mmio;
+            end
+
+            if (meta_fire)
+                packet_meta_sent <= 1'b1;
+
+            if (out_fire) begin
+                if (txn_generator_out_tlast) begin
+                    packet_active <= 1'b0;
+                    packet_meta_sent <= 1'b0;
+                    packet_source_valid <= 1'b0;
+                end else begin
+                    packet_active <= 1'b1;
+                end
+            end
         end
     end
 
-    // rdma_wr_valid: asserted on the first beat of each outgoing packet
-    wire first_beat = txn_generator_out_tvalid && !packet_active;
+    // rdma_wr_valid stays high until the SQ accepts metadata for the next packet.
+    assign rdma_wr_valid = first_beat_pending && !packet_meta_sent;
 
     // rdma_wr_len: total packet length in bytes
     // Note: dma_direction is cleared by clear_dma_start before SEND_HEADER,
     // so we read the opcode from the actual output data (which uses the latched h2d).
     wire [7:0] out_opcode = txn_generator_out_tdata[OP_POS +: OP_WIDTH];
-    wire [63:0] rdma_pkt_len = mmio_read_valid ? 64'd64 :
+    wire [63:0] rdma_pkt_len = select_mmio ? 64'd64 :
                                (out_opcode == 8'd1 ? (64'd64 + dma_len) : 64'd64);
 
-    assign rdma_wr_valid = first_beat;
     assign rdma_wr_len = rdma_pkt_len;
+
+    always @(posedge aclk) begin
+        if (!aresetn) begin
+            debug_counter_reg <= '0;
+            dma_start_q <= 1'b0;
+            start_computation_q <= 1'b0;
+        end else begin
+            dma_start_q <= dma_start;
+            start_computation_q <= start_computation;
+
+            debug_counter_reg[0] <= {
+                42'b0,
+                dev_op,
+                txn_generator_out_tready,
+                txn_generator_out_tvalid,
+                txn_generator_in_tready,
+                txn_generator_in_tvalid,
+                sq_wr_ready,
+                packet_meta_sent,
+                packet_active,
+                computation_status,
+                computation_status_valid,
+                computation_active,
+                dma_status,
+                dma_status_valid,
+                dma_output_active,
+                state
+            };
+
+            if (route_to_mmio && txn_generator_in_tvalid && txn_generator_in_tready && dev_op == 8'd0)
+                debug_counter_reg[1] <= debug_counter_reg[1] + 1'b1;
+            if (route_to_mmio && txn_generator_in_tvalid && txn_generator_in_tready && dev_op == 8'd1)
+                debug_counter_reg[2] <= debug_counter_reg[2] + 1'b1;
+            if (mmio_read_valid && !dma_output_active)
+                debug_counter_reg[3] <= debug_counter_reg[3] + 1'b1;
+            if (mmio_read_fire)
+                debug_counter_reg[4] <= debug_counter_reg[4] + 1'b1;
+            if (route_to_dma_reply_header && txn_generator_in_tvalid && txn_generator_in_tready) begin
+                debug_counter_reg[5] <= debug_counter_reg[5] + 1'b1;
+                debug_counter_reg[21] <= dma_len;
+            end
+            if (route_to_dma && txn_generator_in_tvalid && txn_generator_in_tready)
+                debug_counter_reg[6] <= debug_counter_reg[6] + 1'b1;
+            if (route_to_dma && txn_generator_in_tvalid && txn_generator_in_tready &&
+                dma_reply_remaining <= KEEP_WIDTH)
+                debug_counter_reg[7] <= debug_counter_reg[7] + 1'b1;
+            if (dma_start_pulse)
+                debug_counter_reg[8] <= debug_counter_reg[8] + 1'b1;
+            if (dma_start_pulse && !dma_direction)
+                debug_counter_reg[9] <= debug_counter_reg[9] + 1'b1;
+            if (dma_start_pulse && dma_direction)
+                debug_counter_reg[10] <= debug_counter_reg[10] + 1'b1;
+            if (dma_status_valid && !dma_status)
+                debug_counter_reg[11] <= debug_counter_reg[11] + 1'b1;
+            if (dma_status_valid && dma_status)
+                debug_counter_reg[12] <= debug_counter_reg[12] + 1'b1;
+            if (start_computation_pulse)
+                debug_counter_reg[13] <= debug_counter_reg[13] + 1'b1;
+            if (computation_status_valid && computation_status)
+                debug_counter_reg[14] <= debug_counter_reg[14] + 1'b1;
+            if (meta_fire)
+                debug_counter_reg[15] <= debug_counter_reg[15] + 1'b1;
+            if (txn_generator_out_tvalid && txn_generator_out_tready && !packet_active)
+                debug_counter_reg[16] <= debug_counter_reg[16] + 1'b1;
+            if (txn_generator_out_tvalid && txn_generator_out_tready && txn_generator_out_tlast)
+                debug_counter_reg[17] <= debug_counter_reg[17] + 1'b1;
+            if (rdma_wr_valid && !sq_wr_ready)
+                debug_counter_reg[18] <= debug_counter_reg[18] + 1'b1;
+            if (txn_generator_out_tvalid && !txn_generator_out_tready)
+                debug_counter_reg[19] <= debug_counter_reg[19] + 1'b1;
+            if (txn_generator_in_tvalid && !txn_generator_in_tready)
+                debug_counter_reg[20] <= debug_counter_reg[20] + 1'b1;
+            if (dma_tx_len_valid)
+                debug_counter_reg[22] <= dma_tx_len;
+            debug_counter_reg[23] <= rdma_pkt_len;
+        end
+    end
 
 endmodule

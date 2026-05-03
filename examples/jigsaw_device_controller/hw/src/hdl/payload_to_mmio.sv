@@ -22,7 +22,10 @@ module payload_to_mmio (
     input wire computation_status_valid,
     input wire clear_dma_start,
     input wire [63:0] dma_tx_len,
-    input wire dma_tx_len_valid
+    input wire dma_tx_len_valid,
+    output wire start_computation,
+    output wire [63:0] cycles_per_computation,
+    input wire clear_computation_start
 );
 
 // Constants
@@ -63,6 +66,8 @@ assign dma_direction = slv_reg[DMA_CMD_REG][1];
 assign dma_src_addr = slv_reg[DMA_SRC_ADDR_REG];
 assign dma_dst_addr = slv_reg[DMA_DST_ADDR_REG];
 assign dma_len = slv_reg[DMA_LEN_REG];
+assign start_computation = slv_reg[START_COMPUTATION_REG][0];
+assign cycles_per_computation = slv_reg[CYCLES_PER_COMPUTATION_REG];
 
 always @(posedge aclk) begin
     if (!aresetn) begin
@@ -93,6 +98,11 @@ always @(posedge aclk) begin
         // Clear command register when clear_dma_start is asserted
         if (clear_dma_start) begin
             slv_reg[DMA_CMD_REG] <= 64'b0;
+        end
+
+        // Auto-clear START_COMPUTATION_REG when computation engine starts
+        if (clear_computation_start) begin
+            slv_reg[START_COMPUTATION_REG] <= 64'b0;
         end
 
         // Handle read data output with ready/valid handshaking

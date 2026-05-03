@@ -33,13 +33,15 @@ module jigsaw_hc_axi_ctrl_parser (
   output logic [63:0] mmio_addr,
   output logic [63:0] mmio_data,
   input logic [63:0] mmio_read_data_in,
-  input logic mmio_read_data_in_valid
+  input logic mmio_read_data_in_valid,
+  input logic [23:0][AXIL_DATA_BITS-1:0] debug_counters
 );
 
 /////////////////////////////////////
 //          CONSTANTS             //
 ///////////////////////////////////
-localparam integer N_REGS = 10;
+localparam integer DEBUG_COUNT = 24;
+localparam integer N_REGS = 10 + DEBUG_COUNT;
 localparam integer ADDR_MSB = $clog2(N_REGS);
 localparam integer ADDR_LSB = $clog2(AXIL_DATA_BITS/8);
 localparam integer AXI_ADDR_BITS = ADDR_LSB + ADDR_MSB;
@@ -87,6 +89,8 @@ localparam MMIO_ADDR_REG = 7;
 localparam MMIO_DATA_REG = 8;
 // 9 (RW) - Store MMIO read data payload
 localparam MMIO_READ_DATA_REG = 9;
+// 10..33 (RO) - jigsaw_host_controller debug counters
+localparam DEBUG_BASE_REG = 10;
 
 /////////////////////////////////////
 //         WRITE PROCESS          //
@@ -220,7 +224,11 @@ always_ff @(posedge aclk) begin
           axi_rdata <= ctrl_reg[MMIO_DATA_REG];
         MMIO_READ_DATA_REG: // MMIO Read Data register
           axi_rdata <= ctrl_reg[MMIO_READ_DATA_REG];
-        default: ;
+        default:
+          if ((axi_araddr[ADDR_LSB+:ADDR_MSB] >= DEBUG_BASE_REG) &&
+              (axi_araddr[ADDR_LSB+:ADDR_MSB] < DEBUG_BASE_REG + DEBUG_COUNT)) begin
+            axi_rdata <= debug_counters[axi_araddr[ADDR_LSB+:ADDR_MSB] - DEBUG_BASE_REG];
+          end
       endcase
     end
   end 

@@ -14,7 +14,9 @@ module payload_to_dma #(
     output reg dma_status_valid,
     output reg clear_dma_start,
 
-    // MMIO arbitration: block DMA output when MMIO response is being sent
+    // MMIO arbitration: block launch of a new DMA output packet while an
+    // MMIO response is pending. Once DMA reaches SEND_HEADER/SEND_PAYLOAD,
+    // it must drain without being interrupted by later MMIO polls.
     input wire mmio_output_active,
     // Indicates DMA wants to output (in SEND_HEADER or SEND_PAYLOAD state)
     output wire dma_output_active,
@@ -74,14 +76,14 @@ module payload_to_dma #(
                 else
                     next_state = IDLE;
             CLEAR_DMA_REG:
-                // Only transition to SEND_HEADER when MMIO is not active
+                // Only launch a new output packet when MMIO is not pending.
                 if (!mmio_output_active)
                     next_state = SEND_HEADER;
                 else
                     next_state = CLEAR_DMA_REG;
             SEND_HEADER:
-                // Only transition when MMIO is not active AND downstream is ready
-                if (!mmio_output_active && payload_to_dma_out_tready) begin
+                // Once launched, drain the DMA packet without MMIO interruption.
+                if (payload_to_dma_out_tready) begin
                     if (h2d)
                         next_state = SEND_PAYLOAD;
                     else
@@ -89,14 +91,13 @@ module payload_to_dma #(
                 end else
                     next_state = SEND_HEADER;
             SEND_PAYLOAD:
-                // Only transition when MMIO is not active AND downstream is ready
-                if (!mmio_output_active && payload_to_dma_out_tready && (dma_d2h_count + KEEP_WIDTH >= dma_len))
+                if (payload_to_dma_out_tready && (dma_d2h_count + KEEP_WIDTH >= dma_len))
                     next_state = IDLE;
                 else
                     next_state = SEND_PAYLOAD;
             RECEIVE_PAYLOAD:
                 // Use byte count instead of tlast (tlast fires per PMTU fragment)
-                if (payload_to_dma_in_tvalid && (dma_d2h_count + KEEP_WIDTH >= dma_len))
+                if (payload_to_dma_in_tvalid && payload_to_dma_in_tready && (dma_d2h_count + KEEP_WIDTH >= dma_len))
                     next_state = IDLE;
                 else
                     next_state = RECEIVE_PAYLOAD;
@@ -114,7 +115,7 @@ module payload_to_dma #(
             dma_d2h_count <= 64'b0;
         end else if (state == SEND_PAYLOAD && payload_to_dma_out_tready) begin
             dma_d2h_count <= dma_d2h_count + KEEP_WIDTH;
-        end else if (state == RECEIVE_PAYLOAD && payload_to_dma_in_tvalid) begin
+        end else if (state == RECEIVE_PAYLOAD && payload_to_dma_in_tvalid && payload_to_dma_in_tready) begin
             dma_d2h_count <= dma_d2h_count + KEEP_WIDTH;
         end
     end
@@ -157,34 +158,35 @@ module payload_to_dma #(
                     payload_to_dma_out_tlast = 1'b1; // Read has no payload
                     payload_to_dma_out_tkeep = {KEEP_WIDTH{1'b1}};
                 end
-                // Gate output by MMIO not being active - prevent overlapping tvalid
-                payload_to_dma_out_tvalid = !mmio_output_active;
+                payload_to_dma_out_tvalid = 1'b1;
             end
 
             SEND_PAYLOAD: begin
                 // TODO: for D2H we should maybe send tlast after SEND_HEADER and SEND_PAYLOAD, instead of sending for each
                 // TODO: Check if we need to use payload_to_dma_out_tready while triggering payload_to_dma_out_tvalid
-                payload_to_dma_out_tdata = {AXI_DATA_BITS{1'b0}};
+                payload_to_dma_out_tdata = {AXI_DATA_BITS{1'b1}};
                 payload_to_dma_out_tkeep = {KEEP_WIDTH{1'b1}};
-                // Gate output by MMIO not being active - prevent overlapping tvalid
-                payload_to_dma_out_tvalid = !mmio_output_active;
+                payload_to_dma_out_tvalid = 1'b1;
                 payload_to_dma_out_tlast = (dma_d2h_count + KEEP_WIDTH >= dma_len);
 
                 // On write completion, set the status of DMA register so that it can be polled by the CPU
-                dma_status_valid = (dma_d2h_count + KEEP_WIDTH >= dma_len);
-                dma_status = (dma_d2h_count + KEEP_WIDTH >= dma_len);
-                dma_tx_length_valid = (dma_d2h_count + KEEP_WIDTH >= dma_len);
+                // IMPORTANT: We must wait for downstream tready before asserting status, 
+                // so we don't declare completion prematurely before the host controller accepts the final block!
+                dma_status_valid = (payload_to_dma_out_tready && (dma_d2h_count + KEEP_WIDTH >= dma_len));
+                dma_status = (payload_to_dma_out_tready && (dma_d2h_count + KEEP_WIDTH >= dma_len));
+                dma_tx_length_valid = (payload_to_dma_out_tready && (dma_d2h_count + KEEP_WIDTH >= dma_len));
                 dma_tx_length = dma_d2h_count + KEEP_WIDTH;
             end
             RECEIVE_PAYLOAD: begin
                 // On read completion, set the status of DMA register so that it can be polled by the CPU
                 // Use byte count instead of tlast (tlast fires per PMTU fragment)
-                dma_status_valid = payload_to_dma_in_tvalid && (dma_d2h_count + KEEP_WIDTH >= dma_len);
-                dma_status = payload_to_dma_in_tvalid && (dma_d2h_count + KEEP_WIDTH >= dma_len);
-                dma_tx_length_valid = payload_to_dma_in_tvalid && (dma_d2h_count + KEEP_WIDTH >= dma_len);
+                dma_status_valid = payload_to_dma_in_tvalid && payload_to_dma_in_tready && (dma_d2h_count + KEEP_WIDTH >= dma_len);
+                dma_status = payload_to_dma_in_tvalid && payload_to_dma_in_tready && (dma_d2h_count + KEEP_WIDTH >= dma_len);
+                dma_tx_length_valid = payload_to_dma_in_tvalid && payload_to_dma_in_tready && (dma_d2h_count + KEEP_WIDTH >= dma_len);
                 dma_tx_length = dma_d2h_count + KEEP_WIDTH;
 
-                // TODO: payload_to_dma_in_tdata also contains the header, this must be stripped off
+                // The op=2 reply header is stripped by txn_generator; this path
+                // only counts payload bytes.
             end
             default: begin
                 // Do nothing

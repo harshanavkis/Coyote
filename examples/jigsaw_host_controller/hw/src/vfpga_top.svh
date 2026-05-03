@@ -45,6 +45,7 @@ axisr_reg inst_reg_out (.aclk(aclk), .aresetn(aresetn), .s_axis(axis_out_int), .
 // RDMA submission signals
 (* mark_debug = "true" *) logic rdma_wr_valid;
 (* mark_debug = "true" *) logic [LEN_BITS-1:0] rdma_wr_len;
+(* mark_debug = "true" *) logic [23:0][63:0] hc_debug_counters;
 
 // ============================================================================
 // AXI control register parser
@@ -64,7 +65,8 @@ jigsaw_hc_axi_ctrl_parser inst_axi_ctrl_parser (
     .mmio_addr(mmio_addr),
     .mmio_data(mmio_data),
     .mmio_read_data_in(mmio_read_data_in),
-    .mmio_read_data_in_valid(mmio_read_data_in_valid)
+    .mmio_read_data_in_valid(mmio_read_data_in_valid),
+    .debug_counters(hc_debug_counters)
 );
 
 // ============================================================================
@@ -118,6 +120,8 @@ jigsaw_host_controller #(
     .sq_dir_read(sq_dir_read),
     .sq_addr_read(sq_addr_read),
     .sq_len_read(sq_len_read),
+    .sq_ready_read(sq_rd.ready),
+    .sq_ready_write(sq_wr.ready),
 
     // MMIO control
     .mmio_vaddr(mmio_vaddr),
@@ -134,7 +138,10 @@ jigsaw_host_controller #(
 
     // RDMA submission
     .rdma_wr_valid(rdma_wr_valid),
-    .rdma_wr_len(rdma_wr_len)
+    .rdma_wr_len(rdma_wr_len),
+
+    // Debug
+    .debug_counters(hc_debug_counters)
 );
 
 // ============================================================================

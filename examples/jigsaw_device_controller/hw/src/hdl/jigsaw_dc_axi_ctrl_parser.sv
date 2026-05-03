@@ -17,13 +17,15 @@ module jigsaw_dc_axi_ctrl_parser (
   AXI4L.s                             axi_ctrl,
 
   output logic [PID_BITS - 1:0] coyote_pid,
-  output logic [VADDR_BITS-1:0] remote_vaddr
+  output logic [VADDR_BITS-1:0] remote_vaddr,
+  input  logic [23:0][AXIL_DATA_BITS-1:0] debug_counters
 );
 
 /////////////////////////////////////
 //          CONSTANTS             //
 ///////////////////////////////////
-localparam integer N_REGS = 2; // minimum 2 to keep $clog2 >= 1 (reg 1 unused)
+localparam integer DEBUG_COUNT = 24;
+localparam integer N_REGS = 2 + DEBUG_COUNT;
 localparam integer ADDR_MSB = $clog2(N_REGS);
 localparam integer ADDR_LSB = $clog2(AXIL_DATA_BITS/8);
 localparam integer AXI_ADDR_BITS = ADDR_LSB + ADDR_MSB;
@@ -52,6 +54,8 @@ logic ctrl_reg_wren;
 localparam COYOTE_PID_REG = 0;
 // 1 (RW) - Remote virtual address for RDMA WRITE
 localparam REMOTE_VADDR_REG = 1;
+// 2..25 (RO) - txn_generator debug counters
+localparam DEBUG_BASE_REG = 2;
 
 /////////////////////////////////////
 //         WRITE PROCESS          //
@@ -100,7 +104,11 @@ always_ff @(posedge aclk) begin
           axi_rdata <= ctrl_reg[COYOTE_PID_REG];
         REMOTE_VADDR_REG:
           axi_rdata <= ctrl_reg[REMOTE_VADDR_REG];
-        default: ;
+        default:
+          if ((axi_araddr[ADDR_LSB+:ADDR_MSB] >= DEBUG_BASE_REG) &&
+              (axi_araddr[ADDR_LSB+:ADDR_MSB] < DEBUG_BASE_REG + DEBUG_COUNT)) begin
+            axi_rdata <= debug_counters[axi_araddr[ADDR_LSB+:ADDR_MSB] - DEBUG_BASE_REG];
+          end
       endcase
     end
   end

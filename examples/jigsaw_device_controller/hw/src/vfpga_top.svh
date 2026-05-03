@@ -16,6 +16,25 @@
 // RDMA submission signals (from txn_generator)
 (* mark_debug = "true" *) logic rdma_wr_valid;
 (* mark_debug = "true" *) logic [63:0] rdma_wr_len;
+(* mark_debug = "true" *) logic [23:0][63:0] dc_debug_counters;
+(* mark_debug = "true" *) logic rdma_wr_inflight;
+(* mark_debug = "true" *) logic rdma_wr_sq_ready;
+(* mark_debug = "true" *) logic rdma_wr_issue;
+
+assign rdma_wr_sq_ready = sq_wr.ready && !rdma_wr_inflight;
+assign rdma_wr_issue = rdma_wr_valid && !rdma_wr_inflight;
+
+always_ff @(posedge aclk) begin
+    if (aresetn == 1'b0) begin
+        rdma_wr_inflight <= 1'b0;
+    end else begin
+        if (rdma_wr_issue && sq_wr.ready) begin
+            rdma_wr_inflight <= 1'b1;
+        end else if (cq_wr.valid && cq_wr.ready) begin
+            rdma_wr_inflight <= 1'b0;
+        end
+    end
+end
 
 // ============================================================================
 // AXI control register parser
@@ -25,7 +44,8 @@ jigsaw_dc_axi_ctrl_parser inst_axi_ctrl_parser (
     .aresetn(aresetn),
     .axi_ctrl(axi_ctrl),
     .coyote_pid(coyote_pid),
-    .remote_vaddr(remote_vaddr)
+    .remote_vaddr(remote_vaddr),
+    .debug_counters(dc_debug_counters)
 );
 
 // ============================================================================
@@ -53,7 +73,11 @@ txn_generator inst_txn_generator (
 
     // RDMA submission signals
     .rdma_wr_valid(rdma_wr_valid),
-    .rdma_wr_len(rdma_wr_len)
+    .rdma_wr_len(rdma_wr_len),
+    .sq_wr_ready(rdma_wr_sq_ready),
+
+    // Debug
+    .debug_counters(dc_debug_counters)
 );
 
 // ============================================================================
@@ -68,7 +92,7 @@ always_comb begin
     sq_wr.data          = 0;
     sq_wr.data.rdma     = 1'b0;
     sq_wr.data.actv     = 1'b0;
-    if (rdma_wr_valid) begin
+    if (rdma_wr_issue) begin
         // RDMA WRITE — auto-fragmented by rdma_req_parser
         sq_wr.data.last     = 1'b1;
         sq_wr.data.pid      = coyote_pid;
