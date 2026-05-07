@@ -119,6 +119,8 @@ module txn_generator #(
     wire sw_dma_direction;
     wire [63:0] dma_src_addr;
     wire [63:0] dma_dst_addr;
+    wire [63:0] dma_h2d_len;
+    wire [63:0] dma_d2h_len;
     wire [63:0] dma_len;
     wire dma_status;
     wire dma_status_valid;
@@ -147,6 +149,7 @@ module txn_generator #(
     wire dma_direction;
     assign dma_start     = computation_active ? comp_dma_start     : sw_dma_start;
     assign dma_direction = computation_active ? comp_dma_direction : sw_dma_direction;
+    assign dma_len       = dma_direction      ? dma_d2h_len        : dma_h2d_len;
     assign debug_counters = debug_counter_reg;
 
     wire dma_start_pulse = dma_start && !dma_start_q;
@@ -290,7 +293,8 @@ module txn_generator #(
         .dma_direction(sw_dma_direction),
         .dma_src_addr(dma_src_addr),
         .dma_dst_addr(dma_dst_addr),
-        .dma_len(dma_len),
+        .dma_h2d_len(dma_h2d_len),
+        .dma_d2h_len(dma_d2h_len),
         .dma_status(dma_status),
         .dma_status_valid(dma_status_valid),
         .computation_status(computation_status),
