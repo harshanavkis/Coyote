@@ -95,7 +95,11 @@ module payload_to_dma #(
                 else
                     next_state = SEND_PAYLOAD;
             RECEIVE_PAYLOAD:
-                if (payload_to_dma_in_tlast && (dma_d2h_count + KEEP_WIDTH >= dma_len))
+                // Don't require tlast on the exit edge — for len==KEEP_WIDTH
+                // (single-beat) XDMA's bypass interface has been observed
+                // not to assert tlast reliably on the only beat. Count-based
+                // termination is unambiguous since the byte length is known.
+                if (payload_to_dma_in_tvalid && (dma_d2h_count + KEEP_WIDTH >= dma_len))
                     next_state = IDLE;
                 else
                     next_state = RECEIVE_PAYLOAD;
@@ -178,10 +182,13 @@ module payload_to_dma #(
                 dma_tx_length = dma_d2h_count + KEEP_WIDTH;
             end
             RECEIVE_PAYLOAD: begin
-                // On read completion, set the status of DMA register so that it can be polled by the CPU
-                dma_status_valid = (payload_to_dma_in_tlast == 1'b1) && (dma_d2h_count + KEEP_WIDTH >= dma_len);
-                dma_status = (payload_to_dma_in_tlast == 1'b1) && (dma_d2h_count + KEEP_WIDTH >= dma_len);
-                dma_tx_length_valid = (payload_to_dma_in_tlast == 1'b1) && (dma_d2h_count + KEEP_WIDTH >= dma_len);
+                // Fire status on the cycle the last beat is accepted, where
+                // "last" is determined by our own byte count rather than by an
+                // upstream tlast we cannot trust (see RECEIVE_PAYLOAD next-state
+                // comment).
+                dma_status_valid = payload_to_dma_in_tvalid && (dma_d2h_count + KEEP_WIDTH >= dma_len);
+                dma_status = payload_to_dma_in_tvalid && (dma_d2h_count + KEEP_WIDTH >= dma_len);
+                dma_tx_length_valid = payload_to_dma_in_tvalid && (dma_d2h_count + KEEP_WIDTH >= dma_len);
                 dma_tx_length = dma_d2h_count + KEEP_WIDTH;
 
                 // TODO: payload_to_dma_in_tdata also contains the header, this must be stripped off

@@ -276,6 +276,7 @@ module txn_generator #(
         .aresetn(aresetn),
         .start_computation(start_computation),
         .cycles_per_computation(cycles_per_computation),
+        .dma_d2h_len(dma_d2h_len),
         .dma_status(dma_status),
         .dma_status_valid(dma_status_valid),
         .comp_dma_start(comp_dma_start),

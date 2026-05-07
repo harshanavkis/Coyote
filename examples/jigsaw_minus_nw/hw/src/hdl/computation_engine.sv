@@ -6,9 +6,12 @@
  *   1. Issues a H2D DMA read (dma_start=1, dma_direction=0)
  *   2. Waits for H2D DMA completion
  *   3. Spins for cycles_per_computation clock cycles
- *   4. Issues a D2H DMA write (dma_start=1, dma_direction=1)
+ *   4. Issues a D2H DMA write (dma_start=1, dma_direction=1) — skipped when dma_d2h_len == 0
  *   5. Waits for D2H DMA completion
  *   6. Signals computation done (computation_status=1, computation_status_valid=1)
+ *
+ * Skipping a phase advances the FSM without pulsing the DMA engine, so
+ * Coyote never sees a len=0 sq_rd/sq_wr request.
  */
 module computation_engine (
     input  logic        aclk,
@@ -17,6 +20,9 @@ module computation_engine (
     // Control inputs (from AXI ctrl parser registers)
     input  logic        start_computation,
     input  logic [63:0] cycles_per_computation,
+
+    // Zero-length D2H is treated as "skip the D2H phase".
+    input  logic [63:0] dma_d2h_len,
 
     // DMA status feedback (from DMA engine)
     input  logic        dma_status,
@@ -76,8 +82,8 @@ always_comb begin
             if (cycle_counter == 0)
                 next_state = D2H_START;
         D2H_START:
-            // Single-cycle pulse to trigger DMA, then wait
-            next_state = D2H_WAIT;
+            // Skip the D2H phase entirely when there's nothing to write back.
+            next_state = (dma_d2h_len == 0) ? DONE : D2H_WAIT;
         D2H_WAIT:
             if (dma_status_valid && dma_status)
                 next_state = DONE;
@@ -129,7 +135,7 @@ always_comb begin
             // Spinning for the configured number of cycles
         end
         D2H_START: begin
-            comp_dma_start     = 1'b1;
+            comp_dma_start     = (dma_d2h_len != 0);  // Skip pulse when nothing to write
             comp_dma_direction = 1'b1;  // D2H (write to host)
         end
         D2H_WAIT: begin
