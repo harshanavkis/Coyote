@@ -83,7 +83,12 @@ begin
             else
                 next_state = SEND_PAYLOAD;
         RECEIVE_PAYLOAD:
-            if (dma_in_tlast && (dma_d2h_count + KEEP_WIDTH >= dma_len))
+            // Don't require dma_in_tlast on the exit edge. For len==KEEP_WIDTH
+            // (single-beat transfer) XDMA's bypass interface has been observed
+            // not to assert tlast reliably on the only beat, while count-based
+            // termination is unambiguous because we know exactly how many
+            // bytes were requested.
+            if (dma_in_tvalid && (dma_d2h_count + KEEP_WIDTH >= dma_len))
                 next_state = IDLE;
             else
                 next_state = RECEIVE_PAYLOAD;
@@ -106,7 +111,7 @@ always @(posedge aclk) begin
             coyote_dma_tx_len_reg <= dma_d2h_count + KEEP_WIDTH;
     end else if (state == RECEIVE_PAYLOAD && dma_in_tvalid) begin
         dma_d2h_count <= dma_d2h_count + KEEP_WIDTH;
-        if (dma_in_tlast)
+        if (dma_d2h_count + KEEP_WIDTH >= dma_len)
             coyote_dma_tx_len_reg <= dma_d2h_count + KEEP_WIDTH;
     end
 end
@@ -164,10 +169,13 @@ begin
             coyote_dma_tx_len = dma_d2h_count + KEEP_WIDTH;
         end
         RECEIVE_PAYLOAD: begin
-            // On read completion, set the status of DMA register so that it can be polled by the CPU
-            dma_status_valid = dma_in_tlast && dma_in_tvalid;
-            dma_status = dma_in_tlast && dma_in_tvalid;
-            coyote_dma_tx_len_valid = dma_in_tlast && dma_in_tvalid;
+            // Fire status on the cycle the last beat is accepted, where
+            // "last" is determined by our own byte count rather than by an
+            // upstream tlast we cannot trust (see RECEIVE_PAYLOAD next-state
+            // comment).
+            dma_status_valid = dma_in_tvalid && (dma_d2h_count + KEEP_WIDTH >= dma_len);
+            dma_status = dma_in_tvalid && (dma_d2h_count + KEEP_WIDTH >= dma_len);
+            coyote_dma_tx_len_valid = dma_in_tvalid && (dma_d2h_count + KEEP_WIDTH >= dma_len);
             coyote_dma_tx_len = dma_d2h_count + KEEP_WIDTH;
         end
         default: begin
