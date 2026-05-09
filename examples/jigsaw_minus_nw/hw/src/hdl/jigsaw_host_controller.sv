@@ -99,20 +99,19 @@ localparam DMA_IDLE = 2'b00;
 localparam DMA_RD = 2'b01;
 localparam DMA_WR = 2'b10;
 
-// Register mmio_ctrl to ensure proper synchronization and known reset value
-reg mmio_ctrl_reg;
-
+// mmio_ctrl is now driven combinationally from the parser FIFO's
+// !fifo_empty. Using it directly (rather than a registered copy) avoids a
+// 1-cycle lag that would let MMIO_IDLE transition to ACTIVE one cycle
+// after the FIFO has drained, leaving mmio_op/addr/data stale.
 always @(posedge aclk) begin
     if (!aresetn) begin
         mmio_state_cur <= MMIO_IDLE;
         dma_wr_state_cur <= DMA_IDLE;
         dma_rd_state_cur <= DMA_IDLE;
-        mmio_ctrl_reg <= 1'b0;
     end else begin
         mmio_state_cur <= mmio_state_next;
         dma_wr_state_cur <= dma_wr_state_next;
         dma_rd_state_cur <= dma_rd_state_next;
-        mmio_ctrl_reg <= mmio_ctrl;
     end
 end
 
@@ -153,11 +152,14 @@ always @(*) begin
     mmio_read_data_in_valid = 1'b0;
 
     // MMIO State Machine
+    // mmio_clear is asserted at ACTIVE->IDLE so that mmio_op/addr/data
+    // (driven from the parser FIFO head) stay stable across all cycles
+    // of MMIO_ACTIVE; it pops the FIFO once the request has been accepted
+    // by the network egress.
     case (mmio_state_cur)
         MMIO_IDLE: begin
-            if (mmio_ctrl_reg && dma_rd_state_cur == DMA_IDLE && dma_wr_state_cur == DMA_IDLE) begin
+            if (mmio_ctrl && dma_rd_state_cur == DMA_IDLE && dma_wr_state_cur == DMA_IDLE) begin
                 mmio_state_next = MMIO_ACTIVE;
-                mmio_clear = 1'b1;
             end
         end
         MMIO_ACTIVE: begin
@@ -167,17 +169,24 @@ always @(*) begin
                 network_out_tdata = {{(AXI_DATA_BITS - 136){1'b0}}, 64'd0, mmio_addr, mmio_op};
                 // Since we do not have a payload for read, we send smaller tkeep
                 network_out_tkeep = {{(KEEP_WIDTH - 17){1'b0}}, 17'h1FFFF};
-                
-                if (network_out_tready) mmio_state_next = MMIO_IDLE;
+
+                if (network_out_tready) begin
+                    mmio_state_next = MMIO_IDLE;
+                    mmio_clear = 1'b1;
+                end
             end else if (mmio_op == 8'd1) begin
                 network_out_tdata = {{(AXI_DATA_BITS - 200){1'b0}}, mmio_data, 64'd0, mmio_addr, mmio_op};
                 network_out_tkeep = {{(KEEP_WIDTH - 25){1'b0}}, 25'h1FFFFFF};
                 mmio_write_done = network_out_tready;
-                
-                if (network_out_tready) mmio_state_next = MMIO_IDLE;
+
+                if (network_out_tready) begin
+                    mmio_state_next = MMIO_IDLE;
+                    mmio_clear = 1'b1;
+                end
             end else begin
-                // Wrong MMIO OP
+                // Wrong MMIO OP: drop it so the FIFO doesn't deadlock
                 mmio_state_next = MMIO_IDLE;
+                mmio_clear = 1'b1;
             end
         end
         default: mmio_state_next = MMIO_IDLE;
