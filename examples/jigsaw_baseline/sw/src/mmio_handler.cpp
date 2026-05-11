@@ -44,7 +44,7 @@ void edu_mmio_read(coyote::cThread &coyote_thread, char *data, uint64_t offset)
             break;
     }
 
-    std::printf("edu_mmio_read offset 0x%lx -> csr %u, got value 0x%lx\n", offset, reg, val);
+    // std::printf("edu_mmio_read offset 0x%lx -> csr %u, got value 0x%lx\n", offset, reg, val);
 
     std::memcpy(data, &val, sizeof(val));
 }
@@ -56,7 +56,7 @@ void edu_mmio_write(coyote::cThread &coyote_thread, char *data, uint64_t offset)
     uint64_t val;
     std::memcpy(&val, data, sizeof(val));
 
-    std::printf("edu_mmio_write offset 0x%lx -> csr %u, val: 0x%lx\n", offset, reg, val);
+    // std::printf("edu_mmio_write offset 0x%lx -> csr %u, val: 0x%lx\n", offset, reg, val);
 
     switch (reg) {
         case static_cast<uint32_t>(JigsawRegisters::DMA_CMD_REG):
