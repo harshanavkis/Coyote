@@ -10,12 +10,13 @@ enum class JigsawRegisters: uint32_t {
     DMA_CMD_REG = 0,
     DMA_SRC_ADDR_REG = 1,
     DMA_DST_ADDR_REG = 2,
-    DMA_LEN_REG = 3,
+    DMA_H2D_LEN_REG = 3,
     DMA_STATUS_REG = 4,
     START_COMPUTATION_REG = 5,
     CYCLES_PER_COMPUTATION_REG = 6,
-    COYOTE_PID_REG = 7,
-    COYOTE_DMA_TX_LEN_REG = 8
+    COYOTE_DMA_TX_LEN_REG = 7,
+    DMA_D2H_LEN_REG = 8,
+    COYOTE_PID_REG = 9
 };
 
 void edu_mmio_write(coyote::cThread &coyote_thread, char *data, uint64_t offset);

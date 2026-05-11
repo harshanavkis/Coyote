@@ -1,12 +1,14 @@
 // Includes
 #include <unistd.h>
 #include <chrono>
+#include <cstdlib>
 #include <thread>
 #include <iostream>
 #include <boost/program_options.hpp>
 
 #include <coyote/cThread.hpp>
 
+#include "mmio_handler.hpp"
 #include "shmem.hpp"
 
 // Constants
@@ -34,10 +36,12 @@ int main(int argc, char *argv[])
     void *shmem = init_shared_memory();
     if (!shmem) {
         printf("SHMEM: init_shared_memory failed\n");
+        return EXIT_FAILURE;
     }
 
     coyote::cThread coyote_thread(DEFAULT_VFPGA_ID, getpid());
 
+    coyote_thread.setCSR(coyote_thread.getCtid(), static_cast<uint32_t>(JigsawRegisters::COYOTE_PID_REG));
     coyote_thread.userMap(reinterpret_cast<char *>(shmem) + DMA_REGION_OFFSET, DMA_SIZE);
 
     // Benchmark sweep
@@ -47,4 +51,3 @@ int main(int argc, char *argv[])
 
     return EXIT_SUCCESS;
 }
-
