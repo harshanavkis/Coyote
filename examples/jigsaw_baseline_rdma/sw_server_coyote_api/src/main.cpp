@@ -98,7 +98,7 @@ int main(int argc, char *argv[]) {
             mailbox->ready = 0;
 
             if (direction == 2) { // Special SYNC mode for perf_rdma style queue flushing
-                std::cout << "[SYNC] Clearing queues and synchronizing network... " << std::flush;
+                // std::cout << "[SYNC] Clearing queues and synchronizing network... " << std::flush;
                 
                 mailbox->type = 1;
                 mailbox->direction = 2;
@@ -107,43 +107,43 @@ int main(int argc, char *argv[]) {
                 coyote_perf.invoke(coyote::CoyoteOper::REMOTE_RDMA_WRITE, compl_sg);
                 
                 // Extremely short hardware settlement delay before tearing down via reset
-                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                // std::this_thread::sleep_for(std::chrono::milliseconds(2));
                 
                 coyote_perf.clearCompleted();
                 coyote_perf.connSync(true);
                 
-                std::cout << "Done." << std::endl;
+                // std::cout << "Done." << std::endl;
                 continue;
             }
 
             if (direction == 0) { // D2H (FPGA -> Network)
-                std::cout << "[D2H] Processing size: " << transfer_size << " bytes..." << std::endl;
+                // std::cout << "[D2H] Processing size: " << transfer_size << " bytes..." << std::endl;
 
                 // 1. Talk to device: Pull data from Jigsaw (vFPGA 1) to shared buffer
-                std::cout << "  -> Talking to device (vFPGA 1)... " << std::flush;
+                // std::cout << "  -> Talking to device (vFPGA 1)... " << std::flush;
                 device_d2h(coyote_jigsaw, dma_buf, transfer_size);
-                std::cout << "Done. (Data ready for client push)" << std::endl;
+                // std::cout << "Done. (Data ready for client push)" << std::endl;
                 
                 // 2. Push payload to Client!
-                std::cout << "  -> Pushing payload to Client (vFPGA 0)... " << std::flush;
+                // std::cout << "  -> Pushing payload to Client (vFPGA 0)... " << std::flush;
                 coyote::rdmaSg push_sg = {
                     .local_offs = CONTROL_SIZE,
                     .remote_offs = CONTROL_SIZE,
                     .len = static_cast<uint32_t>(transfer_size)};
                 coyote_perf.invoke(coyote::CoyoteOper::REMOTE_RDMA_WRITE, push_sg);
-                std::cout << "Done." << std::endl;
+                // std::cout << "Done." << std::endl;
 
             } else { // H2D (Network -> FPGA)
-                std::cout << "[H2D] Processing size: " << transfer_size << " bytes..." << std::endl;
+                // std::cout << "[H2D] Processing size: " << transfer_size << " bytes..." << std::endl;
 
                 // 1. Data completely pushed by Client already! Talk to device: Push data from shared buffer to Jigsaw (vFPGA 1)
-                std::cout << "  -> Talking to device (vFPGA 1)... " << std::flush;
+                // std::cout << "  -> Talking to device (vFPGA 1)... " << std::flush;
                 device_h2d(coyote_jigsaw, dma_buf, transfer_size);
-                std::cout << "Done." << std::endl;
+                // std::cout << "Done." << std::endl;
             }
 
             // 3. Signal completion back to client
-            std::cout << "  -> Signaling completion (vFPGA 0)... " << std::flush;
+            // std::cout << "  -> Signaling completion (vFPGA 0)... " << std::flush;
             mailbox->type = 1;
             mailbox->ready = 1;
 
@@ -156,7 +156,7 @@ int main(int argc, char *argv[]) {
             coyote_perf.invoke(coyote::CoyoteOper::REMOTE_RDMA_WRITE, compl_sg);
             // Wait: outbound RDMA WRITE does not generate a reliable completion to poll on. 
             // The next incoming operation will synchronize via LOCAL_WRITE.
-            std::cout << " Done. Request completed." << std::endl;
+            // std::cout << " Done. Request completed." << std::endl;
         }
     }
 

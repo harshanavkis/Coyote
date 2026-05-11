@@ -77,7 +77,7 @@ int main(int argc, char *argv[])
         std::string direction;
         int iteration;
         double latency_us;
-        double throughput_gbps;
+        double throughput_gibps;
     };
     std::vector<Result> results;
 
@@ -128,10 +128,10 @@ int main(int argc, char *argv[])
             std::chrono::duration<double> diff = end - start;
             double time_s = diff.count();
             double latency_us = time_s * 1000000.0;
-            double data_gb = (static_cast<double>(size) * 8.0) / (1024.0 * 1024.0 * 1024.0);
-            double throughput_gbps = data_gb / time_s;
+            double data_gb = (static_cast<double>(size)) / (1024.0 * 1024.0 * 1024.0);
+            double throughput_gibps = data_gb / time_s;
 
-            results.push_back({size, "d2h", i, latency_us, throughput_gbps});
+            results.push_back({size, "d2h", i, latency_us, throughput_gibps});
         }
         std::cout << "Done." << std::endl;
     }
@@ -183,17 +183,17 @@ int main(int argc, char *argv[])
             // Wait for Server completion notification
             while (!(mailbox->ready == 1 && mailbox->type == 1))
             {
-                std::this_thread::sleep_for(std::chrono::microseconds(1));
+                // tight polling
             }
             auto end = std::chrono::high_resolution_clock::now();
 
             std::chrono::duration<double> diff = end - start;
             double time_s = diff.count();
             double latency_us = time_s * 1000000.0;
-            double data_gb = (static_cast<double>(size) * 8.0) / (1024.0 * 1024.0 * 1024.0);
-            double throughput_gbps = data_gb / time_s;
+            double data_gb = (static_cast<double>(size)) / (1024.0 * 1024.0 * 1024.0);
+            double throughput_gibps = data_gb / time_s;
 
-            results.push_back({size, "h2d", i, latency_us, throughput_gbps});
+            results.push_back({size, "h2d", i, latency_us, throughput_gibps});
         }
         std::cout << "Done." << std::endl;
     }
@@ -201,12 +201,12 @@ int main(int argc, char *argv[])
     std::cout << "\nAll sweeps finished successfully." << std::endl;
 
     // CSV Output
-    std::cout << "\nResults (size, direction, iteration, latency [us], throughput [Gbps]):" << std::endl;
+    std::cout << "\nResults (size, direction, iteration, latency [us], throughput [GiBps]):" << std::endl;
     for (const auto &res : results)
     {
         std::cout << res.size << ", " << res.direction << ", " << res.iteration << ", "
                   << std::fixed << std::setprecision(3) << res.latency_us << ", "
-                  << res.throughput_gbps << std::endl;
+                  << res.throughput_gibps << std::endl;
     }
 
     return EXIT_SUCCESS;
