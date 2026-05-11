@@ -18,12 +18,13 @@ enum class JigsawRegisters: uint32_t {
     DMA_CMD_REG = 0,
     DMA_SRC_ADDR_REG = 1,
     DMA_DST_ADDR_REG = 2,
-    DMA_LEN_REG = 3,
+    DMA_H2D_LEN_REG = 3,
     DMA_STATUS_REG = 4,
     START_COMPUTATION_REG = 5,
     CYCLES_PER_COMPUTATION_REG = 6,
-    COYOTE_PID_REG = 7,
-    COYOTE_DMA_TX_LEN_REG = 8
+    COYOTE_DMA_TX_LEN_REG = 7,
+    DMA_D2H_LEN_REG = 8,
+    COYOTE_PID_REG = 9
 };
 
 // Message structure for control plane
@@ -37,7 +38,7 @@ struct msg {
 
 void device_d2h(coyote::cThread &coyote_thread, void *dst, size_t size) {
     coyote_thread.setCSR(reinterpret_cast<uint64_t>(dst), static_cast<uint32_t>(JigsawRegisters::DMA_DST_ADDR_REG));
-    coyote_thread.setCSR(static_cast<uint64_t>(size), static_cast<uint32_t>(JigsawRegisters::DMA_LEN_REG));
+    coyote_thread.setCSR(static_cast<uint64_t>(size), static_cast<uint32_t>(JigsawRegisters::DMA_D2H_LEN_REG));
     coyote_thread.setCSR(coyote_thread.getCtid(), static_cast<uint32_t>(JigsawRegisters::COYOTE_PID_REG));
 
     // Start DMA transfer (3 for D2H in original code)
@@ -50,7 +51,7 @@ void device_d2h(coyote::cThread &coyote_thread, void *dst, size_t size) {
 
 void device_h2d(coyote::cThread &coyote_thread, void *src, size_t size) {
     coyote_thread.setCSR(reinterpret_cast<uint64_t>(src), static_cast<uint32_t>(JigsawRegisters::DMA_SRC_ADDR_REG));
-    coyote_thread.setCSR(static_cast<uint64_t>(size), static_cast<uint32_t>(JigsawRegisters::DMA_LEN_REG));
+    coyote_thread.setCSR(static_cast<uint64_t>(size), static_cast<uint32_t>(JigsawRegisters::DMA_H2D_LEN_REG));
     coyote_thread.setCSR(coyote_thread.getCtid(), static_cast<uint32_t>(JigsawRegisters::COYOTE_PID_REG));
 
     // Start DMA transfer (1 for H2D in original code)
