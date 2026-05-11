@@ -360,14 +360,26 @@ module txn_generator #(
     reg packet_source_valid;
     reg packet_source_mmio;
 
+    // Fix C: credit-based metadata pipelining (mirror of HC change).
+    // The original `!packet_meta_sent` gate prevented a new metadata
+    // submission until the current packet's tlast — strict depth-1
+    // serialization. Adding an N_OUTSTANDING-deep credit counter lets DC
+    // submit metadata for up to N_OUTSTANDING packets concurrently, matching
+    // the shell's true queue capacity. Credit consumed on meta_fire (not
+    // paired with same-cycle pkt_done), returned on pkt_done.
+    localparam integer META_CRED_BITS = $clog2(N_OUTSTANDING + 1);
+    reg [META_CRED_BITS-1:0] meta_credits;
+
     wire candidate_select_mmio = mmio_read_valid && !dma_output_active;
     wire candidate_out_valid = candidate_select_mmio ? mmio_read_valid : payload_to_dma_out_tvalid;
     wire select_mmio = packet_source_valid ? packet_source_mmio : candidate_select_mmio;
     wire selected_out_valid = select_mmio ? mmio_read_valid : payload_to_dma_out_tvalid;
     wire first_beat_pending = selected_out_valid && !packet_active;
-    wire meta_fire = first_beat_pending && !packet_meta_sent && sq_wr_ready;
+    wire meta_credits_avail = (meta_credits != 0);
+    wire meta_fire = first_beat_pending && !packet_meta_sent && sq_wr_ready && meta_credits_avail;
     wire first_beat_can_send = !first_beat_pending || packet_meta_sent || meta_fire;
     wire out_fire = txn_generator_out_tvalid && txn_generator_out_tready;
+    wire pkt_done = out_fire && txn_generator_out_tlast;
 
     // Output mux: active DMA output takes priority; MMIO polls wait behind it.
     assign txn_generator_out_tdata = select_mmio ? {{(AXI_DATA_BITS-72){1'b0}}, mmio_read_data} : payload_to_dma_out_tdata;
@@ -385,6 +397,7 @@ module txn_generator #(
             packet_meta_sent <= 1'b0;
             packet_source_valid <= 1'b0;
             packet_source_mmio <= 1'b0;
+            meta_credits <= N_OUTSTANDING[META_CRED_BITS-1:0];
         end else begin
             if (!packet_source_valid && candidate_out_valid) begin
                 packet_source_valid <= 1'b1;
@@ -403,11 +416,22 @@ module txn_generator #(
                     packet_active <= 1'b1;
                 end
             end
+
+            // Fix C: credit accounting. -1 on meta_fire (no concurrent done),
+            // +1 on pkt_done (no concurrent fire). Same-cycle fire+done
+            // (single-beat packets) is a net zero.
+            case ({meta_fire, pkt_done})
+                2'b10: meta_credits <= meta_credits - 1'b1;
+                2'b01: meta_credits <= meta_credits + 1'b1;
+                default: ;
+            endcase
         end
     end
 
-    // rdma_wr_valid stays high until the SQ accepts metadata for the next packet.
-    assign rdma_wr_valid = first_beat_pending && !packet_meta_sent;
+    // rdma_wr_valid: assert when there is a pending first beat, metadata for
+    // the current packet hasn't fired yet, AND a shell-pipeline credit is
+    // available. Allows up to N_OUTSTANDING packets in flight.
+    assign rdma_wr_valid = first_beat_pending && !packet_meta_sent && meta_credits_avail;
 
     // rdma_wr_len: total packet length in bytes
     // Note: dma_direction is cleared by clear_dma_start before SEND_HEADER,

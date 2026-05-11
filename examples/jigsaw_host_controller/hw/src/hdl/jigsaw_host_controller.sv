@@ -124,6 +124,24 @@ reg dma_rd_sq_sent;
 reg rdma_meta_sent;
 logic [23:0][63:0] debug_counter_reg;
 
+// Fix C: credit-based metadata pipelining
+// ---------------------------------------
+// Before this change, `rdma_meta_sent` was a single boolean that prevented
+// a new metadata submission until the current packet's data finished
+// streaming (tlast). That fix solved a real race ("dropped SQ commands"
+// from apr16) but globally serialized HC to depth 1 per packet, regardless
+// of N_OUTSTANDING in the shell pipeline.
+//
+// We now also maintain a credit counter sized to N_OUTSTANDING. A credit
+// is consumed on `rdma_meta_fire` and returned on packet completion
+// (`rdma_pkt_done`). `rdma_meta_sent` still tracks the CURRENT packet's
+// metadata state — required for multi-beat correctness so we don't
+// re-submit during data beats — but `rdma_wr_valid` is now additionally
+// gated on `meta_credits_avail`, which lets the FSM submit metadata for
+// new packets up to N_OUTSTANDING-deep, matching the shell's true capacity.
+localparam integer META_CRED_BITS = $clog2(N_OUTSTANDING + 1);
+reg [META_CRED_BITS-1:0] meta_credits;
+
 wire incoming_dma_cmd =
     network_in_tvalid &&
     (network_in_tdata[OP_POS +: OP_WIDTH] == 8'd0 ||
@@ -131,9 +149,11 @@ wire incoming_dma_cmd =
 wire rdma_meta_fire = rdma_wr_valid && sq_ready_write;
 wire rdma_first_can_send = rdma_meta_sent || rdma_meta_fire;
 wire rdma_data_fire = network_out_tvalid && network_out_tready;
+wire rdma_pkt_done  = rdma_data_fire && network_out_tlast;
 wire network_in_fire = network_in_tvalid && network_in_tready;
 wire network_out_fire = network_out_tvalid && network_out_tready;
 wire host_out_fire = host_out_tvalid && host_out_tready;
+wire meta_credits_avail = (meta_credits != 0);
 
 assign debug_counters = debug_counter_reg;
 
@@ -149,8 +169,17 @@ always @(posedge aclk) begin
         dma_rd_len_reg <= 64'b0;
         dma_rd_sq_sent <= 1'b0;
         rdma_meta_sent <= 1'b0;
+        meta_credits <= N_OUTSTANDING[META_CRED_BITS-1:0];
         debug_counter_reg <= '0;
     end else begin
+        // Fix C: credit accounting. -1 on meta_fire (no concurrent done),
+        // +1 on pkt_done (no concurrent fire). Same-cycle fire+done (1-beat
+        // packets) is a net zero — credit consumed and immediately returned.
+        case ({rdma_meta_fire, rdma_pkt_done})
+            2'b10: meta_credits <= meta_credits - 1'b1;
+            2'b01: meta_credits <= meta_credits + 1'b1;
+            default: ; // 2'b00 (idle) or 2'b11 (1-beat packet completed): no change
+        endcase
         mmio_state_cur <= mmio_state_next;
         dma_wr_state_cur <= dma_wr_state_next;
         dma_rd_state_cur <= dma_rd_state_next;
@@ -315,7 +344,7 @@ always @(*) begin
                 network_out_tdata = {{(AXI_DATA_BITS - 136){1'b0}}, 64'd0, mmio_addr, mmio_op};
                 network_out_tkeep = {KEEP_WIDTH{1'b1}};
                 network_out_tvalid = rdma_first_can_send;
-                rdma_wr_valid = !rdma_meta_sent;
+                rdma_wr_valid = !rdma_meta_sent && meta_credits_avail;
                 rdma_wr_len = 64; // 64 bytes
 
                 if (network_out_tready && rdma_first_can_send) begin
@@ -326,7 +355,7 @@ always @(*) begin
                 network_out_tdata = {{(AXI_DATA_BITS - 200){1'b0}}, mmio_data, 64'd0, mmio_addr, mmio_op};
                 network_out_tkeep = {KEEP_WIDTH{1'b1}};
                 network_out_tvalid = rdma_first_can_send;
-                rdma_wr_valid = !rdma_meta_sent;
+                rdma_wr_valid = !rdma_meta_sent && meta_credits_avail;
                 rdma_wr_len = 64; // 64 bytes
 
                 if (network_out_tready && rdma_first_can_send) begin
@@ -409,7 +438,7 @@ always @(*) begin
             network_out_tdata = {{(AXI_DATA_BITS - 8){1'b0}}, {8'd2}};
             network_out_tkeep = {{KEEP_WIDTH}{1'b1}};
             network_out_tvalid = rdma_first_can_send && (dma_rd_sq_sent || sq_ready_read);
-            rdma_wr_valid = !rdma_meta_sent;
+            rdma_wr_valid = !rdma_meta_sent && meta_credits_avail;
             rdma_wr_len = 64 + dma_rd_len_reg;
 
             if (network_out_tready && rdma_first_can_send &&
