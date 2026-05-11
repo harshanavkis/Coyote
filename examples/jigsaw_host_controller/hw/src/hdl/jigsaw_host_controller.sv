@@ -109,8 +109,10 @@ localparam DMA_RD = 2'b01;
 localparam DMA_WR = 2'b10;
 localparam DMA_REQ = 2'b11;
 
-// Register mmio_ctrl to ensure proper synchronization and known reset value
-reg mmio_ctrl_reg;
+// mmio_ctrl is now driven combinationally from the parser FIFO's
+// !fifo_empty. Using it directly (rather than a registered copy) avoids a
+// 1-cycle lag that would let MMIO_IDLE transition to ACTIVE one cycle
+// after the FIFO has drained, leaving mmio_op/addr/data stale.
 
 // Beat counter for DMA Write: tracks remaining bytes to receive from network
 reg [63:0] dma_wr_remaining;
@@ -140,7 +142,6 @@ always @(posedge aclk) begin
         mmio_state_cur <= MMIO_IDLE;
         dma_wr_state_cur <= DMA_IDLE;
         dma_rd_state_cur <= DMA_IDLE;
-        mmio_ctrl_reg <= 1'b0;
         dma_wr_remaining <= 64'b0;
         dma_wr_addr_reg <= 64'b0;
         dma_wr_len_reg <= 64'b0;
@@ -153,7 +154,6 @@ always @(posedge aclk) begin
         mmio_state_cur <= mmio_state_next;
         dma_wr_state_cur <= dma_wr_state_next;
         dma_rd_state_cur <= dma_rd_state_next;
-        mmio_ctrl_reg <= mmio_ctrl;
 
         debug_counter_reg[0] <= {
             38'b0,
@@ -168,7 +168,7 @@ always @(posedge aclk) begin
             network_out_tvalid,
             network_in_tready,
             network_in_tvalid,
-            mmio_ctrl_reg,
+            mmio_ctrl,
             rdma_meta_sent,
             dma_wr_state_cur,
             dma_rd_state_cur,
@@ -297,12 +297,15 @@ always @(*) begin
     rdma_wr_len = 0;
 
     // MMIO State Machine
+    // mmio_clear is asserted at ACTIVE->IDLE so that mmio_op/addr/data
+    // (driven from the parser FIFO head) stay stable across all cycles
+    // of MMIO_ACTIVE; it pops the FIFO once the request has been accepted
+    // by the network egress.
     case (mmio_state_cur)
         MMIO_IDLE: begin
-            if (mmio_ctrl_reg && dma_rd_state_cur == DMA_IDLE && dma_wr_state_cur == DMA_IDLE &&
+            if (mmio_ctrl && dma_rd_state_cur == DMA_IDLE && dma_wr_state_cur == DMA_IDLE &&
                 !incoming_dma_cmd) begin
                 mmio_state_next = MMIO_ACTIVE;
-                mmio_clear = 1'b1;
             end
         end
         MMIO_ACTIVE: begin
@@ -314,9 +317,10 @@ always @(*) begin
                 network_out_tvalid = rdma_first_can_send;
                 rdma_wr_valid = !rdma_meta_sent;
                 rdma_wr_len = 64; // 64 bytes
-                
+
                 if (network_out_tready && rdma_first_can_send) begin
                     mmio_state_next = MMIO_IDLE;
+                    mmio_clear = 1'b1;
                 end
             end else if (mmio_op == 8'd1) begin
                 network_out_tdata = {{(AXI_DATA_BITS - 200){1'b0}}, mmio_data, 64'd0, mmio_addr, mmio_op};
@@ -324,14 +328,16 @@ always @(*) begin
                 network_out_tvalid = rdma_first_can_send;
                 rdma_wr_valid = !rdma_meta_sent;
                 rdma_wr_len = 64; // 64 bytes
-                
+
                 if (network_out_tready && rdma_first_can_send) begin
                     mmio_write_done = 1'b1;
                     mmio_state_next = MMIO_IDLE;
+                    mmio_clear = 1'b1;
                 end
             end else begin
-                // Wrong MMIO OP
+                // Wrong MMIO OP: drop it so the FIFO doesn't deadlock
                 mmio_state_next = MMIO_IDLE;
+                mmio_clear = 1'b1;
             end
         end
         default: mmio_state_next = MMIO_IDLE;

@@ -41,7 +41,7 @@ module jigsaw_hc_axi_ctrl_parser (
 //          CONSTANTS             //
 ///////////////////////////////////
 localparam integer DEBUG_COUNT = 24;
-localparam integer N_REGS = 10 + DEBUG_COUNT;
+localparam integer N_REGS = 11 + DEBUG_COUNT;
 localparam integer ADDR_MSB = $clog2(N_REGS);
 localparam integer ADDR_LSB = $clog2(AXIL_DATA_BITS/8);
 localparam integer AXI_ADDR_BITS = ADDR_LSB + ADDR_MSB;
@@ -91,6 +91,65 @@ localparam MMIO_DATA_REG = 8;
 localparam MMIO_READ_DATA_REG = 9;
 // 10..33 (RO) - jigsaw_host_controller debug counters
 localparam DEBUG_BASE_REG = 10;
+// 34 (RW) - FIFO overflow sticky bit. HW sets to 1 if a SW push to MMIO_CTRL_REG
+//   arrives while the request FIFO is full (request was dropped). SW clears
+//   by writing 0. Diagnostic only — with FIFO_DEPTH=32 and the current SW
+//   pattern (max 7-deep burst), this should never fire in practice.
+localparam MMIO_FIFO_DROPPED_REG = DEBUG_BASE_REG + DEBUG_COUNT;
+
+/////////////////////////////////////
+//        REQUEST FIFO            //
+///////////////////////////////////
+// Decouples SW MMIO submission from HW emission. SW pushes by writing
+// MMIO_CTRL_REG=1 (after staging OP/ADDR/DATA). HW pops via mmio_clear
+// when a request is fully accepted by the network egress.
+//
+// MMIO_WRITE_STATUS_REG is asserted immediately on enqueue of a write op,
+// so SW's poll loop in write_mmio() can be elided entirely. Reads still
+// wait for MMIO_READ_STATUS_REG, set by the HC when the response packet
+// arrives over the network.
+localparam integer FIFO_DEPTH = 32;
+localparam integer FIFO_AW    = 5; // log2(FIFO_DEPTH)
+localparam integer ENTRY_W    = 8 + 64 + 64; // op | addr | data
+
+reg  [ENTRY_W-1:0] req_fifo [0:FIFO_DEPTH-1];
+reg  [FIFO_AW:0]   fifo_wptr;
+reg  [FIFO_AW:0]   fifo_rptr;
+
+wire fifo_empty = (fifo_wptr == fifo_rptr);
+wire fifo_full  = (fifo_wptr[FIFO_AW] != fifo_rptr[FIFO_AW])
+                && (fifo_wptr[FIFO_AW-1:0] == fifo_rptr[FIFO_AW-1:0]);
+
+// SW-side trigger: AXI write to MMIO_CTRL_REG with bit 0 set
+wire ctrl_trigger = ctrl_reg_wren
+                  && (axi_awaddr[ADDR_LSB+:ADDR_MSB] == MMIO_CTRL_REG)
+                  && axi_ctrl.wstrb[0]
+                  && axi_ctrl.wdata[0];
+wire fifo_push    = ctrl_trigger && !fifo_full;
+wire fifo_pop     = mmio_clear   && !fifo_empty;
+// Sticky overflow detect: SW push attempted while FIFO was full.
+wire fifo_drop    = ctrl_trigger && fifo_full;
+
+wire [7:0]  push_op   = ctrl_reg[MMIO_OP_REG][7:0];
+wire [63:0] push_addr = ctrl_reg[MMIO_ADDR_REG][63:0];
+wire [63:0] push_data = ctrl_reg[MMIO_DATA_REG][63:0];
+
+always_ff @(posedge aclk) begin
+    if (!aresetn) begin
+        fifo_wptr <= 0;
+        fifo_rptr <= 0;
+    end else begin
+        if (fifo_push) begin
+            req_fifo[fifo_wptr[FIFO_AW-1:0]] <= {push_data, push_addr, push_op};
+            fifo_wptr <= fifo_wptr + 1'b1;
+        end
+        if (fifo_pop) begin
+            fifo_rptr <= fifo_rptr + 1'b1;
+        end
+    end
+end
+
+wire [ENTRY_W-1:0] fifo_head_data = req_fifo[fifo_rptr[FIFO_AW-1:0]];
 
 /////////////////////////////////////
 //         WRITE PROCESS          //
@@ -166,8 +225,27 @@ always_ff @(posedge aclk) begin
               ctrl_reg[MMIO_READ_DATA_REG][(i*8)+:8] <= axi_ctrl.wdata[(i*8)+:8];
             end
           end
+        MMIO_FIFO_DROPPED_REG: // SW writes to clear the sticky overflow bit
+          for (int i = 0; i < (AXIL_DATA_BITS/8); i++) begin
+            if(axi_ctrl.wstrb[i]) begin
+              ctrl_reg[MMIO_FIFO_DROPPED_REG][(i*8)+:8] <= axi_ctrl.wdata[(i*8)+:8];
+            end
+          end
         default: ;
       endcase
+    end
+
+    // Immediate write-status ack on enqueue: SW's write_mmio() poll exits
+    // without a PCIe round trip. Only fires for write ops (op==1); reads
+    // still rely on MMIO_READ_STATUS_REG signaled by mmio_read_done below.
+    if (fifo_push && push_op == 8'd1) begin
+        ctrl_reg[MMIO_WRITE_STATUS_REG] <= 1;
+    end
+
+    // Sticky overflow flag: HW set wins over SW clear in the same cycle, so
+    // a drop is never lost. SW can clear by writing 0 when the FIFO is idle.
+    if (fifo_drop) begin
+        ctrl_reg[MMIO_FIFO_DROPPED_REG] <= 1;
     end
 
     // Hardware overrides (higher priority than AXI)
@@ -224,6 +302,8 @@ always_ff @(posedge aclk) begin
           axi_rdata <= ctrl_reg[MMIO_DATA_REG];
         MMIO_READ_DATA_REG: // MMIO Read Data register
           axi_rdata <= ctrl_reg[MMIO_READ_DATA_REG];
+        MMIO_FIFO_DROPPED_REG: // FIFO overflow sticky bit
+          axi_rdata <= ctrl_reg[MMIO_FIFO_DROPPED_REG];
         default:
           if ((axi_araddr[ADDR_LSB+:ADDR_MSB] >= DEBUG_BASE_REG) &&
               (axi_araddr[ADDR_LSB+:ADDR_MSB] < DEBUG_BASE_REG + DEBUG_COUNT)) begin
@@ -239,12 +319,14 @@ end
 ///////////////////////////////////
 always_comb begin
   mmio_vaddr = ctrl_reg[MMIO_VADDR_REG];
-  mmio_ctrl = ctrl_reg[MMIO_CTRL_REG][0];
   coyote_pid = ctrl_reg[COYOTE_PID_REG];
   remote_vaddr = ctrl_reg[REMOTE_VADDR_REG];
-  mmio_op = ctrl_reg[MMIO_OP_REG][7:0];
-  mmio_addr = ctrl_reg[MMIO_ADDR_REG][63:0];
-  mmio_data = ctrl_reg[MMIO_DATA_REG][63:0];
+  // Outputs to host_controller now come from the FIFO head, not the staging
+  // registers. mmio_ctrl signals "request available"; mmio_clear pops it.
+  mmio_ctrl = !fifo_empty;
+  mmio_op   = fifo_head_data[7:0];
+  mmio_addr = fifo_head_data[71:8];
+  mmio_data = fifo_head_data[135:72];
 end
 
 /////////////////////////////////////
