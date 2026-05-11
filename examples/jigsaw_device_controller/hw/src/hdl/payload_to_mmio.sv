@@ -99,9 +99,18 @@ always @(posedge aclk) begin
             slv_reg[DMA_STATUS_REG][1] <= computation_status;
         end
 
-        // Clear command register when clear_dma_start is asserted
+        // Clear command register bit 0 (start) when clear_dma_start is asserted.
+        // IMPORTANT: do NOT clear bit 1 (direction) — txn_generator's dma_len
+        // mux is combinational on dma_direction (= slv_reg[CMD][1]), so
+        // clearing direction mid-DMA would flip dma_len from dma_d2h_len
+        // back to dma_h2d_len before SEND_PAYLOAD reaches completion. That
+        // bug caused D2H to transfer dma_h2d_len bytes instead of
+        // dma_d2h_len: D2H-only failed (h2d_len was 0 → tx_len=64),
+        // and D2H-after-H2D looked correct only because the previous H2D
+        // size happened to match. payload_to_dma's internal `h2d` register
+        // is latched separately so its FSM stays on the correct branch.
         if (clear_dma_start) begin
-            slv_reg[DMA_CMD_REG] <= 64'b0;
+            slv_reg[DMA_CMD_REG][0] <= 1'b0;
         end
 
         // Auto-clear START_COMPUTATION_REG when computation engine starts
