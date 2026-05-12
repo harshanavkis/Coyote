@@ -130,12 +130,12 @@ void mmio_read(coyote::cThread &coyote_thread, uint64_t addr)
 
     while (coyote_thread.getCSR(static_cast<uint32_t>(HCReg::MMIO_READ_STATUS)) != 0)
     {
-        std::this_thread::sleep_for(std::chrono::nanoseconds(CLOCK_PERIOD_NS));
+        // std::this_thread::sleep_for(std::chrono::nanoseconds(CLOCK_PERIOD_NS));
     }
 
     while (coyote_thread.getCSR(static_cast<uint32_t>(HCReg::MMIO_CTRL)) != 0)
     {
-        std::this_thread::sleep_for(std::chrono::nanoseconds(CLOCK_PERIOD_NS));
+        // std::this_thread::sleep_for(std::chrono::nanoseconds(CLOCK_PERIOD_NS));
     }
 
     // Phase 1: Set MMIO parameters directly via AXI-Lite registers
@@ -151,7 +151,7 @@ void mmio_read(coyote::cThread &coyote_thread, uint64_t addr)
 
     while (coyote_thread.getCSR(static_cast<uint32_t>(HCReg::MMIO_READ_STATUS)) != 1)
     {
-        std::this_thread::sleep_for(std::chrono::nanoseconds(CLOCK_PERIOD_NS));
+        // std::this_thread::sleep_for(std::chrono::nanoseconds(CLOCK_PERIOD_NS));
     }
 
     // Phase 2: Read response from AXI-Lite register and write to shmem + 16
@@ -168,12 +168,12 @@ void mmio_write(coyote::cThread &coyote_thread, uint64_t addr, uint64_t data)
 
     while (coyote_thread.getCSR(static_cast<uint32_t>(HCReg::MMIO_WRITE_STATUS)) != 0)
     {
-        std::this_thread::sleep_for(std::chrono::nanoseconds(CLOCK_PERIOD_NS));
+        // std::this_thread::sleep_for(std::chrono::nanoseconds(CLOCK_PERIOD_NS));
     }
 
     while (coyote_thread.getCSR(static_cast<uint32_t>(HCReg::MMIO_CTRL)) != 0)
     {
-        std::this_thread::sleep_for(std::chrono::nanoseconds(CLOCK_PERIOD_NS));
+        // std::this_thread::sleep_for(std::chrono::nanoseconds(CLOCK_PERIOD_NS));
     }
 
     // Phase 1: Set MMIO parameters directly via AXI-Lite registers
@@ -192,7 +192,7 @@ void mmio_write(coyote::cThread &coyote_thread, uint64_t addr, uint64_t data)
     // Poll for completion
     while (coyote_thread.getCSR(static_cast<uint32_t>(HCReg::MMIO_WRITE_STATUS)) != 1)
     {
-        std::this_thread::sleep_for(std::chrono::nanoseconds(CLOCK_PERIOD_NS));
+        // std::this_thread::sleep_for(std::chrono::nanoseconds(CLOCK_PERIOD_NS));
     }
 };
 
@@ -216,10 +216,10 @@ void *run_shmem_app(coyote::cThread &coyote_thread)
             continue;
         }
 
-#ifdef CONFIG_DISAGG_DEBUG_MMIO
-        printf("Received message: operation=%u, address=0x%lx, length=%u\n",
-               header.operation, header.address, header.length);
-#endif
+// #ifdef CONFIG_DISAGG_DEBUG_MMIO
+//         printf("Received message: operation=%u, address=0x%lx, length=%u\n",
+//                header.operation, header.address, header.length);
+// #endif
 
         switch (header.operation)
         {
@@ -241,7 +241,7 @@ void *run_shmem_app(coyote::cThread &coyote_thread)
             continue;
         }
 
-        printf("Response sent. Waiting for next message...\n");
+        // printf("Response sent. Waiting for next message...\n");
     }
 
     munmap(shmem, SHMEM_SIZE);

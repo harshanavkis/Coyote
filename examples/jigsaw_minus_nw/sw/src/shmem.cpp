@@ -164,10 +164,10 @@ void *run_shmem_app(coyote::cThread &coyote_thread) {
             continue;
         }
 
-#ifdef CONFIG_DISAGG_DEBUG_MMIO
-        printf("Received message: operation=%u, address=0x%lx, length=%u\n",
-                header.operation, header.address, header.length);
-#endif
+// #ifdef CONFIG_DISAGG_DEBUG_MMIO
+//         printf("Received message: operation=%u, address=0x%lx, length=%u\n",
+//                 header.operation, header.address, header.length);
+// #endif
 
         switch (header.operation) {
 
@@ -188,9 +188,8 @@ void *run_shmem_app(coyote::cThread &coyote_thread) {
                 continue;
         }
 
-        printf("Response sent. Waiting for next message...\n");
+        // printf("Response sent. Waiting for next message...\n");
     }
 
     munmap(shmem, SHMEM_SIZE);
 }
-
