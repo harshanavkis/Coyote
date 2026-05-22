@@ -8,7 +8,16 @@
 // ---------------------------------------------------------------------------
 #define CLOCK_PERIOD_NS      4
 #define DEFAULT_VFPGA_ID     0
-#define RDMA_BUFFER_SIZE     (1024 * 1024)  // 1 MiB
+// Size of the host's RDMA-registered buffer (the `mem` from initRDMA).
+// This is the region the device's NIC writes into for D2H operations and
+// what the QP exchange reports as the host's Local SIZE; the device must
+// not be told it can write more than this. Kept in lockstep with
+// jigsaw_device_controller/sw/src/main.cpp's RDMA_BUFFER_SIZE so both
+// endpoints can serve transfers up to JIGSAW_TRACE_MAX_BYTES (~14 MiB).
+// Note: the trace data itself flows through the separate /dev/hugepages
+// shmem region (16 MiB) registered via userMap; this buffer carries the
+// jigsaw protocol's reverse-direction DMA payloads.
+#define RDMA_BUFFER_SIZE     (16U * 1024 * 1024)  // 16 MiB
 
 
 // ---------------------------------------------------------------------------
@@ -31,8 +40,16 @@ enum class HCReg : uint32_t {
 /* Some macros for the shared memory and its structure 
  */
 
-#define SHMEM_FILE "/dev/shm/ivshmem"  // Adjust this path as needed
-#define SHMEM_SIZE (1 << 21)  // 2 MB, adjust as needed
+// hugetlbfs-backed so the daemon's userMap region uses 2 MiB pages instead
+// of 4 KiB tmpfs pages. Without this, the vFPGA takes ~1024 page faults per
+// 4 MiB H2D, which serializes behind the host_controller's MMIO arbitration
+// and stalls the kernel's DMA_STATUS poll loop. Path must match the QEMU
+// memory-backend-file mem-path in jigsaw-overall/scripts/run/vm.sh.
+#define SHMEM_FILE "/dev/hugepages/ivshmem"
+// Sized to fit JIGSAW_TRACE_MAX_BYTES (~14 MiB) + 4 KiB DMA offset. Must
+// stay in lockstep with SHMEM_SIZE in spdm-linux/include/misc/qemu_ivshmem.h
+// and the QEMU ivshmem -object size in jigsaw-overall/scripts/run/vm.sh.
+#define SHMEM_SIZE (1 << 24)  // 16 MiB
 #define READ_DOORBELL_OFFSET 0
 #define WRITE_DOORBELL_OFFSET 1
 #define DOORBELL_SIZE 1  // 1 byte for each doorbell

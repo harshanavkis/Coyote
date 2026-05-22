@@ -19,6 +19,7 @@
 #include <atomic>
 #include <cerrno>
 #include <chrono>
+#include <csignal>
 #include <cstring>
 #include <cstdlib>
 #include <functional>
@@ -40,7 +41,13 @@
 // Constants
 // ---------------------------------------------------------------------------
 #define DEFAULT_VFPGA_ID     0
-#define RDMA_BUFFER_SIZE     (2048 * 1024)  // 1 MiB
+// The host_controller's HW DMAs straight into this RDMA-registered buffer,
+// so it must hold the largest single h2d transfer driven by the host.
+// JIGSAW_TRACE_MAX_BYTES in traces.hpp (used by jigsaw_host_controller/
+// sw_no_vm) is currently 14550656 bytes; rounded up to a 2 MiB hugepage
+// multiple gives 16 MiB. Bump in lockstep if extract_traces.py emits
+// larger events.
+#define RDMA_BUFFER_SIZE     (16U * 1024 * 1024)  // 16 MiB
 static constexpr uint16_t DEBUG_PORT_OFFSET = 1;
 
 // ---------------------------------------------------------------------------
@@ -315,6 +322,25 @@ int main(int argc, char *argv[]) {
     std::cout << "  Remote VADDR = 0x" << std::hex << remote_vaddr << std::dec << std::endl;
     std::cout << "  Using RDMA WRITE" << std::endl;
     std::cout << std::endl;
+
+    // SIGUSR1 → snapshot device-side debug counters. The existing
+    // --dump-debug TCP server only fires while a client (sw_no_vm) has sent
+    // START, so it produces nothing when driven by the VM-path daemon.
+    // SIGUSR1 lets us snapshot on demand:  kill -USR1 <device-pid>
+    static std::atomic<bool> sigusr1_pending{false};
+    static const coyote::cThread *sigusr1_ct = &ct;
+    std::signal(SIGUSR1, [](int) { sigusr1_pending.store(true); });
+    std::cout << "Device debug SIGUSR1 armed (PID " << getpid()
+              << " — kill -USR1 " << getpid() << " for snapshot)" << std::endl;
+    std::thread sig_dumper([] {
+        while (true) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(250));
+            if (sigusr1_pending.exchange(false)) {
+                dump_debug_counters(*sigusr1_ct, "SIGUSR1");
+            }
+        }
+    });
+    sig_dumper.detach();
 
     std::atomic<bool> keep_dumping{dump_debug};
     std::atomic<bool> debug_server_ready{!dump_debug};
