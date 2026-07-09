@@ -4,6 +4,8 @@
 #include <chrono>
 #include <thread>
 #include <iomanip>
+#include <cstring>
+#include <cstdlib>
 #include <getopt.h>
 #include <unistd.h>
 
@@ -67,6 +69,18 @@ int main(int argc, char *argv[])
     volatile struct msg *mailbox = static_cast<volatile struct msg *>(mem);
     void *dma_buf = static_cast<char *>(mem) + CONTROL_SIZE;
 
+    // Application buffer, deliberately separate from the NIC (QP) buffer. It
+    // stands in for the guest/application memory a software forwarder serves:
+    // payloads are bounced between it and the NIC buffer inside the timed
+    // window, mirroring the host-side copy every real forwarder pays.
+    void *app_buf = malloc(DMA_SIZE);
+    if (!app_buf)
+    {
+        std::cerr << "Failed to allocate application buffer" << std::endl;
+        return EXIT_FAILURE;
+    }
+    memset(app_buf, 0xAB, DMA_SIZE); // pre-fault
+
     // Initial sync with server
     coyote_thread.connSync(true);
 
@@ -118,10 +132,14 @@ int main(int argc, char *argv[])
             coyote::rdmaSg d2h_sg = {.local_offs = 0, .remote_offs = 0, .len = 64};
             coyote_thread.invoke(coyote::CoyoteOper::REMOTE_RDMA_WRITE, d2h_sg);
 
-            // The Server will PUSH the payload directly to our RAM via REMOTE_RDMA_WRITE, 
+            // The Server will PUSH the payload directly to our RAM via REMOTE_RDMA_WRITE,
             // and then PUSH the completion mailbox. We just wait for the completion mailbox!
             while (!(mailbox->ready == 1 && mailbox->type == 1))
                 ;
+
+            // Bounce the payload from the NIC buffer into the application
+            // buffer — part of the forwarding cost, so inside the timed window.
+            memcpy(app_buf, dma_buf, size);
 
             auto end = std::chrono::high_resolution_clock::now();
 
@@ -163,6 +181,11 @@ int main(int argc, char *argv[])
             coyote_thread.connSync(false);
 
             auto start = std::chrono::high_resolution_clock::now();
+
+            // Bounce the payload from the application buffer into the NIC
+            // buffer — part of the forwarding cost, so inside the timed window.
+            memcpy(dma_buf, app_buf, size);
+
             mailbox->ready = 0;
             mailbox->type = 0;
             mailbox->size = size;
