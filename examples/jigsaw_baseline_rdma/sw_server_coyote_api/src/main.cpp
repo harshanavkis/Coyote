@@ -3,6 +3,7 @@
 #include <string>
 #include <vector>
 #include <chrono>
+#include <cstring>
 
 #include <coyote/cThread.hpp>
 
@@ -78,8 +79,18 @@ int main(int argc, char *argv[]) {
         return EXIT_FAILURE;
     }
 
-    // Share the same physical memory with vFPGA 1 by mapping it into its TLB
-    coyote_jigsaw.userMap(mem_shared, static_cast<uint32_t>(total_size));
+    // Staging buffer for the device (vFPGA 1). The NIC buffer and the device
+    // buffer are deliberately separate: a software forwarder on commodity
+    // hardware cannot DMA the accelerator directly out of the NIC's buffers
+    // (separate DMA/IOMMU domains, buffers owned by different stacks), so it
+    // pays a bounce copy between them (cf. AvA shadow buffers, rCUDA pinned
+    // pools). Only this buffer is mapped into vFPGA 1's TLB.
+    void *device_buf = coyote_jigsaw.getMem({coyote::CoyoteAllocType::HPF, DMA_SIZE});
+    if (!device_buf) {
+        std::cerr << "Failed to allocate device staging buffer" << std::endl;
+        return EXIT_FAILURE;
+    }
+    memset(device_buf, 0, DMA_SIZE); // pre-fault
 
     volatile struct msg *mailbox = static_cast<volatile struct msg *>(mem_shared);
     void *dma_buf = static_cast<char *>(mem_shared) + CONTROL_SIZE;
@@ -120,11 +131,11 @@ int main(int argc, char *argv[]) {
             if (direction == 0) { // D2H (FPGA -> Network)
                 // std::cout << "[D2H] Processing size: " << transfer_size << " bytes..." << std::endl;
 
-                // 1. Talk to device: Pull data from Jigsaw (vFPGA 1) to shared buffer
-                // std::cout << "  -> Talking to device (vFPGA 1)... " << std::flush;
-                device_d2h(coyote_jigsaw, dma_buf, transfer_size);
-                // std::cout << "Done. (Data ready for client push)" << std::endl;
-                
+                // 1. Talk to device: Pull data from Jigsaw (vFPGA 1) to the
+                //    device staging buffer, then bounce it into the NIC buffer.
+                device_d2h(coyote_jigsaw, device_buf, transfer_size);
+                memcpy(dma_buf, device_buf, transfer_size);
+
                 // 2. Push payload to Client!
                 // std::cout << "  -> Pushing payload to Client (vFPGA 0)... " << std::flush;
                 coyote::rdmaSg push_sg = {
@@ -137,10 +148,11 @@ int main(int argc, char *argv[]) {
             } else { // H2D (Network -> FPGA)
                 // std::cout << "[H2D] Processing size: " << transfer_size << " bytes..." << std::endl;
 
-                // 1. Data completely pushed by Client already! Talk to device: Push data from shared buffer to Jigsaw (vFPGA 1)
-                // std::cout << "  -> Talking to device (vFPGA 1)... " << std::flush;
-                device_h2d(coyote_jigsaw, dma_buf, transfer_size);
-                // std::cout << "Done." << std::endl;
+                // 1. Data completely pushed by Client already! Bounce it from
+                //    the NIC buffer into the device staging buffer, then push
+                //    it from there to Jigsaw (vFPGA 1).
+                memcpy(device_buf, dma_buf, transfer_size);
+                device_h2d(coyote_jigsaw, device_buf, transfer_size);
             }
 
             // 3. Signal completion back to client
