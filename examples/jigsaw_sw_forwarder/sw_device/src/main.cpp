@@ -52,66 +52,57 @@ public:
     // Serve one request; returns false once the host sent MBOX_STOP.
     bool serve_one() {
         mbox_msg m;
-        mbox_wait(nic_buf, MBOX_REQ_OFF, last_rid, m);
-        last_rid = m.req_id;
-
-        // The host's retry layer resends a lost request with a fresh req_id
-        // but the same orig. Execute each orig exactly once: duplicates are
-        // answered again (reads re-execute — idempotent) but a write, in
-        // particular a DMA/compute trigger, can never fire twice.
-        bool duplicate = (m.orig <= last_orig);
-        if (!duplicate) {
-            last_orig = m.orig;
-            served++;
-        }
+        mbox_wait(nic_buf, MBOX_REQ_OFF, last_seq, m);
+        last_seq = m.seq;
+        served++;
 
         switch (m.type) {
         case MBOX_SETUP:
-            if (!duplicate) {
-                app_base = m.addr;
-                std::cout << "Setup received: app_base = 0x" << std::hex
-                          << app_base << std::dec << ", payload = " << m.value
-                          << " bytes" << std::endl;
-            }
-            respond(m.req_id, 0);
+            app_base = m.addr;
+            std::cout << "Setup received: app_base = 0x" << std::hex
+                      << app_base << std::dec << ", payload = " << m.value
+                      << " bytes" << std::endl;
+            respond(m.seq, 0);
             break;
         case MBOX_MMIO_WRITE:
             // respond only after the write fully took effect: for DMA and
             // compute triggers that is after the device finished and any
             // D2H payload was pushed — the response can never overtake data
-            if (!duplicate)
-                handle_write(m.addr, m.value);
-            respond(m.req_id, 0);
+            handle_write(m.addr, m.value);
+            respond(m.seq, 0);
             break;
         case MBOX_MMIO_READ:
-            respond(m.req_id, jig.getCSR(dev_reg_index(m.addr)));
+            respond(m.seq, jig.getCSR(dev_reg_index(m.addr)));
             break;
         case MBOX_SYNC:
-            // full quiesce, as the May software does around every
-            // iteration: ack first, then both sides clear completion
+            // full quiesce, as the jigsaw_baseline_rdma pair does around
+            // every transfer: ack first, then both sides clear completion
             // state and meet in the TCP barrier with an idle wire
-            respond(m.req_id, 0);
-            if (!duplicate) {
-                nic.clearCompleted();
-                nic.connSync(false);
-            }
+            respond(m.seq, 0);
+            nic.clearCompleted();
+            nic.connSync(false);
             break;
         case MBOX_STOP:
-            respond(m.req_id, 0);
+            respond(m.seq, 0);
             return false;
         default:
             std::cerr << "Unknown mailbox type: " << m.type << std::endl;
-            respond(m.req_id, 0);
+            respond(m.seq, 0);
             break;
         }
+        // Clear local completion state every request, matching the baseline
+        // server's per-transfer clear (cheap local register write, safe
+        // because the protocol is synchronous — the response and any D2H
+        // payload push are already posted, nothing else is outstanding).
+        nic.clearCompleted();
         return true;
     }
 
     uint64_t requests_served() const { return served; }
 
 private:
-    void respond(uint64_t req_id, uint64_t value) {
-        mbox_send(nic, nic_buf, MBOX_RESP_OFF, 0, 0, value, req_id, req_id);
+    void respond(uint64_t seq, uint64_t value) {
+        mbox_send(nic, nic_buf, MBOX_RESP_OFF, 0, 0, value, seq);
     }
 
     void handle_write(uint64_t addr, uint64_t value) {
@@ -206,8 +197,7 @@ private:
     char *device_buf;
 
     uint64_t app_base = 0;
-    uint64_t last_rid = 0;
-    uint64_t last_orig = 0;
+    uint64_t last_seq = 0;
     uint64_t served = 0;
     uint64_t sh_src = 0, sh_dst = 0, sh_h2d = 0, sh_d2h = 0;
 };

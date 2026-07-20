@@ -54,17 +54,16 @@ enum MboxType : uint64_t {
     MBOX_STOP       = 5,
 };
 
-// req_id is the last word on purpose: it publishes the rest of the message.
-// orig names the first attempt of a request: retries use a fresh req_id (so
-// the publish flag advances and the receiver wakes) but keep orig, letting
-// the device execute each logical request exactly once without caching.
+// seq is the last word on purpose: it publishes the rest of the message
+// (RDMA WRITE places bytes in increasing address order). Monotonic, so a
+// reader detects a new message as seq > last_seen — the same role as the
+// jigsaw_baseline_rdma mailbox's `ready` flag, without needing to clear it.
 struct mbox_msg {
     uint64_t type;
     uint64_t addr;
     uint64_t value;
-    uint64_t orig;
-    uint64_t pad[3];
-    uint64_t req_id;
+    uint64_t pad[4];
+    uint64_t seq;
 };
 static_assert(sizeof(mbox_msg) == MBOX_BYTES, "mbox_msg must be 64 B");
 
@@ -104,14 +103,13 @@ inline uint64_t now_ms() {
 // Compose a message in the local mailbox and write it into the peer's.
 inline void mbox_send(coyote::cThread &ct, char *buf, uint32_t off,
                       uint64_t type, uint64_t addr, uint64_t value,
-                      uint64_t orig, uint64_t req_id) {
+                      uint64_t seq) {
     mbox_msg *m = reinterpret_cast<mbox_msg *>(buf + off);
     m->type = type;
     m->addr = addr;
     m->value = value;
-    m->orig = orig;
-    m->pad[0] = m->pad[1] = m->pad[2] = 0;
-    m->req_id = req_id;
+    m->pad[0] = m->pad[1] = m->pad[2] = m->pad[3] = 0;
+    m->seq = seq;
     coyote::rdmaSg sg = {.local_offs = off, .remote_offs = off, .len = MBOX_BYTES};
     ct.invoke(coyote::CoyoteOper::REMOTE_RDMA_WRITE, sg);
 }
@@ -122,7 +120,7 @@ inline bool mbox_wait(char *buf, uint32_t off, uint64_t last_seen,
                       mbox_msg &out, uint64_t deadline_ms = 0) {
     volatile mbox_msg *m = reinterpret_cast<volatile mbox_msg *>(buf + off);
     uint32_t spins = 0;
-    while (m->req_id <= last_seen) {
+    while (m->seq <= last_seen) {
         _mm_pause();
         if (deadline_ms && ++spins == 4096) {
             spins = 0;
@@ -134,8 +132,7 @@ inline bool mbox_wait(char *buf, uint32_t off, uint64_t last_seen,
     out.type = m->type;
     out.addr = m->addr;
     out.value = m->value;
-    out.orig = m->orig;
-    out.req_id = m->req_id;
+    out.seq = m->seq;
     return true;
 }
 
@@ -221,39 +218,26 @@ public:
     }
 
 private:
-    // A request or its response can vanish: the stack's go-back-N
-    // retransmission does not reliably replay 64 B writes (observed with a
-    // trigger posted behind a payload as well as in 64 B-only phases). On
-    // timeout, retry with a FRESH req_id (so the mailbox publish flag
-    // advances and the device wakes even if the original was delivered)
-    // carrying the same `orig`: the device executes each orig exactly once
-    // — a retry can never re-fire a trigger — and simply responds again
-    // (reads re-execute; they are idempotent, nothing is cached).
-    static const uint32_t MAX_ATTEMPTS = 10;
-
     uint64_t request(uint64_t type, uint64_t addr, uint64_t value) {
-        uint64_t orig = ++next_req_id;
-        uint64_t rid = orig;
+        uint64_t seq = ++req_seq;
+        mbox_send(ct, nic, MBOX_REQ_OFF, type, addr, value, seq);
         mbox_msg resp;
-        for (uint32_t attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-            mbox_send(ct, nic, MBOX_REQ_OFF, type, addr, value, orig, rid);
-            uint64_t deadline = now_ms() + RESP_TIMEOUT_MS;
-            while (mbox_wait(nic, MBOX_RESP_OFF, last_resp_rid, resp, deadline)) {
-                last_resp_rid = resp.req_id;
-                if (resp.req_id == rid)
-                    return resp.value;
-                // stale response to an earlier attempt — skip it
-            }
-            std::cerr << "[mbox] no response for req_id=" << rid
-                      << " (orig=" << orig << ") type=" << type
-                      << " addr=0x" << std::hex << addr << std::dec
-                      << " — retrying (attempt " << attempt << ")" << std::endl;
-            rid = ++next_req_id;
+        if (!mbox_wait(nic, MBOX_RESP_OFF, seq - 1, resp,
+                       now_ms() + RESP_TIMEOUT_MS)) {
+            std::cerr << "[mbox] FATAL: no response for seq=" << seq
+                      << " type=" << type << " addr=0x" << std::hex << addr
+                      << std::dec << std::endl;
+            abort();
         }
-        std::cerr << "[mbox] FATAL: request orig=" << orig
-                  << " unrecoverable after " << MAX_ATTEMPTS
-                  << " attempts" << std::endl;
-        abort();
+        // Clear local completion state every round trip, exactly as the
+        // jigsaw_baseline_rdma pair does per transfer: a cheap local
+        // register write (NOT the connSync barrier), safe because the
+        // protocol is synchronous so nothing is in flight here. This clear
+        // cadence is what keeps the requester from saturating over a long
+        // run — the barrier discipline that makes the simple mailbox
+        // reliable, so no retry/dedup machinery is needed.
+        ct.clearCompleted();
+        return resp.value;
     }
 
     // H2D: bounce application memory into the NIC buffer and push it before
@@ -282,8 +266,7 @@ private:
     char *nic;
     char *app;
 
-    uint64_t next_req_id = 0;
-    uint64_t last_resp_rid = 0;
+    uint64_t req_seq = 0;
     uint64_t sh_src = 0, sh_dst = 0, sh_h2d = 0, sh_d2h = 0;
     struct { bool armed = false; uint64_t off = 0, len = 0, mask = 0; } d2h;
 };
