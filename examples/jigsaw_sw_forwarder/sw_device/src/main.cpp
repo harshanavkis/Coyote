@@ -69,6 +69,11 @@ public:
         switch (m.op) {
         case WIRE_MMIO_WRITE:
             handle_write(m.addr, m.value);
+            // ack after the write fully took effect (for DMA/compute
+            // triggers that means after the device finished and any D2H
+            // payload was pushed — the ack can then never overtake data)
+            tx.post(WIRE_WRITE_ACK, m.addr, rx.consumed(), 0);
+            last_credit = rx.consumed();
             break;
         case WIRE_MMIO_READ: {
             uint64_t value = jig.getCSR(dev_reg_index(m.addr));

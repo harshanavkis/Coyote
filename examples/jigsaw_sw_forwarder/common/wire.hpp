@@ -52,10 +52,11 @@ constexpr uint32_t BUF_BYTES    = 16U * 1024 * 1024;  // == ivshmem SHMEM_SIZE
 constexpr uint64_t SETUP_MAGIC  = 0x4a53465744313641ULL;
 
 enum WireOp : uint64_t {
-    WIRE_MMIO_WRITE = 1,  // posted, no reply
+    WIRE_MMIO_WRITE = 1,  // acknowledged: the host waits for WIRE_WRITE_ACK
     WIRE_MMIO_READ  = 2,
     WIRE_READ_RESP  = 3,  // len carries the device's consumed request count
     WIRE_STOP       = 4,
+    WIRE_WRITE_ACK  = 5,  // len carries the consumed count (credit)
 };
 
 // `seq` is the last word on purpose: RDMA WRITE payload is placed in
@@ -247,6 +248,13 @@ public:
             break;
         }
         tx.post(WIRE_MMIO_WRITE, addr, 8, value);
+        // Fully synchronous, like the reference perf_rdma / May-baseline
+        // software: wait for the device's ack so at most ONE control
+        // message is ever in flight. Posted-write pipelining kept several
+        // heterogeneous WQEs outstanding, which the Coyote command path
+        // does not sustain reliably (observed wedges under bursts).
+        wire_msg ack = rx.wait();
+        tx.note_credit(ack.len);
     }
 
     uint64_t mmio_read(uint64_t addr) {
@@ -269,11 +277,29 @@ public:
 private:
     // H2D: copy application memory into the NIC buffer and push it, before
     // the trigger itself is posted (same QP => ordered).
+    //
+    // Large pushes are followed by one 64 B read round trip before control
+    // writes may queue behind them: the shell supports only N_OUTSTANDING=8
+    // transactions, and a large payload WQE with the full control sequence
+    // stacked behind it rides that limit — if a retransmission then needs a
+    // slot, the QP wedges (observed at 1 MiB + 6 control WQEs; <=512 KiB
+    // with the same control burst is empirically safe, so small transfers
+    // skip the barrier and pay no extra RTT).
+    static const uint64_t DRAIN_THRESHOLD = 512UL << 10;
+
     void stage_in(uint64_t src_ptr, uint64_t len) {
         uint64_t off = src_ptr - reinterpret_cast<uint64_t>(app);
         if (!payload_range_ok(off, len)) return;
         memcpy(nic + off, app + off, len);
+        // drain BEFORE the push too: at a chunk transition the previous
+        // chunk's trailing writes plus this chunk's setup writes are still
+        // queued, and payload + queued smalls rides the N_OUTSTANDING=8
+        // limit — the payload must enter an empty queue
+        if (len > DRAIN_THRESHOLD)
+            (void)mmio_read(static_cast<uint64_t>(DevReg::DMA_STATUS));
         push_payload(ct, off, len);
+        if (len > DRAIN_THRESHOLD)
+            (void)mmio_read(static_cast<uint64_t>(DevReg::DMA_STATUS));
     }
 
     void arm_d2h(uint64_t dst_ptr, uint64_t len, uint64_t mask) {
