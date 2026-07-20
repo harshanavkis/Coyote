@@ -191,9 +191,32 @@ private:
     }
 
     void wait_status(uint64_t mask) {
+        uint64_t start = now_ms();
+        bool dumped = false;
         while ((jig.getCSR(dev_reg_index(
                    static_cast<uint64_t>(DevReg::DMA_STATUS))) & mask) != mask) {
             std::this_thread::sleep_for(std::chrono::nanoseconds(CLOCK_PERIOD_NS));
+            // Diagnose a wedged operation: dump the engine-visible registers
+            // once after 3 s. CMD bit0 still set => the engine never consumed
+            // the start (busy/held elsewhere); bit0 cleared with STATUS never
+            // arriving => the engine consumed the start and its single-cycle
+            // un-handshaked sq command was dropped by the shell (it is then
+            // stuck in SEND_PAYLOAD/RECEIVE_PAYLOAD; see dma_engine.sv).
+            if (!dumped && now_ms() - start > 3000) {
+                dumped = true;
+                std::cerr << "[dev] wait_status(0x" << std::hex << mask
+                          << ") stuck 3s: STATUS=0x"
+                          << jig.getCSR(dev_reg_index(static_cast<uint64_t>(DevReg::DMA_STATUS)))
+                          << " CMD=0x"
+                          << jig.getCSR(dev_reg_index(static_cast<uint64_t>(DevReg::DMA_CMD)))
+                          << " TX_LEN=0x"
+                          << jig.getCSR(dev_reg_index(static_cast<uint64_t>(DevReg::DMA_TX_LEN)))
+                          << " H2D_LEN=0x"
+                          << jig.getCSR(dev_reg_index(static_cast<uint64_t>(DevReg::DMA_H2D_LEN)))
+                          << " D2H_LEN=0x"
+                          << jig.getCSR(dev_reg_index(static_cast<uint64_t>(DevReg::DMA_D2H_LEN)))
+                          << std::dec << std::endl;
+            }
         }
     }
 
