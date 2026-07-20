@@ -53,9 +53,9 @@ guest/app buffer --memcpy--> NIC buffer --RDMA--> NIC buffer --memcpy--> device 
   Vortex trace directly on the accelerator vFPGA (no RDMA), with the
   forwarder's exact register sequences, chunking and staging buffer.
 - `sw_host` — VM-path daemon: identical ivshmem/doorbell protocol to
-  `jigsaw_host_controller/sw`, so the QEMU/guest stack runs unchanged.
-  Run pinned to one core (`taskset -c <core>`). (Pending rewrite onto
-  `messages.hpp`; currently not building.)
+  `jigsaw_host_controller/sw`, so the QEMU/guest stack runs unchanged;
+  same wire primitives as `sw_host_no_vm`. Run pinned to one core
+  (`taskset -c <core>`).
 - `sw_host_no_vm` — bring-up/benchmark harness: same Vortex trace replay
   as `jigsaw_host_controller/sw_no_vm` (shares its `traces.hpp`), through
   the forwarding path.
