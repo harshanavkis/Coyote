@@ -23,6 +23,8 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <iostream>
 #include <cstdint>
 #include <cstring>
 #include <immintrin.h>
@@ -66,7 +68,8 @@ struct wire_msg {
     uint64_t addr;
     uint64_t len;
     uint64_t value;
-    uint64_t pad[3];
+    uint64_t req_id;   // end-to-end request id for timeout/retry dedup
+    uint64_t pad[2];
     uint64_t seq;
 };
 static_assert(sizeof(wire_msg) == WIRE_BYTES, "wire_msg must be one slot");
@@ -119,7 +122,8 @@ public:
         : ct(ct), local(local), ring_off(ring_off), nslots(nslots),
           credit_word(credit_word) {}
 
-    void post(uint64_t op, uint64_t addr, uint64_t len, uint64_t value) {
+    void post(uint64_t op, uint64_t addr, uint64_t len, uint64_t value,
+              uint64_t req_id = 0) {
         uint64_t seq = next_seq + 1;
         if (credit_word) {
             while (seq - credit_seen > nslots - 2) {
@@ -135,12 +139,23 @@ public:
         m->addr = addr;
         m->len = len;
         m->value = value;
-        m->pad[0] = m->pad[1] = m->pad[2] = 0;
+        m->req_id = req_id;
+        m->pad[0] = m->pad[1] = 0;
         m->seq = seq;
 
         coyote::rdmaSg sg = {.local_offs = slot, .remote_offs = slot, .len = WIRE_BYTES};
         ct.invoke(coyote::CoyoteOper::REMOTE_RDMA_WRITE, sg);
         next_seq = seq;
+        last_slot = slot;
+    }
+
+    // Re-transmit the last posted message unchanged (same slot, same seq).
+    // Used by the retry layer when a ring-slot write appears lost: the
+    // receiver is still waiting for exactly this seq at exactly this slot.
+    void repost_last() {
+        coyote::rdmaSg sg = {.local_offs = last_slot, .remote_offs = last_slot,
+                             .len = WIRE_BYTES};
+        ct.invoke(coyote::CoyoteOper::REMOTE_RDMA_WRITE, sg);
     }
 
     void note_credit(uint64_t c) { if (c > credit_seen) credit_seen = c; }
@@ -153,6 +168,7 @@ private:
     volatile uint64_t *credit_word;
     uint64_t next_seq = 0;
     uint64_t credit_seen = 0;
+    uint32_t last_slot = 0;
 };
 
 // Receiver side: poll the next expected slot in the local QP buffer.
@@ -162,21 +178,41 @@ public:
         : local(local), ring_off(ring_off), nslots(nslots) {}
 
     wire_msg wait() {
+        wire_msg out;
+        while (!wait_until(out, UINT64_MAX)) {
+        }
+        return out;
+    }
+
+    // Waits for the next message until the deadline (ms since some epoch,
+    // from now_ms()); returns false on timeout.
+    bool wait_until(wire_msg &out, uint64_t deadline_ms) {
         uint64_t seq = seen + 1;
         volatile wire_msg *m = reinterpret_cast<volatile wire_msg *>(
             local + ring_off + static_cast<uint32_t>((seq - 1) % nslots) * WIRE_BYTES);
+        uint32_t spins = 0;
         while (m->seq != seq) {
             _mm_pause();
+            if (++spins == 4096) {
+                spins = 0;
+                if (now_ms() > deadline_ms)
+                    return false;
+            }
         }
         std::atomic_thread_fence(std::memory_order_acquire);
-        wire_msg out;
         out.op = m->op;
         out.addr = m->addr;
         out.len = m->len;
         out.value = m->value;
+        out.req_id = m->req_id;
         out.seq = m->seq;
         seen = seq;
-        return out;
+        return true;
+    }
+
+    static uint64_t now_ms() {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
     }
 
     uint64_t consumed() const { return seen; }
@@ -247,29 +283,64 @@ public:
         default:
             break;
         }
-        tx.post(WIRE_MMIO_WRITE, addr, 8, value);
-        // Fully synchronous, like the reference perf_rdma / May-baseline
-        // software: wait for the device's ack so at most ONE control
-        // message is ever in flight. Posted-write pipelining kept several
-        // heterogeneous WQEs outstanding, which the Coyote command path
-        // does not sustain reliably (observed wedges under bursts).
-        wire_msg ack = rx.wait();
-        tx.note_credit(ack.len);
+        (void)request(WIRE_MMIO_WRITE, addr, value);
     }
 
     uint64_t mmio_read(uint64_t addr) {
-        tx.post(WIRE_MMIO_READ, addr, 8, 0);
-        wire_msg m = rx.wait();
-        tx.note_credit(m.len);
+        uint64_t value = request(WIRE_MMIO_READ, addr, 0);
         // The guest must never observe a completed D2H before its payload is
-        // in application memory: the device pushes the payload before this
+        // in application memory: the device pushes the payload before its
         // response on the same QP, so it has landed — copy it out now.
         if (static_cast<DevReg>(addr) == DevReg::DMA_STATUS && d2h.armed &&
-            (m.value & d2h.mask) == d2h.mask) {
+            (value & d2h.mask) == d2h.mask) {
             memcpy(app + d2h.off, nic + d2h.off, d2h.len);
             d2h.armed = false;
         }
-        return m.value;
+        return value;
+    }
+
+    // Fully synchronous request-response (the perf_rdma / May-baseline
+    // discipline: at most one control message in flight), hardened with an
+    // application-level timeout + retry: retransmitted 64 B ring writes are
+    // not reliably replayed by the RoCE stack (observed: one PSN drop plus
+    // one retransmission and the protocol froze with a quiet, fully
+    // symmetric wire), so the ring must be treated as lossy.
+    //
+    // Retry alternates two repair modes because the loss can be on either
+    // side: repost_last() re-places the identical slot/seq (repairs a lost
+    // REQUEST — the device is still waiting for exactly that seq), while a
+    // fresh-seq duplicate carrying the same req_id advances the ring
+    // (repairs a lost ACK/RESPONSE — the device consumed the request, its
+    // req_id dedup answers again without re-executing). Triggers block on
+    // the device until the operation completes (up to ~214 ms for the
+    // largest compute bundle), so the timeout sits well above that.
+    static const uint64_t ACK_TIMEOUT_MS = 1000;
+    static const uint32_t MAX_ATTEMPTS = 30;
+
+    uint64_t request(uint64_t op, uint64_t addr, uint64_t value) {
+        uint64_t rid = ++next_req_id;
+        tx.post(op, addr, 8, value, rid);
+        for (uint32_t attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+            uint64_t deadline = RxRing::now_ms() + ACK_TIMEOUT_MS;
+            wire_msg m;
+            while (rx.wait_until(m, deadline)) {
+                tx.note_credit(m.len);
+                if (m.req_id == rid)
+                    return m.value;
+                // stale duplicate from an earlier retry — skip it
+            }
+            std::cerr << "[wire] timeout rid=" << rid << " op=" << op
+                      << " addr=0x" << std::hex << addr << std::dec
+                      << " attempt=" << attempt << " — retrying" << std::endl;
+            if (attempt % 2 == 1)
+                tx.repost_last();           // lost request: same slot, same seq
+            else
+                tx.post(op, addr, 8, value, rid);  // lost reply: dedup by req_id
+        }
+        std::cerr << "[wire] FATAL: request rid=" << next_req_id
+                  << " unrecoverable after " << MAX_ATTEMPTS
+                  << " attempts" << std::endl;
+        abort();
     }
 
     void send_stop() { tx.post(WIRE_STOP, 0, 0, 0); }
@@ -319,6 +390,7 @@ private:
     RxRing rx;
 
     uint64_t sh_src = 0, sh_dst = 0, sh_h2d = 0, sh_d2h = 0;
+    uint64_t next_req_id = 0;
     struct { bool armed = false; uint64_t off = 0, len = 0, mask = 0; } d2h;
 };
 

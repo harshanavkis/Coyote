@@ -68,17 +68,29 @@ public:
 
         switch (m.op) {
         case WIRE_MMIO_WRITE:
-            handle_write(m.addr, m.value);
-            // ack after the write fully took effect (for DMA/compute
-            // triggers that means after the device finished and any D2H
-            // payload was pushed — the ack can then never overtake data)
-            tx.post(WIRE_WRITE_ACK, m.addr, rx.consumed(), 0);
+            // exactly-once for non-idempotent writes (DMA/compute
+            // triggers): request ids are monotonic, so anything at or
+            // below the high-water mark is a duplicate or straggler from
+            // the retry layer — ack it again, never re-execute. The ack
+            // itself carries no value, so nothing needs to be stored.
+            if (m.req_id > last_rid) {
+                handle_write(m.addr, m.value);
+                // ack only after the write fully took effect (for
+                // triggers: after the device finished and any D2H payload
+                // was pushed — the ack can then never overtake data)
+                last_rid = m.req_id;
+            }
+            tx.post(WIRE_WRITE_ACK, m.addr, rx.consumed(), 0, m.req_id);
             last_credit = rx.consumed();
             break;
         case WIRE_MMIO_READ: {
+            // reads are idempotent — duplicates simply re-execute and
+            // return a fresh value
             uint64_t value = jig.getCSR(dev_reg_index(m.addr));
+            if (m.req_id > last_rid)
+                last_rid = m.req_id;
             // len piggybacks the consumed count as a credit update
-            tx.post(WIRE_READ_RESP, m.addr, rx.consumed(), value);
+            tx.post(WIRE_READ_RESP, m.addr, rx.consumed(), value, m.req_id);
             last_credit = rx.consumed();
             break;
         }
@@ -204,6 +216,7 @@ private:
     uint64_t app_base = 0;
     uint64_t sh_src = 0, sh_dst = 0, sh_h2d = 0, sh_d2h = 0;
     uint64_t last_credit = 0;
+    uint64_t last_rid = 0;   // high-water request id: exactly-once guard for writes
 };
 
 // ---------------------------------------------------------------------------
