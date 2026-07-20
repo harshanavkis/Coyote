@@ -29,7 +29,7 @@
 
 #include <coyote/cThread.hpp>
 
-#include "wire.hpp"
+#include "mailbox.hpp"
 
 using namespace jsfwd;
 
@@ -191,6 +191,10 @@ static void run_traces(HostForwarder &fw, uint64_t dma_addr, uint64_t dma_capaci
                 results.push_back({app.name, run, static_cast<int>(i), ev.kind,
                                    ev.h2d_size, ev.d2h_size, ev.cycles,
                                    total_s * 1e6, ev.original_count});
+
+                // full quiesce between events, outside the timed window —
+                // the May-baseline discipline that keeps the stack healthy
+                fw.sync();
             }
             std::cerr << "[trace] " << app.name << " run " << run << " done"
                       << std::endl;

@@ -31,7 +31,7 @@
 #include <coyote/cThread.hpp>
 
 #include "shmem.hpp"
-#include "wire.hpp"
+#include "mailbox.hpp"
 
 using namespace jsfwd;
 
@@ -56,8 +56,17 @@ static void run_forwarder(HostForwarder &fw)
 {
     std::cout << "SHMEM application started. Waiting for messages..." << std::endl;
 
+    uint64_t since_sync = 0;
     while (!g_stop.load(std::memory_order_relaxed))
     {
+        // full quiesce every so often, outside any in-flight guest request
+        // (the daemon is idle between shmem messages) — the May-baseline
+        // discipline that keeps the stack healthy over long runs
+        if (++since_sync >= 32) {
+            since_sync = 0;
+            fw.sync();
+        }
+
         shmem_arm_write_doorbell();
 
         shmem_wait_write_doorbell();

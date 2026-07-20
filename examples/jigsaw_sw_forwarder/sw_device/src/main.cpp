@@ -2,18 +2,19 @@
  * Jigsaw Software Forwarder — device-side replayer
  *
  * Software-only counterpart of the jigsaw device controller: receives the
- * host's encapsulated MMIO accesses over the Coyote RDMA stack (perf_rdma on
- * vFPGA 0 acting as a dumb NIC) and replays them on the unmodified
- * jigsaw_baseline accelerator (vFPGA 1) through its AXI-Lite CSRs.
+ * host's MMIO accesses as mailbox requests over the Coyote RDMA stack
+ * (perf_rdma on vFPGA 0 acting as a dumb NIC) and replays them on the
+ * unmodified jigsaw_baseline accelerator (vFPGA 1) through its CSRs.
+ * Strict ping-pong: one request, one response, nothing else in flight —
+ * the proven jigsaw_baseline_rdma coyote_api discipline, including the
+ * periodic full quiesce (SYNC: clearCompleted + connSync).
  *
  * DMA payloads are staged through a dedicated device buffer: the NIC (QP)
  * buffer and the buffer the accelerator DMAs from/to are deliberately
- * separate, with a memcpy between them, because a software forwarder on
- * commodity hardware cannot point a device's DMA engine at the NIC's
- * buffers (separate DMA/IOMMU domains, buffers owned by different stacks).
+ * separate, with a memcpy between them (a software forwarder on commodity
+ * hardware cannot point a device's DMA engine at the NIC's buffers).
  * Guest DMA pointers arriving in MMIO writes are rewritten to the device
- * buffer at the same payload offset, so alignment is preserved and no
- * translation tables are needed.
+ * buffer at the same payload offset.
  *
  * Usage:
  *   ./test            (waits for the host forwarder to connect)
@@ -27,7 +28,7 @@
 
 #include <coyote/cThread.hpp>
 
-#include "wire.hpp"
+#include "mailbox.hpp"
 
 using namespace jsfwd;
 
@@ -46,70 +47,59 @@ public:
     Replayer(coyote::cThread &nic_thread, coyote::cThread &jigsaw_thread,
              char *nic_buf, char *device_buf)
         : nic(nic_thread), jig(jigsaw_thread), nic_buf(nic_buf),
-          device_buf(device_buf),
-          rx(nic_buf, REQ_RING_OFF, REQ_SLOTS),
-          tx(nic, nic_buf, RESP_RING_OFF, RESP_SLOTS) {}
+          device_buf(device_buf) {}
 
-    void wait_setup() {
-        volatile setup_msg *s =
-            reinterpret_cast<volatile setup_msg *>(nic_buf + SETUP_OFF);
-        while (s->magic != SETUP_MAGIC) {
-            _mm_pause();
-        }
-        app_base = s->app_base;
-        std::cout << "Setup received: app_base = 0x" << std::hex << app_base
-                  << std::dec << ", payload = " << s->payload_bytes
-                  << " bytes" << std::endl;
-    }
-
-    // Returns false once the host posted WIRE_STOP.
+    // Serve one request; returns false once the host sent MBOX_STOP.
     bool serve_one() {
-        wire_msg m = rx.wait();
+        mbox_msg m;
+        mbox_wait(nic_buf, MBOX_REQ_OFF, last_rid, m);
+        last_rid = m.req_id;
+        served++;
 
-        switch (m.op) {
-        case WIRE_MMIO_WRITE:
-            // exactly-once for non-idempotent writes (DMA/compute
-            // triggers): request ids are monotonic, so anything at or
-            // below the high-water mark is a duplicate or straggler from
-            // the retry layer — ack it again, never re-execute. The ack
-            // itself carries no value, so nothing needs to be stored.
-            if (m.req_id > last_rid) {
-                handle_write(m.addr, m.value);
-                // ack only after the write fully took effect (for
-                // triggers: after the device finished and any D2H payload
-                // was pushed — the ack can then never overtake data)
-                last_rid = m.req_id;
-            }
-            tx.post(WIRE_WRITE_ACK, m.addr, rx.consumed(), 0, m.req_id);
-            last_credit = rx.consumed();
+        switch (m.type) {
+        case MBOX_SETUP:
+            app_base = m.addr;
+            std::cout << "Setup received: app_base = 0x" << std::hex
+                      << app_base << std::dec << ", payload = " << m.value
+                      << " bytes" << std::endl;
+            respond(m.req_id, 0);
             break;
-        case WIRE_MMIO_READ: {
-            // reads are idempotent — duplicates simply re-execute and
-            // return a fresh value
-            uint64_t value = jig.getCSR(dev_reg_index(m.addr));
-            if (m.req_id > last_rid)
-                last_rid = m.req_id;
-            // len piggybacks the consumed count as a credit update
-            tx.post(WIRE_READ_RESP, m.addr, rx.consumed(), value, m.req_id);
-            last_credit = rx.consumed();
+        case MBOX_MMIO_WRITE:
+            // respond only after the write fully took effect: for DMA and
+            // compute triggers that is after the device finished and any
+            // D2H payload was pushed — the response can never overtake data
+            handle_write(m.addr, m.value);
+            respond(m.req_id, 0);
             break;
-        }
-        case WIRE_STOP:
+        case MBOX_MMIO_READ:
+            respond(m.req_id, jig.getCSR(dev_reg_index(m.addr)));
+            break;
+        case MBOX_SYNC:
+            // full quiesce, as the May software does around every
+            // iteration: ack first, then both sides clear completion
+            // state and meet in the TCP barrier with an idle wire
+            respond(m.req_id, 0);
+            nic.clearCompleted();
+            nic.connSync(false);
+            break;
+        case MBOX_STOP:
+            respond(m.req_id, 0);
             return false;
         default:
-            std::cerr << "Unknown wire op: " << m.op << std::endl;
+            std::cerr << "Unknown mailbox type: " << m.type << std::endl;
+            respond(m.req_id, 0);
             break;
-        }
-
-        // Posted writes generate no responses, so return credits standalone
-        // before the host's request window can fill up.
-        if (rx.consumed() - last_credit >= REQ_SLOTS / 2) {
-            send_credit();
         }
         return true;
     }
 
+    uint64_t requests_served() const { return served; }
+
 private:
+    void respond(uint64_t req_id, uint64_t value) {
+        mbox_send(nic, nic_buf, MBOX_RESP_OFF, 0, 0, value, req_id);
+    }
+
     void handle_write(uint64_t addr, uint64_t value) {
         switch (static_cast<DevReg>(addr)) {
         case DevReg::DMA_SRC_ADDR:
@@ -164,7 +154,7 @@ private:
     }
 
     // H2D: the payload was pushed into our NIC buffer before the trigger
-    // arrived (same QP, ordered) — bounce it into the device buffer.
+    // request (same QP, placed in order) — bounce it into the device buffer.
     void stage_in(uint64_t src_ptr, uint64_t len) {
         uint64_t off = src_ptr - app_base;
         if (!payload_range_ok(off, len)) {
@@ -175,9 +165,9 @@ private:
         memcpy(device_buf + off, nic_buf + off, len);
     }
 
-    // D2H: bounce the accelerator's output into the NIC buffer and push it
-    // to the host. The push precedes any later status-read response on the
-    // same QP, so the host never sees "done" before the data has landed.
+    // D2H: bounce the accelerator's output into the NIC buffer and push it;
+    // the trigger's response follows on the same QP, so the host can never
+    // see completion before the data has landed.
     void stage_out(uint64_t dst_ptr, uint64_t len) {
         uint64_t off = dst_ptr - app_base;
         if (!payload_range_ok(off, len)) {
@@ -196,27 +186,15 @@ private:
         }
     }
 
-    void send_credit() {
-        wire_msg *c = reinterpret_cast<wire_msg *>(nic_buf + CREDIT_OFF);
-        memset(c, 0, sizeof(*c));
-        c->seq = rx.consumed();  // last word: placed last at the host
-        coyote::rdmaSg sg = {.local_offs = CREDIT_OFF, .remote_offs = CREDIT_OFF,
-                             .len = WIRE_BYTES};
-        nic.invoke(coyote::CoyoteOper::REMOTE_RDMA_WRITE, sg);
-        last_credit = rx.consumed();
-    }
-
     coyote::cThread &nic;
     coyote::cThread &jig;
     char *nic_buf;
     char *device_buf;
-    RxRing rx;
-    TxRing tx;
 
     uint64_t app_base = 0;
+    uint64_t last_rid = 0;
+    uint64_t served = 0;
     uint64_t sh_src = 0, sh_dst = 0, sh_h2d = 0, sh_d2h = 0;
-    uint64_t last_credit = 0;
-    uint64_t last_rid = 0;   // high-water request id: exactly-once guard for writes
 };
 
 // ---------------------------------------------------------------------------
@@ -256,13 +234,10 @@ int main(int argc, char *argv[]) {
     nic_thread.connSync(false);
     std::cout << "Host connected." << std::endl;
 
-    replayer.wait_setup();
-
-    uint64_t served = 0;
     while (replayer.serve_one()) {
-        served++;
     }
-    std::cout << "Host posted STOP after " << served << " requests." << std::endl;
+    std::cout << "Host posted STOP after " << replayer.requests_served()
+              << " requests." << std::endl;
 
     nic_thread.connSync(false);
     nic_thread.closeConn();
