@@ -1,8 +1,8 @@
 /**
- * Jigsaw Software Forwarder — host-side trace/sweep harness (no VM)
+ * Jigsaw Software Forwarder — host-side trace harness (no VM)
  *
  * Drives the same device interactions as jigsaw_host_controller/sw_no_vm
- * (raw DMA sweep + Vortex OpenCL trace replay), but through the software
+ * (Vortex OpenCL trace replay), but through the software
  * forwarding path instead of the jigsaw host-controller hardware: every
  * MMIO access is encapsulated into a wire message and carried over the
  * Coyote RDMA stack (perf_rdma as a dumb NIC) to the device-side replayer,
@@ -13,8 +13,7 @@
  * cost a software forwarder on commodity hardware cannot avoid.
  *
  * Usage:
- *   ./test -i <device_oob_ip> [-n <sweep iterations>] [-r <trace runs>]
- *          [--skip_sweep] [--skip_traces]
+ *   ./test -i <device_oob_ip> [-r <trace runs>]
  */
 
 #include <chrono>
@@ -39,9 +38,6 @@ using namespace jsfwd;
 // ---------------------------------------------------------------------------
 #define DEFAULT_VFPGA_ID 0
 
-static constexpr uint32_t SWEEP_MIN_BYTES = 4096;
-static constexpr uint32_t SWEEP_MAX_BYTES = 1024 * 1024;
-
 // ---------------------------------------------------------------------------
 // Trace Replay (bundled, embedded via traces.hpp)
 // ---------------------------------------------------------------------------
@@ -49,14 +45,6 @@ static constexpr uint32_t SWEEP_MAX_BYTES = 1024 * 1024;
 using namespace jigsaw_traces_ns;
 
 static constexpr uint32_t MIN_DMA_BYTES = 64;
-
-struct DmaResult {
-    size_t size;
-    std::string direction;
-    int iteration;
-    double latency_us;
-    double throughput_gibps;
-};
 
 struct TraceResult {
     std::string app;
@@ -91,18 +79,31 @@ static double secs(clk::time_point a, clk::time_point b)
     return std::chrono::duration<double>(b - a).count();
 }
 
+// Bulk transfers are sliced into 1 MiB chunks with a full MMIO sequence per
+// chunk — mirroring the guest driver (my_qemu_edu.c TRACE_CHUNK_BYTES): the
+// system's established convention, since >1 MiB single transfers are not
+// reliable on either forwarding path. Timing covers the whole chunked loop;
+// bundles are never chunked (their transfers are tiny by construction).
+static constexpr uint64_t TRACE_CHUNK_BYTES = 1ULL << 20;
+
 static double do_bulk(HostForwarder &fw, uint64_t dma_addr, uint32_t size, bool d2h)
 {
     auto start = clk::now();
-    fw.mmio_write(static_cast<uint64_t>(DevReg::DMA_SRC_ADDR), dma_addr);
-    fw.mmio_write(static_cast<uint64_t>(DevReg::DMA_DST_ADDR), dma_addr);
-    fw.mmio_write(static_cast<uint64_t>(d2h ? DevReg::DMA_D2H_LEN : DevReg::DMA_H2D_LEN),
-                  size);
-    fw.mmio_write(static_cast<uint64_t>(DevReg::DMA_STATUS), 0);
-
-    fw.mmio_write(static_cast<uint64_t>(DevReg::DMA_CMD), d2h ? DMA_CMD_D2H : DMA_CMD_H2D);
-
-    while ((fw.mmio_read(static_cast<uint64_t>(DevReg::DMA_STATUS)) & 0x1) != 1) {
+    uint64_t remaining = size, off = 0;
+    while (remaining > 0) {
+        uint64_t chunk = remaining > TRACE_CHUNK_BYTES ? TRACE_CHUNK_BYTES : remaining;
+        fw.mmio_write(static_cast<uint64_t>(DevReg::DMA_SRC_ADDR), dma_addr + off);
+        fw.mmio_write(static_cast<uint64_t>(DevReg::DMA_DST_ADDR), dma_addr + off);
+        fw.mmio_write(static_cast<uint64_t>(d2h ? DevReg::DMA_D2H_LEN : DevReg::DMA_H2D_LEN),
+                      chunk);
+        fw.mmio_write(static_cast<uint64_t>(DevReg::DMA_STATUS), 0);
+        fw.mmio_write(static_cast<uint64_t>(DevReg::DMA_CMD),
+                      d2h ? DMA_CMD_D2H : DMA_CMD_H2D);
+        while ((fw.mmio_read(static_cast<uint64_t>(DevReg::DMA_STATUS)) & 0x1) != 1) {
+        }
+        fw.mmio_write(static_cast<uint64_t>(DevReg::DMA_STATUS), 0);
+        off += chunk;
+        remaining -= chunk;
     }
     auto end = clk::now();
     return secs(start, end);
@@ -136,24 +137,6 @@ static double do_bundle(HostForwarder &fw, uint64_t dma_addr, uint32_t h2d,
     return secs(start, end);
 }
 
-static void run_sweep(HostForwarder &fw, uint64_t dma_addr, int iterations,
-                      std::vector<DmaResult> &results)
-{
-    for (int pass = 0; pass < 2; pass++) {
-        bool d2h = (pass == 0);
-        std::cout << "\n--- " << (d2h ? "D2H" : "H2D") << " Sweep ---" << std::endl;
-        for (uint32_t size = SWEEP_MIN_BYTES; size <= SWEEP_MAX_BYTES; size *= 2) {
-            std::cout << "Size: " << (size / 1024) << " KiB... " << std::flush;
-            for (int i = 0; i < iterations; i++) {
-                double t = do_bulk(fw, dma_addr, size, d2h);
-                double gib = static_cast<double>(size) / (1024.0 * 1024.0 * 1024.0);
-                results.push_back({size, d2h ? "d2h" : "h2d", i, t * 1e6, gib / t});
-            }
-            std::cout << "Done." << std::endl;
-        }
-    }
-}
-
 static void run_traces(HostForwarder &fw, uint64_t dma_addr, uint64_t dma_capacity,
                        int n_runs, std::vector<TraceResult> &results)
 {
@@ -178,6 +161,11 @@ static void run_traces(HostForwarder &fw, uint64_t dma_addr, uint64_t dma_capaci
                 double total_s = 0;
                 uint64_t h2d = 0, d2h = 0;
 
+                std::cerr << "[trace]   " << app.name << " ev=" << i << "/" << app.n
+                          << " kind=" << kind_str(ev.kind)
+                          << " h2d=" << ev.h2d_size << " d2h=" << ev.d2h_size
+                          << " cycles=" << ev.cycles << " ... " << std::flush;
+
                 switch (ev.kind) {
                 case TRACE_BULK_H2D:
                     h2d = clamp_dma(ev.h2d_size, dma_capacity);
@@ -198,6 +186,8 @@ static void run_traces(HostForwarder &fw, uint64_t dma_addr, uint64_t dma_capaci
                     continue;
                 }
 
+                std::cerr << "done " << (total_s * 1e6) << " us" << std::endl;
+
                 results.push_back({app.name, run, static_cast<int>(i), ev.kind,
                                    ev.h2d_size, ev.d2h_size, ev.cycles,
                                    total_s * 1e6, ev.original_count});
@@ -206,7 +196,6 @@ static void run_traces(HostForwarder &fw, uint64_t dma_addr, uint64_t dma_capaci
                       << std::endl;
         }
     }
-    (void)kind_str;
 }
 
 // ---------------------------------------------------------------------------
@@ -215,26 +204,16 @@ static void run_traces(HostForwarder &fw, uint64_t dma_addr, uint64_t dma_capaci
 int main(int argc, char *argv[])
 {
     std::string device_ip;
-    int iterations = 10;
     int trace_runs = 5;
-    bool skip_sweep = false;
-    bool skip_traces = false;
 
     boost::program_options::options_description opts("Jigsaw SW Forwarder (no VM) Options");
     opts.add_options()
         ("ip_address,i",
             boost::program_options::value<std::string>(&device_ip),
             "Device-side OOB TCP/IP address (for QP exchange)")
-        ("iterations,n",
-            boost::program_options::value<int>(&iterations),
-            "Iterations per size in the DMA sweep")
         ("trace_runs,r",
             boost::program_options::value<int>(&trace_runs),
-            "Runs per trace application")
-        ("skip_sweep", boost::program_options::bool_switch(&skip_sweep),
-            "Skip the raw DMA sweep")
-        ("skip_traces", boost::program_options::bool_switch(&skip_traces),
-            "Skip the trace replay");
+            "Runs per trace application");
 
     boost::program_options::variables_map vm;
     boost::program_options::store(
@@ -278,28 +257,13 @@ int main(int argc, char *argv[])
     uint64_t dma_addr = reinterpret_cast<uint64_t>(app) + PAYLOAD_OFF;
     uint64_t dma_capacity = BUF_BYTES - PAYLOAD_OFF;
 
-    std::vector<DmaResult> dma_results;
     std::vector<TraceResult> trace_results;
 
-    if (!skip_sweep) {
-        run_sweep(fw, dma_addr, iterations, dma_results);
-    }
-    if (!skip_traces) {
-        run_traces(fw, dma_addr, dma_capacity, trace_runs, trace_results);
-    }
+    run_traces(fw, dma_addr, dma_capacity, trace_runs, trace_results);
 
     fw.send_stop();
 
     // CSV output
-    if (!dma_results.empty()) {
-        std::cout << "\nDMA results (size, direction, iteration, latency [us], throughput [GiBps]):"
-                  << std::endl;
-        for (const auto &r : dma_results) {
-            std::cout << r.size << ", " << r.direction << ", " << r.iteration << ", "
-                      << std::fixed << std::setprecision(3) << r.latency_us << ", "
-                      << r.throughput_gibps << std::endl;
-        }
-    }
     if (!trace_results.empty()) {
         std::cout << "\nTrace results (app, run, event, kind, h2d, d2h, cycles, total [us], original_count):"
                   << std::endl;
