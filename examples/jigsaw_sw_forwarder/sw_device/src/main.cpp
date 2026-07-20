@@ -54,21 +54,33 @@ public:
         mbox_msg m;
         mbox_wait(nic_buf, MBOX_REQ_OFF, last_rid, m);
         last_rid = m.req_id;
-        served++;
+
+        // The host's retry layer resends a lost request with a fresh req_id
+        // but the same orig. Execute each orig exactly once: duplicates are
+        // answered again (reads re-execute — idempotent) but a write, in
+        // particular a DMA/compute trigger, can never fire twice.
+        bool duplicate = (m.orig <= last_orig);
+        if (!duplicate) {
+            last_orig = m.orig;
+            served++;
+        }
 
         switch (m.type) {
         case MBOX_SETUP:
-            app_base = m.addr;
-            std::cout << "Setup received: app_base = 0x" << std::hex
-                      << app_base << std::dec << ", payload = " << m.value
-                      << " bytes" << std::endl;
+            if (!duplicate) {
+                app_base = m.addr;
+                std::cout << "Setup received: app_base = 0x" << std::hex
+                          << app_base << std::dec << ", payload = " << m.value
+                          << " bytes" << std::endl;
+            }
             respond(m.req_id, 0);
             break;
         case MBOX_MMIO_WRITE:
             // respond only after the write fully took effect: for DMA and
             // compute triggers that is after the device finished and any
             // D2H payload was pushed — the response can never overtake data
-            handle_write(m.addr, m.value);
+            if (!duplicate)
+                handle_write(m.addr, m.value);
             respond(m.req_id, 0);
             break;
         case MBOX_MMIO_READ:
@@ -79,8 +91,10 @@ public:
             // iteration: ack first, then both sides clear completion
             // state and meet in the TCP barrier with an idle wire
             respond(m.req_id, 0);
-            nic.clearCompleted();
-            nic.connSync(false);
+            if (!duplicate) {
+                nic.clearCompleted();
+                nic.connSync(false);
+            }
             break;
         case MBOX_STOP:
             respond(m.req_id, 0);
@@ -97,7 +111,7 @@ public:
 
 private:
     void respond(uint64_t req_id, uint64_t value) {
-        mbox_send(nic, nic_buf, MBOX_RESP_OFF, 0, 0, value, req_id);
+        mbox_send(nic, nic_buf, MBOX_RESP_OFF, 0, 0, value, req_id, req_id);
     }
 
     void handle_write(uint64_t addr, uint64_t value) {
@@ -193,6 +207,7 @@ private:
 
     uint64_t app_base = 0;
     uint64_t last_rid = 0;
+    uint64_t last_orig = 0;
     uint64_t served = 0;
     uint64_t sh_src = 0, sh_dst = 0, sh_h2d = 0, sh_d2h = 0;
 };
