@@ -227,14 +227,14 @@ static void poll_status(uint64_t mask, const char *what)
 
 // Bulk transfers are sliced into 1 MiB chunks with a full MMIO sequence per
 // chunk — mirroring the guest driver (my_qemu_edu.c TRACE_CHUNK_BYTES).
+// Timed exactly as the driver's replay_one: one window around the whole
+// chunked loop, including the per-chunk trailing STATUS clear.
 static double do_bulk(uint64_t dma_addr, uint32_t size, bool d2h)
 {
-    double total_s = 0;
+    auto start = clk::now();
     uint64_t remaining = size, off = 0;
     while (remaining > 0) {
         uint64_t chunk = remaining > TRACE_CHUNK_BYTES ? TRACE_CHUNK_BYTES : remaining;
-
-        auto start = clk::now();
         mmio_write(static_cast<uint64_t>(DevReg::DMA_SRC_ADDR), dma_addr + off);
         mmio_write(static_cast<uint64_t>(DevReg::DMA_DST_ADDR), dma_addr + off);
         mmio_write(static_cast<uint64_t>(d2h ? DevReg::DMA_D2H_LEN : DevReg::DMA_H2D_LEN),
@@ -244,12 +244,10 @@ static double do_bulk(uint64_t dma_addr, uint32_t size, bool d2h)
                    d2h ? DMA_CMD_D2H : DMA_CMD_H2D);
         poll_status(STATUS_DMA_DONE_MASK, d2h ? "BULK_D2H" : "BULK_H2D");
         mmio_write(static_cast<uint64_t>(DevReg::DMA_STATUS), 0);
-        total_s += secs(start, clk::now());
-
         off += chunk;
         remaining -= chunk;
     }
-    return total_s;
+    return secs(start, clk::now());
 }
 
 static double do_bundle(uint64_t dma_addr, uint32_t h2d, uint32_t d2h,
@@ -276,8 +274,15 @@ static double do_bundle(uint64_t dma_addr, uint32_t h2d, uint32_t d2h,
     mmio_write(static_cast<uint64_t>(DevReg::START_COMPUTE), 1);
     poll_status(STATUS_BUNDLE_DONE_MASK, "BUNDLE");
     auto end = clk::now();
+    // Trailing STATUS clear outside the timed window, as in the driver
+    mmio_write(static_cast<uint64_t>(DevReg::DMA_STATUS), 0);
     return secs(start, end);
 }
+
+// The embedded traces.hpp is byte-identical to the guest driver's
+// long-traces.h, so the driver's `set` column value applies directly and
+// TRACE_EVENT / TRACE_SUMMARY lines are comparable with driver dmesg logs.
+static constexpr const char *TRACE_SET_LABEL = "long";
 
 static void run_traces(uint64_t dma_addr, uint64_t dma_capacity,
                        int n_runs, std::vector<TraceResult> &results)
@@ -298,6 +303,11 @@ static void run_traces(uint64_t dma_addr, uint64_t dma_capacity,
                   << n_runs << " runs)" << std::endl;
 
         for (int run = 0; run < n_runs; run++) {
+            // Per-(app, run) aggregates, exactly as the driver's replay_one
+            int agg_n_bulk_h2d = 0, agg_n_bulk_d2h = 0, agg_n_bundle = 0;
+            uint64_t agg_h2d_ns = 0, agg_d2h_ns = 0, agg_bundle_ns = 0;
+            uint64_t agg_h2d_bytes = 0, agg_d2h_bytes = 0, agg_cycles = 0;
+
             for (size_t i = 0; i < app.n; i++) {
                 const auto &ev = app.events[i];
                 double total_s = 0;
@@ -311,29 +321,80 @@ static void run_traces(uint64_t dma_addr, uint64_t dma_capacity,
                 switch (ev.kind) {
                 case TRACE_BULK_H2D:
                     h2d = clamp_dma(ev.h2d_size, dma_capacity);
-                    total_s = do_bulk(dma_addr, static_cast<uint32_t>(h2d), false);
                     break;
                 case TRACE_BULK_D2H:
                     d2h = clamp_dma(ev.d2h_size, dma_capacity);
-                    total_s = do_bulk(dma_addr, static_cast<uint32_t>(d2h), true);
                     break;
                 case TRACE_BUNDLE:
                     h2d = clamp_dma(ev.h2d_size, dma_capacity);
                     d2h = clamp_dma(ev.d2h_size, dma_capacity);
-                    total_s = do_bundle(dma_addr, static_cast<uint32_t>(h2d),
-                                        static_cast<uint32_t>(d2h), ev.cycles);
                     break;
                 default:
                     std::cerr << "[warn] unknown kind " << (int)ev.kind << std::endl;
                     continue;
                 }
 
+                // Same schema as the driver:
+                // TRACE_EVENT: set,app,run,event,kind,h2d_bytes,d2h_bytes,cycles
+                std::cout << "TRACE_EVENT: " << TRACE_SET_LABEL << ","
+                          << app.name << "," << run << "," << i << ","
+                          << static_cast<unsigned>(ev.kind) << "," << h2d << ","
+                          << d2h << "," << ev.cycles << std::endl;
+
+                switch (ev.kind) {
+                case TRACE_BULK_H2D:
+                    total_s = do_bulk(dma_addr, static_cast<uint32_t>(h2d), false);
+                    break;
+                case TRACE_BULK_D2H:
+                    total_s = do_bulk(dma_addr, static_cast<uint32_t>(d2h), true);
+                    break;
+                case TRACE_BUNDLE:
+                    total_s = do_bundle(dma_addr, static_cast<uint32_t>(h2d),
+                                        static_cast<uint32_t>(d2h), ev.cycles);
+                    break;
+                }
+
                 std::cerr << "done " << (total_s * 1e6) << " us" << std::endl;
+
+                uint64_t total_ns = static_cast<uint64_t>(total_s * 1e9);
+                switch (ev.kind) {
+                case TRACE_BULK_H2D:
+                    agg_n_bulk_h2d++;
+                    agg_h2d_ns    += total_ns;
+                    agg_h2d_bytes += ev.h2d_size;  // raw size, as the driver
+                    break;
+                case TRACE_BULK_D2H:
+                    agg_n_bulk_d2h++;
+                    agg_d2h_ns    += total_ns;
+                    agg_d2h_bytes += ev.d2h_size;
+                    break;
+                case TRACE_BUNDLE:
+                    agg_n_bundle++;
+                    agg_bundle_ns += total_ns;
+                    agg_h2d_bytes += ev.h2d_size;
+                    agg_d2h_bytes += ev.d2h_size;
+                    agg_cycles    += ev.cycles;
+                    break;
+                }
 
                 results.push_back({app.name, run, static_cast<int>(i), ev.kind,
                                    ev.h2d_size, ev.d2h_size, ev.cycles,
                                    total_s * 1e6, ev.original_count});
             }
+
+            // Same schema as the driver:
+            // TRACE_SUMMARY: set,app,run,n_events,n_bulk_h2d,n_bulk_d2h,
+            //                n_bundle,total_h2d_ns,total_d2h_ns,
+            //                total_bundle_ns,total_ns,total_h2d_bytes,
+            //                total_d2h_bytes,total_cycles
+            std::cout << "TRACE_SUMMARY: " << TRACE_SET_LABEL << ","
+                      << app.name << "," << run << "," << app.n << ","
+                      << agg_n_bulk_h2d << "," << agg_n_bulk_d2h << ","
+                      << agg_n_bundle << "," << agg_h2d_ns << ","
+                      << agg_d2h_ns << "," << agg_bundle_ns << ","
+                      << (agg_h2d_ns + agg_d2h_ns + agg_bundle_ns) << ","
+                      << agg_h2d_bytes << "," << agg_d2h_bytes << ","
+                      << agg_cycles << std::endl;
             std::cerr << "[trace] " << app.name << " run " << run << " done"
                       << std::endl;
         }
