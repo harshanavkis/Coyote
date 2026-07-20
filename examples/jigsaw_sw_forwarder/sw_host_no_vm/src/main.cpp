@@ -74,7 +74,8 @@ static uint64_t request(uint64_t op, uint64_t addr, uint64_t value)
     req_slot->addr = addr;
     req_slot->value = value;
     req_slot->seq = seq;  // publish flag, written last
-    coyote::rdmaSg sg = {.local_offs = REQ_OFF, .remote_offs = REQ_OFF, .len = 64};
+    coyote::rdmaSg sg = {.local_offs = REQ_OFF, .remote_offs = REQ_OFF,
+                         .len = SLOT_BYTES};
     ct->invoke(coyote::CoyoteOper::REMOTE_RDMA_WRITE, sg);
 
     uint64_t deadline = now_ms() + RESP_TIMEOUT_MS;
@@ -97,28 +98,8 @@ static bool payload_range_ok(uint64_t off, uint64_t len)
     return off >= PAYLOAD_OFF && off < BUF_BYTES && len <= BUF_BYTES - off;
 }
 
-// Wait until a posted RDMA write completes before putting anything else on
-// the QP. Every captured fatal hang shows one go-back-N event (Retrans 4)
-// fired during a payload burst whose replay window covered the 64 B
-// message posted right behind it — and the shell's replayer does not
-// reproduce small writes reliably. Serializing payload -> completion ->
-// message keeps any replay window over full-size packets only, which
-// replay correctly (source bytes stable under strict ping-pong).
-static void await_write_completion(const char *what)
-{
-    uint64_t deadline = now_ms() + RESP_TIMEOUT_MS;
-    while (ct->checkCompleted(coyote::CoyoteOper::REMOTE_RDMA_WRITE) == 0) {
-        if (now_ms() > deadline) {
-            std::cerr << "[mbox] FATAL: payload completion timeout ("
-                      << what << ")" << std::endl;
-            abort();
-        }
-    }
-    ct->clearCompleted();
-}
-
-// H2D: bounce application memory into the NIC buffer, push it and wait for
-// the push to complete before the trigger request is sent.
+// H2D: bounce application memory into the NIC buffer and push it before
+// the trigger request is sent (same QP => payload placed first).
 static void stage_in(uint64_t src_ptr, uint64_t len)
 {
     uint64_t off = src_ptr - reinterpret_cast<uint64_t>(app_buf);
@@ -130,7 +111,6 @@ static void stage_in(uint64_t src_ptr, uint64_t len)
     coyote::rdmaSg sg = {.local_offs = off, .remote_offs = off,
                          .len = static_cast<uint32_t>(aligned)};
     ct->invoke(coyote::CoyoteOper::REMOTE_RDMA_WRITE, sg);
-    await_write_completion("stage_in");
 }
 
 // Forward one MMIO access, in the exact order the guest driver issues

@@ -34,12 +34,20 @@
 
 namespace jsfwd {
 
-// QP buffer layout (identical on both nodes)
+// QP buffer layout (identical on both nodes). Each mailbox message is sent
+// as a SLOT_BYTES-long write even though the msg struct is 64 B: the
+// shell's go-back-N replayer reproduces full-size packets correctly but
+// not tiny writes (the documented failure behind every captured hang), so
+// the message write is padded to a respectable single-packet size. The
+// padding bytes are zeroed once at init and never touched afterwards, so
+// a replayed message is byte-identical.
+constexpr uint32_t SLOT_BYTES   = 2048;               // per-message write size
 constexpr uint32_t REQ_OFF      = 0;                  // host -> device requests
-constexpr uint32_t RESP_OFF     = 64;                 // device -> host responses
+constexpr uint32_t RESP_OFF     = SLOT_BYTES;         // device -> host responses
 constexpr uint32_t CONTROL_SIZE = 0x1000;             // control page (mailboxes)
 constexpr uint32_t PAYLOAD_OFF  = CONTROL_SIZE;       // == ivshmem DMA_REGION_OFFSET
 constexpr uint32_t BUF_BYTES    = 16U * 1024 * 1024;  // == ivshmem SHMEM_SIZE
+static_assert(2 * SLOT_BYTES <= CONTROL_SIZE, "slots must fit the control page");
 
 // Message structure for the control plane
 struct msg {
