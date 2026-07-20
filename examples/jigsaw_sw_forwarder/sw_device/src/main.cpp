@@ -81,9 +81,28 @@ static void stage_in(uint64_t src_ptr, uint64_t len) {
     memcpy(device_buf + off, nic_buf + off, len);
 }
 
-// D2H: bounce the accelerator's output into the NIC buffer and push it to
-// the host; the pending response follows on the same QP, so the host can
-// never see completion before the data has landed.
+// Wait until a posted RDMA write completes before putting anything else on
+// the QP. Every captured fatal hang shows one go-back-N event (Retrans 4)
+// fired during a payload burst whose replay window covered the 64 B
+// message posted right behind it — and the shell's replayer does not
+// reproduce small writes reliably. Serializing payload -> completion ->
+// message keeps any replay window over full-size packets only, which
+// replay correctly (source bytes stable under strict ping-pong).
+static void await_write_completion(const char *what) {
+    uint64_t deadline = now_ms() + 5000;
+    while (nic->checkCompleted(coyote::CoyoteOper::REMOTE_RDMA_WRITE) == 0) {
+        if (now_ms() > deadline) {
+            std::cerr << "[dev] FATAL: payload completion timeout ("
+                      << what << ")" << std::endl;
+            abort();
+        }
+    }
+    nic->clearCompleted();
+}
+
+// D2H: bounce the accelerator's output into the NIC buffer, push it to the
+// host and wait for the push to complete; the pending response follows on
+// a quiet QP, so the host can never see completion before the data landed.
 static void stage_out(uint64_t dst_ptr, uint64_t len) {
     uint64_t off = dst_ptr - app_base;
     if (!payload_range_ok(off, len)) {
@@ -98,6 +117,7 @@ static void stage_out(uint64_t dst_ptr, uint64_t len) {
     coyote::rdmaSg sg = {.local_offs = off, .remote_offs = off,
                          .len = static_cast<uint32_t>(aligned)};
     nic->invoke(coyote::CoyoteOper::REMOTE_RDMA_WRITE, sg);
+    await_write_completion("stage_out");
 }
 
 // Replay one MMIO write on the accelerator, verbatim: every path ends in
