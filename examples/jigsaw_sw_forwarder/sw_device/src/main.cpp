@@ -1,20 +1,27 @@
 /**
  * Jigsaw Software Forwarder — device-side replayer
  *
- * Software-only counterpart of the jigsaw device controller: receives the
- * host's MMIO accesses as mailbox requests over the Coyote RDMA stack
- * (perf_rdma on vFPGA 0 acting as a dumb NIC) and replays them on the
- * unmodified jigsaw_baseline accelerator (vFPGA 1) through its CSRs.
- * Strict ping-pong: one request, one response, nothing else in flight —
- * the proven jigsaw_baseline_rdma coyote_api discipline, including the
- * periodic full quiesce (SYNC: clearCompleted + connSync).
+ * Structured exactly like jigsaw_baseline_rdma/sw_server_coyote_api: two
+ * cThreads (vFPGA 0 = perf_rdma dumb NIC, vFPGA 1 = unmodified
+ * jigsaw_baseline accelerator), one volatile 64 B mailbox at offset 0 of
+ * the QP buffer polled with a clear-and-wait ready flag, requests executed
+ * synchronously and completed in place, and a full quiesce (clearCompleted
+ * + connSync) whenever the host asks for one — which the host does before
+ * every payload-bearing transfer, the cadence under which this stack is
+ * proven reliable.
  *
- * DMA payloads are staged through a dedicated device buffer: the NIC (QP)
- * buffer and the buffer the accelerator DMAs from/to are deliberately
- * separate, with a memcpy between them (a software forwarder on commodity
- * hardware cannot point a device's DMA engine at the NIC's buffers).
- * Guest DMA pointers arriving in MMIO writes are rewritten to the device
- * buffer at the same payload offset.
+ * The host forwards the guest's MMIO accesses as mailbox requests; they are
+ * replayed on the accelerator through its CSRs. DMA triggers execute fully
+ * before the completion is sent (the accelerator's STATUS is polled here,
+ * like the May server's device_h2d/device_d2h), so by the time the host
+ * sees the completion, the operation — including any D2H payload push,
+ * which travels the same QP ahead of the completion — has finished.
+ *
+ * DMA payloads are staged through a dedicated device buffer (NIC buffer and
+ * accelerator buffer deliberately separate, memcpy between them — the copy
+ * a software forwarder on commodity hardware cannot avoid; cf. AvA shadow
+ * buffers, rCUDA pinned pools). Guest DMA pointers arriving in MMIO writes
+ * are rewritten to the device buffer at the same payload offset.
  *
  * Usage:
  *   ./test            (waits for the host forwarder to connect)
@@ -28,253 +35,243 @@
 
 #include <coyote/cThread.hpp>
 
-#include "mailbox.hpp"
+#include "messages.hpp"
 
 using namespace jsfwd;
 
-// ---------------------------------------------------------------------------
 // Constants
-// ---------------------------------------------------------------------------
 #define CLOCK_PERIOD_NS 4
 #define NIC_VFPGA_ID    0
 #define JIGSAW_VFPGA_ID 1
+#define DEF_PORT        coyote::DEF_PORT
 
-// ---------------------------------------------------------------------------
-// Replayer
-// ---------------------------------------------------------------------------
-class Replayer {
-public:
-    Replayer(coyote::cThread &nic_thread, coyote::cThread &jigsaw_thread,
-             char *nic_buf, char *device_buf)
-        : nic(nic_thread), jig(jigsaw_thread), nic_buf(nic_buf),
-          device_buf(device_buf) {}
+// Globals (May-server style: plain file-scope state, logic in main)
+static coyote::cThread *nic;
+static coyote::cThread *jig;
+static char *nic_buf;
+static char *device_buf;
+static uint64_t app_base;
 
-    // Serve one request; returns false once the host sent MBOX_STOP.
-    bool serve_one() {
-        mbox_msg m;
-        mbox_wait(nic_buf, MBOX_REQ_OFF, last_seq, m);
-        last_seq = m.seq;
-        served++;
+// Shadow copies of the last-written DMA parameter registers, needed to
+// stage payloads and rewrite guest pointers at trigger time.
+static uint64_t sh_src, sh_dst, sh_h2d, sh_d2h;
 
-        switch (m.type) {
-        case MBOX_SETUP:
-            app_base = m.addr;
-            std::cout << "Setup received: app_base = 0x" << std::hex
-                      << app_base << std::dec << ", payload = " << m.value
-                      << " bytes" << std::endl;
-            respond(m.seq, 0);
-            break;
-        case MBOX_MMIO_WRITE:
-            // respond only after the write fully took effect: for DMA and
-            // compute triggers that is after the device finished and any
-            // D2H payload was pushed — the response can never overtake data
-            handle_write(m.addr, m.value);
-            respond(m.seq, 0);
-            break;
-        case MBOX_MMIO_READ:
-            respond(m.seq, jig.getCSR(dev_reg_index(m.addr)));
-            break;
-        case MBOX_SYNC:
-            // full quiesce, as the jigsaw_baseline_rdma pair does around
-            // every transfer: ack first, then both sides clear completion
-            // state and meet in the TCP barrier with an idle wire
-            respond(m.seq, 0);
-            nic.clearCompleted();
-            nic.connSync(false);
-            break;
-        case MBOX_STOP:
-            respond(m.seq, 0);
-            return false;
-        default:
-            std::cerr << "Unknown mailbox type: " << m.type << std::endl;
-            respond(m.seq, 0);
-            break;
+// Guest DMA pointer -> device buffer address at the same payload offset
+static uint64_t rewrite(uint64_t guest_ptr) {
+    return reinterpret_cast<uint64_t>(device_buf) + (guest_ptr - app_base);
+}
+
+static bool payload_range_ok(uint64_t off, uint64_t len) {
+    return off >= PAYLOAD_OFF && off < BUF_BYTES && len <= BUF_BYTES - off;
+}
+
+// Poll the accelerator's STATUS until `mask` is set, like the May server's
+// device_h2d/device_d2h. Diagnose a wedged operation: dump the
+// engine-visible registers once after 3 s stuck.
+static void wait_status(uint64_t mask) {
+    uint64_t start = now_ms();
+    bool dumped = false;
+    while ((jig->getCSR(dev_reg_index(
+               static_cast<uint64_t>(DevReg::DMA_STATUS))) & mask) != mask) {
+        std::this_thread::sleep_for(std::chrono::nanoseconds(CLOCK_PERIOD_NS));
+        if (!dumped && now_ms() - start > 3000) {
+            dumped = true;
+            std::cerr << "[dev] wait_status(0x" << std::hex << mask
+                      << ") stuck 3s: STATUS=0x"
+                      << jig->getCSR(dev_reg_index(static_cast<uint64_t>(DevReg::DMA_STATUS)))
+                      << " CMD=0x"
+                      << jig->getCSR(dev_reg_index(static_cast<uint64_t>(DevReg::DMA_CMD)))
+                      << " TX_LEN=0x"
+                      << jig->getCSR(dev_reg_index(static_cast<uint64_t>(DevReg::DMA_TX_LEN)))
+                      << " H2D_LEN=0x"
+                      << jig->getCSR(dev_reg_index(static_cast<uint64_t>(DevReg::DMA_H2D_LEN)))
+                      << " D2H_LEN=0x"
+                      << jig->getCSR(dev_reg_index(static_cast<uint64_t>(DevReg::DMA_D2H_LEN)))
+                      << std::dec << std::endl;
         }
-        // Clear local completion state every request, matching the baseline
-        // server's per-transfer clear (cheap local register write, safe
-        // because the protocol is synchronous — the response and any D2H
-        // payload push are already posted, nothing else is outstanding).
-        // Clear BOTH threads: the jigsaw vFPGA's DMA operations accumulate
-        // completion state on their own cThread, and leaving it uncleared
-        // for thousands of DMAs eventually wedged the vFPGA's D2H
-        // completion signaling deep into a trace run (observed at spmv
-        // ev8 with a perfectly healthy wire).
-        nic.clearCompleted();
-        jig.clearCompleted();
-        return true;
     }
+}
 
-    uint64_t requests_served() const { return served; }
-
-private:
-    void respond(uint64_t seq, uint64_t value) {
-        mbox_send(nic, nic_buf, MBOX_RESP_OFF, 0, 0, value, seq);
+// H2D: the payload was pushed into our NIC buffer before the trigger
+// request (same QP, placed in order) — bounce it into the device buffer.
+static void stage_in(uint64_t src_ptr, uint64_t len) {
+    uint64_t off = src_ptr - app_base;
+    if (!payload_range_ok(off, len)) {
+        std::cerr << "stage_in: payload out of range (off=0x" << std::hex
+                  << off << ", len=0x" << len << std::dec << ")" << std::endl;
+        return;
     }
+    memcpy(device_buf + off, nic_buf + off, len);
+}
 
-    void handle_write(uint64_t addr, uint64_t value) {
-        switch (static_cast<DevReg>(addr)) {
-        case DevReg::DMA_SRC_ADDR:
-            sh_src = value;
-            jig.setCSR(rewrite(value), dev_reg_index(addr));
-            return;
-        case DevReg::DMA_DST_ADDR:
-            sh_dst = value;
-            jig.setCSR(rewrite(value), dev_reg_index(addr));
-            return;
-        case DevReg::DMA_H2D_LEN:
-            sh_h2d = value;
-            break;
-        case DevReg::DMA_D2H_LEN:
-            sh_d2h = value;
-            break;
-        case DevReg::DMA_CMD:
-            if (value == DMA_CMD_H2D) {
-                stage_in(sh_src, sh_h2d);
-                jig.setCSR(value, dev_reg_index(addr));
-                return;
-            }
-            if (value == DMA_CMD_D2H) {
-                jig.setCSR(value, dev_reg_index(addr));
-                wait_status(STATUS_DMA_DONE_MASK);
-                stage_out(sh_dst, sh_d2h);
-                return;
-            }
-            break;
-        case DevReg::START_COMPUTE:
-            if (value == 1) {
-                if (sh_h2d) stage_in(sh_src, sh_h2d);
-                jig.setCSR(value, dev_reg_index(addr));
-                wait_status(STATUS_BUNDLE_DONE_MASK);
-                if (sh_d2h) stage_out(sh_dst, sh_d2h);
-                return;
-            }
-            break;
-        default:
-            break;
-        }
-        jig.setCSR(value, dev_reg_index(addr));
+// D2H: bounce the accelerator's output into the NIC buffer and push it to
+// the host; the completion follows on the same QP, so the host can never
+// see it before the data has landed.
+static void stage_out(uint64_t dst_ptr, uint64_t len) {
+    uint64_t off = dst_ptr - app_base;
+    if (!payload_range_ok(off, len)) {
+        std::cerr << "stage_out: payload out of range (off=0x" << std::hex
+                  << off << ", len=0x" << len << std::dec << ")" << std::endl;
+        return;
     }
+    memcpy(nic_buf + off, device_buf + off, len);
+    uint64_t aligned = (len + 63) & ~uint64_t(63);
+    if (off + aligned > BUF_BYTES)
+        aligned = BUF_BYTES - off;
+    coyote::rdmaSg sg = {.local_offs = off, .remote_offs = off,
+                         .len = static_cast<uint32_t>(aligned)};
+    nic->invoke(coyote::CoyoteOper::REMOTE_RDMA_WRITE, sg);
+}
 
-    // Guest DMA pointer -> device buffer address at the same payload offset
-    uint64_t rewrite(uint64_t guest_ptr) const {
-        return reinterpret_cast<uint64_t>(device_buf) + (guest_ptr - app_base);
-    }
-
-    bool payload_range_ok(uint64_t off, uint64_t len) const {
-        return off >= PAYLOAD_OFF && off < BUF_BYTES && len <= BUF_BYTES - off;
-    }
-
-    // H2D: the payload was pushed into our NIC buffer before the trigger
-    // request (same QP, placed in order) — bounce it into the device buffer.
-    void stage_in(uint64_t src_ptr, uint64_t len) {
-        uint64_t off = src_ptr - app_base;
-        if (!payload_range_ok(off, len)) {
-            std::cerr << "stage_in: payload out of range (off=0x" << std::hex
-                      << off << ", len=0x" << len << std::dec << ")" << std::endl;
+// Replay one MMIO write on the accelerator. Triggers execute fully
+// (STATUS polled) before this returns, so the completion sent afterwards
+// means the operation is done.
+static void handle_write(uint64_t addr, uint64_t value) {
+    switch (static_cast<DevReg>(addr)) {
+    case DevReg::DMA_SRC_ADDR:
+        sh_src = value;
+        jig->setCSR(rewrite(value), dev_reg_index(addr));
+        return;
+    case DevReg::DMA_DST_ADDR:
+        sh_dst = value;
+        jig->setCSR(rewrite(value), dev_reg_index(addr));
+        return;
+    case DevReg::DMA_H2D_LEN:
+        sh_h2d = value;
+        break;
+    case DevReg::DMA_D2H_LEN:
+        sh_d2h = value;
+        break;
+    case DevReg::DMA_CMD:
+        if (value == DMA_CMD_H2D) {
+            stage_in(sh_src, sh_h2d);
+            jig->setCSR(value, dev_reg_index(addr));
+            wait_status(STATUS_DMA_DONE_MASK);
             return;
         }
-        memcpy(device_buf + off, nic_buf + off, len);
-    }
-
-    // D2H: bounce the accelerator's output into the NIC buffer and push it;
-    // the trigger's response follows on the same QP, so the host can never
-    // see completion before the data has landed.
-    void stage_out(uint64_t dst_ptr, uint64_t len) {
-        uint64_t off = dst_ptr - app_base;
-        if (!payload_range_ok(off, len)) {
-            std::cerr << "stage_out: payload out of range (off=0x" << std::hex
-                      << off << ", len=0x" << len << std::dec << ")" << std::endl;
+        if (value == DMA_CMD_D2H) {
+            jig->setCSR(value, dev_reg_index(addr));
+            wait_status(STATUS_DMA_DONE_MASK);
+            stage_out(sh_dst, sh_d2h);
             return;
         }
-        memcpy(nic_buf + off, device_buf + off, len);
-        push_payload(nic, off, len);
-    }
-
-    void wait_status(uint64_t mask) {
-        uint64_t start = now_ms();
-        bool dumped = false;
-        while ((jig.getCSR(dev_reg_index(
-                   static_cast<uint64_t>(DevReg::DMA_STATUS))) & mask) != mask) {
-            std::this_thread::sleep_for(std::chrono::nanoseconds(CLOCK_PERIOD_NS));
-            // Diagnose a wedged operation: dump the engine-visible registers
-            // once after 3 s. CMD bit0 still set => the engine never consumed
-            // the start (busy/held elsewhere); bit0 cleared with STATUS never
-            // arriving => the engine consumed the start and its single-cycle
-            // un-handshaked sq command was dropped by the shell (it is then
-            // stuck in SEND_PAYLOAD/RECEIVE_PAYLOAD; see dma_engine.sv).
-            if (!dumped && now_ms() - start > 3000) {
-                dumped = true;
-                std::cerr << "[dev] wait_status(0x" << std::hex << mask
-                          << ") stuck 3s: STATUS=0x"
-                          << jig.getCSR(dev_reg_index(static_cast<uint64_t>(DevReg::DMA_STATUS)))
-                          << " CMD=0x"
-                          << jig.getCSR(dev_reg_index(static_cast<uint64_t>(DevReg::DMA_CMD)))
-                          << " TX_LEN=0x"
-                          << jig.getCSR(dev_reg_index(static_cast<uint64_t>(DevReg::DMA_TX_LEN)))
-                          << " H2D_LEN=0x"
-                          << jig.getCSR(dev_reg_index(static_cast<uint64_t>(DevReg::DMA_H2D_LEN)))
-                          << " D2H_LEN=0x"
-                          << jig.getCSR(dev_reg_index(static_cast<uint64_t>(DevReg::DMA_D2H_LEN)))
-                          << std::dec << std::endl;
-            }
+        break;
+    case DevReg::START_COMPUTE:
+        if (value == 1) {
+            if (sh_h2d) stage_in(sh_src, sh_h2d);
+            jig->setCSR(value, dev_reg_index(addr));
+            wait_status(STATUS_BUNDLE_DONE_MASK);
+            if (sh_d2h) stage_out(sh_dst, sh_d2h);
+            return;
         }
+        break;
+    default:
+        break;
     }
+    jig->setCSR(value, dev_reg_index(addr));
+}
 
-    coyote::cThread &nic;
-    coyote::cThread &jig;
-    char *nic_buf;
-    char *device_buf;
-
-    uint64_t app_base = 0;
-    uint64_t last_seq = 0;
-    uint64_t served = 0;
-    uint64_t sh_src = 0, sh_dst = 0, sh_h2d = 0, sh_d2h = 0;
-};
-
-// ---------------------------------------------------------------------------
-// Main
-// ---------------------------------------------------------------------------
 int main(int argc, char *argv[]) {
-    HEADER("JIGSAW SW FORWARDER — DEVICE REPLAYER");
+    std::cout << "Starting Jigsaw SW Forwarder — Device Replayer..." << std::endl;
 
     // vFPGA 0: perf_rdma (dumb NIC), vFPGA 1: jigsaw_baseline (accelerator)
-    coyote::cThread nic_thread(NIC_VFPGA_ID, getpid());
-    coyote::cThread jigsaw_thread(JIGSAW_VFPGA_ID, getpid());
+    coyote::cThread coyote_nic(NIC_VFPGA_ID, getpid());
+    coyote::cThread coyote_jigsaw(JIGSAW_VFPGA_ID, getpid());
+    nic = &coyote_nic;
+    jig = &coyote_jigsaw;
 
-    std::cout << "Waiting for host connection on port " << coyote::DEF_PORT
-              << " ..." << std::endl;
-    char *nic_buf = static_cast<char *>(
-        nic_thread.initRDMA(BUF_BYTES, coyote::DEF_PORT));
+    std::cout << "Waiting for host connection on port " << DEF_PORT << " ..."
+              << std::endl;
+    nic_buf = static_cast<char *>(coyote_nic.initRDMA(BUF_BYTES, DEF_PORT));
     if (!nic_buf) {
         std::cerr << "initRDMA failed" << std::endl;
         return EXIT_FAILURE;
     }
-    memset(nic_buf, 0, CTRL_BYTES);
+    memset(nic_buf, 0, CONTROL_SIZE);
 
-    // Device staging buffer, mapped only into the accelerator's TLB
-    char *device_buf = static_cast<char *>(
-        jigsaw_thread.getMem({coyote::CoyoteAllocType::HPF, BUF_BYTES}));
+    // Staging buffer for the accelerator, mapped only into vFPGA 1's TLB
+    device_buf = static_cast<char *>(
+        coyote_jigsaw.getMem({coyote::CoyoteAllocType::HPF, BUF_BYTES}));
     if (!device_buf) {
         std::cerr << "device staging buffer allocation failed" << std::endl;
         return EXIT_FAILURE;
     }
     memset(device_buf, 0, BUF_BYTES);  // pre-fault
 
-    jigsaw_thread.setCSR(jigsaw_thread.getCtid(), COYOTE_PID_REG);
+    coyote_jigsaw.setCSR(coyote_jigsaw.getCtid(), COYOTE_PID_REG);
 
-    Replayer replayer(nic_thread, jigsaw_thread, nic_buf, device_buf);
+    volatile struct msg *mailbox = reinterpret_cast<volatile struct msg *>(nic_buf);
 
-    // Barrier: both sides have zeroed their control pages
-    nic_thread.connSync(false);
+    // Initial sync with the host (May-server parity)
+    coyote_nic.connSync(false);
     std::cout << "Host connected." << std::endl;
 
-    while (replayer.serve_one()) {
-    }
-    std::cout << "Host posted STOP after " << replayer.requests_served()
-              << " requests." << std::endl;
+    uint64_t served = 0;
+    bool running = true;
+    while (running) {
+        // Poll the mailbox for a request (clear-and-wait ready flag)
+        if (!(mailbox->ready == 1 && mailbox->type == MSG_REQUEST)) {
+            continue;
+        }
+        uint64_t op = mailbox->op;
+        uint64_t addr = mailbox->addr;
+        uint64_t value = mailbox->value;
 
-    nic_thread.connSync(false);
-    nic_thread.closeConn();
+        // Clear local ready flag immediately to prevent re-processing
+        mailbox->ready = 0;
+        served++;
+
+        uint64_t result = 0;
+        switch (op) {
+        case OP_SETUP:
+            app_base = value;
+            std::cout << "Setup received: app_base = 0x" << std::hex
+                      << app_base << std::dec << std::endl;
+            break;
+        case OP_MMIO_WRITE:
+            handle_write(addr, value);
+            break;
+        case OP_MMIO_READ:
+            result = jig->getCSR(dev_reg_index(addr));
+            break;
+        case OP_SYNC:
+        case OP_STOP:
+            // completion sent below; quiesce/exit handled after the send
+            break;
+        default:
+            std::cerr << "Unknown op: " << op << std::endl;
+            break;
+        }
+
+        // Signal completion back to the host: compose in place, write the
+        // single 64 B mailbox into the host's slot (offset 0, same QP as
+        // any D2H payload pushed above, so it is placed after the data).
+        mailbox->type = MSG_COMPLETION;
+        mailbox->value = result;
+        mailbox->ready = 1;
+        coyote::rdmaSg compl_sg = {.local_offs = 0, .remote_offs = 0, .len = 64};
+        coyote_nic.invoke(coyote::CoyoteOper::REMOTE_RDMA_WRITE, compl_sg);
+
+        if (op == OP_SYNC) {
+            // Full quiesce, exactly as the May server does: flush completion
+            // state on both threads and meet the host in the TCP barrier
+            // with an idle wire.
+            coyote_nic.clearCompleted();
+            coyote_jigsaw.clearCompleted();
+            coyote_nic.connSync(true);
+        } else if (op == OP_STOP) {
+            running = false;
+        } else {
+            // Cheap local flush every request, the baseline server's cadence
+            coyote_nic.clearCompleted();
+            coyote_jigsaw.clearCompleted();
+        }
+    }
+
+    std::cout << "Host posted STOP after " << served << " requests." << std::endl;
+
+    coyote_nic.connSync(true);
+    coyote_nic.closeConn();
 
     return EXIT_SUCCESS;
 }

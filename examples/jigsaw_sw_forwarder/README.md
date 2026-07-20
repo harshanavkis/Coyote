@@ -18,23 +18,43 @@ guest/app buffer --memcpy--> NIC buffer --RDMA--> NIC buffer --memcpy--> device 
       (host)                  (host)              (device)                (device)
 ```
 
+## Protocol
+
+Structured exactly like the proven `jigsaw_baseline_rdma` coyote_api pair:
+
+- One 64 B mailbox at offset 0 of the QP buffer, same slot both directions,
+  clear-and-wait `ready` flag (`type` distinguishes request/completion).
+  Strict ping-pong: at most one request in flight, ever.
+- Payloads live behind the control page at offsets mirroring the ivshmem
+  layout; ≤1 MiB per transfer (guest-driver chunking convention). An H2D
+  payload is pushed before its trigger request, a D2H payload before its
+  completion — same QP, so data is always placed before the signal.
+- The device executes MMIO writes synchronously: DMA/compute triggers poll
+  the accelerator's STATUS before completing, so a completion means done.
+- **Full quiesce before every payload-bearing transfer** (SYNC exchange +
+  `clearCompleted` + TCP `connSync` barrier) — the May client's
+  per-iteration discipline. Between two barriers the wire carries only a
+  handful of writes; that is the envelope in which this stack is reliable.
+- No retries: a missing completion after 5 s dumps diagnostics and aborts.
+
 ## Components
 
-- `common/wire.hpp` — wire protocol: 64 B request/response rings over
-  `REMOTE_RDMA_WRITE` mailboxes with credit flow control (MMIO writes are
-  posted, reads round-trip), payload region mirroring the ivshmem layout,
-  and the shared host-side forwarder core.
+- `common/messages.hpp` — wire layout only (message struct, ops, register
+  map, buffer layout); protocol logic sits inline in each `main.cpp`.
 - `sw_device` — device-node replayer: `perf_rdma` on vFPGA 0,
   `jigsaw_baseline` on vFPGA 1. Replays MMIO through the accelerator CSRs
   (CSR index = BAR offset >> 3), rewrites guest DMA pointers to a dedicated
-  device staging buffer, and pushes D2H payloads before answering status
-  reads so completion is never visible before the data.
+  device staging buffer.
+- `sw_device_selftest` — single-node debug tool: replays the full-size
+  Vortex trace directly on the accelerator vFPGA (no RDMA), with the
+  forwarder's exact register sequences, chunking and staging buffer.
 - `sw_host` — VM-path daemon: identical ivshmem/doorbell protocol to
   `jigsaw_host_controller/sw`, so the QEMU/guest stack runs unchanged.
-  Run pinned to one core (`taskset -c <core>`).
-- `sw_host_no_vm` — bring-up/benchmark harness: same raw DMA sweep and
-  Vortex trace replay as `jigsaw_host_controller/sw_no_vm` (shares its
-  `traces.hpp`), through the forwarding path.
+  Run pinned to one core (`taskset -c <core>`). (Pending rewrite onto
+  `messages.hpp`; currently not building.)
+- `sw_host_no_vm` — bring-up/benchmark harness: same Vortex trace replay
+  as `jigsaw_host_controller/sw_no_vm` (shares its `traces.hpp`), through
+  the forwarding path.
 
 ## Hardware
 
@@ -53,7 +73,7 @@ cd sw_device/build && ./test
 Then, on the host node, either the no-VM harness:
 
 ```
-cd sw_host_no_vm/build && ./test -i <device_oob_ip> [-n <iters>] [-r <trace runs>]
+cd sw_host_no_vm/build && ./test -i <device_oob_ip> [-r <trace runs>]
 ```
 
 or the VM daemon (with the VM started as in the jigsaw e2e setup):

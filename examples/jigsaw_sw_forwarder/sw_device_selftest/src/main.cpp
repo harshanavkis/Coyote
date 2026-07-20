@@ -34,7 +34,7 @@
 
 #include <coyote/cThread.hpp>
 
-#include "mailbox.hpp"
+#include "messages.hpp"
 
 using namespace jsfwd;
 
@@ -44,8 +44,6 @@ using namespace jsfwd;
 using namespace jigsaw_traces_ns;
 
 static constexpr uint32_t MIN_DMA_BYTES = 64;
-// Same chunking convention as the forwarder harness / guest driver.
-static constexpr uint64_t TRACE_CHUNK_BYTES = 1ULL << 20;
 
 static coyote::cThread *g_jig = nullptr;
 
