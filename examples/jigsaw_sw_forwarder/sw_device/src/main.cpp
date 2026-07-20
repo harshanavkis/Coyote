@@ -94,7 +94,13 @@ public:
         // server's per-transfer clear (cheap local register write, safe
         // because the protocol is synchronous — the response and any D2H
         // payload push are already posted, nothing else is outstanding).
+        // Clear BOTH threads: the jigsaw vFPGA's DMA operations accumulate
+        // completion state on their own cThread, and leaving it uncleared
+        // for thousands of DMAs eventually wedged the vFPGA's D2H
+        // completion signaling deep into a trace run (observed at spmv
+        // ev8 with a perfectly healthy wire).
         nic.clearCompleted();
+        jig.clearCompleted();
         return true;
     }
 
