@@ -86,6 +86,37 @@ static double secs(clk::time_point a, clk::time_point b)
 // bundles are never chunked (their transfers are tiny by construction).
 static constexpr uint64_t TRACE_CHUNK_BYTES = 1ULL << 20;
 
+// Diagnose a stuck completion poll from the host side: after 3 s of polling
+// without the expected STATUS bits, dump the device's engine-visible
+// registers once (read over the wire — the replayer answers MMIO_READs even
+// while the accelerator is wedged, since it only blocks in wait_status for
+// D2H/bundle operations). CMD bit0 still set means the engine never consumed
+// the start; bit0 cleared with STATUS stuck means the engine consumed the
+// start and its DMA command was dropped (stuck in SEND_PAYLOAD /
+// RECEIVE_PAYLOAD, see dma_engine.sv).
+static void poll_status(HostForwarder &fw, uint64_t mask, const char *what)
+{
+    auto start = clk::now();
+    bool dumped = false;
+    while ((fw.mmio_read(static_cast<uint64_t>(DevReg::DMA_STATUS)) & mask) != mask) {
+        if (!dumped && secs(start, clk::now()) > 3.0) {
+            dumped = true;
+            std::cerr << "\n[host] " << what << " poll(0x" << std::hex << mask
+                      << ") stuck 3s: STATUS=0x"
+                      << fw.mmio_read(static_cast<uint64_t>(DevReg::DMA_STATUS))
+                      << " CMD=0x"
+                      << fw.mmio_read(static_cast<uint64_t>(DevReg::DMA_CMD))
+                      << " TX_LEN=0x"
+                      << fw.mmio_read(static_cast<uint64_t>(DevReg::DMA_TX_LEN))
+                      << " H2D_LEN=0x"
+                      << fw.mmio_read(static_cast<uint64_t>(DevReg::DMA_H2D_LEN))
+                      << " D2H_LEN=0x"
+                      << fw.mmio_read(static_cast<uint64_t>(DevReg::DMA_D2H_LEN))
+                      << std::dec << std::endl;
+        }
+    }
+}
+
 static double do_bulk(HostForwarder &fw, uint64_t dma_addr, uint32_t size, bool d2h)
 {
     auto start = clk::now();
@@ -99,8 +130,7 @@ static double do_bulk(HostForwarder &fw, uint64_t dma_addr, uint32_t size, bool 
         fw.mmio_write(static_cast<uint64_t>(DevReg::DMA_STATUS), 0);
         fw.mmio_write(static_cast<uint64_t>(DevReg::DMA_CMD),
                       d2h ? DMA_CMD_D2H : DMA_CMD_H2D);
-        while ((fw.mmio_read(static_cast<uint64_t>(DevReg::DMA_STATUS)) & 0x1) != 1) {
-        }
+        poll_status(fw, STATUS_DMA_DONE_MASK, d2h ? "BULK_D2H" : "BULK_H2D");
         fw.mmio_write(static_cast<uint64_t>(DevReg::DMA_STATUS), 0);
         off += chunk;
         remaining -= chunk;
@@ -131,8 +161,7 @@ static double do_bundle(HostForwarder &fw, uint64_t dma_addr, uint32_t h2d,
     fw.mmio_write(static_cast<uint64_t>(DevReg::DMA_STATUS), 0);
 
     fw.mmio_write(static_cast<uint64_t>(DevReg::START_COMPUTE), 1);
-    while ((fw.mmio_read(static_cast<uint64_t>(DevReg::DMA_STATUS)) & 0x3) != 0x3) {
-    }
+    poll_status(fw, STATUS_BUNDLE_DONE_MASK, "BUNDLE");
     auto end = clk::now();
     return secs(start, end);
 }
