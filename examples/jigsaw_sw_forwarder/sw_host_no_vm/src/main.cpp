@@ -1,20 +1,19 @@
 /**
  * Jigsaw Software Forwarder — host-side trace harness (no VM)
  *
- * Structured exactly like jigsaw_baseline_rdma/sw_client_coyote_api: one
- * cThread on the perf_rdma vFPGA, a volatile 64 B mailbox at offset 0 of
- * the QP buffer with a clear-and-wait ready flag, payloads pushed into the
- * region behind the control page, and — the keystone of the proven May
- * discipline — a full quiesce (SYNC exchange + clearCompleted + TCP
- * connSync barrier) before EVERY payload-bearing transfer, so the wire
- * never carries more than a handful of writes between barriers.
+ * One cThread on the perf_rdma vFPGA (dumb NIC), one 64 B mailbox slot per
+ * direction (requests at offset 0, responses at offset 64 — each slot has
+ * exactly one writer, see messages.hpp), payloads pushed into the region
+ * behind the control page, strict ping-pong.
  *
  * Drives the same device interactions as jigsaw_host_controller/sw_no_vm
  * (Vortex OpenCL trace replay), but every MMIO access is encapsulated into
- * a mailbox request and replayed by the device-side replayer on the
- * unmodified jigsaw_baseline accelerator. The device executes triggers
- * synchronously and completes only afterwards (any D2H payload pushed
- * ahead of the completion on the same QP), so a completion means done.
+ * a mailbox request and replayed VERBATIM by the device-side replayer on
+ * the unmodified jigsaw_baseline accelerator — the device never waits on
+ * the accelerator; this harness polls STATUS over the wire exactly as the
+ * guest driver polls it locally. D2H data is pushed by the device ahead of
+ * the first STATUS response that reports "done" (same QP, placed first),
+ * so it is present in the NIC buffer the moment "done" is visible.
  *
  * DMA payloads bounce through two staging copies (application buffer ->
  * NIC buffer here, NIC buffer -> device buffer on the device node), the
@@ -44,64 +43,53 @@ using namespace jsfwd;
 // Constants
 #define DEFAULT_VFPGA_ID 0
 
-// Globals (May-client style: plain file-scope state, logic in helpers)
+// Globals (plain file-scope state, logic in helpers)
 static coyote::cThread *ct;
 static char *nic_buf;
 static char *app_buf;
-static volatile struct msg *mailbox;
+static struct msg *req_slot;             // this node is its only writer
+static volatile struct msg *resp_slot;   // written by the device
 
 // Shadow copies of the last-written DMA parameter registers, needed to
 // stage payloads at trigger time (same role as on the device side).
 static uint64_t sh_src, sh_dst, sh_h2d, sh_d2h;
 
+// Armed D2H: set at the trigger write; consumed by the first STATUS read
+// that observes the done bits (the device pushed the payload ahead of
+// that read's response on the same QP, so the data is already local).
+static struct { bool armed; uint64_t off, len, mask; } d2h_pending;
+
+static uint64_t req_seq = 0;
+
 static const uint64_t RESP_TIMEOUT_MS = 5000;
 
 // ---------------------------------------------------------------------------
-// Mailbox primitives (single slot, clear-and-wait ready flag, as in the
-// jigsaw_baseline_rdma client)
+// Mailbox primitives: one slot per direction, monotonic publish counter
+// (see messages.hpp for why not a clear-and-wait ready flag)
 // ---------------------------------------------------------------------------
-static void mbox_request(uint64_t op, uint64_t addr, uint64_t value)
+static uint64_t request(uint64_t op, uint64_t addr, uint64_t value)
 {
-    mailbox->ready = 0;
-    mailbox->type = MSG_REQUEST;
-    mailbox->op = op;
-    mailbox->addr = addr;
-    mailbox->value = value;
-    mailbox->ready = 1;
-    coyote::rdmaSg sg = {.local_offs = 0, .remote_offs = 0, .len = 64};
+    uint64_t seq = ++req_seq;
+    req_slot->op = op;
+    req_slot->addr = addr;
+    req_slot->value = value;
+    req_slot->seq = seq;  // publish flag, written last
+    coyote::rdmaSg sg = {.local_offs = REQ_OFF, .remote_offs = REQ_OFF, .len = 64};
     ct->invoke(coyote::CoyoteOper::REMOTE_RDMA_WRITE, sg);
-}
 
-static uint64_t wait_completion(uint64_t op, uint64_t addr)
-{
     uint64_t deadline = now_ms() + RESP_TIMEOUT_MS;
-    while (!(mailbox->ready == 1 && mailbox->type == MSG_COMPLETION)) {
+    while (resp_slot->seq < seq) {
         if (now_ms() > deadline) {
-            std::cerr << "[mbox] FATAL: no completion for op=" << op
-                      << " addr=0x" << std::hex << addr << std::dec
-                      << std::endl;
+            std::cerr << "[mbox] FATAL: no response for seq=" << seq
+                      << " op=" << op << " addr=0x" << std::hex << addr
+                      << std::dec << std::endl;
             abort();
         }
     }
-    return mailbox->value;
-}
-
-static uint64_t request(uint64_t op, uint64_t addr, uint64_t value)
-{
-    mbox_request(op, addr, value);
-    return wait_completion(op, addr);
-}
-
-// Full quiesce before every payload-bearing transfer — the May client's
-// "Structural Synchronization & Queue Flush": SYNC exchange, then both
-// sides flush completion state and meet in the TCP barrier with an idle
-// wire. Between two barriers the wire carries only a handful of writes,
-// the envelope in which this stack is proven reliable.
-static void quiesce()
-{
-    (void)request(OP_SYNC, 0, 0);
+    uint64_t result = resp_slot->value;
+    // Cheap local flush every round trip, the baseline pair's cadence
     ct->clearCompleted();
-    ct->connSync(false);
+    return result;
 }
 
 static bool payload_range_ok(uint64_t off, uint64_t len)
@@ -124,18 +112,10 @@ static void stage_in(uint64_t src_ptr, uint64_t len)
     ct->invoke(coyote::CoyoteOper::REMOTE_RDMA_WRITE, sg);
 }
 
-// D2H: by the time the trigger's completion arrived, the device's payload
-// push has landed (same QP, placed first) — bounce it into the app buffer.
-static void stage_out(uint64_t dst_ptr, uint64_t len)
-{
-    uint64_t off = dst_ptr - reinterpret_cast<uint64_t>(app_buf);
-    if (!payload_range_ok(off, len)) return;
-    memcpy(app_buf + off, nic_buf + off, len);
-}
-
-// Forward one MMIO access. Writes to trigger registers carry their payload
-// dance; the device executes triggers synchronously, so the completion of
-// the trigger write itself means the operation is done.
+// Forward one MMIO access, in the exact order the guest driver issues
+// them. An H2D trigger is preceded by its payload push (same QP, placed
+// first); a trigger with a D2H phase arms the copy-out consumed by the
+// STATUS poll below.
 static void mmio_write(uint64_t addr, uint64_t value)
 {
     switch (static_cast<DevReg>(addr)) {
@@ -146,21 +126,18 @@ static void mmio_write(uint64_t addr, uint64_t value)
     case DevReg::DMA_CMD:
         if (value == DMA_CMD_H2D) {
             stage_in(sh_src, sh_h2d);
-            (void)request(OP_MMIO_WRITE, addr, value);
-            return;
-        }
-        if (value == DMA_CMD_D2H) {
-            (void)request(OP_MMIO_WRITE, addr, value);
-            stage_out(sh_dst, sh_d2h);
-            return;
+        } else if (value == DMA_CMD_D2H) {
+            uint64_t off = sh_dst - reinterpret_cast<uint64_t>(app_buf);
+            d2h_pending = {true, off, sh_d2h, STATUS_DMA_DONE_MASK};
         }
         break;
     case DevReg::START_COMPUTE:
         if (value == 1) {
             if (sh_h2d) stage_in(sh_src, sh_h2d);
-            (void)request(OP_MMIO_WRITE, addr, value);
-            if (sh_d2h) stage_out(sh_dst, sh_d2h);
-            return;
+            if (sh_d2h) {
+                uint64_t off = sh_dst - reinterpret_cast<uint64_t>(app_buf);
+                d2h_pending = {true, off, sh_d2h, STATUS_BUNDLE_DONE_MASK};
+            }
         }
         break;
     default:
@@ -171,7 +148,18 @@ static void mmio_write(uint64_t addr, uint64_t value)
 
 static uint64_t mmio_read(uint64_t addr)
 {
-    return request(OP_MMIO_READ, addr, 0);
+    uint64_t value = request(OP_MMIO_READ, addr, 0);
+    // The device pushes an armed D2H payload before the STATUS response
+    // that first reports "done" (same QP, placed first), so the data is in
+    // the NIC buffer by the time "done" is visible — bounce it out.
+    if (static_cast<DevReg>(addr) == DevReg::DMA_STATUS && d2h_pending.armed &&
+        (value & d2h_pending.mask) == d2h_pending.mask) {
+        if (payload_range_ok(d2h_pending.off, d2h_pending.len))
+            memcpy(app_buf + d2h_pending.off, nic_buf + d2h_pending.off,
+                   d2h_pending.len);
+        d2h_pending.armed = false;
+    }
+    return value;
 }
 
 // ---------------------------------------------------------------------------
@@ -239,17 +227,12 @@ static void poll_status(uint64_t mask, const char *what)
 
 // Bulk transfers are sliced into 1 MiB chunks with a full MMIO sequence per
 // chunk — mirroring the guest driver (my_qemu_edu.c TRACE_CHUNK_BYTES).
-// Each chunk cycle is bracketed by a quiesce, exactly one May-client
-// iteration; the quiesce sits outside the timed window, as in the May
-// benchmarks. Timing accumulates over the chunks of an event.
 static double do_bulk(uint64_t dma_addr, uint32_t size, bool d2h)
 {
     double total_s = 0;
     uint64_t remaining = size, off = 0;
     while (remaining > 0) {
         uint64_t chunk = remaining > TRACE_CHUNK_BYTES ? TRACE_CHUNK_BYTES : remaining;
-
-        quiesce();
 
         auto start = clk::now();
         mmio_write(static_cast<uint64_t>(DevReg::DMA_SRC_ADDR), dma_addr + off);
@@ -282,8 +265,6 @@ static double do_bundle(uint64_t dma_addr, uint32_t h2d, uint32_t d2h,
                   << ", read " << cycles_readback << std::endl;
         throw std::runtime_error("CYCLES_COMPUTE readback mismatch");
     }
-
-    quiesce();
 
     auto start = clk::now();
     mmio_write(static_cast<uint64_t>(DevReg::DMA_SRC_ADDR), dma_addr);
@@ -399,7 +380,8 @@ int main(int argc, char *argv[])
         return EXIT_FAILURE;
     }
     memset(nic_buf, 0, CONTROL_SIZE);
-    mailbox = reinterpret_cast<volatile struct msg *>(nic_buf);
+    req_slot = reinterpret_cast<struct msg *>(nic_buf + REQ_OFF);
+    resp_slot = reinterpret_cast<volatile struct msg *>(nic_buf + RESP_OFF);
 
     // Application buffer standing in for the guest/ivshmem memory the
     // forwarder serves; payload region mirrors the QP buffer layout.
@@ -409,7 +391,7 @@ int main(int argc, char *argv[])
     }
     memset(app_buf, 0xAB, BUF_BYTES);  // pre-fault + recognizable payload
 
-    // Initial sync with the device (May-client parity)
+    // Initial sync with the device
     coyote_thread.connSync(true);
     std::cout << "RDMA connection established." << std::endl;
 
@@ -436,7 +418,7 @@ int main(int argc, char *argv[])
         }
     }
 
-    coyote_thread.connSync(false);
+    coyote_thread.connSync(true);
     coyote_thread.closeConn();
 
     std::cout << "All benchmarks completed." << std::endl;

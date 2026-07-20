@@ -8,14 +8,25 @@
  * all protocol logic sits inline in each program's main.cpp, mirroring the
  * structure of the proven jigsaw_baseline_rdma pair.
  *
- * Control plane exactly as in jigsaw_baseline_rdma: a single 64 B mailbox
- * at offset 0 of the QP buffer, used for both directions (the host writes a
- * request into the device's slot, the device writes the completion back
- * into the host's slot). Clear-and-wait `ready` flag, `type` distinguishes
- * request from completion. The payload region starts behind the control
- * page and mirrors the ivshmem layout one-to-one (ivshmem offset X == QP
- * buffer offset X), so guest DMA pointers translate with a single base
- * subtraction.
+ * Control plane: one 64 B mailbox slot per direction — requests at offset
+ * 0, responses at offset 64 — so every slot has exactly ONE writer and a
+ * node's send-source bytes are never overwritten by incoming traffic.
+ * This matters because the stack's retransmitter re-reads local memory
+ * when it replays a packet: under strict ping-pong a sender only reuses
+ * its slot after the peer's answer proves the previous message was
+ * delivered, so any packet that can still be retransmitted has stable
+ * source bytes and its replay is byte-identical.
+ *
+ * The publish flag (`seq`, written last; RDMA WRITE places bytes in
+ * increasing address order) is a monotonic counter rather than a
+ * clear-and-wait ready flag: a replayed message is RE-PLACED identically
+ * at the receiver, and a ready flag would re-arm and double-fire it,
+ * while a counter identifies it as already seen. This is duplicate
+ * detection for hardware-level replays, not a retry mechanism.
+ *
+ * The payload region starts behind the control page and mirrors the
+ * ivshmem layout one-to-one (ivshmem offset X == QP buffer offset X), so
+ * guest DMA pointers translate with a single base subtraction.
  */
 
 #include <chrono>
@@ -24,30 +35,27 @@
 namespace jsfwd {
 
 // QP buffer layout (identical on both nodes)
-constexpr uint32_t CONTROL_SIZE = 0x1000;             // control page (mailbox)
+constexpr uint32_t REQ_OFF      = 0;                  // host -> device requests
+constexpr uint32_t RESP_OFF     = 64;                 // device -> host responses
+constexpr uint32_t CONTROL_SIZE = 0x1000;             // control page (mailboxes)
 constexpr uint32_t PAYLOAD_OFF  = CONTROL_SIZE;       // == ivshmem DMA_REGION_OFFSET
 constexpr uint32_t BUF_BYTES    = 16U * 1024 * 1024;  // == ivshmem SHMEM_SIZE
 
 // Message structure for the control plane
 struct msg {
-    uint64_t type;       // 0 = request, 1 = completion
-    uint64_t op;         // OP_* below
+    uint64_t op;         // OP_* below (unused in responses)
     uint64_t addr;       // device register byte offset (MMIO ops)
     uint64_t value;      // write value / read result / setup base
-    uint64_t ready;      // signaling flag: 1 means message is valid
-    uint64_t padding[3]; // pad to 64 bytes
+    uint64_t padding[4]; // pad to 64 bytes
+    uint64_t seq;        // monotonic publish flag, written last
 };
 static_assert(sizeof(msg) == 64, "msg must be 64 B");
-
-constexpr uint64_t MSG_REQUEST    = 0;
-constexpr uint64_t MSG_COMPLETION = 1;
 
 enum : uint64_t {
     OP_SETUP      = 1,  // value = host vaddr of the app/ivshmem buffer
     OP_MMIO_WRITE = 2,
     OP_MMIO_READ  = 3,
-    OP_SYNC       = 4,  // full quiesce: both sides clearCompleted + connSync
-    OP_STOP       = 5,
+    OP_STOP       = 4,
 };
 
 // Device register map of the jigsaw_baseline vFPGA (byte offsets in the

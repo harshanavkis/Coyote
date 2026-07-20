@@ -20,22 +20,26 @@ guest/app buffer --memcpy--> NIC buffer --RDMA--> NIC buffer --memcpy--> device 
 
 ## Protocol
 
-Structured exactly like the proven `jigsaw_baseline_rdma` coyote_api pair:
-
-- One 64 B mailbox at offset 0 of the QP buffer, same slot both directions,
-  clear-and-wait `ready` flag (`type` distinguishes request/completion).
-  Strict ping-pong: at most one request in flight, ever.
+- One 64 B mailbox slot **per direction** (requests at offset 0, responses
+  at offset 64), so every slot has exactly one writer and a node's
+  send-source bytes are never overwritten by incoming traffic — the
+  stack's retransmitter re-reads local memory on replay, and under strict
+  ping-pong this guarantees any replayable packet has stable source bytes.
+- The publish flag is a **monotonic counter** (written last; RDMA WRITE
+  places bytes in increasing address order): a replayed message is
+  re-placed identically at the receiver and recognized as already seen —
+  duplicate detection for hardware-level replays, not a retry layer.
+- Strict ping-pong: at most one request in flight, ever. `clearCompleted`
+  after every round trip on both nodes (the baseline pair's cadence).
+- The device replays MMIO **verbatim**, like the guest driver: writes are
+  `setCSR` + immediate response, reads are `getCSR`; the host's forwarded
+  STATUS polls do the waiting. The device never waits on the accelerator.
 - Payloads live behind the control page at offsets mirroring the ivshmem
   layout; ≤1 MiB per transfer (guest-driver chunking convention). An H2D
-  payload is pushed before its trigger request, a D2H payload before its
-  completion — same QP, so data is always placed before the signal.
-- The device executes MMIO writes synchronously: DMA/compute triggers poll
-  the accelerator's STATUS before completing, so a completion means done.
-- **Full quiesce before every payload-bearing transfer** (SYNC exchange +
-  `clearCompleted` + TCP `connSync` barrier) — the May client's
-  per-iteration discipline. Between two barriers the wire carries only a
-  handful of writes; that is the envelope in which this stack is reliable.
-- No retries: a missing completion after 5 s dumps diagnostics and aborts.
+  payload is pushed before its trigger request; a D2H payload is pushed
+  before the response of the first STATUS read that reports "done" — same
+  QP, so data is always placed before the signal that announces it.
+- No retries: a missing response after 5 s dumps diagnostics and aborts.
 
 ## Components
 
