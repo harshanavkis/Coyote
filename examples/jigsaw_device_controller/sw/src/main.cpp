@@ -263,10 +263,13 @@ static void debug_server_loop(const coyote::cThread &ct,
 // ---------------------------------------------------------------------------
 int main(int argc, char *argv[]) {
     bool dump_debug = false;
+    bool sigusr1_debug = false;
     uint64_t dump_debug_us = 1000000;
 
     for (int i = 1; i < argc; i++) {
-        if (std::strcmp(argv[i], "--dump-debug") == 0) {
+        if (std::strcmp(argv[i], "--debug") == 0) {
+            sigusr1_debug = true;
+        } else if (std::strcmp(argv[i], "--dump-debug") == 0) {
             dump_debug = true;
         } else if (std::strcmp(argv[i], "--dump-debug-us") == 0) {
             dump_debug = true;
@@ -284,7 +287,7 @@ int main(int argc, char *argv[]) {
             }
         } else {
             std::cerr << "Usage: " << argv[0]
-                      << " [--dump-debug] [--dump-debug-us <us>]"
+                      << " [--debug] [--dump-debug] [--dump-debug-us <us>]"
                       << std::endl;
             return EXIT_FAILURE;
         }
@@ -323,24 +326,27 @@ int main(int argc, char *argv[]) {
     std::cout << "  Using RDMA WRITE" << std::endl;
     std::cout << std::endl;
 
-    // SIGUSR1 → snapshot device-side debug counters. The existing
-    // --dump-debug TCP server only fires while a client (sw_no_vm) has sent
-    // START, so it produces nothing when driven by the VM-path daemon.
-    // SIGUSR1 lets us snapshot on demand:  kill -USR1 <device-pid>
-    static std::atomic<bool> sigusr1_pending{false};
-    static const coyote::cThread *sigusr1_ct = &ct;
-    std::signal(SIGUSR1, [](int) { sigusr1_pending.store(true); });
-    std::cout << "Device debug SIGUSR1 armed (PID " << getpid()
-              << " — kill -USR1 " << getpid() << " for snapshot)" << std::endl;
-    std::thread sig_dumper([] {
-        while (true) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(250));
-            if (sigusr1_pending.exchange(false)) {
-                dump_debug_counters(*sigusr1_ct, "SIGUSR1");
+    // SIGUSR1 → snapshot device-side debug counters (opt-in via --debug;
+    // measurement runs stay clean). The existing --dump-debug TCP server
+    // only fires while a client (sw_no_vm) has sent START, so it produces
+    // nothing when driven by the VM-path daemon. SIGUSR1 lets us snapshot
+    // on demand:  kill -USR1 <device-pid>
+    if (sigusr1_debug) {
+        static std::atomic<bool> sigusr1_pending{false};
+        static const coyote::cThread *sigusr1_ct = &ct;
+        std::signal(SIGUSR1, [](int) { sigusr1_pending.store(true); });
+        std::cout << "Device debug SIGUSR1 armed (PID " << getpid()
+                  << " — kill -USR1 " << getpid() << " for snapshot)" << std::endl;
+        std::thread sig_dumper([] {
+            while (true) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(250));
+                if (sigusr1_pending.exchange(false)) {
+                    dump_debug_counters(*sigusr1_ct, "SIGUSR1");
+                }
             }
-        }
-    });
-    sig_dumper.detach();
+        });
+        sig_dumper.detach();
+    }
 
     std::atomic<bool> keep_dumping{dump_debug};
     std::atomic<bool> debug_server_ready{!dump_debug};

@@ -69,7 +69,7 @@ static void dump_hc_debug(coyote::cThread &ct, const char *label)
 
 static void on_sigusr1(int) { g_dump_pending.store(true); }
 
-static void run_app(coyote::cThread &ct, void *mem)
+static void run_app(coyote::cThread &ct, void *mem, bool debug_watcher)
 {
     uint64_t mem_addr = reinterpret_cast<uint64_t>(mem);
 
@@ -77,27 +77,30 @@ static void run_app(coyote::cThread &ct, void *mem)
     ct.setCSR(ct.getCtid(), static_cast<uint32_t>(HCReg::COYOTE_PID));
     ct.setCSR(mem_addr,     static_cast<uint32_t>(HCReg::MMIO_VADDR));
 
-    // Background watcher: every 250 ms, check MMIO_FIFO_DROPPED and dump full
-    // counters if it ever becomes non-zero (silent request drop). Also serves
-    // SIGUSR1 for on-demand snapshots when the daemon looks wedged.
-    std::signal(SIGUSR1, on_sigusr1);
-    std::cout << "HC debug watcher armed (PID " << getpid()
-              << " — kill -USR1 " << getpid() << " for snapshot)" << std::endl;
-    std::thread dumper([&ct] {
-        bool drop_reported = false;
-        while (true) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(250));
-            if (g_dump_pending.exchange(false)) {
-                dump_hc_debug(ct, "SIGUSR1");
+    // Background watcher (opt-in via --debug; measurement runs stay clean):
+    // every 250 ms, check MMIO_FIFO_DROPPED and dump full counters if it
+    // ever becomes non-zero (silent request drop). Also serves SIGUSR1 for
+    // on-demand snapshots when the daemon looks wedged.
+    if (debug_watcher) {
+        std::signal(SIGUSR1, on_sigusr1);
+        std::cout << "HC debug watcher armed (PID " << getpid()
+                  << " — kill -USR1 " << getpid() << " for snapshot)" << std::endl;
+        std::thread dumper([&ct] {
+            bool drop_reported = false;
+            while (true) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(250));
+                if (g_dump_pending.exchange(false)) {
+                    dump_hc_debug(ct, "SIGUSR1");
+                }
+                if (!drop_reported &&
+                    ct.getCSR(HC_FIFO_DROPPED_REG) != 0) {
+                    dump_hc_debug(ct, "FIFO_DROPPED detected");
+                    drop_reported = true;
+                }
             }
-            if (!drop_reported &&
-                ct.getCSR(HC_FIFO_DROPPED_REG) != 0) {
-                dump_hc_debug(ct, "FIFO_DROPPED detected");
-                drop_reported = true;
-            }
-        }
-    });
-    dumper.detach();
+        });
+        dumper.detach();
+    }
 
     void *ret = run_shmem_app(ct);
 }
@@ -107,12 +110,16 @@ static void run_app(coyote::cThread &ct, void *mem)
 // ---------------------------------------------------------------------------
 int main(int argc, char *argv[]) {
     std::string device_ip;
+    bool debug_watcher = false;
 
     boost::program_options::options_description opts("Jigsaw Host Controller Options");
     opts.add_options()
         ("ip_address,i",
             boost::program_options::value<std::string>(&device_ip),
-            "Device-side OOB TCP/IP address (for QP exchange)");
+            "Device-side OOB TCP/IP address (for QP exchange)")
+        ("debug,d",
+            boost::program_options::bool_switch(&debug_watcher),
+            "Enable the HC debug watcher (SIGUSR1 snapshots + FIFO-drop autodump); off by default");
 
     boost::program_options::variables_map vm;
     boost::program_options::store(
@@ -159,7 +166,7 @@ int main(int argc, char *argv[]) {
     ct.connSync(true);
 
     // Run the application
-    run_app(ct, shmem);
+    run_app(ct, shmem, debug_watcher);
 
     // Sync with device after finishing
     ct.connSync(true);
