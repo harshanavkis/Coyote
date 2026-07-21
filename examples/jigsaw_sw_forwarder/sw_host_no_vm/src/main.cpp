@@ -285,9 +285,18 @@ static double do_bundle(uint64_t dma_addr, uint32_t h2d, uint32_t d2h,
 // TRACE_EVENT / TRACE_SUMMARY lines are comparable with driver dmesg logs.
 static constexpr const char *TRACE_SET_LABEL = "long";
 
+// cycles_scale divides every bundle's compute cycles, modeling a faster
+// accelerator (traces captured on Vortex-on-FPGA at 250 MHz; a
+// Vortex-family ASIC clocks ~1.5 GHz, i.e. ~6x — arXiv:2512.00053).
+// Mirrors the guest driver's cycles_scale module parameter; scaled cycles
+// are programmed AND reported, so logs stay self-consistent. Sweep points:
+// 1 (as captured) and 6.
 static void run_traces(uint64_t dma_addr, uint64_t dma_capacity,
-                       int n_runs, std::vector<TraceResult> &results)
+                       int n_runs, uint64_t cycles_scale,
+                       std::vector<TraceResult> &results)
 {
+    if (cycles_scale == 0) cycles_scale = 1;
+    std::cout << "TRACE_CSV: cycles_scale=" << cycles_scale << std::endl;
     auto kind_str = [](uint8_t k) -> const char * {
         switch (k) {
             case TRACE_BULK_H2D: return "BULK_H2D";
@@ -313,11 +322,12 @@ static void run_traces(uint64_t dma_addr, uint64_t dma_capacity,
                 const auto &ev = app.events[i];
                 double total_s = 0;
                 uint64_t h2d = 0, d2h = 0;
+                const uint64_t cycles = ev.cycles / cycles_scale;
 
                 std::cerr << "[trace]   " << app.name << " ev=" << i << "/" << app.n
                           << " kind=" << kind_str(ev.kind)
                           << " h2d=" << ev.h2d_size << " d2h=" << ev.d2h_size
-                          << " cycles=" << ev.cycles << " ... " << std::flush;
+                          << " cycles=" << cycles << " ... " << std::flush;
 
                 switch (ev.kind) {
                 case TRACE_BULK_H2D:
@@ -340,7 +350,7 @@ static void run_traces(uint64_t dma_addr, uint64_t dma_capacity,
                 std::cout << "TRACE_EVENT: " << TRACE_SET_LABEL << ","
                           << app.name << "," << run << "," << i << ","
                           << static_cast<unsigned>(ev.kind) << "," << h2d << ","
-                          << d2h << "," << ev.cycles << std::endl;
+                          << d2h << "," << cycles << std::endl;
 
                 switch (ev.kind) {
                 case TRACE_BULK_H2D:
@@ -351,7 +361,7 @@ static void run_traces(uint64_t dma_addr, uint64_t dma_capacity,
                     break;
                 case TRACE_BUNDLE:
                     total_s = do_bundle(dma_addr, static_cast<uint32_t>(h2d),
-                                        static_cast<uint32_t>(d2h), ev.cycles);
+                                        static_cast<uint32_t>(d2h), cycles);
                     break;
                 }
 
@@ -374,12 +384,12 @@ static void run_traces(uint64_t dma_addr, uint64_t dma_capacity,
                     agg_bundle_ns += total_ns;
                     agg_h2d_bytes += ev.h2d_size;
                     agg_d2h_bytes += ev.d2h_size;
-                    agg_cycles    += ev.cycles;
+                    agg_cycles    += cycles;
                     break;
                 }
 
                 results.push_back({app.name, run, static_cast<int>(i), ev.kind,
-                                   ev.h2d_size, ev.d2h_size, ev.cycles,
+                                   ev.h2d_size, ev.d2h_size, cycles,
                                    total_s * 1e6, ev.original_count});
             }
 
@@ -409,6 +419,7 @@ int main(int argc, char *argv[])
 {
     std::string device_ip;
     int trace_runs = 5;
+    uint64_t cycles_scale = 1;
 
     boost::program_options::options_description opts("Jigsaw SW Forwarder (no VM) Options");
     opts.add_options()
@@ -417,7 +428,10 @@ int main(int argc, char *argv[])
             "Device-side OOB TCP/IP address (for QP exchange)")
         ("trace_runs,r",
             boost::program_options::value<int>(&trace_runs),
-            "Runs per trace application");
+            "Runs per trace application")
+        ("cycles_scale,c",
+            boost::program_options::value<uint64_t>(&cycles_scale),
+            "Divide bundle compute cycles by this factor (default 1; 6 = Vortex-ASIC-class accelerator)");
 
     boost::program_options::variables_map vm;
     boost::program_options::store(
@@ -463,7 +477,7 @@ int main(int argc, char *argv[])
     uint64_t dma_capacity = BUF_BYTES - PAYLOAD_OFF;
 
     std::vector<TraceResult> trace_results;
-    run_traces(dma_addr, dma_capacity, trace_runs, trace_results);
+    run_traces(dma_addr, dma_capacity, trace_runs, cycles_scale, trace_results);
 
     (void)request(OP_STOP, 0, 0);
 
