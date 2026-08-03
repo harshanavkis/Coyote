@@ -44,6 +44,7 @@ logic [LEN_BITS-1:0]   lu_len;
 logic cnt_local_wr, cnt_rdma_wr, cnt_drop, cnt_compl;
 logic [63:0] rd_resp_data;
 logic        rd_resp_valid;
+logic [VADDR_BITS-1:0] rdma_staging_va;
 
 // Shell-side mocks
 req_t rd_req, wr_req;
@@ -72,6 +73,7 @@ loom_ctrl inst_ctrl (
     .fifo_win(fifo_win), .fifo_off(fifo_off), .fifo_len(fifo_len),
     .fifo_src_pid(fifo_src_pid), .fifo_compl_va(fifo_compl_va),
     .fifo_payload(fifo_payload), .fifo_pop(fifo_pop),
+    .rdma_staging_va(rdma_staging_va),
     .rd_resp_data(rd_resp_data), .rd_resp_valid(rd_resp_valid),
     .cnt_local_wr(cnt_local_wr), .cnt_rdma_wr(cnt_rdma_wr),
     .cnt_rx_fwd(1'b0), .cnt_drop(cnt_drop), .cnt_compl(cnt_compl)
@@ -95,6 +97,7 @@ loom_engine inst_engine (
     .fifo_payload(fifo_payload), .fifo_pop(fifo_pop),
     .lu_idx(lu_idx), .lu_valid(lu_valid), .lu_route(lu_route),
     .lu_pid(lu_pid), .lu_base(lu_base), .lu_len(lu_len),
+    .rdma_staging_va(rdma_staging_va),
     .rd_req(rd_req), .rd_valid(rd_valid), .rd_ready(rd_ready),
     .wr_req(wr_req), .wr_valid(wr_valid), .wr_ready(wr_ready),
     .s_tdata(s_tdata), .s_tkeep(s_tkeep), .s_tvalid(s_tvalid),
@@ -113,16 +116,19 @@ loom_engine inst_engine (
 
 // ---- capture queues ----
 req_t rdq[$], wrq[$];
-typedef struct { logic [63:0] data; logic last; } beat_t;
+typedef struct { logic [63:0] data; logic [63:0] q1; logic [63:0] q2;
+                 logic last; } beat_t;
 beat_t hostq[$], netq[$];
 
 always @(posedge aclk) begin
     if (rd_valid && rd_ready) rdq.push_back(rd_req);
     if (wr_valid && wr_ready) wrq.push_back(wr_req);
     if (m_host_tvalid && m_host_tready)
-        hostq.push_back('{data: m_host_tdata[63:0], last: m_host_tlast});
+        hostq.push_back('{data: m_host_tdata[63:0], q1: m_host_tdata[127:64],
+                          q2: m_host_tdata[191:128], last: m_host_tlast});
     if (m_net_tvalid && m_net_tready)
-        netq.push_back('{data: m_net_tdata[63:0], last: m_net_tlast});
+        netq.push_back('{data: m_net_tdata[63:0], q1: m_net_tdata[127:64],
+                          q2: m_net_tdata[191:128], last: m_net_tlast});
 end
 
 // ---- helpers ----
@@ -214,6 +220,7 @@ localparam [47:0] BASE_B = 48'h7f1b_d420_0000;   // win 1, local, pid 1
 localparam [47:0] BASE_C = 48'h7f9e_8860_0000;   // win 2, rdma, pid 3
 localparam [47:0] SRC_VA = 48'h7f6a_2000_0000;
 localparam [47:0] CPL_VA = 48'h7f6a_3000_0000;
+localparam [47:0] STAGING = 48'h7f00_0000_0000;
 
 logic [63:0] rdata;
 req_t r;
@@ -231,6 +238,7 @@ initial begin
     // Setup: two windows + completion config
     program_win(4'd1, 1'b0, 6'd1, {16'b0, BASE_B}, 64'h40_0000);
     program_win(4'd2, 1'b1, 6'd3, {16'b0, BASE_C}, 64'h40_0000);
+    axil_write(16'd112, {16'b0, STAGING});   // RDMA staging vaddr (reg 14)
 
     // --- 1. Local store ---
     axil_write(16'h1040, 64'hDEAD_BEEF_0000_0001);
@@ -254,12 +262,14 @@ initial begin
     if (wrq.size() > 0) begin
         r = wrq.pop_front();
         check(r.opcode == APP_WRITE && r.strm == STRM_RDMA && r.pid == 6'd3 &&
-              r.vaddr == BASE_C + 48'h40 && r.len == 8 && r.remote && r.rdma &&
+              r.vaddr == STAGING && r.len == 64 && r.remote && r.rdma &&
               r.actv && !r.mode,
-              "rdma store: wr_req fields");
+              "rdma store: 64B message at staging vaddr");
     end
-    check(netq.size() == 1 && netq[0].data == 64'hDEAD_BEEF_0000_0002 && netq[0].last,
-          "rdma store: net beat");
+    check(netq.size() == 1 && netq[0].data == {28'b0, 28'd8, 8'd2} &&
+          netq[0].q1 == {16'b0, BASE_C + 48'h40} &&
+          netq[0].q2 == 64'hDEAD_BEEF_0000_0002 && netq[0].last,
+          "rdma store: inline message lanes");
     netq.delete();
     check(hostq.size() == 0, "rdma store: nothing on host");
 
@@ -305,13 +315,19 @@ initial begin
     if (wrq.size() == 2) begin
         r = wrq.pop_front();
         check(r.opcode == APP_WRITE && r.strm == STRM_RDMA && r.pid == 6'd3 &&
-              r.vaddr == BASE_C + 48'h200 && r.len == 128 && r.remote,
-              "dma rdma: wr_req fields");
+              r.vaddr == STAGING && r.len == 64 + 128 && r.remote,
+              "dma rdma: wire len = header + payload, staging vaddr");
         r = wrq.pop_front();
         check(r.vaddr == CPL_VA, "dma rdma: completion wr_req");
     end else wrq.delete();
-    check(netq.size() == 2 && netq[0].data == 64'hBB00 && netq[1].data == 64'hBB01 &&
-          netq[1].last, "dma rdma: net beats");
+    check(netq.size() == 3, "dma rdma: header + 2 payload beats");
+    if (netq.size() == 3) begin
+        check(netq[0].data == {28'b0, 28'd128, 8'd1} &&
+              netq[0].q1 == {16'b0, BASE_C + 48'h200} && !netq[0].last,
+              "dma rdma: header beat");
+        check(netq[1].data == 64'hBB00 && netq[2].data == 64'hBB01 &&
+              netq[2].last, "dma rdma: payload beats after header");
+    end
     netq.delete();
     check(hostq.size() == 1 && hostq[0].data == 64'd2, "dma rdma: completion value 2");
     hostq.delete();
@@ -386,7 +402,7 @@ initial begin
     check(netq.size() == 0, "bp: net beat held under backpressure");
     @(negedge aclk); m_net_tready = 1;
     wait_idle();
-    check(netq.size() == 1 && netq[0].data == 64'h7C01, "bp: net beat after release");
+    check(netq.size() == 1 && netq[0].q2 == 64'h7C01, "bp: net message after release");
     wrq.delete(); netq.delete();
 
     // --- 8. Bounds edges (window len 4MB) ---

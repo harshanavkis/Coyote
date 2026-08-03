@@ -47,15 +47,18 @@ class LoomRdmaTx(FPGATestCase):
         self.overwrite_simulation_time(FixedSimulationTime.from_string("1ms"))
         stop = self.simulate_fpga_non_blocking()
 
-        # Allocate the destination segment in the TB's RDMA-REMOTE mock
-        # (plays the exporter's registered buffer on the far host)
+        # Allocate the STAGING segment in the TB's RDMA-REMOTE mock: all
+        # wire messages land there (RETH vaddr is data-meaningless; the
+        # true target rides the message header)
         self.remote_rdma_write(0x7F9E_8860_0000, bytearray(4096))
+        self.write_register(reg64(14, 0x7F9E_8860_0000))   # RDMA_STAGING_VA
 
-        # Window 2 -> rdma route, QP-owner pid 0, base = exporter's VA, 4 MB
+        # Window 2 -> rdma route, QP-owner pid 0, base = exporter's VA
+        # (header content only - never dereferenced on this side)
         self.write_register(reg64(0, 2))
         self.write_register(reg64(1, 0b11))
         self.write_register(reg64(2, 0))
-        self.write_register(reg64(3, 0x7F9E_8860_0000))
+        self.write_register(reg64(3, 0x7FAA_0000_0000))
         self.write_register(reg64(4, 0x40_0000))
         self.write_register(reg64(5, 1))
         # Aperture store: window 2, offset 0x40 (register ids are 64-bit

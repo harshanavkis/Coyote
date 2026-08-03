@@ -38,6 +38,7 @@ constexpr uint32_t DMA_LEN     = 0x50;
 constexpr uint32_t DMA_SRC_PID = 0x58;
 constexpr uint32_t DMA_TRIGGER = 0x60;
 constexpr uint32_t DMA_COMPL_VA = 0x68;
+constexpr uint32_t RDMA_STAGING_VA = 0x70;  // RETH vaddr for outgoing wire messages
 constexpr uint32_t DBG_BASE    = 0x100;  // 8 x RO counters (see loom_ctrl.sv)
 
 // Aperture: windows 1..15, 4 KB each (byte 0x1000-0xFFFF)
@@ -87,6 +88,13 @@ inline void aperture_store(coyote::cThread &t, uint32_t win, uint32_t off,
 constexpr uint64_t READ_POISON = ~0ULL;
 inline uint64_t aperture_read(coyote::cThread &t, uint32_t win, uint32_t off) {
     return csr_read(t, aperture(win, off));
+}
+
+// Program the RDMA staging vaddr (per-host; exchanged at QP setup). All
+// outgoing rdma wire messages carry this as the RETH vaddr; the true
+// target rides the message header (op-len-vaddr).
+inline void set_rdma_staging(coyote::cThread &t, const void *va) {
+    csr_write(t, RDMA_STAGING_VA, reinterpret_cast<uint64_t>(va));
 }
 
 // Bulk transfer: configure the DMA engine, then it moves the data.

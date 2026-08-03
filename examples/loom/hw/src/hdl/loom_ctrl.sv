@@ -28,6 +28,10 @@ import lynxTypes::*;
  *   11 DMA_SRC_PID  (RW) issuer's cThread pid (used for the pull)
  *   12 DMA_TRIGGER  (W)  write 1 -> enqueue descriptor into the order FIFO
  *   13 DMA_COMPL_VA (RW) per-descriptor completion (fence) VA; 0 = none.
+ *   14 RDMA_STAGING_VA (RW) RETH vaddr used for ALL outgoing rdma
+ *                        messages (per-host staging address, exchanged at
+ *                        QP setup; the true target rides the message
+ *                        header - the wire carries op-len-vaddr).
  *                        When the descriptor retires, the engine writes an
  *                        incrementing count to (DMA_SRC_PID, DMA_COMPL_VA),
  *                        like a copy engine's semaphore release.
@@ -76,6 +80,9 @@ module loom_ctrl (
     output logic [63:0]                 fifo_payload,  // STORE: data; DESC: source VA
     input  logic                        fifo_pop,
 
+    // RDMA staging VA (to loom_engine): RETH vaddr for outgoing messages
+    output logic [VADDR_BITS-1:0]       rdma_staging_va,
+
     // Read response (from loom_engine): completes the held-open AXI read
     input  logic [63:0]                 rd_resp_data,
     input  logic                        rd_resp_valid,
@@ -106,6 +113,7 @@ localparam integer R_DMA_LEN     = 10;
 localparam integer R_DMA_SRC_PID = 11;
 localparam integer R_DMA_TRIGGER = 12;
 localparam integer R_DMA_COMPL_VA = 13;
+localparam integer R_RDMA_STAGING = 14;
 localparam integer R_DBG_BASE    = 32;
 localparam integer N_DBG         = 9;
 
@@ -179,6 +187,7 @@ wire [CSR_BITS-1:0] rd_idx = axi_araddr[ADDR_LSB +: CSR_BITS];
 // -------------------------------------------------------------------------
 logic [63:0] r_tbl_idx, r_tbl_cfg, r_tbl_pid, r_tbl_base, r_tbl_len;
 logic [63:0] r_dma_dst, r_dma_src_va, r_dma_len, r_dma_src_pid, r_dma_compl_va;
+logic [63:0] r_rdma_staging;
 logic [63:0] dbg [N_DBG];
 
 // COMMIT/TRIGGER are edge-style: they fire on the write pulse itself
@@ -196,7 +205,7 @@ always_ff @(posedge aclk) begin
     if (!aresetn) begin
         r_tbl_idx <= 0; r_tbl_cfg <= 0; r_tbl_pid <= 0; r_tbl_base <= 0; r_tbl_len <= 0;
         r_dma_dst <= 0; r_dma_src_va <= 0; r_dma_len <= 0; r_dma_src_pid <= 0;
-        r_dma_compl_va <= 0;
+        r_dma_compl_va <= 0; r_rdma_staging <= 0;
     end else if (csr_wr) begin
         case (wr_idx)
             R_TBL_IDX:     r_tbl_idx     <= axi_ctrl.wdata;
@@ -209,6 +218,7 @@ always_ff @(posedge aclk) begin
             R_DMA_LEN:     r_dma_len     <= axi_ctrl.wdata;
             R_DMA_SRC_PID: r_dma_src_pid <= axi_ctrl.wdata;
             R_DMA_COMPL_VA: r_dma_compl_va <= axi_ctrl.wdata;
+            R_RDMA_STAGING: r_rdma_staging <= axi_ctrl.wdata;
             default: ;
         endcase
     end
@@ -221,6 +231,7 @@ assign tbl_route  = r_tbl_cfg[1];
 assign tbl_pid    = r_tbl_pid[PID_BITS-1:0];
 assign tbl_base   = r_tbl_base[VADDR_BITS-1:0];
 assign tbl_len    = r_tbl_len[LEN_BITS-1:0];
+assign rdma_staging_va = r_rdma_staging[VADDR_BITS-1:0];
 
 // -------------------------------------------------------------------------
 // Order FIFO - the ordering heart of the design
@@ -366,6 +377,7 @@ always_ff @(posedge aclk) begin
             R_DMA_LEN:     axi_rdata <= r_dma_len;
             R_DMA_SRC_PID: axi_rdata <= r_dma_src_pid;
             R_DMA_COMPL_VA: axi_rdata <= r_dma_compl_va;
+            R_RDMA_STAGING: axi_rdata <= r_rdma_staging;
             default:
                 if (rd_idx >= R_DBG_BASE && rd_idx < R_DBG_BASE + N_DBG)
                     axi_rdata <= dbg[rd_idx - R_DBG_BASE];

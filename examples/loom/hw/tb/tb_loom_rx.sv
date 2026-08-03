@@ -3,9 +3,14 @@
 import lynxTypes::*;
 
 /**
- * tb_loom_rx — block test for the receive-side forwarder.
- * Mocks the incoming request (rq_wr fields), the payload stream, and the
- * shared write path (wr_ready / output stream + grant).
+ * tb_loom_rx — block test for the receive-side message parser.
+ * Mocks the incoming request (rq_wr fields), the message payload stream,
+ * and the shared write path (wr_ready / output stream + grant).
+ *
+ * Wire-message format under test (see loom_rx.sv header):
+ *   header beat: lane0 = {len[27:0], op[7:0]}, lane1 = target VA,
+ *                lane2 = inline data (op 2)
+ *   op 1 WRITE: payload beats follow; op 2 WRITE_INLINE: single beat.
  */
 module tb_loom_rx;
 
@@ -34,6 +39,10 @@ logic req, grant = 0, busy, cnt_rx_fwd;
 int errors = 0;
 int fwd_pulses = 0;
 
+localparam [7:0] OP_WR = 8'd1, OP_INL = 8'd2;
+localparam [47:0] STAGING = 48'h7f00_0000_0000;
+localparam [47:0] TARGET  = 48'h7f9e_8860_0000;
+
 loom_rx dut (
     .aclk(aclk), .aresetn(aresetn),
     .rq_req(rq_req), .rq_valid(rq_valid), .rq_ready(rq_ready),
@@ -47,12 +56,13 @@ loom_rx dut (
 );
 
 req_t wrq[$];
-typedef struct { logic [63:0] data; logic last; } beat_t;
+typedef struct { logic [63:0] data; logic [7:0] keep8; logic last; } beat_t;
 beat_t outq[$];
 
 always @(posedge aclk) begin
     if (wr_valid && wr_ready) wrq.push_back(wr_req);
-    if (m_tvalid && m_tready) outq.push_back('{data: m_tdata[63:0], last: m_tlast});
+    if (m_tvalid && m_tready)
+        outq.push_back('{data: m_tdata[63:0], keep8: m_tkeep[7:0], last: m_tlast});
     if (cnt_rx_fwd) fwd_pulses++;
 end
 
@@ -63,27 +73,30 @@ task check(input bit cond, input string msg);
     end
 endtask
 
-task incoming(input [PID_BITS-1:0] pid, input [47:0] vaddr, input [27:0] len);
+task incoming(input [PID_BITS-1:0] pid, input [27:0] wire_len);
     @(negedge aclk);
     rq_req = '0;
-    rq_req.pid = pid; rq_req.vaddr = vaddr; rq_req.len = len;
+    rq_req.pid = pid; rq_req.vaddr = STAGING; rq_req.len = wire_len;
     rq_valid = 1;
     do @(posedge aclk); while (!rq_ready);
     @(negedge aclk);
     rq_valid = 0;
 endtask
 
-task send_beats(input int n, input [63:0] base_val);
-    for (int i = 0; i < n; i++) begin
-        @(negedge aclk);
-        s_tdata  = {448'b0, base_val + 64'(i)};
-        s_tkeep  = {64{1'b1}};
-        s_tvalid = 1;
-        s_tlast  = (i == n-1);
-        do @(posedge aclk); while (!s_tready);
-        @(negedge aclk);
-        s_tvalid = 0; s_tlast = 0;
-    end
+// One message beat with explicit lanes
+task send_msg_beat(input [63:0] q0, input [63:0] q1, input [63:0] q2,
+                   input last);
+    @(negedge aclk);
+    s_tdata = '0;
+    s_tdata[63:0]    = q0;
+    s_tdata[127:64]  = q1;
+    s_tdata[191:128] = q2;
+    s_tkeep  = {64{1'b1}};
+    s_tvalid = 1;
+    s_tlast  = last;
+    do @(posedge aclk); while (!s_tready);
+    @(negedge aclk);
+    s_tvalid = 0; s_tlast = 0;
 endtask
 
 task wait_idle();
@@ -91,7 +104,6 @@ task wait_idle();
     repeat (2) @(posedge aclk);
 endtask
 
-localparam [47:0] BUF_C = 48'h7f9e_8860_0000;
 req_t r;
 
 initial begin
@@ -102,55 +114,80 @@ initial begin
     repeat (2) @(negedge aclk);
 
     // --- 1. No grant, no acceptance ---
-    @(negedge aclk); rq_valid = 1; rq_req.pid = 6'd0; rq_req.vaddr = BUF_C; rq_req.len = 128;
+    @(negedge aclk); rq_valid = 1; rq_req.pid = 6'd0;
+    rq_req.vaddr = STAGING; rq_req.len = 64;
     repeat (10) @(posedge aclk);
     check(req && !rq_ready && !busy, "must request but not accept without grant");
     @(negedge aclk); rq_valid = 0;
 
-    // --- 2. Granted single write, 2 beats ---
+    // --- 2. Inline store message: exact 8 B write, no clobber ---
     @(negedge aclk); grant = 1;
-    incoming(6'd0, BUF_C + 48'h40, 28'd128);
-    fork send_beats(2, 64'hEE00); join_none
+    incoming(6'd2, 28'd64);
+    send_msg_beat({28'b0, 28'd8, OP_INL}, {16'b0, TARGET + 48'h40},
+                  64'hEE00_0000_0000_0001, 1'b1);
     wait_idle();
-    check(wrq.size() == 1, "one wr_req");
+    check(wrq.size() == 1, "inline: one wr_req");
     if (wrq.size() > 0) begin
         r = wrq.pop_front();
-        check(r.opcode == LOCAL_WRITE && r.strm == STRM_HOST && r.pid == 6'd0 &&
-              r.vaddr == BUF_C + 48'h40 && r.len == 128 && r.last,
-              "wr_req fields");
+        check(r.opcode == LOCAL_WRITE && r.strm == STRM_HOST && r.pid == 6'd2 &&
+              r.vaddr == TARGET + 48'h40 && r.len == 8 && r.last,
+              "inline: exact 8 B write at header target");
     end
-    check(outq.size() == 2 && outq[0].data == 64'hEE00 && !outq[0].last &&
-          outq[1].data == 64'hEE01 && outq[1].last, "forwarded beats");
+    check(outq.size() == 1 && outq[0].data == 64'hEE00_0000_0000_0001 &&
+          outq[0].keep8 == 8'hFF && outq[0].last,
+          "inline: data moved to lane 0, 8 B keep");
     outq.delete();
-    check(fwd_pulses == 1, "one rx_fwd pulse");
+    check(fwd_pulses == 1, "inline: one fwd pulse");
 
-    // --- 3. Backpressure on the output stalls the input ---
-    @(negedge aclk); m_tready = 0;
-    incoming(6'd1, BUF_C + 48'h100, 28'd64);
-    @(negedge aclk);
-    s_tdata = {448'b0, 64'hDD00}; s_tkeep = {64{1'b1}}; s_tvalid = 1; s_tlast = 1;
-    repeat (10) @(posedge aclk);
-    check(!s_tready && outq.size() == 0, "stalled under backpressure");
-    @(negedge aclk); m_tready = 1;
-    do @(posedge aclk); while (!s_tready);
-    @(negedge aclk); s_tvalid = 0; s_tlast = 0;
+    // --- 3. Bulk message: header + 2 payload beats ---
+    incoming(6'd0, 28'd192);
+    send_msg_beat({28'b0, 28'd128, OP_WR}, {16'b0, TARGET + 48'h100}, 64'b0, 1'b0);
+    send_msg_beat(64'hB0B0_0000, 64'b0, 64'b0, 1'b0);
+    send_msg_beat(64'hB0B0_0001, 64'b0, 64'b0, 1'b1);
     wait_idle();
-    check(outq.size() == 1 && outq[0].data == 64'hDD00 && outq[0].last,
-          "beat delivered after backpressure released");
+    check(wrq.size() == 1, "bulk: one wr_req");
+    if (wrq.size() > 0) begin
+        r = wrq.pop_front();
+        check(r.pid == 6'd0 && r.vaddr == TARGET + 48'h100 && r.len == 128,
+              "bulk: header-described write");
+    end
+    check(outq.size() == 2 && outq[0].data == 64'hB0B0_0000 && !outq[0].last &&
+          outq[1].data == 64'hB0B0_0001 && outq[1].last,
+          "bulk: payload beats forwarded, header stripped");
+    outq.delete();
+    check(fwd_pulses == 2, "bulk: fwd pulse");
+
+    // --- 4. Backpressure: inline data held until output ready ---
+    @(negedge aclk); m_tready = 0;
+    incoming(6'd1, 28'd64);
+    send_msg_beat({28'b0, 28'd8, OP_INL}, {16'b0, TARGET + 48'h200},
+                  64'hDD01, 1'b1);
+    repeat (15) @(posedge aclk);
+    check(outq.size() == 0 && busy, "backpressure: inline beat held");
+    @(negedge aclk); m_tready = 1;
+    wait_idle();
+    check(outq.size() == 1 && outq[0].data == 64'hDD01,
+          "backpressure: inline beat after release");
     outq.delete(); wrq.delete();
 
-    // --- 4. Back-to-back requests ---
-    incoming(6'd0, BUF_C, 28'd64);
-    fork send_beats(1, 64'h1111); join_none
+    // --- 5. Unknown op: drained, nothing written ---
+    incoming(6'd0, 28'd128);
+    send_msg_beat({28'b0, 28'd8, 8'd9}, {16'b0, TARGET}, 64'hBAD0, 1'b0);
+    send_msg_beat(64'hBAD1, 64'b0, 64'b0, 1'b1);
     wait_idle();
-    incoming(6'd1, BUF_C + 48'h1000, 28'd64);
-    fork send_beats(1, 64'h2222); join_none
+    check(wrq.size() == 0 && outq.size() == 0, "unknown op: no write, drained");
+
+    // --- 6. Back-to-back inline messages ---
+    incoming(6'd0, 28'd64);
+    send_msg_beat({28'b0, 28'd8, OP_INL}, {16'b0, TARGET}, 64'h1111, 1'b1);
+    wait_idle();
+    incoming(6'd1, 28'd64);
+    send_msg_beat({28'b0, 28'd8, OP_INL}, {16'b0, TARGET + 48'h1000}, 64'h2222, 1'b1);
     wait_idle();
     check(wrq.size() == 2 && wrq[0].pid == 6'd0 && wrq[1].pid == 6'd1 &&
-          wrq[1].vaddr == BUF_C + 48'h1000, "back-to-back wr_reqs");
+          wrq[1].vaddr == TARGET + 48'h1000, "back-to-back wr_reqs");
     check(outq.size() == 2 && outq[0].data == 64'h1111 && outq[1].data == 64'h2222,
           "back-to-back beats");
-    check(fwd_pulses == 4, "four rx_fwd pulses total");
 
     if (errors == 0) $display("TB PASS (tb_loom_rx)");
     else             $display("TB FAIL (tb_loom_rx): %0d errors", errors);

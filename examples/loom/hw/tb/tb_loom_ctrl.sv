@@ -33,6 +33,7 @@ logic [63:0]           fifo_payload;
 logic                  fifo_pop;
 logic [63:0]           rd_resp_data;
 logic                  rd_resp_valid;
+logic [VADDR_BITS-1:0] rdma_staging_va;
 
 logic cnt_local_wr, cnt_rdma_wr, cnt_rx_fwd, cnt_drop, cnt_compl;
 
@@ -49,6 +50,7 @@ loom_ctrl dut (
     .fifo_win(fifo_win), .fifo_off(fifo_off), .fifo_len(fifo_len),
     .fifo_src_pid(fifo_src_pid), .fifo_compl_va(fifo_compl_va),
     .fifo_payload(fifo_payload), .fifo_pop(fifo_pop),
+    .rdma_staging_va(rdma_staging_va),
     .rd_resp_data(rd_resp_data), .rd_resp_valid(rd_resp_valid),
     .cnt_local_wr(cnt_local_wr), .cnt_rdma_wr(cnt_rdma_wr),
     .cnt_rx_fwd(cnt_rx_fwd), .cnt_drop(cnt_drop), .cnt_compl(cnt_compl)
@@ -222,7 +224,7 @@ initial begin
 
     // --- 11. Full RW CSR readback ---
     begin
-        int idx_list[10] = '{0, 1, 2, 3, 4, 8, 9, 10, 11, 13};
+        int idx_list[11] = '{0, 1, 2, 3, 4, 8, 9, 10, 11, 13, 14};
         foreach (idx_list[j]) begin
             axil_write(16'(idx_list[j] * 8), 64'hC0DE_0000_0000_0000 + 64'(idx_list[j]));
         end

@@ -61,9 +61,12 @@ Transaction-serialized consumer of the order FIFO.
 
 - STORE entry: one write request + one data beat. Local:
   `sq_wr {LOCAL_WRITE, STRM_HOST, pid, base+off, 8}` — the shell TLB
-  translates the exporter's VA under the exporter's pid. Rdma:
-  `sq_wr {APP_WRITE, STRM_RDMA, base+off, 8}` — the RETH virtual address
-  *is* the exporter's VA plus offset; the far host's TLB finishes the job.
+  translates the exporter's VA under the exporter's pid. Rdma: ONE full
+  64 B wire message at the staging RETH vaddr — beat =
+  `{lane0 = ⟨op WRITE_INLINE · len⟩, lane1 = exporter VA + off,
+  lane2 = data}`; the far loom_rx issues the exact 8 B write. Nothing
+  sub-64 B ever goes on the wire (gate G5), and the wire format is the
+  design's ⟨op·len·vaddr⟩ message.
 - DESC entry: pull `sq_rd {LOCAL_READ, src_pid, src_va, len}` (the shell
   TLB translates the issuer's source buffer during the pull), forward the
   stream to the local or rdma write side, then release the fence: if the
@@ -73,10 +76,13 @@ Transaction-serialized consumer of the order FIFO.
 
 ### loom_rx — the receive side
 
-Accepts one incoming RDMA write at a time — request on `rq_wr`
-`{pid, vaddr, len}`, payload on `axis_rrsp_recv` — and forwards it as a
-plain local write under the destination pid. It only starts when granted
-the shared write path.
+Accepts one incoming wire message at a time — request on `rq_wr`
+`{pid = QP owner, staging vaddr, wire len}`, payload on `axis_rrsp_recv`
+— parses the header beat `⟨op · len · target VA⟩` and issues exactly
+what it describes: the inline write (data lane of the header beat,
+exact length) or the header-stripped payload stream, as a local write
+under the QP owner's pid. Unknown ops drain harmlessly. It only starts
+when granted the shared write path.
 
 ### The arbiter (vfpga_top)
 
@@ -98,7 +104,7 @@ by an explicit grant. Mutual exclusion is assertion-tested in
 | per-descriptor completion write (incrementing count to a memory word) | CE **semaphore release**: the engine writes a monotonic fence value to the address the command names; `cudaStreamSynchronize`/events spin on that word | our descriptor carries its fence VA like a CE command carries its release address |
 | polling the destination / fence in ordinary memory | polling mapped fence memory (spin) — the GPU fast path | never a register read on the data path |
 | order FIFO + serialized engine | ordering of one issuer's stores and CE ops through one fabric port / stream | our single global FIFO is *stricter* than required (orders across issuers too); per-binding relaxation is future work alongside per-destination queues |
-| RETH vaddr = exporter's VA | an RDMA NIC's virtually-addressed wire format | the "global name" on the wire is just the exporter's process-local VA, meaningless anywhere else |
+| 64 B wire message ⟨op·len·vaddr⟩ at a staging RETH vaddr | an RNIC's inline-send / message descriptor; NCCL's LL protocol likewise packs flag+data into fixed-size lines | the target VA in the header is the exporter's process-local VA, meaningless anywhere else; the staging vaddr is pure transport plumbing |
 | debug counters (stores, descs, writes, drops, fences) | engine performance counters | read via CSRs off the data path |
 
 ## Deliberate simplifications (and where they go next)

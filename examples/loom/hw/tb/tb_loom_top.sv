@@ -129,14 +129,17 @@ initial forever begin
     if (rx_pending > 0) begin
         rq_wr.data = '0;
         rq_wr.data.pid = 6'd2;
-        rq_wr.data.vaddr = 48'h7f9e_8860_0000;
+        rq_wr.data.vaddr = 48'h7f00_0000_0000;   // staging (data-meaningless)
         rq_wr.data.len = 64;
         rq_wr.valid = 1;
         do @(posedge aclk); while (!rq_wr.ready);
         @(negedge aclk);
         rq_wr.valid = 0;
-        // payload
-        axis_rrsp_recv[0].tdata  = {8{64'hEE00}};
+        // Inline wire message: {op WRITE_INLINE, len 8} | target VA | data
+        axis_rrsp_recv[0].tdata  = '0;
+        axis_rrsp_recv[0].tdata[63:0]    = {28'b0, 28'd8, 8'd2};
+        axis_rrsp_recv[0].tdata[127:64]  = {16'b0, 48'h7f9e_8860_0000};
+        axis_rrsp_recv[0].tdata[191:128] = 64'hEE00;
         axis_rrsp_recv[0].tkeep  = {64{1'b1}};
         axis_rrsp_recv[0].tvalid = 1;
         axis_rrsp_recv[0].tlast  = 1;

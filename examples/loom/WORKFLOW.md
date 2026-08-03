@@ -39,13 +39,17 @@ single vFPGA. Coyote pids: A=0, B=1 (host 1); C=0 (host 2).
 
 ## Flow 2 — small write, remote: `*(P_C + 0x40) = v`
 
-Steps 1–2 identical (`awaddr = 0x2040` → win 2). Lookup says rdma:
-`sq_wr {APP_WRITE, STRM_RDMA, pid = QP owner, vaddr buf_C+0x40, len 8}`,
-payload on `axis_rreq_send`. **The RDMA RETH vaddr is C's own VA** — the
-Loom offset in affine encoding (`vaddr = buf_C + offset`; the per-binding
-QP makes them isomorphic). Host 2's RoCE stack + TLB (QP belongs to C,
-pid 0) write into `buf_C`; C polls `buf_C[0x40]`. Same instruction as
-Flow 1 on A's side; divergence only at the table lookup.
+Steps 1–2 identical (`awaddr = 0x2040` → win 2). Lookup says rdma, and
+the switch emits ONE full 64 B wire message (never a sub-beat RDMA
+payload — gate G5): `sq_wr {APP_WRITE, STRM_RDMA, pid = QP owner,
+vaddr = STAGING, len 64}` with the beat
+`{lane0 = ⟨op WRITE_INLINE · len 8⟩, lane1 = buf_C+0x40, lane2 = data}`.
+**The wire carries op·len·vaddr — the design's message format**; the
+RETH staging vaddr is a data-meaningless per-host address exchanged at
+QP setup (jigsaw's remote_vaddr pattern). Host 2's loom_rx parses the
+header and issues the EXACT 8 B local write at `buf_C+0x40` under C's
+pid — padding never clobbers neighbors. C polls `buf_C[0x40]`. Same
+instruction as Flow 1 on A's side; divergence only at the table lookup.
 
 ## Flow 3 — bulk, local: `copy(P_B + 0x10000, src, 1MB)`
 
@@ -66,9 +70,12 @@ The CPU configures the DMA engine, then the engine moves the data:
 
 ## Flow 4 — bulk, remote: `copy(P_C + 0x10000, src, 1MB)`
 
-Same pull as Flow 3; the write side is the RDMA request
-(`vaddr = buf_C+0x10000` on C's QP); the shell fragments to PMTU. On
-host 2, identical landing as Flow 2.
+Same pull as Flow 3; the write side is a wire message of length
+64+len at the staging vaddr: one header beat
+`{⟨op WRITE · len 1MB⟩, buf_C+0x10000}` followed by the payload beats
+(the shell fragments the whole message to PMTU). Host 2's loom_rx strips
+the header and forwards the payload as
+`sq_wr {LOCAL_WRITE, pid 0, buf_C+0x10000, 1MB}`.
 
 ## Flow 5 — peer load (local): `v = *(P_B + 0x48)`
 
@@ -123,7 +130,9 @@ global.
 
 ## Incoming RDMA (receive side)
 
-loom_rx accepts the incoming write request from `rq_wr` (pid, vaddr, len)
-and forwards the payload from `axis_rrsp_recv` to a local
-`sq_wr {LOCAL_WRITE}` — the same egress as Flow 1. (Exact interposition
+loom_rx accepts the incoming request from `rq_wr` (pid = QP owner,
+staging vaddr, wire len), parses the header beat from `axis_rrsp_recv`
+(`⟨op · len · target VA⟩`), and issues exactly what it describes: the
+inline 8 B write, or the header-stripped payload stream — the same
+egress as Flow 1, under the QP owner's pid. (Exact interposition
 semantics of the stock shell are hardware gate G3, see README.)

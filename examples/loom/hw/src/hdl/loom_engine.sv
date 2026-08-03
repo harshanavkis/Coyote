@@ -10,13 +10,23 @@ import lynxTypes::*;
  * STORE entry (small write, <= 8 B):
  *   local: wr_req {LOCAL_WRITE, STRM_HOST, pid, base+off, 8} + 1 beat on
  *          the host output stream (data LSB-aligned, tkeep low 8 bytes)
- *   rdma:  wr_req {APP_WRITE, STRM_RDMA, remote, pid = QP owner,
- *          base+off, 8} + 1 beat on the net output stream
+ *   rdma:  ONE full 64 B wire message (never a sub-64 B RDMA payload -
+ *          gate G5: sub-beat payloads are outside the shell's exercised
+ *          envelope): wr_req {APP_WRITE, STRM_RDMA, vaddr = STAGING, 64}
+ *          + a message beat {lane0 = header (op WRITE_INLINE, len),
+ *          lane1 = target VA (base+off), lane2 = data}. The far side's
+ *          loom_rx parses the header and issues the EXACT 8 B local
+ *          write - padding never clobbers destination bytes. The wire
+ *          thus carries op-len-vaddr, the design's message format; the
+ *          RETH staging vaddr is data-meaningless (jigsaw's
+ *          remote_vaddr pattern).
  *
  * DESC entry (bulk):
  *   1. rd_req {LOCAL_READ, STRM_HOST, src_pid, src_va, len} (the pull)
- *   2. wr_req as above with the descriptor length
- *   3. forward the pull stream to the selected output until tlast
+ *   2. wr_req: local as above with the descriptor length; rdma with
+ *      wire length 64+len at the STAGING vaddr
+ *   3. rdma only: emit the header beat {op WRITE, len, target VA} first
+ *   4. forward the pull stream to the selected output until tlast
  *   4. if the descriptor's fence VA != 0: wr_req {LOCAL_WRITE, src_pid,
  *      fence_va, 8} + one beat carrying an incrementing completion count
  *      (the copy-engine semaphore-release pattern)
@@ -60,6 +70,9 @@ module loom_engine (
     input  logic [PID_BITS-1:0]         lu_pid,
     input  logic [VADDR_BITS-1:0]       lu_base,
     input  logic [LEN_BITS-1:0]         lu_len,
+
+    // RDMA staging VA (RETH vaddr for all outgoing messages)
+    input  logic [VADDR_BITS-1:0]       rdma_staging_va,
 
     // sq_rd (pull requests)
     output req_t                        rd_req,
@@ -130,8 +143,13 @@ typedef enum logic [3:0] {
     ST_IDLE, ST_CHECK, ST_WR_REQ, ST_WR_DATA,
     ST_RD_REQ, ST_DMA_WR_REQ, ST_STREAM,
     ST_CP_REQ, ST_CP_DATA,
-    ST_RDP_REQ, ST_RDP_WAIT, ST_RD_RESP
+    ST_RDP_REQ, ST_RDP_WAIT, ST_RD_RESP,
+    ST_NET_HDR
 } state_t;
+
+// Wire-message header ops (keep in sync with loom_rx.sv)
+localparam [7:0] MSG_OP_WRITE        = 8'd1;   // header beat + payload beats
+localparam [7:0] MSG_OP_WRITE_INLINE = 8'd2;   // single beat, data in lane 2
 
 state_t state;
 
@@ -228,7 +246,9 @@ always_ff @(posedge aclk) begin
 
             // ---- DESC: pull request, write request, stream, fence ----
             ST_RD_REQ:    if (rd_ready) state <= ST_DMA_WR_REQ;
-            ST_DMA_WR_REQ: if (wr_ready) state <= ST_STREAM;
+            // rdma bulk sends the header beat before the payload stream
+            ST_DMA_WR_REQ: if (wr_ready) state <= l_route ? ST_NET_HDR : ST_STREAM;
+            ST_NET_HDR:   if (m_net_tready) state <= ST_STREAM;
             ST_STREAM:
                 if (s_tvalid && s_tlast &&
                     (( l_route && m_net_tready) || (!l_route && m_host_tready)))
@@ -313,6 +333,8 @@ always_comb begin
         wr_req.vaddr  = l_compl_va;
         wr_req.len    = 8;
     end else if (l_route) begin
+        // All rdma writes go out as wire MESSAGES at the staging vaddr:
+        // stores are one 64 B beat, bulk is a 64 B header + the payload
         // Rdma route: an RDMA WRITE on the window's QP. Field meanings:
         //   opcode APP_WRITE + mode 0 (RDMA_MODE_PARSE): the shell's
         //     request parser fragments the payload into PMTU-sized
@@ -336,8 +358,8 @@ always_comb begin
         wr_req.remote = 1'b1;
         wr_req.actv   = 1'b1;
         wr_req.pid    = l_pid;       // QP owner
-        wr_req.vaddr  = dst_vaddr;
-        wr_req.len    = l_is_desc ? l_len[LEN_BITS-1:0] : 'd8;
+        wr_req.vaddr  = rdma_staging_va;
+        wr_req.len    = l_is_desc ? (l_len[LEN_BITS-1:0] + 'd64) : 'd64;
     end else begin
         // Local route: a host-memory write through the shell TLB. pid
         // names the DESTINATION process's address space (the exporter's
@@ -354,6 +376,17 @@ always_comb begin
 
     wr_valid = (state == ST_WR_REQ) || (state == ST_DMA_WR_REQ) || (state == ST_CP_REQ);
 end
+
+// Wire-message header beat: lane0 = {reserved, len[27:0], op[7:0]},
+// lane1 = target VA (the exporter's VA + offset), lane2 = inline data
+wire [63:0] hdr_q0_inline = {28'b0, 28'd8, MSG_OP_WRITE_INLINE};
+wire [63:0] hdr_q0_bulk   = {28'b0, l_len, MSG_OP_WRITE};
+wire [63:0] hdr_q1        = {{(64-VADDR_BITS){1'b0}}, dst_vaddr};
+
+wire [AXI_DATA_BITS-1:0] msg_inline_beat =
+    {{(AXI_DATA_BITS-192){1'b0}}, l_payload, hdr_q1, hdr_q0_inline};
+wire [AXI_DATA_BITS-1:0] msg_hdr_beat =
+    {{(AXI_DATA_BITS-128){1'b0}}, hdr_q1, hdr_q0_bulk};
 
 // -------------------------------------------------------------------------
 // Data streams
@@ -394,11 +427,15 @@ always_comb begin
                     (stream_local && s_tvalid) ||
                     (state == ST_CP_DATA);
 
-    // Net output: store beat (rdma), DMA forward (rdma)
-    m_net_tdata  = stream_net ? s_tdata : beat_data;
-    m_net_tkeep  = stream_net ? s_tkeep : beat_keep;
-    m_net_tlast  = stream_net ? s_tlast : 1'b1;
+    // Net output: inline message (rdma store), header beat (rdma bulk),
+    // then forwarded DMA beats. Message/header beats are always full
+    // 64 B (keep all ones) - nothing sub-beat ever goes on the wire
+    m_net_tdata  = (state == ST_WR_DATA) ? msg_inline_beat :
+                   (state == ST_NET_HDR) ? msg_hdr_beat    : s_tdata;
+    m_net_tkeep  = stream_net ? s_tkeep : {(AXI_DATA_BITS/8){1'b1}};
+    m_net_tlast  = stream_net ? s_tlast : (state == ST_WR_DATA);
     m_net_tvalid = ((state == ST_WR_DATA) && l_route) ||
+                   (state == ST_NET_HDR) ||
                    (stream_net && s_tvalid);
 end
 
