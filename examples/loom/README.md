@@ -72,7 +72,7 @@ N_REGIONS 1`; cf. `examples/jigsaw_baseline_rdma`.
 |---|---|---|
 | 1 | loom_ctrl (CSR page + aperture capture + order FIFO), loom_table, block TBs | done, TBs pass |
 | 2 | loom_engine (store + DMA branches, completion) + block TB | done, TBs pass |
-| 3 | loom_rx + block TB | pending |
+| 3 | loom_rx + block TB | done, TBs pass |
 | 4 | vfpga_top wiring + Coyote integration sim (EN_SIM) | pending |
 | 5 | hardware bring-up, local paths | pending |
 | 6 | hardware, RDMA path (two hosts) | pending |
@@ -114,8 +114,8 @@ examples/loom/hw/tb/run_tbs.sh
 The script re-execs itself inside `xilinx-shell` if needed, compiles
 `lynx_pkg.sv` + `hw/hdl/pkg/axi_intf.sv` + the loom modules, then runs each
 `tb_*` in XSIM. Expected output: `PASS: <tb>` per testbench (currently
-`tb_loom_table`, `tb_loom_ctrl`, `tb_loom_engine`). Logs land in
-`hw/tb/work/`.
+`tb_loom_table`, `tb_loom_ctrl`, `tb_loom_engine`, `tb_loom_rx`). Logs
+land in `hw/tb/work/`.
 
 `tb_loom_engine` is a composite test (real loom_ctrl + loom_table +
 loom_engine, shell side mocked): local/rdma stores, DMA local/rdma with
