@@ -102,18 +102,26 @@ N_REGIONS 1`; cf. `examples/jigsaw_baseline_rdma`.
   integration sim ran fine on 2023.2 here. (No newer version is currently
   installed under `/share/xilinx/Vivado/`.)
 
-### One-time: configure the hw build and render lynx_pkg.sv
-
-The block TBs compile against the generated `lynxTypes` package:
+### One-time simulation setup (script)
 
 ```bash
-cd examples/loom/hw && mkdir -p build_sim && cd build_sim
-xilinx-shell -c "nix-shell -p cmake --run 'cmake .. -DFDEV_NAME=u280'"
-mkdir -p sim
-nix-shell -p 'python3.withPackages(ps: [ps.jinja2])' \
-    --run 'python3 write_hdl.py 3 0 0'
-# -> build_sim/sim/lynx_pkg.sv (+ user_logic_c0_0.sv)
+examples/loom/hw/setup_sim.sh
 ```
+
+The script configures the hw build, renders the generated RTL
+(`build_sim/sim/lynx_pkg.sv` + wrapper), builds the DPI library, and
+creates the XSIM project. Two host quirks it works around (details in
+the script header):
+
+- Vivado's bundled cmake 3.3 is too old for Coyote -> cmake comes from
+  `nix-shell`, Vivado from `xilinx-shell`.
+- **Coyote's `make sim` DPI step (xsc) fails on this host**: Vivado
+  2023.2's bundled `ld` (binutils 2.37) cannot link against NixOS glibc
+  2.42 - the signature is `unknown type [0x13] section \`.relr.dyn'` /
+  `skipping incompatible ... libmvec.so.1`, ending in
+  `Linking failed for "coyote_sim.so"`. The script builds
+  `sim/coyote_sim.so` with the system gcc instead; XSIM only dlopens the
+  library at runtime, so this is equivalent.
 
 ### Block-level testbenches (Phase 1+)
 
@@ -147,20 +155,7 @@ Coverage (hardened in Phase 4.5):
 
 ### Coyote integration sim (Phase 4)
 
-One-time hw project setup (after the lynx_pkg step above). Note: `make sim`'s
-DPI step is broken on this NixOS host (Vivado's bundled binutils cannot link
-against glibc 2.42), so the DPI lib is built with the system toolchain and
-the project created directly:
-
-```bash
-cd examples/loom/hw/build_sim
-nix-shell -p gcc --run \
-  'gcc -shared -fPIC -I/share/xilinx/Vivado/2023.2/data/xsim/include \
-   ../../../../sim/hw/dpi/file_io.c -o sim/coyote_sim.so'
-tmux new-session -d -s loom_crsim \
-  "xilinx-shell -c 'vivado -mode batch -source cr_sim.tcl' > cr_sim_run.log 2>&1"
-# wait for the session to exit; expect sim/example_loom.xpr
-```
+Prerequisite: `setup_sim.sh` above (project + DPI lib in place).
 
 Software build and run (the run spawns Vivado/XSIM, so it goes through
 xilinx-shell; use tmux, it takes minutes):
@@ -242,6 +237,37 @@ Covers: export/import through the orchestrator (windows allocated
 server-side), bogus-handle refusal, stores + fenced copies + the order
 point through the role API, and window release (subsequent stores dropped,
 observed via the drops counter).
+
+### Running on hardware (Phase 5.3 flow - NOT yet validated)
+
+The expected flow once testbed time is available; commands follow the
+standard Coyote flow and this repo's helper scripts:
+
+```bash
+# 1. Bitstream (hours; tmux). Same build dir layout as sim, own dir:
+cd examples/loom/hw && mkdir -p build_hw && cd build_hw
+xilinx-shell -c "nix-shell -p cmake --run 'cmake .. -DFDEV_NAME=u280'"
+tmux new-session -d -s loom_bit \
+  "xilinx-shell -c 'nix-shell -p cmake --run \"make project && make bitgen\"' \
+   > bitgen.log 2>&1"
+# -> bitstreams/cyt_top.bit
+
+# 2. Program the FPGA + load the driver (repo root; needs sudo; the
+#    script hot-resets the PCIe device and insmods with per-host ip/mac):
+cd ../../../..   # Coyote root
+xilinx-shell -c "vivado -mode batch -source program_fpga.tcl ..."  # or hw_server flow
+sudo bash setup_coyote.sh
+
+# 3. Software, hardware mode (no EN_SIM, no COYOTE_SIM_DIR):
+cd examples/loom/sw && mkdir -p build_hw && cd build_hw
+nix-shell -p cmake gcc boost --run 'cmake .. && make -j8'
+./test    # single-process regression (same checks as sim)
+./roles   # role-split demo: on hardware each role gets its OWN cThread,
+          # so imports translate under the exporter's distinct ctid (G1)
+```
+
+Before first hardware run, do the Phase 5.2 gate tests (G1/G2/G4, see
+"Gates to verify first" above) on stock examples.
 
 ### Switching between the C++ and Python sim harnesses
 
