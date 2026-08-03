@@ -31,11 +31,23 @@ import lynxTypes::*;
  *                        When the descriptor retires, the engine writes an
  *                        incrementing count to (DMA_SRC_PID, DMA_COMPL_VA),
  *                        like a copy engine's semaphore release.
- *   32-39 (RO) debug counters:
+ *   32-40 (RO) debug counters:
  *   32 stores captured        33 descriptors queued
  *   34 local writes issued    35 rdma writes issued
  *   36 rx writes forwarded    37 bounds/invalid drops
  *   38 order-FIFO overflows   39 completions written
+ *   40 reads captured
+ *
+ * Aperture READS (loads through a window) are captured too: the read is
+ * pushed into the same order FIFO (kind READ) and the AXI-Lite read
+ * channel is HELD OPEN (rvalid deferred) until the engine returns the
+ * 8 B result - so a load observes program order against earlier stores
+ * and descriptors. Two safety rules: a read is never dropped (arready is
+ * withheld while the FIFO is full - backpressuring a non-posted read is
+ * legal, dropping one wedges the issuing CPU until PCIe completion
+ * timeout), and reads are single-outstanding by construction (this
+ * slave completes one read before accepting the next), which is also
+ * why the design's read-credit tracker degenerates to depth-1 here.
  */
 module loom_ctrl (
     input  logic                        aclk,
@@ -55,6 +67,7 @@ module loom_ctrl (
     // Order FIFO, pop side (to loom_engine)
     output logic                        fifo_empty,
     output logic                        fifo_is_desc,
+    output logic                        fifo_is_read,
     output logic [3:0]                  fifo_win,
     output logic [27:0]                 fifo_off,
     output logic [27:0]                 fifo_len,      // DESC: length; STORE: wstrb in [7:0]
@@ -62,6 +75,10 @@ module loom_ctrl (
     output logic [VADDR_BITS-1:0]       fifo_compl_va, // DESC only: fence VA (0 = none)
     output logic [63:0]                 fifo_payload,  // STORE: data; DESC: source VA
     input  logic                        fifo_pop,
+
+    // Read response (from loom_engine): completes the held-open AXI read
+    input  logic [63:0]                 rd_resp_data,
+    input  logic                        rd_resp_valid,
 
     // Debug counter pulses (from engine / rx)
     input  logic                        cnt_local_wr,
@@ -90,10 +107,12 @@ localparam integer R_DMA_SRC_PID = 11;
 localparam integer R_DMA_TRIGGER = 12;
 localparam integer R_DMA_COMPL_VA = 13;
 localparam integer R_DBG_BASE    = 32;
-localparam integer N_DBG         = 8;
+localparam integer N_DBG         = 9;
 
-// Order FIFO entry: {tag(1), win(4), off(28), len(28), pid(PID_BITS), compl_va(VADDR_BITS), payload(64)}
-localparam integer ENTRY_W    = 1 + 4 + 28 + 28 + PID_BITS + VADDR_BITS + 64;
+// Order FIFO entry: {kind(2), win(4), off(28), len(28), pid(PID_BITS), compl_va(VADDR_BITS), payload(64)}
+// kind: 00 = STORE, 01 = DESC, 10 = READ
+localparam integer ENTRY_W    = 2 + 4 + 28 + 28 + PID_BITS + VADDR_BITS + 64;
+localparam [1:0] KIND_STORE = 2'b00, KIND_DESC = 2'b01, KIND_READ = 2'b10;
 localparam integer FIFO_AW    = 6;
 localparam integer FIFO_DEPTH = 1 << FIFO_AW;
 
@@ -126,9 +145,15 @@ logic [1:0]  axi_rresp;
 logic        axi_rvalid;
 logic        aw_en;
 
+// Aperture-read bookkeeping: rd_pending is set from the AR handshake of a
+// window load until its deferred rvalid completes
+logic rd_pending;
+wire  ar_is_aperture = |axi_ctrl.araddr[15:12];
+wire  ar_hs          = axi_arready && axi_ctrl.arvalid;
+
 logic ctrl_reg_wren, ctrl_reg_rden;
 assign ctrl_reg_wren = axi_wready && axi_ctrl.wvalid && axi_awready && axi_ctrl.awvalid;
-assign ctrl_reg_rden = axi_arready && axi_ctrl.arvalid && ~axi_rvalid;
+assign ctrl_reg_rden = axi_arready && axi_ctrl.arvalid && ~axi_rvalid && !ar_is_aperture;
 
 // Address decode: any write with a nonzero window index (addr[15:12]) is
 // an aperture store; window 0 is the CSR page
@@ -231,25 +256,33 @@ wire fifo_empty_i = (wptr == rptr);
 // the AXI-Lite bridge (posted-write semantics toward the host)
 wire push_store = ctrl_reg_wren && wr_is_aperture && !fifo_full_i;
 wire push_desc  = trigger_pulse && !fifo_full_i;
+// Reads are pushed at the AR handshake; arready is only granted when the
+// FIFO has room (see the arready block), so a read can never be dropped
+wire push_read  = ar_hs && ar_is_aperture;
 wire push_drop  = ((ctrl_reg_wren && wr_is_aperture) || trigger_pulse) && fifo_full_i;
 
 // STORE: len-field slot carries wstrb in its low 8 bits (engine currently
 // assumes full 8 B stores; wstrb kept for a later sub-word extension)
-wire [ENTRY_W-1:0] store_entry = {1'b0, wr_win, {16'b0, wr_win_off},
+wire [ENTRY_W-1:0] store_entry = {KIND_STORE, wr_win, {16'b0, wr_win_off},
                                   {20'b0, axi_ctrl.wstrb},
                                   {PID_BITS{1'b0}}, {VADDR_BITS{1'b0}},
                                   axi_ctrl.wdata};
-wire [ENTRY_W-1:0] desc_entry  = {1'b1, r_dma_dst[63:60], r_dma_dst[27:0],
+wire [ENTRY_W-1:0] desc_entry  = {KIND_DESC, r_dma_dst[63:60], r_dma_dst[27:0],
                                   r_dma_len[27:0], r_dma_src_pid[PID_BITS-1:0],
                                   r_dma_compl_va[VADDR_BITS-1:0],
                                   {{(64-VADDR_BITS){1'b0}}, r_dma_src_va[VADDR_BITS-1:0]}};
+// READ entry: window + offset only (uses the AR address at handshake time)
+wire [ENTRY_W-1:0] read_entry  = {KIND_READ, axi_ctrl.araddr[15:12],
+                                  {16'b0, axi_ctrl.araddr[11:0]},
+                                  28'b0, {PID_BITS{1'b0}}, {VADDR_BITS{1'b0}}, 64'b0};
 
 always_ff @(posedge aclk) begin
     if (!aresetn) begin
         wptr <= 0; rptr <= 0;
     end else begin
-        if (push_store || push_desc) begin
-            fifo_mem[wptr[FIFO_AW-1:0]] <= push_desc ? desc_entry : store_entry;
+        if (push_store || push_desc || push_read) begin
+            fifo_mem[wptr[FIFO_AW-1:0]] <= push_read ? read_entry :
+                                           push_desc ? desc_entry : store_entry;
             wptr <= wptr + 1'b1;
         end
         if (fifo_pop && !fifo_empty_i)
@@ -278,7 +311,8 @@ assign fifo_src_pid  = head[64+VADDR_BITS +: PID_BITS];
 assign fifo_len      = head[64+VADDR_BITS+PID_BITS +: 28];
 assign fifo_off      = head[64+VADDR_BITS+PID_BITS+28 +: 28];
 assign fifo_win      = head[64+VADDR_BITS+PID_BITS+56 +: 4];
-assign fifo_is_desc  = head[64+VADDR_BITS+PID_BITS+60];
+assign fifo_is_desc  = head[64+VADDR_BITS+PID_BITS+60 +: 2] == KIND_DESC;
+assign fifo_is_read  = head[64+VADDR_BITS+PID_BITS+60 +: 2] == KIND_READ;
 assign fifo_empty   = fifo_empty_i;
 
 // -------------------------------------------------------------------------
@@ -306,6 +340,7 @@ always_ff @(posedge aclk) begin
         if (cnt_drop)     dbg[5] <= dbg[5] + 1;
         if (push_drop)    dbg[6] <= dbg[6] + 1;
         if (cnt_compl)    dbg[7] <= dbg[7] + 1;
+        if (push_read)    dbg[8] <= dbg[8] + 1;
     end
 end
 
@@ -315,6 +350,9 @@ end
 always_ff @(posedge aclk) begin
     if (!aresetn) begin
         axi_rdata <= 0;
+    end else if (rd_pending && rd_resp_valid) begin
+        // Deferred aperture-read completion: the engine's 8 B result
+        axi_rdata <= rd_resp_data;
     end else if (ctrl_reg_rden) begin
         axi_rdata <= 0;
         case (rd_idx)
@@ -362,15 +400,27 @@ always_ff @(posedge aclk) begin
     end
 end
 
+// AR channel. CSR reads accept unconditionally (single-outstanding as
+// before). Aperture reads additionally require: no read already pending,
+// room in the order FIFO (this is the never-drop rule - the master just
+// sees arready withheld), and no write handshake completing in the same
+// cycle (the FIFO has one write port; writes keep priority).
 always_ff @(posedge aclk) begin
     if (!aresetn) begin
         axi_arready <= 1'b0; axi_araddr <= 0;
+        rd_pending  <= 1'b0;
     end else begin
-        if (~axi_arready && axi_ctrl.arvalid) begin
+        if (~axi_arready && axi_ctrl.arvalid && !rd_pending &&
+            (!ar_is_aperture ||
+             (!fifo_full_i && !(axi_ctrl.awvalid && axi_ctrl.wvalid)))) begin
             axi_arready <= 1'b1; axi_araddr <= axi_ctrl.araddr[15:0];
         end else begin
             axi_arready <= 1'b0;
         end
+        if (ar_hs && ar_is_aperture)
+            rd_pending <= 1'b1;
+        else if (axi_rvalid && axi_ctrl.rready)
+            rd_pending <= 1'b0;
     end
 end
 
@@ -397,11 +447,15 @@ always_ff @(posedge aclk) begin
     end
 end
 
+// R channel: CSR reads complete on the cycle after the AR handshake;
+// aperture reads complete only when the engine's response arrives
 always_ff @(posedge aclk) begin
     if (!aresetn) begin
         axi_rvalid <= 0; axi_rresp <= 0;
     end else begin
-        if (axi_arready && axi_ctrl.arvalid && ~axi_rvalid) begin
+        if (axi_arready && axi_ctrl.arvalid && ~axi_rvalid && !ar_is_aperture) begin
+            axi_rvalid <= 1'b1; axi_rresp <= 2'b0;
+        end else if (rd_pending && rd_resp_valid) begin
             axi_rvalid <= 1'b1; axi_rresp <= 2'b0;
         end else if (axi_rvalid && axi_ctrl.rready) begin
             axi_rvalid <= 1'b0;

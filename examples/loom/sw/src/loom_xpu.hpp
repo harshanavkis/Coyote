@@ -50,6 +50,14 @@ public:
         aperture_store(t_, win, off, v);
     }
 
+    // Peer load: 8 B read through the window (blocks for the switch round
+    // trip; POISON on invalid windows). Hardware / Python-sim only - see
+    // loom.hpp for the interactive-sim deadlock note.
+    uint64_t load(int win, uint32_t off) {
+        std::lock_guard<std::mutex> g(io_);
+        return aperture_read(t_, win, off);
+    }
+
     // Peer copy: descriptor to the engine; fence released to `fence`
     // (a word in THIS Xpu's memory) when the transfer retires
     void copy(int win, uint32_t seg_off, const void *src, uint64_t len,

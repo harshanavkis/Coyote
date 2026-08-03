@@ -77,6 +77,18 @@ inline void aperture_store(coyote::cThread &t, uint32_t win, uint32_t off,
     csr_write(t, aperture(win, off), val);
 }
 
+// Aperture load: an 8 B peer read through the window. Non-posted: blocks
+// until the switch returns the data (the engine pulls the destination's
+// 64 B line and lane-selects). Invalid windows return POISON (all-ones)
+// rather than hanging. NOTE: unusable in the C++ interactive simulation
+// (the blocking ctrl read parks the sim generator, which then cannot
+// service the engine's pull - the documented interactive-mode deadlock);
+// covered by block TBs + the Python framework + hardware.
+constexpr uint64_t READ_POISON = ~0ULL;
+inline uint64_t aperture_read(coyote::cThread &t, uint32_t win, uint32_t off) {
+    return csr_read(t, aperture(win, off));
+}
+
 // Bulk transfer: configure the DMA engine, then it moves the data.
 // compl_va is the per-descriptor completion (fence) address: when the
 // descriptor retires, the engine writes an incrementing count there under

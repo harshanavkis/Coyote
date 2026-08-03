@@ -28,7 +28,7 @@ logic [PID_BITS-1:0]   tbl_pid;
 logic [VADDR_BITS-1:0] tbl_base;
 logic [LEN_BITS-1:0]   tbl_len;
 
-logic                  fifo_empty, fifo_is_desc, fifo_pop;
+logic                  fifo_empty, fifo_is_desc, fifo_is_read, fifo_pop;
 logic [3:0]            fifo_win;
 logic [27:0]           fifo_off, fifo_len;
 logic [PID_BITS-1:0]   fifo_src_pid;
@@ -42,6 +42,8 @@ logic [VADDR_BITS-1:0] lu_base;
 logic [LEN_BITS-1:0]   lu_len;
 
 logic cnt_local_wr, cnt_rdma_wr, cnt_drop, cnt_compl;
+logic [63:0] rd_resp_data;
+logic        rd_resp_valid;
 
 // Shell-side mocks
 req_t rd_req, wr_req;
@@ -66,9 +68,11 @@ loom_ctrl inst_ctrl (
     .tbl_route(tbl_route), .tbl_pid(tbl_pid), .tbl_base(tbl_base),
     .tbl_len(tbl_len),
     .fifo_empty(fifo_empty), .fifo_is_desc(fifo_is_desc),
+    .fifo_is_read(fifo_is_read),
     .fifo_win(fifo_win), .fifo_off(fifo_off), .fifo_len(fifo_len),
     .fifo_src_pid(fifo_src_pid), .fifo_compl_va(fifo_compl_va),
     .fifo_payload(fifo_payload), .fifo_pop(fifo_pop),
+    .rd_resp_data(rd_resp_data), .rd_resp_valid(rd_resp_valid),
     .cnt_local_wr(cnt_local_wr), .cnt_rdma_wr(cnt_rdma_wr),
     .cnt_rx_fwd(1'b0), .cnt_drop(cnt_drop), .cnt_compl(cnt_compl)
 );
@@ -85,6 +89,7 @@ loom_table inst_table (
 loom_engine inst_engine (
     .aclk(aclk), .aresetn(aresetn),
     .fifo_empty(fifo_empty), .fifo_is_desc(fifo_is_desc),
+    .fifo_is_read(fifo_is_read),
     .fifo_win(fifo_win), .fifo_off(fifo_off), .fifo_len(fifo_len),
     .fifo_src_pid(fifo_src_pid), .fifo_compl_va(fifo_compl_va),
     .fifo_payload(fifo_payload), .fifo_pop(fifo_pop),
@@ -100,6 +105,7 @@ loom_engine inst_engine (
     .m_net_tdata(m_net_tdata), .m_net_tkeep(m_net_tkeep),
     .m_net_tvalid(m_net_tvalid), .m_net_tready(m_net_tready),
     .m_net_tlast(m_net_tlast),
+    .rd_resp_data(rd_resp_data), .rd_resp_valid(rd_resp_valid),
     .cnt_local_wr(cnt_local_wr), .cnt_rdma_wr(cnt_rdma_wr),
     .cnt_drop(cnt_drop), .cnt_compl(cnt_compl),
     .busy(busy)
@@ -183,6 +189,19 @@ task send_beats(input int n, input [63:0] base_val);
         @(negedge aclk);
         s_tvalid = 0; s_tlast = 0;
     end
+endtask
+
+// Feed one 64 B line beat whose 8 lanes carry base_val+lane (for
+// verifying the engine's lane select on aperture reads)
+task send_line_beat(input [63:0] base_val);
+    @(negedge aclk);
+    for (int i = 0; i < 8; i++) s_tdata[64*i +: 64] = base_val + 64'(i);
+    s_tkeep  = {64{1'b1}};
+    s_tvalid = 1;
+    s_tlast  = 1;
+    do @(posedge aclk); while (!s_tready);
+    @(negedge aclk);
+    s_tvalid = 0; s_tlast = 0;
 endtask
 
 task wait_idle();
@@ -436,6 +455,58 @@ initial begin
         check(c_drops1 - c_drops0 == 64'(exp_drops),
               $sformatf("soak: drops delta %0d, expected %0d", c_drops1 - c_drops0, exp_drops));
         wrq.delete(); hostq.delete(); netq.delete(); rdq.delete();
+    end
+
+    // --- 12. Aperture read: line pull under DEST pid, lane select ---
+    begin
+        logic [63:0] rd_out;
+        fork
+            axil_read(16'h1048, rd_out);            // win 1, offset 0x48 -> lane 1
+            begin
+                do @(posedge aclk); while (rdq.size() == 0);
+                send_line_beat(64'h1D00);
+            end
+        join
+        check(rdq.size() == 1, "read: one pull request");
+        if (rdq.size() > 0) begin
+            r = rdq.pop_front();
+            check(r.opcode == LOCAL_READ && r.pid == 6'd1 &&
+                  r.vaddr == BASE_B + 48'h40 && r.len == 64,
+                  "read: aligned line pull under dest pid");
+        end
+        check(rd_out == 64'h1D01, $sformatf("read: lane select got %h", rd_out));
+        wrq.delete(); hostq.delete();
+    end
+
+    // --- 13. Read-after-write ordering through the FIFO ---
+    begin
+        logic [63:0] rd_out;
+        wr_ready = 0;                                // stall the store
+        axil_write(16'h1040, 64'h0D3A);
+        fork
+            axil_read(16'h1040, rd_out);
+            begin
+                repeat (30) @(posedge aclk);
+                check(rdq.size() == 0, "ordering: no pull while store stalled");
+                @(negedge aclk); wr_ready = 1;       // release the store
+                do @(posedge aclk); while (rdq.size() == 0);
+                send_line_beat(64'h2D00);
+            end
+        join
+        check(wrq.size() == 1 && wrq[0].vaddr == BASE_B + 48'h40,
+              "ordering: store issued before the read");
+        check(rd_out == 64'h2D00, "ordering: read data after store");
+        wrq.delete(); hostq.delete(); rdq.delete();
+    end
+
+    // --- 14. Poison: invalid window and rdma-route window ---
+    begin
+        logic [63:0] rd_out;
+        axil_read(16'h5040, rd_out);                 // window 5: unprogrammed
+        check(rd_out == 64'hFFFF_FFFF_FFFF_FFFF, "poison on invalid window");
+        axil_read(16'h2040, rd_out);                 // window 2: rdma route
+        check(rd_out == 64'hFFFF_FFFF_FFFF_FFFF, "poison on rdma window");
+        check(rdq.size() == 0, "poison reads issue no pull");
     end
 
     if (errors == 0) $display("TB PASS (tb_loom_engine)");

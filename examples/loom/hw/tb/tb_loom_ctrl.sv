@@ -24,13 +24,15 @@ logic [PID_BITS-1:0]   tbl_pid;
 logic [VADDR_BITS-1:0] tbl_base;
 logic [LEN_BITS-1:0]   tbl_len;
 
-logic                  fifo_empty, fifo_is_desc;
+logic                  fifo_empty, fifo_is_desc, fifo_is_read;
 logic [3:0]            fifo_win;
 logic [27:0]           fifo_off, fifo_len;
 logic [PID_BITS-1:0]   fifo_src_pid;
 logic [VADDR_BITS-1:0] fifo_compl_va;
 logic [63:0]           fifo_payload;
 logic                  fifo_pop;
+logic [63:0]           rd_resp_data;
+logic                  rd_resp_valid;
 
 logic cnt_local_wr, cnt_rdma_wr, cnt_rx_fwd, cnt_drop, cnt_compl;
 
@@ -43,9 +45,11 @@ loom_ctrl dut (
     .tbl_route(tbl_route), .tbl_pid(tbl_pid), .tbl_base(tbl_base),
     .tbl_len(tbl_len),
     .fifo_empty(fifo_empty), .fifo_is_desc(fifo_is_desc),
+    .fifo_is_read(fifo_is_read),
     .fifo_win(fifo_win), .fifo_off(fifo_off), .fifo_len(fifo_len),
     .fifo_src_pid(fifo_src_pid), .fifo_compl_va(fifo_compl_va),
     .fifo_payload(fifo_payload), .fifo_pop(fifo_pop),
+    .rd_resp_data(rd_resp_data), .rd_resp_valid(rd_resp_valid),
     .cnt_local_wr(cnt_local_wr), .cnt_rdma_wr(cnt_rdma_wr),
     .cnt_rx_fwd(cnt_rx_fwd), .cnt_drop(cnt_drop), .cnt_compl(cnt_compl)
 );
@@ -109,6 +113,7 @@ initial begin
     axi_ctrl.bready = 0; axi_ctrl.rready = 0;
     axi_ctrl.awaddr = 0; axi_ctrl.wdata = 0; axi_ctrl.wstrb = 0; axi_ctrl.araddr = 0;
     fifo_pop = 0;
+    rd_resp_data = 0; rd_resp_valid = 0;
     cnt_local_wr = 0; cnt_rdma_wr = 0; cnt_rx_fwd = 0; cnt_drop = 0; cnt_compl = 0;
 
     repeat (5) @(negedge aclk);
@@ -227,6 +232,57 @@ initial begin
                   $sformatf("readback reg %0d", idx_list[j]));
         end
     end
+
+    // --- 12. Aperture read: held-open channel, READ FIFO entry, response ---
+    begin
+        // begin an AXI read to window 3 offset 0x28 without waiting rvalid
+        @(negedge aclk);
+        axi_ctrl.araddr = 64'h3028; axi_ctrl.arvalid = 1; axi_ctrl.rready = 1;
+        do @(posedge aclk); while (!axi_ctrl.arready);
+        @(negedge aclk);
+        axi_ctrl.arvalid = 0;
+        check(!fifo_empty && fifo_is_read && fifo_win == 4'd3 &&
+              fifo_off == 28'h028, "read entry captured");
+        repeat (20) @(posedge aclk);
+        check(!axi_ctrl.rvalid, "read held open until response");
+        pop_one();
+        @(negedge aclk);
+        rd_resp_data = 64'hCAFE_F00D_0000_0001; rd_resp_valid = 1;
+        @(negedge aclk);
+        rd_resp_valid = 0;
+        while (!axi_ctrl.rvalid) @(posedge aclk);
+        check(axi_ctrl.rdata == 64'hCAFE_F00D_0000_0001, "deferred read data");
+        @(negedge aclk);
+    end
+
+    // --- 13. Read never dropped: arready withheld while FIFO full ---
+    begin
+        for (int i = 0; i < 64; i++)
+            axil_write(16'h1000 + 16'(8 * (i % 512)), 64'(i));   // fill FIFO
+        @(negedge aclk);
+        axi_ctrl.araddr = 64'h1040; axi_ctrl.arvalid = 1; axi_ctrl.rready = 1;
+        repeat (20) @(posedge aclk);
+        check(!axi_ctrl.arready, "aperture read blocked while FIFO full");
+        pop_one();                                               // make room
+        do @(posedge aclk); while (!axi_ctrl.arready);
+        @(negedge aclk);
+        axi_ctrl.arvalid = 0;
+        // drain the 63 stores + our read entry, answering the read
+        for (int i = 0; i < 63; i++) pop_one();
+        check(!fifo_empty && fifo_is_read, "read entry after the stores");
+        pop_one();
+        @(negedge aclk);
+        rd_resp_data = 64'hCAFE_F00D_0000_0002; rd_resp_valid = 1;
+        @(negedge aclk);
+        rd_resp_valid = 0;
+        while (!axi_ctrl.rvalid) @(posedge aclk);
+        check(axi_ctrl.rdata == 64'hCAFE_F00D_0000_0002, "blocked read completes");
+        @(negedge aclk);
+    end
+
+    // --- 14. Reads-captured counter (idx 40) ---
+    axil_read(16'd320, rdata);
+    check(rdata == 64'd2, $sformatf("reads captured = %0d, expected 2", rdata));
 
     if (errors == 0) $display("TB PASS (tb_loom_ctrl)");
     else             $display("TB FAIL (tb_loom_ctrl): %0d errors", errors);

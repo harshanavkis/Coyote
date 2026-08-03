@@ -23,7 +23,7 @@ logic [PID_BITS-1:0]    tbl_pid;
 logic [VADDR_BITS-1:0]  tbl_base;
 logic [LEN_BITS-1:0]    tbl_len;
 
-logic                   fifo_empty, fifo_is_desc, fifo_pop;
+logic                   fifo_empty, fifo_is_desc, fifo_is_read, fifo_pop;
 logic [3:0]             fifo_win;
 logic [27:0]            fifo_off, fifo_len;
 logic [PID_BITS-1:0]    fifo_src_pid;
@@ -37,6 +37,10 @@ logic [VADDR_BITS-1:0]  lu_base;
 logic [LEN_BITS-1:0]    lu_len;
 
 logic cnt_local_wr, cnt_rdma_wr, cnt_rx_fwd, cnt_drop, cnt_compl;
+
+// Aperture-read response: engine -> ctrl (completes the held-open AXI read)
+logic [63:0] rd_resp_data;
+logic        rd_resp_valid;
 
 // Engine shell-side signals
 req_t eng_rd_req, eng_wr_req;
@@ -120,9 +124,11 @@ loom_ctrl inst_loom_ctrl (
     .tbl_route(tbl_route), .tbl_pid(tbl_pid), .tbl_base(tbl_base),
     .tbl_len(tbl_len),
     .fifo_empty(fifo_empty), .fifo_is_desc(fifo_is_desc),
+    .fifo_is_read(fifo_is_read),
     .fifo_win(fifo_win), .fifo_off(fifo_off), .fifo_len(fifo_len),
     .fifo_src_pid(fifo_src_pid), .fifo_compl_va(fifo_compl_va),
     .fifo_payload(fifo_payload), .fifo_pop(fifo_pop),
+    .rd_resp_data(rd_resp_data), .rd_resp_valid(rd_resp_valid),
     .cnt_local_wr(cnt_local_wr), .cnt_rdma_wr(cnt_rdma_wr),
     .cnt_rx_fwd(cnt_rx_fwd), .cnt_drop(cnt_drop), .cnt_compl(cnt_compl)
 );
@@ -140,7 +146,8 @@ loom_engine inst_loom_engine (
     .aclk(aclk), .aresetn(aresetn),
     // FIFO-empty masked by the arbiter: the engine runs only while granted
     .fifo_empty(fifo_empty || !eng_grant),
-    .fifo_is_desc(fifo_is_desc), .fifo_win(fifo_win), .fifo_off(fifo_off),
+    .fifo_is_desc(fifo_is_desc), .fifo_is_read(fifo_is_read),
+    .fifo_win(fifo_win), .fifo_off(fifo_off),
     .fifo_len(fifo_len), .fifo_src_pid(fifo_src_pid),
     .fifo_compl_va(fifo_compl_va),
     .fifo_payload(fifo_payload), .fifo_pop(fifo_pop),
@@ -160,6 +167,7 @@ loom_engine inst_loom_engine (
     .m_net_tvalid(eng_net_tvalid),
     .m_net_tready(axis_rreq_send[0].tready),
     .m_net_tlast(eng_net_tlast),
+    .rd_resp_data(rd_resp_data), .rd_resp_valid(rd_resp_valid),
     .cnt_local_wr(cnt_local_wr), .cnt_rdma_wr(cnt_rdma_wr),
     .cnt_drop(cnt_drop), .cnt_compl(cnt_compl),
     .busy(eng_busy)

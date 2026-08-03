@@ -70,18 +70,48 @@ Same pull as Flow 3; the write side is the RDMA request
 (`vaddr = buf_C+0x10000` on C's QP); the shell fragments to PMTU. On
 host 2, identical landing as Flow 2.
 
+## Flow 5 — peer load (local): `v = *(P_B + 0x48)`
+
+Reads are non-posted: the issuing CPU stalls until the switch answers.
+
+1. A's CPU MMU turns the load into an AXI-Lite READ at `araddr = 0x1048`.
+2. loom_ctrl pushes a READ entry (win 1, off `0x48`) into the same order
+   FIFO and HOLDS the read channel open (rvalid deferred). Two safety
+   rules: arready is withheld while the FIFO is full (a read is never
+   dropped - dropping one would wedge the CPU until PCIe completion
+   timeout), and reads are single-outstanding by construction.
+3. loom_engine pops it, looks up window 1, bounds-checks, then pulls the
+   full 64 B ALIGNED line containing the target:
+   `sq_rd {LOCAL_READ, pid 1, vaddr buf_B+0x40, len 64}` - a full-line
+   pull avoids sub-line DMA entirely (cf. the 64 B minimum RDMA payload
+   jigsaw ran into) - and lane-selects qword 1 of the returned beat.
+4. The 8 B travels back (rd_resp) and loom_ctrl completes the AXI read;
+   A's load retires with B's data.
+5. Because the READ entry sits in the same FIFO as stores and
+   descriptors, a load issued after a store to the same location returns
+   the fresh value (read-after-write in program order).
+
+Invalid reads ALWAYS answer: a dead window, an out-of-bounds offset, or
+(for now) an rdma-route window returns POISON (all-ones) instead of
+hanging the CPU. Remote loads arrive with the two-host phase via the
+shell's RDMA READ. Note the asymmetry with Flow 1-4 is inherited from
+the design: writes are posted (fire-and-forget), loads stall the issuer
+for the round trip - which is why peer communication stays push-only on
+the fast path and loads exist as a correctness/debug facility.
+
 ## Ordering across flows
 
-Stores and descriptors share one arrival-ordered FIFO, so
+Stores, descriptors AND reads share one arrival-ordered FIFO, so
 `copy(P_B+off, src, len); *(P_B+flag) = 1` can never show the flag before
-the data: the flag store sits behind the descriptor in the FIFO and the
-engine is transaction-serialized.
+the data (the flag store sits behind the descriptor), and a load issued
+after either observes their effects: the engine is
+transaction-serialized.
 
 ## The translation chain in one table
 
 | Address the app used | Translated by | Into |
 |---|---|---|
-| `P_B`/`P_C` (+offset), on dereference | A's CPU page tables (mmap of ctrl region) | ctrl window + offset |
+| `P_B`/`P_C` (+offset), on dereference (store or load) | A's CPU page tables (mmap of ctrl region) | ctrl window + offset |
 | ctrl window + offset | loom_table entry (installed by the daemon) | `{local: (pid, base)}` or `{rdma: qp, base}` |
 | `src` in the descriptor | shell TLB under A's pid, during the pull | A's memory |
 | `base + offset` at the destination | shell TLB under the exporter's pid (locally or on the remote host via the QP) | exporter's memory |

@@ -113,17 +113,22 @@ by an explicit grant. Mutual exclusion is assertion-tested in
   unit are **descoped** (2026-08 eval review: the paper makes no
   isolation claim, the victim-flow experiment is dead, failure
   containment dropped).
-- Aperture reads (loads through the window) are **not implemented yet -
-  planned, scoped to T6 calibration**: today a CPU load from the
-  aperture returns CSR values (window 0) or zeros; the data path is
-  write-only. The planned read path adds a READ entry kind to the order
-  FIFO - the engine pulls 8 B from the destination under its pid and
-  the ctrl slave holds the AXI-Lite read channel open until the data
-  returns (local reads sim-testable via getCSR; remote read RTT via the
-  shell's RDMA READ path is hardware-only, PCIe completion timeout
-  watched). The credit *model* stays in the simulation (sweep_credits);
-  AXI-Lite's single-outstanding reads make the hardware tracker
-  trivially depth-1.
+- Aperture reads (loads through a window) are **implemented for local
+  windows** (Phase 5.2): a READ entry rides the same order FIFO, the
+  engine pulls the full 64 B aligned line containing the target under
+  the destination pid and lane-selects the 8 B, and the ctrl slave
+  holds the AXI-Lite read channel open until the data returns. Safety:
+  reads are never dropped (arready withheld while the FIFO is full) and
+  every read answers - invalid/dead/rdma-route windows return POISON
+  (all-ones) instead of wedging the CPU. The full-line pull is
+  deliberate: it avoids sub-line DMA entirely (cf. the 64 B minimum
+  RDMA payload jigsaw hit, gate G5). Remote loads arrive with the
+  two-host phase (shell RDMA READ, T6 remote RTT). The credit *model*
+  stays in the simulation (sweep_credits); AXI-Lite's single-outstanding
+  reads make the hardware tracker trivially depth-1. GPU-equivalence
+  note: the stall-until-answer load matches the non-posted peer read a
+  GPU issues over PCIe P2P today - slow by nature, which is exactly why
+  the fast path stays push-only.
 - The completion count is a single monotonic counter per engine. Apps that
   serialize their own DMAs can poll for change/expected values; carrying a
   caller-chosen fence *payload* in the descriptor (full CE semantics) is a

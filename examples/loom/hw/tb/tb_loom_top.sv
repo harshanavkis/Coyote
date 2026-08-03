@@ -306,6 +306,15 @@ initial begin
     axil_read(16'((32 + 6) * 8), rdata);
     check(rdata == 64'd0, "T5: no overflow");
 
+    // --- T6: aperture read through the wrapper (feeder answers the pull) ---
+    begin
+        logic [63:0] rd_out;
+        axil_read(16'h1040, rd_out);   // feeder beat data: all lanes D0D0_0000
+        check(rd_out == 64'hD0D0_0000, $sformatf("T6: read got %h", rd_out));
+        axil_read(16'((32 + 8) * 8), rdata);
+        check(rdata == 64'd1, "T6: reads-captured counter");
+    end
+
     if (errors == 0) $display("TB PASS (tb_loom_top)");
     else             $display("TB FAIL (tb_loom_top): %0d errors", errors);
     $finish;

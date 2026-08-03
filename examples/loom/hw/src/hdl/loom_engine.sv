@@ -21,7 +21,19 @@ import lynxTypes::*;
  *      fence_va, 8} + one beat carrying an incrementing completion count
  *      (the copy-engine semaphore-release pattern)
  *
- * Invalid window / bounds violation: entry dropped, cnt_drop pulsed.
+ * READ entry (aperture load, local windows only):
+ *   pull one full 64 B ALIGNED line containing the target
+ *   (sq_rd {LOCAL_READ, dest pid, line address, 64}), lane-select the
+ *   requested 8 B from the returned beat, and hand it back to loom_ctrl
+ *   (rd_resp), which completes the held-open AXI-Lite read. The aligned
+ *   full-line pull deliberately avoids sub-line DMA (min-payload/
+ *   alignment hazards - cf. the 64 B minimum RDMA payload jigsaw hit).
+ *   An INVALID read (dead window, bounds, or an rdma-route window -
+ *   remote loads arrive with the two-host phase) still ALWAYS responds:
+ *   poison (all-ones) + cnt_drop, so the issuing CPU is never wedged.
+ *
+ * Invalid window / bounds violation: entry dropped (writes) or answered
+ * with poison (reads), cnt_drop pulsed either way.
  * Sub-8B stores (wstrb != 0xFF) are issued as full 8 B writes for now
  * (hardware gate G2 covers sub-line write semantics).
  */
@@ -32,6 +44,7 @@ module loom_engine (
     // Order FIFO (from loom_ctrl)
     input  logic                        fifo_empty,
     input  logic                        fifo_is_desc,
+    input  logic                        fifo_is_read,
     input  logic [3:0]                  fifo_win,
     input  logic [27:0]                 fifo_off,
     input  logic [27:0]                 fifo_len,
@@ -79,6 +92,10 @@ module loom_engine (
     input  logic                        m_net_tready,
     output logic                        m_net_tlast,
 
+    // Read response (to loom_ctrl): completes the held-open AXI read
+    output logic [63:0]                 rd_resp_data,
+    output logic                        rd_resp_valid,
+
     // Debug counter pulses (to loom_ctrl)
     output logic                        cnt_local_wr,
     output logic                        cnt_rdma_wr,
@@ -112,7 +129,8 @@ module loom_engine (
 typedef enum logic [3:0] {
     ST_IDLE, ST_CHECK, ST_WR_REQ, ST_WR_DATA,
     ST_RD_REQ, ST_DMA_WR_REQ, ST_STREAM,
-    ST_CP_REQ, ST_CP_DATA
+    ST_CP_REQ, ST_CP_DATA,
+    ST_RDP_REQ, ST_RDP_WAIT, ST_RD_RESP
 } state_t;
 
 state_t state;
@@ -125,7 +143,7 @@ state_t state;
 // the control plane, and a latched route makes each transaction see one
 // consistent snapshot (the same reason the design compiles bindings
 // ahead of time instead of consulting live state per beat).
-logic                  l_is_desc;
+logic                  l_is_desc, l_is_read;
 logic [27:0]           l_off, l_len;
 logic [PID_BITS-1:0]   l_src_pid;
 logic [VADDR_BITS-1:0] l_compl_va;
@@ -136,6 +154,8 @@ logic [VADDR_BITS-1:0] l_base;
 logic [LEN_BITS-1:0]   l_lim;
 
 logic [63:0] compl_cnt;
+logic [63:0] rd_data;      // lane-selected read result (or poison)
+logic [2:0]  rd_lane;      // which 8 B lane of the pulled line
 
 assign lu_idx = fifo_win;
 assign busy   = (state != ST_IDLE);
@@ -144,14 +164,23 @@ assign busy   = (state != ST_IDLE);
 // are fixed 8 B; descriptors use their full length (and len==0 is invalid)
 wire [28:0] end_off = l_is_desc ? ({1'b0, l_off} + {1'b0, l_len})
                                 : ({1'b0, l_off} + 29'd8);
+// Reads are additionally local-only for now: an rdma-route window load
+// is answered with poison until the two-host phase implements RDMA READ
 wire ok = l_valid && (l_is_desc ? (l_len != 0) : 1'b1)
+                  && (l_is_read ? !l_route : 1'b1)
                   && (end_off <= {1'b0, l_lim});
+
+// Read target: the 64 B line containing (base + off), and the lane in it
+wire [VADDR_BITS-1:0] rd_addr    = l_base + {{(VADDR_BITS-28){1'b0}}, l_off};
+wire [VADDR_BITS-1:0] rd_line_va = {rd_addr[VADDR_BITS-1:6], 6'b0};
 
 always_ff @(posedge aclk) begin
     if (!aresetn) begin
         state <= ST_IDLE;
         compl_cnt <= 0;
-        l_is_desc <= 0; l_off <= 0; l_len <= 0; l_src_pid <= 0; l_compl_va <= 0;
+        l_is_desc <= 0; l_is_read <= 0; l_off <= 0; l_len <= 0;
+        l_src_pid <= 0; l_compl_va <= 0;
+        rd_data <= 0; rd_lane <= 0;
         l_payload <= 0;
         l_valid <= 0; l_route <= 0; l_pid <= 0; l_base <= 0; l_lim <= 0;
     end else begin
@@ -160,6 +189,7 @@ always_ff @(posedge aclk) begin
             // (combinational below) retires the entry in this same cycle
             ST_IDLE: if (!fifo_empty) begin
                 l_is_desc <= fifo_is_desc;
+                l_is_read <= fifo_is_read;
                 l_off     <= fifo_off;
                 l_len     <= fifo_len;
                 l_src_pid <= fifo_src_pid;
@@ -176,7 +206,16 @@ always_ff @(posedge aclk) begin
             // Validation gate: invalid window or out-of-bounds access is
             // dropped here and never reaches the shell
             ST_CHECK:
-                if (!ok)            state <= ST_IDLE;        // cnt_drop pulses below
+                if (l_is_read) begin
+                    // A read ALWAYS answers: poison on any invalidity
+                    rd_lane <= rd_addr[5:3];
+                    if (!ok) begin
+                        rd_data <= 64'hFFFF_FFFF_FFFF_FFFF;   // poison
+                        state   <= ST_RD_RESP;
+                    end else
+                        state   <= ST_RDP_REQ;
+                end
+                else if (!ok)       state <= ST_IDLE;        // cnt_drop pulses below
                 else if (l_is_desc) state <= ST_RD_REQ;
                 else                state <= ST_WR_REQ;
 
@@ -194,6 +233,17 @@ always_ff @(posedge aclk) begin
                 if (s_tvalid && s_tlast &&
                     (( l_route && m_net_tready) || (!l_route && m_host_tready)))
                     state <= (l_compl_va != 0) ? ST_CP_REQ : ST_IDLE;
+
+            // Fence release: skipped entirely when the descriptor's
+            // completion VA is 0
+            // ---- READ: aligned line pull, lane select, respond ----
+            ST_RDP_REQ:   if (rd_ready) state <= ST_RDP_WAIT;
+            ST_RDP_WAIT:
+                if (s_tvalid) begin
+                    rd_data <= s_tdata[64*rd_lane +: 64];
+                    if (s_tlast) state <= ST_RD_RESP;
+                end
+            ST_RD_RESP:   state <= ST_IDLE;    // rd_resp_valid pulses below
 
             // Fence release: skipped entirely when the descriptor's
             // completion VA is 0
@@ -232,12 +282,21 @@ always_comb begin
     rd_req = '0;
     rd_req.opcode = LOCAL_READ;
     rd_req.strm   = STRM_HOST;
-    rd_req.pid    = l_src_pid;
-    rd_req.vaddr  = l_payload[VADDR_BITS-1:0];
-    rd_req.len    = l_len[LEN_BITS-1:0];
     rd_req.dest   = 0;
     rd_req.last   = 1'b1;
-    rd_valid = (state == ST_RD_REQ);
+    if (state == ST_RDP_REQ) begin
+        // Aperture read: pull the full aligned line from the DESTINATION
+        // process's buffer (pid = the window's pid, like a local write)
+        rd_req.pid   = l_pid;
+        rd_req.vaddr = rd_line_va;
+        rd_req.len   = 64;
+    end else begin
+        // DMA pull: the issuer's source buffer
+        rd_req.pid   = l_src_pid;
+        rd_req.vaddr = l_payload[VADDR_BITS-1:0];
+        rd_req.len   = l_len[LEN_BITS-1:0];
+    end
+    rd_valid = (state == ST_RD_REQ) || (state == ST_RDP_REQ);
 end
 
 always_comb begin
@@ -322,8 +381,10 @@ wire stream_local = (state == ST_STREAM) && !l_route;
 wire stream_net   = (state == ST_STREAM) &&  l_route;
 
 always_comb begin
-    // Pull stream ready only while forwarding, from the selected output
-    s_tready = (stream_local && m_host_tready) || (stream_net && m_net_tready);
+    // Pull stream ready while forwarding (from the selected output) or
+    // while sinking the read line (always ready: nothing downstream)
+    s_tready = (stream_local && m_host_tready) || (stream_net && m_net_tready) ||
+               (state == ST_RDP_WAIT);
 
     // Host output: store beat (local), DMA forward (local), completion beat
     m_host_tdata  = stream_local ? s_tdata : beat_data;
@@ -351,6 +412,9 @@ end
 // condition includes the corresponding ready, so a stalled beat is not
 // double-counted while it waits.
 // -------------------------------------------------------------------------
+assign rd_resp_data  = rd_data;
+assign rd_resp_valid = (state == ST_RD_RESP);
+
 assign cnt_drop     = (state == ST_CHECK) && !ok;
 assign cnt_local_wr = ((state == ST_WR_DATA) && !l_route && m_host_tready) ||
                       (stream_local && s_tvalid && s_tlast && m_host_tready);

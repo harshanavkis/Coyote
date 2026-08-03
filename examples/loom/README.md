@@ -66,6 +66,12 @@ out; the wire carries the exporter's VA (offset in affine encoding).
 3. RX interposition: where incoming RDMA writes surface (`rq_wr` +
    `axis_rrsp_recv`, per jigsaw) vs. direct-to-memory.
 4. QP selection from user logic when more than one binding/QP exists.
+5. Minimum RDMA payload: jigsaw needed 64 B (it pads every network
+   message to one full beat, `rdma_wr_len = 64`). Our 8 B `APP_WRITE`
+   remote stores likely violate this; naive padding would clobber 56
+   neighbor bytes at the destination. Expected fix (Phase 6): 64 B wire
+   message = header + payload, far-side loom_rx issues the exact 8 B
+   local write. Verify the constraint on hardware first.
 
 Shell config (when hw is added): `EN_STRM 1, N_STRM_AXI 1, EN_RDMA 1,
 N_REGIONS 1`; cf. `examples/jigsaw_baseline_rdma`.
@@ -81,7 +87,7 @@ N_REGIONS 1`; cf. `examples/jigsaw_baseline_rdma`.
 | 4.5 | test hardening: tb_loom_top (arbitration), engine/ctrl corner cases, extended integration sim, Python RDMA TX test | done, all pass |
 | 5.0 | per-descriptor completion (fence VA in descriptor, CE semaphore-release model) | done, all sims pass |
 | 5.1a | single-process software: client/server role split (OrchClient iface, in-process transport) | done, ROLES TEST PASS (sim) |
-| 5.2 | aperture reads, local path (READ order-FIFO entry, held-open AXI-Lite read, poison on invalid) + TBs + Python-framework sim test | **next** |
+| 5.2 | aperture reads, local path (READ order-FIFO entry, held-open AXI-Lite read, 64B line pull + lane select, poison on invalid) + TBs + Python sim test | done, all pass |
 | 5.3 | multi-process split: libloom + loomd control daemon (Unix socket) | pending |
 | 5.4 | hardware gate tests G1/G2/G4 on stock examples | pending |
 | 5.5 | synthesize + run on U280 (cross-pid); measure the sim's FPGA-owned constants: T3 per-stage latencies (needs stage cycle counters), T2 coalescing curve (needs coalescer RTL, on/off), substrate floors, B2 rdma-init, local read RTT | pending |
@@ -202,6 +208,15 @@ tmux new-session -d -s loom_py \
 tail -f pytest_run.log     # expect: test_tx_store_takes_rdma_path ... ok
                            #         OK (skipped=1)
 ```
+
+The local aperture-read test runs the same way (or together:
+`python3 -m unittest test_loom_rdma test_loom_read -v`):
+`test_loom_read.py` writes a patterned buffer into the sim's memory mock,
+programs a window, and checks that window loads return the right qwords
+(aligned 64 B line pull + lane select) and that an unprogrammed window
+returns POISON. Aperture reads cannot run in the C++ interactive sim
+(the blocking ctrl read parks the generator that would have to service
+the engine's pull - the documented interactive-mode deadlock).
 
 The RX test is skipped by design: the stock TB delivers only the rq_wr
 request of an incoming RDMA write and discards the payload
