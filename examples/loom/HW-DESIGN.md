@@ -106,9 +106,19 @@ by an explicit grant. Mutual exclusion is assertion-tested in
 - Aperture ops are <= 8 B (one AXI-Lite beat); larger transfers use the
   DMA path. Sub-word `wstrb` is captured but writes issue as full 8 B
   (hardware gate G2).
-- One engine, fully serialized: no per-destination queues, no coalescer,
-  no scheduler yet — those are the performance-isolation phase of the
-  implementation plan; correctness does not depend on them.
+- One engine, fully serialized. Of the classic switch machinery, only
+  the TX **coalescer** is still planned (it produces the T2
+  coalescing/goodput curve the simulation calibrates against, coalescer
+  on/off). Per-destination queues + scheduler and the error containment
+  unit are **descoped** (2026-08 eval review: the paper makes no
+  isolation claim, the victim-flow experiment is dead, failure
+  containment dropped).
+- Aperture reads (loads through the window) are **not implemented and
+  optional**: the data path is write-only, matching the push-only GPU
+  communication idiom; a CPU load from the aperture today returns CSR
+  values (window 0) or zeros. The simulation models credit-capped reads
+  on its own; hardware reads would only calibrate its read-RTT
+  placeholder (T6) if time permits.
 - The completion count is a single monotonic counter per engine. Apps that
   serialize their own DMAs can poll for change/expected values; carrying a
   caller-chosen fence *payload* in the descriptor (full CE semantics) is a
