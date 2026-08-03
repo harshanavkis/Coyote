@@ -114,14 +114,26 @@ examples/loom/hw/tb/run_tbs.sh
 The script re-execs itself inside `xilinx-shell` if needed, compiles
 `lynx_pkg.sv` + `hw/hdl/pkg/axi_intf.sv` + the loom modules, then runs each
 `tb_*` in XSIM. Expected output: `PASS: <tb>` per testbench (currently
-`tb_loom_table`, `tb_loom_ctrl`, `tb_loom_engine`, `tb_loom_rx`). Logs
-land in `hw/tb/work/`.
+`tb_loom_table`, `tb_loom_ctrl`, `tb_loom_engine`, `tb_loom_rx`,
+`tb_loom_top`). Logs land in `hw/tb/work/`.
 
-`tb_loom_engine` is a composite test (real loom_ctrl + loom_table +
-loom_engine, shell side mocked): local/rdma stores, DMA local/rdma with
-completion writes, invalid-window and bounds drops, and the ordering
-property (flag store behind a DMA descriptor issues only after the DMA
-stream + completion).
+Coverage (hardened in Phase 4.5):
+- `tb_loom_ctrl`: CSR readback (all RW regs), commit pulse, aperture
+  capture fields incl. sub-word wstrb, descriptor enqueue, arrival
+  ordering, overflow drops, FIFO wraparound (rolling 5-in/5-out across
+  the 64-entry boundary), counters.
+- `tb_loom_engine` (composite ctrl+table+engine, shell mocked):
+  local/rdma stores, DMA local/rdma with completion values,
+  descriptor-then-flag ordering, backpressure matrix (wr_ready, host and
+  net tready, mid-stream), bounds edges (end==lim vs end==lim+8, store at
+  window end), non-64B-multiple lengths, completion-disabled path, and a
+  60-op soak checked against exact counter deltas.
+- `tb_loom_rx`: grant gating, forwarding, backpressure, back-to-back.
+- `tb_loom_top`: the generated `design_user_logic_c0_0` wrapper as DUT
+  (vfpga_top.svh verbatim) - engine/rx arbitration: continuous mutual-
+  exclusion assertions, races in both directions, starvation recovery
+  after a store burst, and a mixed 40-op soak (stores/descs/rx) with
+  exact wr_req/beat/counter accounting.
 
 ### Coyote integration sim (Phase 4)
 

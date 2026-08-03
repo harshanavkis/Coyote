@@ -197,6 +197,42 @@ initial begin
     axil_read(16'((R_DBG + 5) * 8), rdata);
     check(rdata == 64'd1, "cnt_drop counter");
 
+    // --- 9. Sub-word wstrb capture ---
+    axil_write(16'h1050, 64'hFFFF_FFFF_FFFF_FFFF, 8'h0F);
+    check(!fifo_empty && fifo_len[7:0] == 8'h0F, "wstrb 0x0F captured");
+    pop_one();
+
+    // --- 10. FIFO wraparound: rolling 5-in/5-out, 30 rounds (crosses 64) ---
+    begin
+        int seq;
+        seq = 0;
+        for (int round = 0; round < 30; round++) begin
+            for (int k = 0; k < 5; k++) begin
+                axil_write(16'h1000 + 16'(8 * ((seq + k) % 512)), 64'(1000 + seq + k));
+            end
+            for (int k = 0; k < 5; k++) begin
+                check(!fifo_empty && fifo_payload == 64'(1000 + seq + k),
+                      $sformatf("wrap: round %0d entry %0d", round, k));
+                pop_one();
+            end
+            seq += 5;
+        end
+        check(fifo_empty, "wrap: empty after rolling test");
+    end
+
+    // --- 11. Full RW CSR readback ---
+    begin
+        int idx_list[11] = '{0, 1, 2, 3, 4, 8, 9, 10, 11, 16, 17};
+        foreach (idx_list[j]) begin
+            axil_write(16'(idx_list[j] * 8), 64'hC0DE_0000_0000_0000 + 64'(idx_list[j]));
+        end
+        foreach (idx_list[j]) begin
+            axil_read(16'(idx_list[j] * 8), rdata);
+            check(rdata == 64'hC0DE_0000_0000_0000 + 64'(idx_list[j]),
+                  $sformatf("readback reg %0d", idx_list[j]));
+        end
+    end
+
     if (errors == 0) $display("TB PASS (tb_loom_ctrl)");
     else             $display("TB FAIL (tb_loom_ctrl): %0d errors", errors);
     $finish;

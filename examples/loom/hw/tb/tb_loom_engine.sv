@@ -340,6 +340,108 @@ initial begin
     end
     hostq.delete();
 
+    // --- 7. Backpressure matrix ---
+    // 7a. wr_ready stalled during a store
+    wr_ready = 0;
+    axil_write(16'h1040, 64'h7A01);
+    repeat (20) @(posedge aclk);
+    check(wrq.size() == 0, "bp: no wr_req while wr_ready low");
+    @(negedge aclk); wr_ready = 1;
+    wait_idle();
+    check(wrq.size() == 1 && hostq.size() == 1 && hostq[0].data == 64'h7A01,
+          "bp: store completes after wr_ready release");
+    wrq.delete(); hostq.delete();
+    // 7b. host tready stalled mid-DMA-stream
+    descriptor(4'd1, 28'h400, {16'b0, SRC_VA}, 28'd128, 6'd2);
+    fork send_beats(2, 64'h7B00); join_none
+    do @(posedge aclk); while (hostq.size() < 1);      // first beat through
+    @(negedge aclk); m_host_tready = 0;
+    repeat (20) @(posedge aclk);
+    check(hostq.size() == 1, "bp: stream stalled under host backpressure");
+    @(negedge aclk); m_host_tready = 1;
+    wait_idle();
+    check(hostq.size() == 3 && hostq[1].data == 64'h7B01,
+          "bp: stream + completion after release");   // 2 beats + compl
+    wrq.delete(); hostq.delete(); rdq.delete();
+    // 7c. net tready stalled during an rdma store
+    m_net_tready = 0;
+    axil_write(16'h2040, 64'h7C01);
+    repeat (20) @(posedge aclk);
+    check(netq.size() == 0, "bp: net beat held under backpressure");
+    @(negedge aclk); m_net_tready = 1;
+    wait_idle();
+    check(netq.size() == 1 && netq[0].data == 64'h7C01, "bp: net beat after release");
+    wrq.delete(); netq.delete();
+
+    // --- 8. Bounds edges (window len 4MB) ---
+    descriptor(4'd1, 28'h3F_FFC0, {16'b0, SRC_VA}, 28'd64, 6'd2);  // end == 4MB: pass
+    fork send_beats(1, 64'h8A00); join_none
+    wait_idle();
+    check(wrq.size() == 2 && wrq[0].len == 64, "bounds: end==lim accepted");
+    wrq.delete(); hostq.delete(); rdq.delete();
+    descriptor(4'd1, 28'h3F_FFC0, {16'b0, SRC_VA}, 28'd72, 6'd2);  // end == 4MB+8: drop
+    wait_idle();
+    check(wrq.size() == 0 && rdq.size() == 0, "bounds: end==lim+8 dropped");
+    axil_write(16'h1FF8, 64'h8B01);                                 // store end == 4KB: pass
+    wait_idle();
+    check(wrq.size() == 1 && wrq[0].vaddr == BASE_B + 48'hFF8, "bounds: store at window end");
+    wrq.delete(); hostq.delete();
+
+    // --- 9. Length not a multiple of 64 B ---
+    descriptor(4'd1, 28'h500, {16'b0, SRC_VA}, 28'd100, 6'd2);
+    fork send_beats(2, 64'h9A00); join_none
+    wait_idle();
+    check(wrq.size() == 2 && wrq[0].len == 100, "oddlen: wr_req len 100");
+    check(hostq.size() == 3, "oddlen: 2 data beats + completion");
+    wrq.delete(); hostq.delete(); rdq.delete();
+
+    // --- 10. Completion disabled ---
+    axil_write(16'd136, 64'd0);                     // COMPL_VA = 0
+    descriptor(4'd1, 28'h600, {16'b0, SRC_VA}, 28'd64, 6'd2);
+    fork send_beats(1, 64'hA100); join_none
+    wait_idle();
+    check(wrq.size() == 1, "compl-off: single wr_req");
+    check(hostq.size() == 1, "compl-off: data beat only, no completion beat");
+    wrq.delete(); hostq.delete(); rdq.delete();
+
+    // --- 11. Soak with exact counter deltas (completion still disabled) ---
+    begin
+        logic [63:0] c_stores0, c_local0, c_drops0, c_stores1, c_local1, c_drops1;
+        int exp_stores, exp_local, exp_drops;
+        exp_stores = 0; exp_local = 0; exp_drops = 0;
+        axil_read(16'((32+0)*8), c_stores0);
+        axil_read(16'((32+2)*8), c_local0);
+        axil_read(16'((32+5)*8), c_drops0);
+        for (int i = 0; i < 60; i++) begin
+            case (i % 4)
+                0, 1: begin                          // valid store, win 1
+                    axil_write(16'h1000 + 16'(8 * (i % 500)), 64'(i));
+                    exp_stores++; exp_local++;
+                end
+                2: begin                             // valid 1-beat desc
+                    descriptor(4'd1, 28'(64 * i), {16'b0, SRC_VA}, 28'd64, 6'd2);
+                    fork send_beats(1, 64'(i)); join_none
+                    exp_local++;
+                end
+                3: begin                             // invalid window
+                    axil_write(16'h7000 + 16'(8 * (i % 500)), 64'(i));
+                    exp_stores++; exp_drops++;
+                end
+            endcase
+            wait_idle();                             // serialized: keeps feeder simple
+        end
+        axil_read(16'((32+0)*8), c_stores1);
+        axil_read(16'((32+2)*8), c_local1);
+        axil_read(16'((32+5)*8), c_drops1);
+        check(c_stores1 - c_stores0 == 64'(exp_stores),
+              $sformatf("soak: stores delta %0d, expected %0d", c_stores1 - c_stores0, exp_stores));
+        check(c_local1 - c_local0 == 64'(exp_local),
+              $sformatf("soak: local_wr delta %0d, expected %0d", c_local1 - c_local0, exp_local));
+        check(c_drops1 - c_drops0 == 64'(exp_drops),
+              $sformatf("soak: drops delta %0d, expected %0d", c_drops1 - c_drops0, exp_drops));
+        wrq.delete(); hostq.delete(); netq.delete(); rdq.delete();
+    end
+
     if (errors == 0) $display("TB PASS (tb_loom_engine)");
     else             $display("TB FAIL (tb_loom_engine): %0d errors", errors);
     $finish;
