@@ -153,9 +153,9 @@ N_REGIONS 1`; cf. `examples/jigsaw_baseline_rdma`.
 | 5.3 | loomd control daemon: socket<->OrchClient adapter, SockOrchClient, standalone loomd binary; FPGA-free protocol test + full flow over a real socket in sim | done, all pass |
 | 5.4 | hardware gate tests G1/G2/G4 on stock examples | pending |
 | 5.5 | synthesize + run on U280 (cross-pid); measure the sim's FPGA-owned constants: T3 per-stage latencies (needs stage cycle counters), T2 coalescing curve (needs coalescer RTL, on/off), substrate floors, B2 rdma-init, local read RTT | pending |
-| 5.4a | deployment binaries: app_export/app_import (per side: loomd + 2 app processes; single-host bring-up = same binaries, one loomd) | pending |
+| 5.4a | deployment binaries: app_export/app_import (per side: loomd + 2 app processes; single-host bring-up = same binaries, one loomd) | pending (AFTER 6.2a, owner reorder) |
 | 6.1 | loomd-loomd TCP, QP setup via Coyote RDMA API (QP owned by the exporter's cThread; staging = a small getMem buffer of the QP owner), remote export/import; move staging from the global CSR into the window table if hosts have multiple QP owners | pending |
-| 6.2a | two-host BUNDLED configuration: one process per host (daemon thread + that side's app roles), loomd-loomd TCP + QP setup + real wire - the cross-host bring-up vehicle (2 processes total) | pending |
+| 6.2a | two-host BUNDLED configuration: one process per host (daemon thread + that side's app roles), loomd-loomd TCP + QP setup + real wire - the cross-host bring-up vehicle (2 processes total) | **next** (owner reorder: before 5.4a; code + FPGA-free smoke tests now, execution needs two hosts) |
 | 6.2b | two-host FULL deployment topology (per side: loomd + 2 app processes); remote measurements incl. remote reads via shell RDMA READ (T6 remote RTT) | pending |
 
 ## Running
