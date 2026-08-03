@@ -130,6 +130,12 @@ CLIENT side (host 1)                    SERVER side (host 2)
   owner) + the exporter and importer processes together; client and
   server sides collapse onto the single host. A stepping stone, not a
   separate variant.
+- **Two-host bundled configuration** (Phase 6.2a, remote-route
+  bring-up): one process PER HOST, bundling the daemon role (thread) +
+  that side's app roles - two processes total across the cluster.
+  Exercises everything new in 6.x (loomd<->loomd TCP, QP setup, staging
+  exchange, the real wire) with minimal moving parts; the full per-side
+  split (6.2b) is then a process-topology rerun on a proven data path.
 - **Simulation degenerate**: the mock backend allows one cThread per
   process (each spawns its own simulator), so true process splits
   cannot run in sim - the threaded harnesses (`roles`, `roles_sock`)
