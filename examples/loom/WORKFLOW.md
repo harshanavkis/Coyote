@@ -105,9 +105,10 @@ vaddr = `buf_C+0x10000` (the true target), len = 1 MB, raw payload, no
 Loom framing (op·len·vaddr on the wire is RDMA's own BTH/RETH; the shell
 fragments to PMTU). On host 2 the write is landed verbatim —
 `sq_wr {LOCAL_WRITE, pid 0, buf_C+0x10000, 1MB}` via loom_rx's
-pass-through (or the stock path directly; gate G3). Only sub-64 B
-stores (Flow 2) use the staging-addressed inline message, because a
-RETH cannot express "64 B envelope, 8 B true write".
+pass-through - which is not optional: the shell's contract (see
+09_perf_rdma) is that incoming writes land only if user logic issues
+them. Only sub-64 B stores (Flow 2) use the staging-addressed inline
+message, because a RETH cannot express "64 B envelope, 8 B true write".
 
 ## Flow 5 — peer load (local): `v = *(P_B + 0x48)`
 

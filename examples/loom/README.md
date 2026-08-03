@@ -63,19 +63,19 @@ out; the wire carries the exporter's VA (offset in affine encoding).
 1. Cross-pid write: `sq_wr` under another attached cThread's pid lands in
    that process's buffer.
 2. Sub-line writes: alignment/keep semantics of an 8 B `LOCAL_WRITE`.
-3. RX interposition - LOAD-BEARING for the inline-message path. Three
-   possible stock-shell behaviors for an incoming write: (b) surfaces
-   request+payload to user logic only -> our design works as-is;
-   (c) writes memory AND notifies user logic -> works, staging memory
-   harmlessly scribbled; (a) writes memory silently -> loom_rx never
-   fires and inline messages are DEAD until we adopt jigsaw's exact
-   configuration (which provably delivers messages to user logic on
-   this shell). G3 = determine which behavior/knobs apply. Corollaries:
-   the staging buffer must be REAL TLB-mapped memory (under (a)/(c) the
-   shell writes it; unmapped would fault), and confirm writes to ANY
-   TLB-mapped vaddr of the QP owner land (no verbs-style MR
-   registration - validity = a TLB entry; the hybrid needs two
-   reachable regions per QP owner: exporter buffer + staging buffer).
+3. RX interposition - RESOLVED FROM SOURCE (09_perf_rdma/hw/src/
+   vfpga_top.svh): the shell's contract is that an incoming RDMA WRITE
+   surfaces as rq_wr (request) + axis_rrsp_recv (payload) and USER
+   LOGIC must land it (perf_rdma forwards rq_wr -> sq_wr {STRM_HOST}
+   and rrsp_recv -> host_send; nothing lands without user logic). There
+   is no silent-to-memory path; loom_rx is the required component, and
+   the staging vaddr is pure addressing (the shell never writes it
+   itself). Incoming remote READs likewise surface on rq_rd for user
+   logic to serve (rq_rd -> sq_rd, host_recv -> rrsp_send) - the 6.x
+   remote-read template. Remaining hardware check: sanity-confirm the
+   contract + that rq_wr carries the RETH vaddr verbatim for ANY target
+   (direct-bulk dispatch relies on it; no verbs MR registration exists,
+   validity = a TLB entry under the QP owner's pid).
 4. QP selection from user logic when more than one binding/QP exists.
 5. Minimum RDMA payload, shell-side evidence (checked in the Coyote
    sources, 2026-08-03): there is NO explicit `len >= 64` check anywhere
