@@ -15,7 +15,7 @@ logic and user-space software; the shell and driver stay stock.
   offset = `addr[11:0]`. Every write beat here is captured as a small-write
   transaction (posted).
 
-## Components (planned hw/src/hdl/)
+## Components (hw/src/hdl/)
 
 - **loom_ctrl** — AXI4-Lite slave: CSR page + aperture capture. Captured
   stores and triggered DMA descriptors are pushed into one arrival-ordered
@@ -73,7 +73,7 @@ N_REGIONS 1`; cf. `examples/jigsaw_baseline_rdma`.
 | 1 | loom_ctrl (CSR page + aperture capture + order FIFO), loom_table, block TBs | done, TBs pass |
 | 2 | loom_engine (store + DMA branches, completion) + block TB | done, TBs pass |
 | 3 | loom_rx + block TB | done, TBs pass |
-| 4 | vfpga_top wiring + Coyote integration sim (EN_SIM) | pending |
+| 4 | vfpga_top wiring + Coyote integration sim (EN_SIM) | done, LOOM TEST PASS |
 | 5 | hardware bring-up, local paths | pending |
 | 6 | hardware, RDMA path (two hosts) | pending |
 
@@ -87,10 +87,10 @@ N_REGIONS 1`; cf. `examples/jigsaw_baseline_rdma`.
 - `cmake` inside xilinx-shell is Vivado's ancient 3.3.2; use nix instead:
   `nix-shell -p cmake --run "..."` (nested inside xilinx-shell when the
   CMake run needs to find Vivado).
-- Note: Coyote's `sim/README.md` flags Vivado 2023.2 as broken for their
-  full `tb_user` testbench (mailbox regression). The block TBs below do
-  not use that testbench and work on 2023.2; for Phase 4 integration sim,
-  try 2025.1 if 2023.2 fails.
+- Coyote's `sim/README.md` flags Vivado 2023.2 as broken for their full
+  `tb_user` testbench (mailbox regression); in practice the Phase 4
+  integration sim ran fine on 2023.2 here. (No newer version is currently
+  installed under `/share/xilinx/Vivado/`.)
 
 ### One-time: configure the hw build and render lynx_pkg.sv
 
@@ -122,3 +122,45 @@ loom_engine, shell side mocked): local/rdma stores, DMA local/rdma with
 completion writes, invalid-window and bounds drops, and the ordering
 property (flag store behind a DMA descriptor issues only after the DMA
 stream + completion).
+
+### Coyote integration sim (Phase 4)
+
+One-time hw project setup (after the lynx_pkg step above). Note: `make sim`'s
+DPI step is broken on this NixOS host (Vivado's bundled binutils cannot link
+against glibc 2.42), so the DPI lib is built with the system toolchain and
+the project created directly:
+
+```bash
+cd examples/loom/hw/build_sim
+nix-shell -p gcc --run \
+  'gcc -shared -fPIC -I/share/xilinx/Vivado/2023.2/data/xsim/include \
+   ../../../../sim/hw/dpi/file_io.c -o sim/coyote_sim.so'
+tmux new-session -d -s loom_crsim \
+  "xilinx-shell -c 'vivado -mode batch -source cr_sim.tcl' > cr_sim_run.log 2>&1"
+# wait for the session to exit; expect sim/example_loom.xpr
+```
+
+Software build and run (the run spawns Vivado/XSIM, so it goes through
+xilinx-shell; use tmux, it takes minutes):
+
+```bash
+cd examples/loom/sw && mkdir -p build_sim && cd build_sim
+nix-shell -p cmake gcc boost --run 'cmake .. -DEN_SIM=ON && make -j8'
+tmux new-session -d -s loom_run \
+  "xilinx-shell -c 'export COYOTE_SIM_DIR=$PWD/../../hw/build_sim/; ./test' \
+   > run_test.log 2>&1"
+tail -f run_test.log     # expect: 6x PASS, counter dump, LOOM TEST PASS
+# waveform: hw/build_sim/sim/sim_dump.vcd
+```
+
+Sim-backend notes (learned the hard way):
+- `setCSR/getCSR` take 64-bit **word indices** in both backends (the sim
+  generator multiplies by 8 onto the AXI address); `loom.hpp` handles it.
+- The TB's `EN_RANDOMIZATION` pads every ctrl write with random writes up
+  to the next 64 B boundary. Consequences: `dbg[stores]` counts padding
+  stores landing in the aperture (random data written at nearby offsets in
+  valid windows - keep test offsets clear of each other), and CSR staging
+  sequences must end with the meaningful write (ours do: COMMIT/TRIGGER
+  last). Counters read immediately after a poll may still be draining.
+- Poll destination/completion *memory*, never CSRs, while a DMA is in
+  flight (sim CSR reads block behind the generator).
