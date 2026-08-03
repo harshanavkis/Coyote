@@ -86,6 +86,7 @@ N_REGIONS 1`; cf. `examples/jigsaw_baseline_rdma`.
 | 5.3 | synthesize + run on U280 (cross-pid); measure the sim's FPGA-owned constants: T3 per-stage latencies (needs stage cycle counters), T2 coalescing curve (needs coalescer RTL, on/off), substrate floors, B2 rdma-init | pending |
 | 6.1 | loomd-loomd TCP, QP setup via Coyote RDMA API, remote export/import | pending |
 | 6.2 | two-host run (resolves G3), remote measurements | pending |
+| 6.3 | aperture reads for T6 (READ order-FIFO entry, held-open AXI-Lite read; local sim-testable, remote RTT hardware-only) | pending |
 
 ## Running
 

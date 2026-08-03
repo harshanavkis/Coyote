@@ -113,12 +113,17 @@ by an explicit grant. Mutual exclusion is assertion-tested in
   unit are **descoped** (2026-08 eval review: the paper makes no
   isolation claim, the victim-flow experiment is dead, failure
   containment dropped).
-- Aperture reads (loads through the window) are **not implemented and
-  optional**: the data path is write-only, matching the push-only GPU
-  communication idiom; a CPU load from the aperture today returns CSR
-  values (window 0) or zeros. The simulation models credit-capped reads
-  on its own; hardware reads would only calibrate its read-RTT
-  placeholder (T6) if time permits.
+- Aperture reads (loads through the window) are **not implemented yet -
+  planned, scoped to T6 calibration**: today a CPU load from the
+  aperture returns CSR values (window 0) or zeros; the data path is
+  write-only. The planned read path adds a READ entry kind to the order
+  FIFO - the engine pulls 8 B from the destination under its pid and
+  the ctrl slave holds the AXI-Lite read channel open until the data
+  returns (local reads sim-testable via getCSR; remote read RTT via the
+  shell's RDMA READ path is hardware-only, PCIe completion timeout
+  watched). The credit *model* stays in the simulation (sweep_credits);
+  AXI-Lite's single-outstanding reads make the hardware tracker
+  trivially depth-1.
 - The completion count is a single monotonic counter per engine. Apps that
   serialize their own DMAs can poll for change/expected values; carrying a
   caller-chosen fence *payload* in the descriptor (full CE semantics) is a
