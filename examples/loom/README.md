@@ -64,7 +64,11 @@ out; the wire carries the exporter's VA (offset in affine encoding).
    that process's buffer.
 2. Sub-line writes: alignment/keep semantics of an 8 B `LOCAL_WRITE`.
 3. RX interposition: where incoming RDMA writes surface (`rq_wr` +
-   `axis_rrsp_recv`, per jigsaw) vs. direct-to-memory.
+   `axis_rrsp_recv`, per jigsaw) vs. direct-to-memory. Also confirm that
+   incoming writes to ANY TLB-mapped vaddr of the QP owner's pid land
+   (Coyote has no verbs-style MR registration - validity = a TLB entry;
+   the hybrid needs two reachable regions per QP owner: the exporter's
+   buffer for direct bulk and its small staging buffer for messages).
 4. QP selection from user logic when more than one binding/QP exists.
 5. Minimum RDMA payload, shell-side evidence (checked in the Coyote
    sources, 2026-08-03): there is NO explicit `len >= 64` check anywhere
@@ -122,7 +126,7 @@ N_REGIONS 1`; cf. `examples/jigsaw_baseline_rdma`.
 | 5.3 | multi-process split: libloom + loomd control daemon (Unix socket) | pending |
 | 5.4 | hardware gate tests G1/G2/G4 on stock examples | pending |
 | 5.5 | synthesize + run on U280 (cross-pid); measure the sim's FPGA-owned constants: T3 per-stage latencies (needs stage cycle counters), T2 coalescing curve (needs coalescer RTL, on/off), substrate floors, B2 rdma-init, local read RTT | pending |
-| 6.1 | loomd-loomd TCP, QP setup via Coyote RDMA API, remote export/import | pending |
+| 6.1 | loomd-loomd TCP, QP setup via Coyote RDMA API (QP owned by the exporter's cThread; staging = a small getMem buffer of the QP owner), remote export/import; move staging from the global CSR into the window table if hosts have multiple QP owners | pending |
 | 6.2 | two-host run (resolves G3), remote measurements incl. remote reads via shell RDMA READ (T6 remote RTT) | pending |
 
 ## Running
