@@ -4,6 +4,9 @@ Single vFPGA per host acts as the switch. All emulated-XPU processes and the
 control daemon attach to it as cThreads. Changes are confined to vFPGA user
 logic and user-space software; the shell and driver stay stock.
 
+> **Running things**: every commit that runs anything documents how to run
+> it in the "Running" section at the bottom of this file. Keep it current.
+
 ## Ctrl-region layout (64 KB, AXI4-Lite)
 
 - `0x0000-0x0FFF` — CSR page: window-table programming, DMA descriptor
@@ -59,3 +62,53 @@ out; the wire carries the exporter's VA (offset in affine encoding).
 
 Shell config (when hw is added): `EN_STRM 1, N_STRM_AXI 1, EN_RDMA 1,
 N_REGIONS 1`; cf. `examples/jigsaw_baseline_rdma`.
+
+## Status
+
+| Phase | Content | State |
+|---|---|---|
+| 1 | loom_ctrl (CSR page + aperture capture + order FIFO), loom_table, block TBs | done, TBs pass |
+| 2 | loom_engine (store + DMA branches, completion) + block TB | pending |
+| 3 | loom_rx + block TB | pending |
+| 4 | vfpga_top wiring + Coyote integration sim (EN_SIM) | pending |
+| 5 | hardware bring-up, local paths | pending |
+| 6 | hardware, RDMA path (two hosts) | pending |
+
+## Running
+
+### Environment (NixOS testbed)
+
+- Vivado tools (vivado, xvlog, xelab, xsim, xsc) are only on PATH inside
+  `xilinx-shell` (non-interactive: `xilinx-shell -c "cmd"`). Default is
+  Vivado 2023.2; others under `/share/xilinx/Vivado/`.
+- `cmake` inside xilinx-shell is Vivado's ancient 3.3.2; use nix instead:
+  `nix-shell -p cmake --run "..."` (nested inside xilinx-shell when the
+  CMake run needs to find Vivado).
+- Note: Coyote's `sim/README.md` flags Vivado 2023.2 as broken for their
+  full `tb_user` testbench (mailbox regression). The block TBs below do
+  not use that testbench and work on 2023.2; for Phase 4 integration sim,
+  try 2025.1 if 2023.2 fails.
+
+### One-time: configure the hw build and render lynx_pkg.sv
+
+The block TBs compile against the generated `lynxTypes` package:
+
+```bash
+cd examples/loom/hw && mkdir -p build_sim && cd build_sim
+xilinx-shell -c "nix-shell -p cmake --run 'cmake .. -DFDEV_NAME=u280'"
+mkdir -p sim
+nix-shell -p 'python3.withPackages(ps: [ps.jinja2])' \
+    --run 'python3 write_hdl.py 3 0 0'
+# -> build_sim/sim/lynx_pkg.sv (+ user_logic_c0_0.sv)
+```
+
+### Block-level testbenches (Phase 1+)
+
+```bash
+examples/loom/hw/tb/run_tbs.sh
+```
+
+The script re-execs itself inside `xilinx-shell` if needed, compiles
+`lynx_pkg.sv` + `hw/hdl/pkg/axi_intf.sv` + the loom modules, then runs each
+`tb_*` in XSIM. Expected output: `PASS: <tb>` per testbench (currently
+`tb_loom_table`, `tb_loom_ctrl`). Logs land in `hw/tb/work/`.
