@@ -72,10 +72,16 @@ out; the wire carries the exporter's VA (offset in affine encoding).
    the staging vaddr is pure addressing (the shell never writes it
    itself). Incoming remote READs likewise surface on rq_rd for user
    logic to serve (rq_rd -> sq_rd, host_recv -> rrsp_send) - the 6.x
-   remote-read template. Remaining hardware check: sanity-confirm the
-   contract + that rq_wr carries the RETH vaddr verbatim for ANY target
-   (direct-bulk dispatch relies on it; no verbs MR registration exists,
-   validity = a TLB entry under the QP owner's pid).
+   remote-read template. The vaddr semantics are ALSO source-confirmed
+   (ib_transport_protocol.cpp:628): the RX parser puts
+   rdmaHeader.getVirtualAddress() - the RETH vaddr, verbatim, no MR
+   table or filter - into the memory command that becomes rq_wr, and
+   MIDDLE/LAST packets continue from an MSN-table cursor initialized
+   from it; perf_rdma forwards exactly this field into sq_wr and is the
+   hardware-validated example. G3 CLOSED - the staging-compare dispatch
+   works by construction; nothing deferred to hardware beyond ordinary
+   bring-up. (No verbs MR registration exists anywhere in this path;
+   validity = a TLB entry under the QP owner's pid at write-issue time.)
 4. QP selection from user logic when more than one binding/QP exists.
 5. Minimum RDMA payload, shell-side evidence (checked in the Coyote
    sources, 2026-08-03): there is NO explicit `len >= 64` check anywhere
