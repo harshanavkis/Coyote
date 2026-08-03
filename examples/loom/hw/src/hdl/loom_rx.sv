@@ -52,6 +52,18 @@ module loom_rx (
     output logic                        cnt_rx_fwd
 );
 
+// FSM: one incoming write processed end-to-end, mirroring the engine's
+// serialization:
+//   ST_IDLE    a request is pending on rq_wr; wait until the arbiter
+//              grants the shared write path, then latch {pid,vaddr,len}
+//              and consume the request (rq_ready pulse)
+//   ST_WR_REQ  hold the LOCAL_WRITE toward sq_wr until accepted
+//   ST_STREAM  forward payload beats from axis_rrsp_recv to the host
+//              output; done on the tlast handshake
+// Note the request is NOT accepted before the grant: consuming rq_wr
+// early would commit us to a transaction we cannot start, and the
+// payload beats behind it would back-pressure the shell's receive path
+// while the engine still owns the write stream.
 typedef enum logic [1:0] { ST_IDLE, ST_WR_REQ, ST_STREAM } state_t;
 state_t state;
 
@@ -84,6 +96,13 @@ always_ff @(posedge aclk) begin
     end
 end
 
+// The forwarded write reuses the incoming request's fields verbatim:
+// vaddr is the RETH vaddr our TX side put on the wire (= the exporter's
+// own VA + offset), and pid is the QP owner at THIS host - when the QP
+// belongs to the exporting process's cThread, the shell TLB translates
+// straight into the right address space. No table lookup is needed on
+// the receive side in this scheme; a per-QP table (offset-on-the-wire
+// variant) would slot in here if the wire format changes.
 always_comb begin
     wr_req = '0;
     wr_req.opcode = LOCAL_WRITE;

@@ -99,6 +99,20 @@ localparam integer FIFO_DEPTH = 1 << FIFO_AW;
 
 // -------------------------------------------------------------------------
 // AXI4-Lite handshake registers (standard Coyote ctrl-slave pattern)
+//
+// This slave accepts one write at a time: it waits until BOTH awvalid and
+// wvalid are up (the XDMA bridge presents address and data together),
+// latches awaddr, asserts awready/wready for exactly one cycle, and then
+// raises bvalid until the master takes the response. aw_en blocks a new
+// address phase until the previous response was accepted, so there is
+// never more than one write in flight inside this module. Reads follow
+// the same single-outstanding pattern on ar/r.
+//
+// Note the consequence for the aperture: the write response (bvalid) is
+// returned as soon as the beat is captured into the order FIFO, before
+// anything downstream happens. Toward the host this makes aperture
+// stores posted writes, which is exactly the peer-store semantics we are
+// emulating (a GPU peer store completes at the fabric, not at the peer).
 // -------------------------------------------------------------------------
 logic [15:0] axi_awaddr;
 logic        axi_awready;
@@ -126,14 +140,29 @@ wire [CSR_BITS-1:0] rd_idx = axi_araddr[ADDR_LSB +: CSR_BITS];
 
 // -------------------------------------------------------------------------
 // CSRs
+//
+// A table entry (5 words) and a DMA descriptor (5 words) are both wider
+// than one AXI-Lite beat, so they cannot be written atomically. The
+// scheme used here is stage-then-pulse: software writes the individual
+// r_tbl_* / r_dma_* staging registers in any order, then writes 1 to
+// COMMIT (table) or TRIGGER (descriptor). Only that final write has a
+// side effect - it snapshots the staged values into the table / the
+// order FIFO in a single cycle, so a half-written entry can never be
+// observed by the data path. Staged values persist, so back-to-back
+// descriptors that share fields (e.g. same source pid) only need to
+// rewrite what changed.
 // -------------------------------------------------------------------------
 logic [63:0] r_tbl_idx, r_tbl_cfg, r_tbl_pid, r_tbl_base, r_tbl_len;
 logic [63:0] r_dma_dst, r_dma_src_va, r_dma_len, r_dma_src_pid, r_dma_compl_va;
 logic [63:0] dbg [N_DBG];
 
-// COMMIT/TRIGGER act on write pulses (not stored values) and require the
-// low byte strobe - this also makes them immune to strobe-less padding
-// writes some environments generate
+// COMMIT/TRIGGER are edge-style: they fire on the write pulse itself
+// (ctrl_reg_wren), not on a stored value, so writing 1 twice fires twice
+// and there is nothing to clear afterwards. Requiring wstrb[0] and
+// wdata[0] means a write must actually assert the low byte with bit 0
+// set - writes with empty strobes (e.g. the randomized padding writes
+// the Coyote simulation TB generates around real accesses) cannot fire
+// a spurious commit or trigger.
 wire csr_wr        = ctrl_reg_wren && !wr_is_aperture;
 wire commit_pulse  = csr_wr && (wr_idx == R_TBL_COMMIT)  && axi_ctrl.wstrb[0] && axi_ctrl.wdata[0];
 wire trigger_pulse = csr_wr && (wr_idx == R_DMA_TRIGGER) && axi_ctrl.wstrb[0] && axi_ctrl.wdata[0];
@@ -169,7 +198,27 @@ assign tbl_base   = r_tbl_base[VADDR_BITS-1:0];
 assign tbl_len    = r_tbl_len[LEN_BITS-1:0];
 
 // -------------------------------------------------------------------------
-// Order FIFO
+// Order FIFO - the ordering heart of the design
+//
+// Both producer paths (aperture store beats and descriptor triggers)
+// funnel into this single FIFO in bus-arrival order, and the engine
+// consumes it strictly in order, one transaction at a time. That is the
+// entire mechanism behind the data-then-flag guarantee: if software
+// triggers a DMA and then stores a flag, the flag entry physically sits
+// behind the descriptor entry and cannot be issued until the DMA's whole
+// stream (and fence) has drained.
+//
+// Implementation: classic power-of-two circular buffer with (AW+1)-bit
+// read/write pointers. Empty when the pointers are equal; full when the
+// low AW bits match but the wrap (MSB) bits differ - the extra bit
+// distinguishes "same slot, zero laps apart" from "same slot, one lap
+// apart" without a separate count register.
+//
+// A full FIFO DROPS the incoming entry (and counts it in dbg[6]) instead
+// of stalling: stalling would deassert wready/bvalid back through the
+// AXI-Lite bridge into the PCIe fabric, turning our posted aperture
+// stores into blocking ones. Software sizes its outstanding work against
+// the depth (64) or checks the overflow counter.
 // -------------------------------------------------------------------------
 logic [ENTRY_W-1:0] fifo_mem [FIFO_DEPTH];
 logic [FIFO_AW:0]   wptr, rptr;
@@ -208,6 +257,19 @@ always_ff @(posedge aclk) begin
     end
 end
 
+// Head decode. The entry is a manual bit-pack, MSB to LSB:
+//   { tag(1) | win(4) | off(28) | len(28) | pid(PID) | compl_va(VADDR) | payload(64) }
+// tag: 0 = STORE, 1 = DESC. Field reuse between the two entry kinds:
+//   STORE: off = 12-bit window offset (upper bits 0), the len slot's low
+//          8 bits carry the AXI write strobes, payload = store data,
+//          pid/compl_va unused (zero).
+//   DESC:  off = 28-bit segment offset, len = transfer bytes, pid = the
+//          issuer's cThread id (used for the pull and the fence),
+//          compl_va = fence address (0 = no fence), payload holds the
+//          source VA in its low VADDR_BITS.
+// The read is combinational (head is just a slice of the memory word at
+// rptr), so the engine sees a valid head in the same cycle fifo_empty
+// deasserts.
 wire [ENTRY_W-1:0] head = fifo_mem[rptr[FIFO_AW-1:0]];
 
 assign fifo_payload  = head[63:0];
@@ -221,6 +283,16 @@ assign fifo_empty   = fifo_empty_i;
 
 // -------------------------------------------------------------------------
 // Debug counters
+//
+// Free-running 64-bit event counters, read-only through the CSR page,
+// never cleared (software computes deltas). The first two (stores
+// captured, descriptors queued) are counted here at push time; the rest
+// arrive as single-cycle pulses from the engine (writes issued per
+// route, drops, fences) and from rx (writes forwarded). Their intended
+// use is exact accounting in tests - e.g. local_wr == stores + descs
+// when everything is valid and local - and first-line triage on
+// hardware (a store that "vanished" shows up as either a drop or an
+// overflow here before any ILA is needed).
 // -------------------------------------------------------------------------
 always_ff @(posedge aclk) begin
     if (!aresetn) begin

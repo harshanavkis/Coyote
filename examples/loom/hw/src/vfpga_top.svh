@@ -56,6 +56,27 @@ logic rx_tvalid, rx_tlast;
 
 // ---------------------------------------------------------------------------
 // Arbiter: exclusive, whole-transaction ownership of {sq_wr, axis_host_send}
+//
+// Why it exists: the engine (stores, DMA writes, fences) and rx
+// (forwarded incoming writes) both need the single sq_wr request channel
+// and the single host output stream. Interleaving beats of two
+// transactions on one stream would corrupt both, so ownership is granted
+// for WHOLE transactions.
+//
+// Why it is registered: a combinational arbiter here closes a loop -
+// the grant would depend on the engine's pop decision, which depends on
+// the (masked) fifo_empty, which would depend on the grant. Registering
+// the decision breaks the loop at the cost of one idle cycle per
+// ownership change, which is negligible against transaction lengths.
+//
+// How the engine is gated without a grant port: its fifo_empty input is
+// OR-masked with !eng_grant, so outside its grant window the engine
+// simply believes the FIFO is empty and stays in IDLE. rx has an
+// explicit req/grant pair instead, because its trigger (rq_wr.valid)
+// lives outside our modules. Engine priority is a policy choice: local
+// work drains ahead of network ingress; rx work waits (bounded by the
+// FIFO running dry) and cannot be starved indefinitely by design since
+// software's aperture writes are finite.
 // ---------------------------------------------------------------------------
 typedef enum logic [1:0] { ARB_IDLE, ARB_ENG, ARB_RX } arb_t;
 arb_t arb;
@@ -160,6 +181,14 @@ loom_rx inst_loom_rx (
 
 // ---------------------------------------------------------------------------
 // Shared-path muxes
+//
+// Data/valid toward the shared resources select on the current grant;
+// the corresponding readys are masked on the way INTO each producer
+// (see the eng/rx instantiations above: `sq_wr.ready && eng_grant` etc.),
+// so an ungranted producer can neither drive nor mistakenly complete a
+// handshake. Resources with a single user need no mux: sq_rd and the
+// pull stream belong to the engine, the rdma TX stream to the engine,
+// the rdma RX stream to loom_rx.
 // ---------------------------------------------------------------------------
 always_comb begin
     sq_wr.data  = rx_grant ? rx_wr_req  : eng_wr_req;

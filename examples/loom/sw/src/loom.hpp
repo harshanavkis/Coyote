@@ -6,6 +6,22 @@
 /**
  * Loom CSR map (byte offsets in the vFPGA's 64 KB user ctrl region) and
  * access helpers. Keep in sync with hw/src/hdl/loom_ctrl.sv.
+ *
+ * Programming model in one paragraph: every participating process holds
+ * a cThread (its identity toward the shell TLB) and, through it, the
+ * mmap'd ctrl region. Byte 0x0000-0x0FFF of that region is the CSR page
+ * (control plane: window-table programming, DMA descriptor staging,
+ * debug counters); bytes 0x1000-0xFFFF are 15 aperture windows of 4 KB
+ * (data plane: an 8-byte store at window w, offset o becomes a peer
+ * write of 8 bytes at offset o of whatever segment the control plane
+ * bound to w). Multi-word structures (table entries, descriptors) are
+ * staged register-by-register and committed atomically by the final
+ * COMMIT/TRIGGER write. Bulk transfers are descriptors: the engine pulls
+ * the source buffer (named by the issuer's own VA + pid) and writes the
+ * destination; completion is a fence - the engine writes an incrementing
+ * count to the descriptor's compl VA, and software polls that word in
+ * ordinary memory (never a CSR: memory polls are cache-cheap on
+ * hardware, and in simulation CSR reads block behind the generator).
  */
 namespace loom {
 

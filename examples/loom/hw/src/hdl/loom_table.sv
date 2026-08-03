@@ -31,6 +31,12 @@ module loom_table (
     output logic [LEN_BITS-1:0]     lu_len
 );
 
+// 16 entries (window 0 = the CSR page, so 15 usable) in plain registers
+// rather than BRAM: at this size the register file costs little and the
+// lookup can be a purely combinational mux, which lets the engine latch
+// the head entry and its route in the same cycle it pops the FIFO. A
+// bigger window space (e.g. after an AXI4 aperture upgrade) would move
+// this to BRAM and add a one-cycle lookup stage in the engine.
 localparam integer N_WIN = 16;
 
 logic                  e_valid [N_WIN];

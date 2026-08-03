@@ -88,6 +88,27 @@ module loom_engine (
     output logic                        busy
 );
 
+// FSM. One FIFO entry is processed start-to-finish before the next pop:
+//
+//   ST_IDLE       wait for a FIFO entry; latch it + its table hit, pop
+//   ST_CHECK      validate (window valid, bounds, len != 0 for DESC)
+//   -- STORE path --
+//   ST_WR_REQ     hold wr_req until the shell accepts it (sq_wr handshake)
+//   ST_WR_DATA    drive the single data beat until the stream takes it
+//   -- DESC path --
+//   ST_RD_REQ     issue the pull request (sq_rd); the shell starts
+//                 translating and streaming the source buffer
+//   ST_DMA_WR_REQ issue the matching write request before any data moves,
+//                 so the shell knows where the forwarded stream goes
+//   ST_STREAM     forward pull beats to the selected output; leave on the
+//                 handshake of the tlast beat
+//   ST_CP_REQ/    optional fence: one more write request + one beat
+//   ST_CP_DATA    carrying the incremented completion count
+//
+// The serialization is deliberate: it is what turns the shared FIFO into
+// an order point. Overlap/pipelining across entries would need
+// per-window queues and completion tracking (future work, alongside the
+// coalescer and per-destination scheduling).
 typedef enum logic [3:0] {
     ST_IDLE, ST_CHECK, ST_WR_REQ, ST_WR_DATA,
     ST_RD_REQ, ST_DMA_WR_REQ, ST_STREAM,
@@ -96,7 +117,14 @@ typedef enum logic [3:0] {
 
 state_t state;
 
-// Latched entry + table hit
+// Latched copy of the FIFO head and its window-table hit. Latching at
+// pop time matters for two reasons: (1) the FIFO head and the table
+// lookup (lu_idx = fifo_win, combinational read) are only guaranteed
+// stable while the entry is at the head - once popped, the next entry
+// replaces them; (2) the table could be reprogrammed mid-transaction by
+// the control plane, and a latched route makes each transaction see one
+// consistent snapshot (the same reason the design compiles bindings
+// ahead of time instead of consulting live state per beat).
 logic                  l_is_desc;
 logic [27:0]           l_off, l_len;
 logic [PID_BITS-1:0]   l_src_pid;
@@ -189,6 +217,17 @@ assign fifo_pop = (state == ST_IDLE) && !fifo_empty;
 // -------------------------------------------------------------------------
 wire [VADDR_BITS-1:0] dst_vaddr = l_base + {{(VADDR_BITS-28){1'b0}}, l_off};
 
+// Pull request (DESC only). Field meanings on Coyote's sq_rd:
+//   opcode LOCAL_READ + strm STRM_HOST: read host memory, deliver the
+//     data to user logic on axis_host_recv[dest]
+//   pid: WHICH cThread's address space the vaddr lives in - the shell
+//     TLB translates (pid, vaddr) to physical pages. Using the
+//     descriptor's src_pid is what lets any attached process name its
+//     own buffer as the DMA source.
+//   vaddr: the issuer's source VA, passed through verbatim from the
+//     descriptor (payload field) - no address rewriting anywhere.
+//   last: request a tlast at the end of the stream so ST_STREAM knows
+//     when the transfer is done without counting bytes itself.
 always_comb begin
     rd_req = '0;
     rd_req.opcode = LOCAL_READ;
@@ -215,7 +254,22 @@ always_comb begin
         wr_req.vaddr  = l_compl_va;
         wr_req.len    = 8;
     end else if (l_route) begin
-        // rdma: RETH vaddr = exporter's VA (base + offset)
+        // Rdma route: an RDMA WRITE on the window's QP. Field meanings:
+        //   opcode APP_WRITE + mode 0 (RDMA_MODE_PARSE): the shell's
+        //     request parser fragments the payload into PMTU-sized
+        //     RC_RDMA_WRITE packets - we hand over one request for the
+        //     whole transfer regardless of size.
+        //   pid: selects WHOSE QP carries the write (the QP established
+        //     for this window's binding). It does not name a memory
+        //     space here - translation happens at the far host.
+        //   vaddr: goes into the RETH on the wire. We set it to the
+        //     exporter's own VA (window base + offset), so the receiving
+        //     host's TLB - under the far QP owner's pid - finishes the
+        //     translation. This is the "wire carries the exporter's VA /
+        //     offset in affine encoding" property of the design.
+        //   remote/rdma/actv: shell-side routing flags marking this as
+        //     an active-side remote RDMA operation (conventions taken
+        //     from the working jigsaw example).
         wr_req.opcode = APP_WRITE;
         wr_req.strm   = STRM_RDMA;
         wr_req.mode   = 1'b0;        // RDMA_MODE_PARSE: shell fragments to PMTU
@@ -226,6 +280,12 @@ always_comb begin
         wr_req.vaddr  = dst_vaddr;
         wr_req.len    = l_is_desc ? l_len[LEN_BITS-1:0] : 'd8;
     end else begin
+        // Local route: a host-memory write through the shell TLB. pid
+        // names the DESTINATION process's address space (the exporter's
+        // cThread), vaddr is the exporter's own buffer VA plus the
+        // window offset. This is the cross-pid write at the heart of the
+        // prototype: user logic writing one attached process's memory on
+        // behalf of another (hardware gate G1 verifies the TLB honors it).
         wr_req.opcode = LOCAL_WRITE;
         wr_req.strm   = STRM_HOST;
         wr_req.pid    = l_pid;
@@ -238,6 +298,20 @@ end
 
 // -------------------------------------------------------------------------
 // Data streams
+//
+// Three kinds of beats leave this module:
+//   - the single beat of a STORE (or of a fence write): built here, data
+//     in the low 8 bytes, tkeep marking exactly those 8 bytes valid.
+//     The shell writes `len` bytes starting at the request's vaddr; how
+//     a sub-line beat aligns against a non-64B-aligned vaddr is exactly
+//     hardware gate G2 (LSB alignment assumed until measured).
+//   - forwarded DMA beats: passed through combinationally from
+//     axis_host_recv (data/keep/last untouched), so the engine adds no
+//     buffering or latency - backpressure from the selected output
+//     propagates straight back into the shell's pull engine via s_tready.
+// The host and net outputs are driven from the same sources but gated by
+// the latched route, so exactly one of them carries traffic per
+// transaction.
 // -------------------------------------------------------------------------
 // Store/completion beat: data LSB-aligned, low 8 bytes valid (gate G2)
 wire [AXI_DATA_BITS-1:0]   beat_data = {{(AXI_DATA_BITS-64){1'b0}},
@@ -268,7 +342,14 @@ always_comb begin
 end
 
 // -------------------------------------------------------------------------
-// Counter pulses
+// Counter pulses (single-cycle events consumed by loom_ctrl's counters)
+//
+// A write is counted at the moment its LAST beat is accepted: for stores
+// that is the one ST_WR_DATA handshake; for DMA it is the tlast beat
+// handshake in ST_STREAM. Drops are counted in the one cycle ST_CHECK
+// rejects an entry; fences when the completion beat is taken. Each
+// condition includes the corresponding ready, so a stalled beat is not
+// double-counted while it waits.
 // -------------------------------------------------------------------------
 assign cnt_drop     = (state == ST_CHECK) && !ok;
 assign cnt_local_wr = ((state == ST_WR_DATA) && !l_route && m_host_tready) ||
