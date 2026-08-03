@@ -69,7 +69,6 @@ int main() {
     // 1. Two local windows + completion word
     loom::program_window(t, 1, false, pid, dst1, BUF_SIZE);
     loom::program_window(t, 2, false, pid, dst2, BUF_SIZE);
-    loom::set_completion(t, pid, cpl);
 
     // 2. Small stores, one per window (distinct 64 B lines)
     loom::aperture_store(t, 1, 0x40, 0xDEAD'BEEF'0000'0001ULL);
@@ -78,8 +77,8 @@ int main() {
     check(poll64(&dst2[8], 0xDEAD'BEEF'0000'0002ULL), "win2 small store lands");
 
     // 3. Bulk DMA on both windows
-    loom::dma(t, 1, 0x10000, src, DMA_BYTES, pid);
-    loom::dma(t, 2, 0x10000, src, DMA_BYTES, pid);
+    loom::dma(t, 1, 0x10000, src, DMA_BYTES, pid, cpl);
+    loom::dma(t, 2, 0x10000, src, DMA_BYTES, pid, cpl);
     check(poll64(&cpl[0], 2), "DMA completion count 2");
     check(memcmp(reinterpret_cast<uint8_t *>(dst1) + 0x10000, src, DMA_BYTES) == 0,
           "win1 DMA payload matches source");
@@ -87,7 +86,7 @@ int main() {
           "win2 DMA payload matches source");
 
     // 4. Cross-window global ordering: descriptor (win 1), flag (win 2)
-    loom::dma(t, 1, 0x20000, src, DMA_BYTES, pid);
+    loom::dma(t, 1, 0x20000, src, DMA_BYTES, pid, cpl);
     loom::aperture_store(t, 2, 0x800, 0xF1A6ULL);
     check(poll64(&dst2[0x800 / 8], 0xF1A6ULL), "cross-window flag lands");
     check(cpl[0] == 3, "flag implies DMA completed (global order point)");

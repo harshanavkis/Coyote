@@ -17,8 +17,9 @@ import lynxTypes::*;
  *   1. rd_req {LOCAL_READ, STRM_HOST, src_pid, src_va, len} (the pull)
  *   2. wr_req as above with the descriptor length
  *   3. forward the pull stream to the selected output until tlast
- *   4. if COMPL_VA != 0: wr_req {LOCAL_WRITE, compl_pid, compl_va, 8} +
- *      one beat carrying an incrementing completion count
+ *   4. if the descriptor's fence VA != 0: wr_req {LOCAL_WRITE, src_pid,
+ *      fence_va, 8} + one beat carrying an incrementing completion count
+ *      (the copy-engine semaphore-release pattern)
  *
  * Invalid window / bounds violation: entry dropped, cnt_drop pulsed.
  * Sub-8B stores (wstrb != 0xFF) are issued as full 8 B writes for now
@@ -35,6 +36,7 @@ module loom_engine (
     input  logic [27:0]                 fifo_off,
     input  logic [27:0]                 fifo_len,
     input  logic [PID_BITS-1:0]         fifo_src_pid,
+    input  logic [VADDR_BITS-1:0]       fifo_compl_va,
     input  logic [63:0]                 fifo_payload,
     output logic                        fifo_pop,
 
@@ -45,10 +47,6 @@ module loom_engine (
     input  logic [PID_BITS-1:0]         lu_pid,
     input  logic [VADDR_BITS-1:0]       lu_base,
     input  logic [LEN_BITS-1:0]         lu_len,
-
-    // Completion config (from loom_ctrl)
-    input  logic [PID_BITS-1:0]         compl_pid,
-    input  logic [VADDR_BITS-1:0]       compl_va,
 
     // sq_rd (pull requests)
     output req_t                        rd_req,
@@ -102,6 +100,7 @@ state_t state;
 logic                  l_is_desc;
 logic [27:0]           l_off, l_len;
 logic [PID_BITS-1:0]   l_src_pid;
+logic [VADDR_BITS-1:0] l_compl_va;
 logic [63:0]           l_payload;
 logic                  l_valid, l_route;
 logic [PID_BITS-1:0]   l_pid;
@@ -123,7 +122,8 @@ always_ff @(posedge aclk) begin
     if (!aresetn) begin
         state <= ST_IDLE;
         compl_cnt <= 0;
-        l_is_desc <= 0; l_off <= 0; l_len <= 0; l_src_pid <= 0; l_payload <= 0;
+        l_is_desc <= 0; l_off <= 0; l_len <= 0; l_src_pid <= 0; l_compl_va <= 0;
+        l_payload <= 0;
         l_valid <= 0; l_route <= 0; l_pid <= 0; l_base <= 0; l_lim <= 0;
     end else begin
         case (state)
@@ -132,6 +132,7 @@ always_ff @(posedge aclk) begin
                 l_off     <= fifo_off;
                 l_len     <= fifo_len;
                 l_src_pid <= fifo_src_pid;
+                l_compl_va <= fifo_compl_va;
                 l_payload <= fifo_payload;
                 l_valid   <= lu_valid;
                 l_route   <= lu_route;
@@ -156,7 +157,7 @@ always_ff @(posedge aclk) begin
             ST_STREAM:
                 if (s_tvalid && s_tlast &&
                     (( l_route && m_net_tready) || (!l_route && m_host_tready)))
-                    state <= (compl_va != 0) ? ST_CP_REQ : ST_IDLE;
+                    state <= (l_compl_va != 0) ? ST_CP_REQ : ST_IDLE;
 
             ST_CP_REQ:    if (wr_ready) state <= ST_CP_DATA;
             ST_CP_DATA:
@@ -196,10 +197,12 @@ always_comb begin
     wr_req.dest = 0;
 
     if (state == ST_CP_REQ || state == ST_CP_DATA) begin
+        // Completion (fence) write: the descriptor carries its own fence
+        // address, released under the issuer's pid - the CE semaphore model
         wr_req.opcode = LOCAL_WRITE;
         wr_req.strm   = STRM_HOST;
-        wr_req.pid    = compl_pid;
-        wr_req.vaddr  = compl_va;
+        wr_req.pid    = l_src_pid;
+        wr_req.vaddr  = l_compl_va;
         wr_req.len    = 8;
     end else if (l_route) begin
         // rdma: RETH vaddr = exporter's VA (base + offset)

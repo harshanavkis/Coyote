@@ -23,13 +23,12 @@ logic                  tbl_valid, tbl_route;
 logic [PID_BITS-1:0]   tbl_pid;
 logic [VADDR_BITS-1:0] tbl_base;
 logic [LEN_BITS-1:0]   tbl_len;
-logic [PID_BITS-1:0]   compl_pid;
-logic [VADDR_BITS-1:0] compl_va;
 
 logic                  fifo_empty, fifo_is_desc;
 logic [3:0]            fifo_win;
 logic [27:0]           fifo_off, fifo_len;
 logic [PID_BITS-1:0]   fifo_src_pid;
+logic [VADDR_BITS-1:0] fifo_compl_va;
 logic [63:0]           fifo_payload;
 logic                  fifo_pop;
 
@@ -43,11 +42,10 @@ loom_ctrl dut (
     .tbl_commit(tbl_commit), .tbl_idx(tbl_idx), .tbl_valid(tbl_valid),
     .tbl_route(tbl_route), .tbl_pid(tbl_pid), .tbl_base(tbl_base),
     .tbl_len(tbl_len),
-    .compl_pid(compl_pid), .compl_va(compl_va),
     .fifo_empty(fifo_empty), .fifo_is_desc(fifo_is_desc),
     .fifo_win(fifo_win), .fifo_off(fifo_off), .fifo_len(fifo_len),
-    .fifo_src_pid(fifo_src_pid), .fifo_payload(fifo_payload),
-    .fifo_pop(fifo_pop),
+    .fifo_src_pid(fifo_src_pid), .fifo_compl_va(fifo_compl_va),
+    .fifo_payload(fifo_payload), .fifo_pop(fifo_pop),
     .cnt_local_wr(cnt_local_wr), .cnt_rdma_wr(cnt_rdma_wr),
     .cnt_rx_fwd(cnt_rx_fwd), .cnt_drop(cnt_drop), .cnt_compl(cnt_compl)
 );
@@ -58,8 +56,7 @@ always @(posedge aclk) if (tbl_commit) commit_pulses++;
 localparam int R_TBL_IDX = 0, R_TBL_CFG = 1, R_TBL_PID = 2, R_TBL_BASE = 3,
                R_TBL_LEN = 4, R_TBL_COMMIT = 5, R_DMA_DST = 8,
                R_DMA_SRC_VA = 9, R_DMA_LEN = 10, R_DMA_SRC_PID = 11,
-               R_DMA_TRIGGER = 12, R_COMPL_PID = 16, R_COMPL_VA = 17,
-               R_DBG = 32;
+               R_DMA_TRIGGER = 12, R_DMA_COMPL_VA = 13, R_DBG = 32;
 
 task check(input bit cond, input string msg);
     if (!cond) begin
@@ -135,10 +132,6 @@ initial begin
           tbl_base == 48'h7f1b_d420_0000 && tbl_len == 28'h40_0000,
           "table programming outputs");
 
-    // --- 3. Completion config ---
-    axil_write(16'(R_COMPL_PID * 8), 64'd2);
-    axil_write(16'(R_COMPL_VA * 8), 64'h0000_7f6a_3000_0000);
-    check(compl_pid == 6'd2 && compl_va == 48'h7f6a_3000_0000, "completion config");
 
     // --- 4. Aperture store capture ---
     check(fifo_empty, "FIFO not empty before first store");
@@ -155,11 +148,13 @@ initial begin
     axil_write(16'(R_DMA_SRC_VA * 8),  64'h0000_7f6a_2000_0000);
     axil_write(16'(R_DMA_LEN * 8),     64'h4_0000);
     axil_write(16'(R_DMA_SRC_PID * 8), 64'd2);
+    axil_write(16'(R_DMA_COMPL_VA * 8), 64'h0000_7f6a_3000_0000);
     check(fifo_empty, "descriptor enqueued before trigger");
     axil_write(16'(R_DMA_TRIGGER * 8), 64'd1);
     check(!fifo_empty && fifo_is_desc && fifo_win == 4'd1 &&
           fifo_off == 28'h001_0000 && fifo_len == 28'h4_0000 &&
-          fifo_src_pid == 6'd2 && fifo_payload[47:0] == 48'h7f6a_2000_0000,
+          fifo_src_pid == 6'd2 && fifo_compl_va == 48'h7f6a_3000_0000 &&
+          fifo_payload[47:0] == 48'h7f6a_2000_0000,
           "descriptor entry fields");
     pop_one();
 
@@ -222,7 +217,7 @@ initial begin
 
     // --- 11. Full RW CSR readback ---
     begin
-        int idx_list[11] = '{0, 1, 2, 3, 4, 8, 9, 10, 11, 16, 17};
+        int idx_list[10] = '{0, 1, 2, 3, 4, 8, 9, 10, 11, 13};
         foreach (idx_list[j]) begin
             axil_write(16'(idx_list[j] * 8), 64'hC0DE_0000_0000_0000 + 64'(idx_list[j]));
         end

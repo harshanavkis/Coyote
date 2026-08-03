@@ -21,8 +21,7 @@ constexpr uint32_t DMA_SRC_VA  = 0x48;
 constexpr uint32_t DMA_LEN     = 0x50;
 constexpr uint32_t DMA_SRC_PID = 0x58;
 constexpr uint32_t DMA_TRIGGER = 0x60;
-constexpr uint32_t COMPL_PID   = 0x80;
-constexpr uint32_t COMPL_VA    = 0x88;
+constexpr uint32_t DMA_COMPL_VA = 0x68;
 constexpr uint32_t DBG_BASE    = 0x100;  // 8 x RO counters (see loom_ctrl.sv)
 
 // Aperture: windows 1..15, 4 KB each (byte 0x1000-0xFFFF)
@@ -56,26 +55,25 @@ inline void program_window(coyote::cThread &t, uint32_t win, bool rdma,
     csr_write(t, TBL_COMMIT, 1);
 }
 
-// Configure the completion word
-inline void set_completion(coyote::cThread &t, uint32_t pid, const void *va) {
-    csr_write(t, COMPL_PID, pid);
-    csr_write(t, COMPL_VA,  reinterpret_cast<uint64_t>(va));
-}
-
 // Small write through the aperture (the emulated peer store)
 inline void aperture_store(coyote::cThread &t, uint32_t win, uint32_t off,
                            uint64_t val) {
     csr_write(t, aperture(win, off), val);
 }
 
-// Bulk transfer: configure the DMA engine, then it moves the data
+// Bulk transfer: configure the DMA engine, then it moves the data.
+// compl_va is the per-descriptor completion (fence) address: when the
+// descriptor retires, the engine writes an incrementing count there under
+// src_pid (the copy-engine semaphore-release pattern). nullptr = none.
 inline void dma(coyote::cThread &t, uint32_t win, uint32_t seg_off,
-                const void *src, uint64_t len, uint32_t src_pid) {
-    csr_write(t, DMA_DST,     (uint64_t(win) << 60) | seg_off);
-    csr_write(t, DMA_SRC_VA,  reinterpret_cast<uint64_t>(src));
-    csr_write(t, DMA_LEN,     len);
-    csr_write(t, DMA_SRC_PID, src_pid);
-    csr_write(t, DMA_TRIGGER, 1);
+                const void *src, uint64_t len, uint32_t src_pid,
+                const void *compl_va = nullptr) {
+    csr_write(t, DMA_DST,      (uint64_t(win) << 60) | seg_off);
+    csr_write(t, DMA_SRC_VA,   reinterpret_cast<uint64_t>(src));
+    csr_write(t, DMA_LEN,      len);
+    csr_write(t, DMA_SRC_PID,  src_pid);
+    csr_write(t, DMA_COMPL_VA, reinterpret_cast<uint64_t>(compl_va));
+    csr_write(t, DMA_TRIGGER,  1);
 }
 
 } // namespace loom

@@ -15,6 +15,9 @@ logic and user-space software; the shell and driver stay stock.
   offset = `addr[11:0]`. Every write beat here is captured as a small-write
   transaction (posted).
 
+Detailed hardware description and the GPU-equivalence argument:
+[HW-DESIGN.md](HW-DESIGN.md).
+
 ## Components (hw/src/hdl/)
 
 - **loom_ctrl** — AXI4-Lite slave: CSR page + aperture capture. Captured
@@ -75,8 +78,13 @@ N_REGIONS 1`; cf. `examples/jigsaw_baseline_rdma`.
 | 3 | loom_rx + block TB | done, TBs pass |
 | 4 | vfpga_top wiring + Coyote integration sim (EN_SIM) | done, LOOM TEST PASS |
 | 4.5 | test hardening: tb_loom_top (arbitration), engine/ctrl corner cases, extended integration sim, Python RDMA TX test | done, all pass |
-| 5 | hardware bring-up, local paths | pending |
-| 6 | hardware, RDMA path (two hosts) | pending |
+| 5.0 | per-descriptor completion (fence VA in descriptor, CE semaphore-release model) | done, all sims pass |
+| 5.1a | single-process software: orchestrator + XPU roles as separate cThreads in one binary | pending |
+| 5.1b | multi-process split: libloom + loomd control daemon (Unix socket) | pending |
+| 5.2 | hardware gate tests G1/G2/G4 on stock examples | pending |
+| 5.3 | synthesize + run on U280 (cross-pid), latency/bandwidth numbers | pending |
+| 6.1 | loomd-loomd TCP, QP setup via Coyote RDMA API, remote export/import | pending |
+| 6.2 | two-host run (resolves G3), remote measurements | pending |
 
 ## Running
 
@@ -208,3 +216,13 @@ Framework quirks: register values are packed as signed 64-bit (keep test
 payloads below 2^63); the RDMA-REMOTE segment must be allocated first
 (remote_rdma_write); live register reads need a long simulation window
 (the test sets 1 ms; the 4 us default closes before responses arrive).
+
+### Switching between the C++ and Python sim harnesses
+
+The two harnesses compile the XSIM project with different defines
+(interactive vs. non-interactive). The stale snapshot makes the *other*
+harness crash at t=0 (XSIM kernel FATAL). After switching, clean once:
+
+```bash
+rm -rf examples/loom/hw/build_sim/sim/example_loom.sim
+```

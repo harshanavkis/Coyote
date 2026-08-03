@@ -23,13 +23,11 @@ logic [PID_BITS-1:0]    tbl_pid;
 logic [VADDR_BITS-1:0]  tbl_base;
 logic [LEN_BITS-1:0]    tbl_len;
 
-logic [PID_BITS-1:0]    compl_pid;
-logic [VADDR_BITS-1:0]  compl_va;
-
 logic                   fifo_empty, fifo_is_desc, fifo_pop;
 logic [3:0]             fifo_win;
 logic [27:0]            fifo_off, fifo_len;
 logic [PID_BITS-1:0]    fifo_src_pid;
+logic [VADDR_BITS-1:0]  fifo_compl_va;
 logic [63:0]            fifo_payload;
 
 logic [3:0]             lu_idx;
@@ -96,11 +94,10 @@ loom_ctrl inst_loom_ctrl (
     .tbl_commit(tbl_commit), .tbl_idx(tbl_idx), .tbl_valid(tbl_valid),
     .tbl_route(tbl_route), .tbl_pid(tbl_pid), .tbl_base(tbl_base),
     .tbl_len(tbl_len),
-    .compl_pid(compl_pid), .compl_va(compl_va),
     .fifo_empty(fifo_empty), .fifo_is_desc(fifo_is_desc),
     .fifo_win(fifo_win), .fifo_off(fifo_off), .fifo_len(fifo_len),
-    .fifo_src_pid(fifo_src_pid), .fifo_payload(fifo_payload),
-    .fifo_pop(fifo_pop),
+    .fifo_src_pid(fifo_src_pid), .fifo_compl_va(fifo_compl_va),
+    .fifo_payload(fifo_payload), .fifo_pop(fifo_pop),
     .cnt_local_wr(cnt_local_wr), .cnt_rdma_wr(cnt_rdma_wr),
     .cnt_rx_fwd(cnt_rx_fwd), .cnt_drop(cnt_drop), .cnt_compl(cnt_compl)
 );
@@ -120,10 +117,10 @@ loom_engine inst_loom_engine (
     .fifo_empty(fifo_empty || !eng_grant),
     .fifo_is_desc(fifo_is_desc), .fifo_win(fifo_win), .fifo_off(fifo_off),
     .fifo_len(fifo_len), .fifo_src_pid(fifo_src_pid),
+    .fifo_compl_va(fifo_compl_va),
     .fifo_payload(fifo_payload), .fifo_pop(fifo_pop),
     .lu_idx(lu_idx), .lu_valid(lu_valid), .lu_route(lu_route),
     .lu_pid(lu_pid), .lu_base(lu_base), .lu_len(lu_len),
-    .compl_pid(compl_pid), .compl_va(compl_va),
     .rd_req(eng_rd_req), .rd_valid(eng_rd_valid), .rd_ready(sq_rd.ready),
     .wr_req(eng_wr_req), .wr_valid(eng_wr_valid),
     .wr_ready(sq_wr.ready && eng_grant),

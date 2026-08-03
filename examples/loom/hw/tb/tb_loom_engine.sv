@@ -27,13 +27,12 @@ logic                  tbl_valid, tbl_route;
 logic [PID_BITS-1:0]   tbl_pid;
 logic [VADDR_BITS-1:0] tbl_base;
 logic [LEN_BITS-1:0]   tbl_len;
-logic [PID_BITS-1:0]   compl_pid;
-logic [VADDR_BITS-1:0] compl_va;
 
 logic                  fifo_empty, fifo_is_desc, fifo_pop;
 logic [3:0]            fifo_win;
 logic [27:0]           fifo_off, fifo_len;
 logic [PID_BITS-1:0]   fifo_src_pid;
+logic [VADDR_BITS-1:0] fifo_compl_va;
 logic [63:0]           fifo_payload;
 
 logic [3:0]            lu_idx;
@@ -66,11 +65,10 @@ loom_ctrl inst_ctrl (
     .tbl_commit(tbl_commit), .tbl_idx(tbl_idx), .tbl_valid(tbl_valid),
     .tbl_route(tbl_route), .tbl_pid(tbl_pid), .tbl_base(tbl_base),
     .tbl_len(tbl_len),
-    .compl_pid(compl_pid), .compl_va(compl_va),
     .fifo_empty(fifo_empty), .fifo_is_desc(fifo_is_desc),
     .fifo_win(fifo_win), .fifo_off(fifo_off), .fifo_len(fifo_len),
-    .fifo_src_pid(fifo_src_pid), .fifo_payload(fifo_payload),
-    .fifo_pop(fifo_pop),
+    .fifo_src_pid(fifo_src_pid), .fifo_compl_va(fifo_compl_va),
+    .fifo_payload(fifo_payload), .fifo_pop(fifo_pop),
     .cnt_local_wr(cnt_local_wr), .cnt_rdma_wr(cnt_rdma_wr),
     .cnt_rx_fwd(1'b0), .cnt_drop(cnt_drop), .cnt_compl(cnt_compl)
 );
@@ -88,11 +86,10 @@ loom_engine inst_engine (
     .aclk(aclk), .aresetn(aresetn),
     .fifo_empty(fifo_empty), .fifo_is_desc(fifo_is_desc),
     .fifo_win(fifo_win), .fifo_off(fifo_off), .fifo_len(fifo_len),
-    .fifo_src_pid(fifo_src_pid), .fifo_payload(fifo_payload),
-    .fifo_pop(fifo_pop),
+    .fifo_src_pid(fifo_src_pid), .fifo_compl_va(fifo_compl_va),
+    .fifo_payload(fifo_payload), .fifo_pop(fifo_pop),
     .lu_idx(lu_idx), .lu_valid(lu_valid), .lu_route(lu_route),
     .lu_pid(lu_pid), .lu_base(lu_base), .lu_len(lu_len),
-    .compl_pid(compl_pid), .compl_va(compl_va),
     .rd_req(rd_req), .rd_valid(rd_valid), .rd_ready(rd_ready),
     .wr_req(wr_req), .wr_valid(wr_valid), .wr_ready(wr_ready),
     .s_tdata(s_tdata), .s_tkeep(s_tkeep), .s_tvalid(s_tvalid),
@@ -164,12 +161,14 @@ task program_win(input [3:0] idx, input route,
 endtask
 
 task descriptor(input [3:0] win, input [27:0] off, input [63:0] src_va,
-                input [27:0] len, input [PID_BITS-1:0] src_pid);
-    axil_write(16'd64, {win, 32'b0, off});
-    axil_write(16'd72, src_va);
-    axil_write(16'd80, {36'b0, len});
-    axil_write(16'd88, {58'b0, src_pid});
-    axil_write(16'd96, 64'd1);
+                input [27:0] len, input [PID_BITS-1:0] src_pid,
+                input [63:0] compl = 64'd0);
+    axil_write(16'd64,  {win, 32'b0, off});
+    axil_write(16'd72,  src_va);
+    axil_write(16'd80,  {36'b0, len});
+    axil_write(16'd88,  {58'b0, src_pid});
+    axil_write(16'd104, compl);          // per-descriptor fence VA
+    axil_write(16'd96,  64'd1);
 endtask
 
 // Feed the pull stream: n beats, data = base_val + beat index
@@ -213,8 +212,6 @@ initial begin
     // Setup: two windows + completion config
     program_win(4'd1, 1'b0, 6'd1, {16'b0, BASE_B}, 64'h40_0000);
     program_win(4'd2, 1'b1, 6'd3, {16'b0, BASE_C}, 64'h40_0000);
-    axil_write(16'd128, 64'd0);                    // COMPL_PID = 0
-    axil_write(16'd136, {16'b0, CPL_VA});          // COMPL_VA
 
     // --- 1. Local store ---
     axil_write(16'h1040, 64'hDEAD_BEEF_0000_0001);
@@ -248,7 +245,7 @@ initial begin
     check(hostq.size() == 0, "rdma store: nothing on host");
 
     // --- 3. DMA local (256 B = 4 beats) ---
-    descriptor(4'd1, 28'h100, {16'b0, SRC_VA}, 28'd256, 6'd2);
+    descriptor(4'd1, 28'h100, {16'b0, SRC_VA}, 28'd256, 6'd2, {16'b0, CPL_VA});
     fork
         send_beats(4, 64'hAA00);
     join_none
@@ -265,7 +262,7 @@ initial begin
         check(r.opcode == LOCAL_WRITE && r.pid == 6'd1 &&
               r.vaddr == BASE_B + 48'h100 && r.len == 256, "dma local: wr_req fields");
         r = wrq.pop_front();
-        check(r.opcode == LOCAL_WRITE && r.pid == 6'd0 && r.vaddr == CPL_VA &&
+        check(r.opcode == LOCAL_WRITE && r.pid == 6'd2 && r.vaddr == CPL_VA &&
               r.len == 8, "dma local: completion wr_req fields");
     end else wrq.delete();
     // host stream: 4 data beats then 1 completion beat (value 1)
@@ -279,7 +276,7 @@ initial begin
     hostq.delete();
 
     // --- 4. DMA rdma (128 B = 2 beats) ---
-    descriptor(4'd2, 28'h200, {16'b0, SRC_VA}, 28'd128, 6'd0);
+    descriptor(4'd2, 28'h200, {16'b0, SRC_VA}, 28'd128, 6'd0, {16'b0, CPL_VA});
     fork
         send_beats(2, 64'hBB00);
     join_none
@@ -311,7 +308,7 @@ initial begin
     check(rdata == 64'd2, $sformatf("drops: counter = %0d, expected 2", rdata));
 
     // --- 6. Ordering: flag store behind a DMA descriptor ---
-    descriptor(4'd1, 28'h300, {16'b0, SRC_VA}, 28'd128, 6'd2);   // 2 beats, not fed yet
+    descriptor(4'd1, 28'h300, {16'b0, SRC_VA}, 28'd128, 6'd2, {16'b0, CPL_VA});   // 2 beats, not fed yet
     axil_write(16'h1800, 64'hF1A6);                              // flag store, win 1
     repeat (50) @(posedge aclk);
     // engine must be stalled in the DMA stream: rd+wr issued, no flag write yet
@@ -352,7 +349,7 @@ initial begin
           "bp: store completes after wr_ready release");
     wrq.delete(); hostq.delete();
     // 7b. host tready stalled mid-DMA-stream
-    descriptor(4'd1, 28'h400, {16'b0, SRC_VA}, 28'd128, 6'd2);
+    descriptor(4'd1, 28'h400, {16'b0, SRC_VA}, 28'd128, 6'd2, {16'b0, CPL_VA});
     fork send_beats(2, 64'h7B00); join_none
     do @(posedge aclk); while (hostq.size() < 1);      // first beat through
     @(negedge aclk); m_host_tready = 0;
@@ -374,7 +371,7 @@ initial begin
     wrq.delete(); netq.delete();
 
     // --- 8. Bounds edges (window len 4MB) ---
-    descriptor(4'd1, 28'h3F_FFC0, {16'b0, SRC_VA}, 28'd64, 6'd2);  // end == 4MB: pass
+    descriptor(4'd1, 28'h3F_FFC0, {16'b0, SRC_VA}, 28'd64, 6'd2, {16'b0, CPL_VA});  // end == 4MB: pass
     fork send_beats(1, 64'h8A00); join_none
     wait_idle();
     check(wrq.size() == 2 && wrq[0].len == 64, "bounds: end==lim accepted");
@@ -388,16 +385,15 @@ initial begin
     wrq.delete(); hostq.delete();
 
     // --- 9. Length not a multiple of 64 B ---
-    descriptor(4'd1, 28'h500, {16'b0, SRC_VA}, 28'd100, 6'd2);
+    descriptor(4'd1, 28'h500, {16'b0, SRC_VA}, 28'd100, 6'd2, {16'b0, CPL_VA});
     fork send_beats(2, 64'h9A00); join_none
     wait_idle();
     check(wrq.size() == 2 && wrq[0].len == 100, "oddlen: wr_req len 100");
     check(hostq.size() == 3, "oddlen: 2 data beats + completion");
     wrq.delete(); hostq.delete(); rdq.delete();
 
-    // --- 10. Completion disabled ---
-    axil_write(16'd136, 64'd0);                     // COMPL_VA = 0
-    descriptor(4'd1, 28'h600, {16'b0, SRC_VA}, 28'd64, 6'd2);
+    // --- 10. Completion disabled (descriptor fence VA = 0) ---
+    descriptor(4'd1, 28'h600, {16'b0, SRC_VA}, 28'd64, 6'd2, 64'd0);
     fork send_beats(1, 64'hA100); join_none
     wait_idle();
     check(wrq.size() == 1, "compl-off: single wr_req");

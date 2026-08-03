@@ -58,10 +58,6 @@ class LoomRdmaTx(FPGATestCase):
         self.write_register(reg64(3, 0x7F9E_8860_0000))
         self.write_register(reg64(4, 0x40_0000))
         self.write_register(reg64(5, 1))
-        # Completion word disabled
-        self.write_register(reg64(16, 0))
-        self.write_register(reg64(17, 0))
-
         # Aperture store: window 2, offset 0x40 (register ids are 64-bit
         # word indices; byte 0x2040 -> id 0x408)
         self.write_register(reg64(0x2040 // 8, 0x1EAD_BEEF_0000_0002))

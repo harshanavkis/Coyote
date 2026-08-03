@@ -27,10 +27,10 @@ import lynxTypes::*;
  *   10 DMA_LEN      (RW) transfer length in bytes
  *   11 DMA_SRC_PID  (RW) issuer's cThread pid (used for the pull)
  *   12 DMA_TRIGGER  (W)  write 1 -> enqueue descriptor into the order FIFO
- *   16 COMPL_PID    (RW) pid for the completion write
- *   17 COMPL_VA     (RW) completion word VA; 0 = disabled. After each
- *                        descriptor retires, the engine writes an
- *                        incrementing 64-bit count to (COMPL_PID, COMPL_VA).
+ *   13 DMA_COMPL_VA (RW) per-descriptor completion (fence) VA; 0 = none.
+ *                        When the descriptor retires, the engine writes an
+ *                        incrementing count to (DMA_SRC_PID, DMA_COMPL_VA),
+ *                        like a copy engine's semaphore release.
  *   32-39 (RO) debug counters:
  *   32 stores captured        33 descriptors queued
  *   34 local writes issued    35 rdma writes issued
@@ -52,10 +52,6 @@ module loom_ctrl (
     output logic [VADDR_BITS-1:0]       tbl_base,
     output logic [LEN_BITS-1:0]         tbl_len,
 
-    // Completion config (to loom_engine)
-    output logic [PID_BITS-1:0]         compl_pid,
-    output logic [VADDR_BITS-1:0]       compl_va,
-
     // Order FIFO, pop side (to loom_engine)
     output logic                        fifo_empty,
     output logic                        fifo_is_desc,
@@ -63,6 +59,7 @@ module loom_ctrl (
     output logic [27:0]                 fifo_off,
     output logic [27:0]                 fifo_len,      // DESC: length; STORE: wstrb in [7:0]
     output logic [PID_BITS-1:0]         fifo_src_pid,  // DESC only
+    output logic [VADDR_BITS-1:0]       fifo_compl_va, // DESC only: fence VA (0 = none)
     output logic [63:0]                 fifo_payload,  // STORE: data; DESC: source VA
     input  logic                        fifo_pop,
 
@@ -91,13 +88,12 @@ localparam integer R_DMA_SRC_VA  = 9;
 localparam integer R_DMA_LEN     = 10;
 localparam integer R_DMA_SRC_PID = 11;
 localparam integer R_DMA_TRIGGER = 12;
-localparam integer R_COMPL_PID   = 16;
-localparam integer R_COMPL_VA    = 17;
+localparam integer R_DMA_COMPL_VA = 13;
 localparam integer R_DBG_BASE    = 32;
 localparam integer N_DBG         = 8;
 
-// Order FIFO entry: {tag(1), win(4), off(28), len(28), pid(PID_BITS), payload(64)}
-localparam integer ENTRY_W    = 1 + 4 + 28 + 28 + PID_BITS + 64;
+// Order FIFO entry: {tag(1), win(4), off(28), len(28), pid(PID_BITS), compl_va(VADDR_BITS), payload(64)}
+localparam integer ENTRY_W    = 1 + 4 + 28 + 28 + PID_BITS + VADDR_BITS + 64;
 localparam integer FIFO_AW    = 6;
 localparam integer FIFO_DEPTH = 1 << FIFO_AW;
 
@@ -130,8 +126,7 @@ wire [CSR_BITS-1:0] rd_idx = axi_araddr[ADDR_LSB +: CSR_BITS];
 // CSRs
 // -------------------------------------------------------------------------
 logic [63:0] r_tbl_idx, r_tbl_cfg, r_tbl_pid, r_tbl_base, r_tbl_len;
-logic [63:0] r_dma_dst, r_dma_src_va, r_dma_len, r_dma_src_pid;
-logic [63:0] r_compl_pid, r_compl_va;
+logic [63:0] r_dma_dst, r_dma_src_va, r_dma_len, r_dma_src_pid, r_dma_compl_va;
 logic [63:0] dbg [N_DBG];
 
 wire csr_wr        = ctrl_reg_wren && !wr_is_aperture;
@@ -142,7 +137,7 @@ always_ff @(posedge aclk) begin
     if (!aresetn) begin
         r_tbl_idx <= 0; r_tbl_cfg <= 0; r_tbl_pid <= 0; r_tbl_base <= 0; r_tbl_len <= 0;
         r_dma_dst <= 0; r_dma_src_va <= 0; r_dma_len <= 0; r_dma_src_pid <= 0;
-        r_compl_pid <= 0; r_compl_va <= 0;
+        r_dma_compl_va <= 0;
     end else if (csr_wr) begin
         case (wr_idx)
             R_TBL_IDX:     r_tbl_idx     <= axi_ctrl.wdata;
@@ -154,8 +149,7 @@ always_ff @(posedge aclk) begin
             R_DMA_SRC_VA:  r_dma_src_va  <= axi_ctrl.wdata;
             R_DMA_LEN:     r_dma_len     <= axi_ctrl.wdata;
             R_DMA_SRC_PID: r_dma_src_pid <= axi_ctrl.wdata;
-            R_COMPL_PID:   r_compl_pid   <= axi_ctrl.wdata;
-            R_COMPL_VA:    r_compl_va    <= axi_ctrl.wdata;
+            R_DMA_COMPL_VA: r_dma_compl_va <= axi_ctrl.wdata;
             default: ;
         endcase
     end
@@ -168,8 +162,6 @@ assign tbl_route  = r_tbl_cfg[1];
 assign tbl_pid    = r_tbl_pid[PID_BITS-1:0];
 assign tbl_base   = r_tbl_base[VADDR_BITS-1:0];
 assign tbl_len    = r_tbl_len[LEN_BITS-1:0];
-assign compl_pid  = r_compl_pid[PID_BITS-1:0];
-assign compl_va   = r_compl_va[VADDR_BITS-1:0];
 
 // -------------------------------------------------------------------------
 // Order FIFO
@@ -188,9 +180,11 @@ wire push_drop  = ((ctrl_reg_wren && wr_is_aperture) || trigger_pulse) && fifo_f
 // assumes full 8 B stores; wstrb kept for a later sub-word extension)
 wire [ENTRY_W-1:0] store_entry = {1'b0, wr_win, {16'b0, wr_win_off},
                                   {20'b0, axi_ctrl.wstrb},
-                                  {PID_BITS{1'b0}}, axi_ctrl.wdata};
+                                  {PID_BITS{1'b0}}, {VADDR_BITS{1'b0}},
+                                  axi_ctrl.wdata};
 wire [ENTRY_W-1:0] desc_entry  = {1'b1, r_dma_dst[63:60], r_dma_dst[27:0],
                                   r_dma_len[27:0], r_dma_src_pid[PID_BITS-1:0],
+                                  r_dma_compl_va[VADDR_BITS-1:0],
                                   {{(64-VADDR_BITS){1'b0}}, r_dma_src_va[VADDR_BITS-1:0]}};
 
 always_ff @(posedge aclk) begin
@@ -208,12 +202,13 @@ end
 
 wire [ENTRY_W-1:0] head = fifo_mem[rptr[FIFO_AW-1:0]];
 
-assign fifo_payload = head[63:0];
-assign fifo_src_pid = head[64 +: PID_BITS];
-assign fifo_len     = head[64+PID_BITS +: 28];
-assign fifo_off     = head[64+PID_BITS+28 +: 28];
-assign fifo_win     = head[64+PID_BITS+56 +: 4];
-assign fifo_is_desc = head[64+PID_BITS+60];
+assign fifo_payload  = head[63:0];
+assign fifo_compl_va = head[64 +: VADDR_BITS];
+assign fifo_src_pid  = head[64+VADDR_BITS +: PID_BITS];
+assign fifo_len      = head[64+VADDR_BITS+PID_BITS +: 28];
+assign fifo_off      = head[64+VADDR_BITS+PID_BITS+28 +: 28];
+assign fifo_win      = head[64+VADDR_BITS+PID_BITS+56 +: 4];
+assign fifo_is_desc  = head[64+VADDR_BITS+PID_BITS+60];
 assign fifo_empty   = fifo_empty_i;
 
 // -------------------------------------------------------------------------
@@ -252,8 +247,7 @@ always_ff @(posedge aclk) begin
             R_DMA_SRC_VA:  axi_rdata <= r_dma_src_va;
             R_DMA_LEN:     axi_rdata <= r_dma_len;
             R_DMA_SRC_PID: axi_rdata <= r_dma_src_pid;
-            R_COMPL_PID:   axi_rdata <= r_compl_pid;
-            R_COMPL_VA:    axi_rdata <= r_compl_va;
+            R_DMA_COMPL_VA: axi_rdata <= r_dma_compl_va;
             default:
                 if (rd_idx >= R_DBG_BASE && rd_idx < R_DBG_BASE + N_DBG)
                     axi_rdata <= dbg[rd_idx - R_DBG_BASE];

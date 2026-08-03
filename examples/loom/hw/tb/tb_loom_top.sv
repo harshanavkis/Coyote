@@ -184,11 +184,12 @@ task program_win(input [3:0] idx, input route,
 endtask
 
 task descriptor(input [3:0] win, input [27:0] off, input [27:0] len);
-    axil_write(16'd64, {win, 32'b0, off});
-    axil_write(16'd72, 64'h0000_7f6a_2000_0000);
-    axil_write(16'd80, {36'b0, len});
-    axil_write(16'd88, 64'd0);
-    axil_write(16'd96, 64'd1);
+    axil_write(16'd64,  {win, 32'b0, off});
+    axil_write(16'd72,  64'h0000_7f6a_2000_0000);
+    axil_write(16'd80,  {36'b0, len});
+    axil_write(16'd88,  64'd0);
+    axil_write(16'd104, 64'd0);          // fence VA = 0: no completion
+    axil_write(16'd96,  64'd1);
 endtask
 
 task wait_quiesce();
@@ -222,8 +223,6 @@ initial begin
     // Windows 1, 2 local; completion disabled (COMPL_VA = 0)
     program_win(4'd1, 1'b0, 6'd1, {16'b0, BASE_B}, 64'h40_0000);
     program_win(4'd2, 1'b0, 6'd2, {16'b0, BASE_B + 48'h100_0000}, 64'h40_0000);
-    axil_write(16'd128, 64'd0);
-    axil_write(16'd136, 64'd0);
 
     // --- T1: smoke through the full top ---
     axil_write(16'h1040, 64'h1111);
