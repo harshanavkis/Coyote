@@ -8,9 +8,11 @@
  * In simulation (COYOTE_SIM_DIR set) the daemon runs as a thread and
  * all roles share the single mock cThread (degenerate process
  * isolation) - but the socket, the protocol, and the daemon state
- * machine are the production code paths, exercised for real. On
- * hardware the same binary uses a cThread per role; the standalone
- * `loomd` binary + separate client processes are the 5.4/5.5 rerun.
+ * machine are the production code paths, exercised for real.
+ *
+ * Hardware two-process mode: set LOOMD_SOCK=<path> to SKIP the internal
+ * daemon and connect to an externally running `./loomd <path>` instead -
+ * the true client/server split (control plane in another process).
  */
 
 #include <cstdio>
@@ -40,19 +42,28 @@ int main() {
     coyote::cThread &ta = sim ? *t_orch : *t_a;
     coyote::cThread &tb = sim ? *t_orch : *t_b;
 
-    // Server role: orchestrator behind loomd on a real socket
-    char sock_path[64];
-    snprintf(sock_path, sizeof(sock_path), "/tmp/loomd_test_%d.sock", getpid());
-    loom::InProcOrchestrator backend(*t_orch);
-    loom::Loomd daemon(backend, sock_path);
-    if (!daemon.start()) { printf("FAIL: loomd start\n"); return 1; }
-    std::thread daemon_thr([&] { daemon.run(); });
+    // Server role: external loomd (LOOMD_SOCK set) or internal thread
+    const char *extern_sock = getenv("LOOMD_SOCK");
+    char sock_path[108];
+    std::unique_ptr<loom::InProcOrchestrator> backend;
+    std::unique_ptr<loom::Loomd> daemon;
+    std::thread daemon_thr;
+    if (extern_sock) {
+        snprintf(sock_path, sizeof(sock_path), "%s", extern_sock);
+        printf("using external loomd at %s\n", sock_path);
+    } else {
+        snprintf(sock_path, sizeof(sock_path), "/tmp/loomd_test_%d.sock", getpid());
+        backend = std::make_unique<loom::InProcOrchestrator>(*t_orch);
+        daemon  = std::make_unique<loom::Loomd>(*backend, sock_path);
+        if (!daemon->start()) { printf("FAIL: loomd start\n"); return 1; }
+        daemon_thr = std::thread([&] { daemon->run(); });
+    }
 
     // Client roles: one socket connection EACH
     loom::SockOrchClient orchA(sock_path), orchB(sock_path);
     if (!orchA.connected() || !orchB.connected()) {
         printf("FAIL: socket connect\n");
-        daemon.stop(); daemon_thr.join();
+        if (daemon) { daemon->stop(); daemon_thr.join(); }
         return 1;
     }
     printf("PASS: two clients connected to %s\n", sock_path);
@@ -63,8 +74,10 @@ int main() {
 
     int failures = loom_test::run_roles_flow(*t_orch, A, B, orchA);
 
-    daemon.stop();
-    daemon_thr.join();
+    if (daemon) {
+        daemon->stop();
+        daemon_thr.join();
+    }
 
     printf(failures == 0 ? "LOOM ROLES-SOCK TEST PASS\n"
                          : "LOOM ROLES-SOCK TEST FAIL (%d)\n", failures);

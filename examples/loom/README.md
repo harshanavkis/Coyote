@@ -291,24 +291,28 @@ payloads below 2^63); the RDMA-REMOTE segment must be allocated first
 (remote_rdma_write); live register reads need a long simulation window
 (the test sets 1 ms; the 4 us default closes before responses arrive).
 
-### Role-split demo (Phase 5.1a)
+### Software demos, SINGLE-PROCESS variant (orchestrator + XPU roles in one binary)
 
-Single binary, client/server structure: `loom_orch.hpp` (OrchClient
-interface + InProcOrchestrator, the only code touching the CSR page) and
-`loom_xpu.hpp` (client role: data plane + control calls through the
-interface); `roles.cpp` runs exporter/importer/orchestrator roles.
-Transport is in-process function calls; 5.1b swaps it for a Unix socket
-to loomd behind the same interface. Mode is runtime-selected: with
-COYOTE_SIM_DIR set, all roles share the single sim cThread (degenerate);
-on hardware each role gets its own cThread (untested until 5.3).
+Two binaries, no sockets, no daemon - everything in one process:
+
+- `./test` - the monolithic regression (one cThread doing everything;
+  run instructions in the integration-sim section above; 13x PASS,
+  `LOOM TEST PASS`).
+- `./roles` - the role-split demo: `loom_orch.hpp` (OrchClient
+  interface + InProcOrchestrator, the only code touching the CSR page),
+  `loom_xpu.hpp` (client role), shared flow in `roles_test.hpp`.
+  Transport = in-process function calls behind the OrchClient
+  interface. Mode is runtime-selected: with COYOTE_SIM_DIR set, all
+  roles share the single sim cThread (degenerate); on hardware each
+  role gets its own cThread (real cross-pid).
 
 ```bash
 cd examples/loom/sw/build_sim   # after the cmake/make above
-nix-shell -p cmake gcc boost --run 'make -j8 roles'
 tmux new-session -d -s loom_roles \
   "xilinx-shell -c 'export COYOTE_SIM_DIR=$PWD/../../hw/build_sim/; ./roles' \
    > run_roles.log 2>&1"
 tail -f run_roles.log   # expect 12x PASS, LOOM ROLES TEST PASS
+# hardware: same binary, no COYOTE_SIM_DIR -> cThread per role
 ```
 
 Covers: export/import through the orchestrator (windows allocated
@@ -316,7 +320,7 @@ server-side), bogus-handle refusal, stores + fenced copies + the order
 point through the role API, and window release (subsequent stores dropped,
 observed via the drops counter).
 
-### Running on hardware (Phase 5.3 flow - NOT yet validated)
+### Running on hardware (Phase 5.4+ flow - NOT yet validated)
 
 The expected flow once testbed time is available; commands follow the
 standard Coyote flow and this repo's helper scripts:
@@ -347,7 +351,7 @@ nix-shell -p cmake gcc boost --run 'cmake .. && make -j8'
 Before first hardware run, do the Phase 5.2 gate tests (G1/G2/G4, see
 "Gates to verify first" above) on stock examples.
 
-### loomd control daemon (Phase 5.3)
+### Software demos, MULTI-PROCESS / client-server variant (loomd, Phase 5.3)
 
 `loomd.hpp` is a Unix-socket front end over any OrchClient backend
 (production: InProcOrchestrator through the daemon's cThread; tests: a
@@ -359,13 +363,36 @@ simulator, so `roles_sock` runs the daemon as a thread over a REAL
 socket instead (protocol/daemon are the production code paths; only
 process isolation is degenerate).
 
+FPGA-free protocol test (no cThread constructed - runs on any machine,
+no COYOTE_SIM_DIR, no Vivado):
+
 ```bash
 cd examples/loom/sw/build_sim
-./test_loomd_proto        # FPGA-free: no cThread, runs anywhere -> 13x PASS
-# full flow over the socket, in sim (tmux + xilinx-shell as usual):
-#   COYOTE_SIM_DIR=... ./roles_sock  -> LOOM ROLES-SOCK TEST PASS
-# hardware (5.4+): ./loomd [sock] in one process, apps connect via
-#   SockOrchClient in others
+./test_loomd_proto              # expect 13x PASS, LOOMD PROTO TEST PASS
+```
+
+Full client/server flow in simulation (daemon on a thread serving a
+real socket; tmux + xilinx-shell like every sim run):
+
+```bash
+cd examples/loom/sw/build_sim
+tmux new-session -d -s loom_sock \
+  "xilinx-shell -c 'export COYOTE_SIM_DIR=$PWD/../../hw/build_sim/; ./roles_sock' \
+   > run_roles_sock.log 2>&1"
+tail -f run_roles_sock.log
+# expect: "two clients connected", 12x PASS, LOOM ROLES-SOCK TEST PASS
+```
+
+Hardware two-process mode (Phase 5.4+, NOT yet validated): the daemon
+runs standalone and clients connect from other processes -
+`roles_sock` skips its internal daemon when LOOMD_SOCK is set:
+
+```bash
+# terminal 1: control daemon (owns the CSR page via its own cThread)
+./loomd /tmp/loomd.sock
+
+# terminal 2: application (cThread per role; connects as a pure client)
+LOOMD_SOCK=/tmp/loomd.sock ./roles_sock
 ```
 
 ### Switching between the C++ and Python sim harnesses
