@@ -80,7 +80,7 @@ N_REGIONS 1`; cf. `examples/jigsaw_baseline_rdma`.
 | 4 | vfpga_top wiring + Coyote integration sim (EN_SIM) | done, LOOM TEST PASS |
 | 4.5 | test hardening: tb_loom_top (arbitration), engine/ctrl corner cases, extended integration sim, Python RDMA TX test | done, all pass |
 | 5.0 | per-descriptor completion (fence VA in descriptor, CE semaphore-release model) | done, all sims pass |
-| 5.1a | single-process software: orchestrator + XPU roles as separate cThreads in one binary | pending |
+| 5.1a | single-process software: client/server role split (OrchClient iface, in-process transport) | done, ROLES TEST PASS (sim) |
 | 5.1b | multi-process split: libloom + loomd control daemon (Unix socket) | pending |
 | 5.2 | hardware gate tests G1/G2/G4 on stock examples | pending |
 | 5.3 | synthesize + run on U280 (cross-pid), latency/bandwidth numbers | pending |
@@ -217,6 +217,31 @@ Framework quirks: register values are packed as signed 64-bit (keep test
 payloads below 2^63); the RDMA-REMOTE segment must be allocated first
 (remote_rdma_write); live register reads need a long simulation window
 (the test sets 1 ms; the 4 us default closes before responses arrive).
+
+### Role-split demo (Phase 5.1a)
+
+Single binary, client/server structure: `loom_orch.hpp` (OrchClient
+interface + InProcOrchestrator, the only code touching the CSR page) and
+`loom_xpu.hpp` (client role: data plane + control calls through the
+interface); `roles.cpp` runs exporter/importer/orchestrator roles.
+Transport is in-process function calls; 5.1b swaps it for a Unix socket
+to loomd behind the same interface. Mode is runtime-selected: with
+COYOTE_SIM_DIR set, all roles share the single sim cThread (degenerate);
+on hardware each role gets its own cThread (untested until 5.3).
+
+```bash
+cd examples/loom/sw/build_sim   # after the cmake/make above
+nix-shell -p cmake gcc boost --run 'make -j8 roles'
+tmux new-session -d -s loom_roles \
+  "xilinx-shell -c 'export COYOTE_SIM_DIR=$PWD/../../hw/build_sim/; ./roles' \
+   > run_roles.log 2>&1"
+tail -f run_roles.log   # expect 12x PASS, LOOM ROLES TEST PASS
+```
+
+Covers: export/import through the orchestrator (windows allocated
+server-side), bogus-handle refusal, stores + fenced copies + the order
+point through the role API, and window release (subsequent stores dropped,
+observed via the drops counter).
 
 ### Switching between the C++ and Python sim harnesses
 

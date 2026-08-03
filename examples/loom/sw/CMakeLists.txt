@@ -18,8 +18,12 @@ set(TARGET_DIR "${CMAKE_SOURCE_DIR}/src/")
 
 set(EXEC test)
 add_executable(${EXEC} ${TARGET_DIR}/main.cpp)
-
 target_link_libraries(${EXEC} PUBLIC Coyote)
+
+# 5.1a role-split demo (client/server structure, in-process transport)
+add_executable(roles ${TARGET_DIR}/roles.cpp)
+target_link_libraries(roles PUBLIC Coyote)
 
 find_package(Boost REQUIRED COMPONENTS program_options)
 target_link_libraries(${EXEC} PUBLIC Boost::program_options)
+target_link_libraries(roles PUBLIC Boost::program_options)
