@@ -24,6 +24,18 @@ target_link_libraries(${EXEC} PUBLIC Coyote)
 add_executable(roles ${TARGET_DIR}/roles.cpp)
 target_link_libraries(roles PUBLIC Coyote)
 
+# 5.3: same flow over a real Unix socket to a threaded loomd
+add_executable(roles_sock ${TARGET_DIR}/roles_sock.cpp)
+target_link_libraries(roles_sock PUBLIC Coyote pthread)
+
+# 5.3: standalone control daemon (hardware mode)
+add_executable(loomd ${TARGET_DIR}/loomd_main.cpp)
+target_link_libraries(loomd PUBLIC Coyote pthread)
+
+# 5.3: FPGA-free protocol test (no cThread; runs anywhere)
+add_executable(test_loomd_proto ${TARGET_DIR}/test_loomd_proto.cpp)
+target_link_libraries(test_loomd_proto PUBLIC Coyote pthread)
+
 find_package(Boost REQUIRED COMPONENTS program_options)
 target_link_libraries(${EXEC} PUBLIC Boost::program_options)
 target_link_libraries(roles PUBLIC Boost::program_options)

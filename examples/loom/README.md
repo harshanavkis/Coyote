@@ -150,7 +150,7 @@ N_REGIONS 1`; cf. `examples/jigsaw_baseline_rdma`.
 | 5.2 | aperture reads, local path (READ order-FIFO entry, held-open AXI-Lite read, 64B line pull + lane select, poison on invalid) + TBs + Python sim test | done, all pass |
 | 5.2b | rdma wire-message format: 64B header ⟨op·len·vaddr⟩ (+inline data for stores), RETH = staging vaddr (CSR 14), loom_rx parses + issues exact writes | done, all pass |
 | 5.2c | hybrid wire scheme: bulk reverts to DIRECT RDMA WRITE (RETH = true target, zero overhead; op·len·vaddr = RDMA's own headers); inline message kept only for sub-64B stores; loom_rx dispatches on staging-vaddr compare | done, all pass |
-| 5.3 | multi-process split: libloom + loomd control daemon (Unix socket) | pending |
+| 5.3 | loomd control daemon: socket<->OrchClient adapter, SockOrchClient, standalone loomd binary; FPGA-free protocol test + full flow over a real socket in sim | done, all pass |
 | 5.4 | hardware gate tests G1/G2/G4 on stock examples | pending |
 | 5.5 | synthesize + run on U280 (cross-pid); measure the sim's FPGA-owned constants: T3 per-stage latencies (needs stage cycle counters), T2 coalescing curve (needs coalescer RTL, on/off), substrate floors, B2 rdma-init, local read RTT | pending |
 | 6.1 | loomd-loomd TCP, QP setup via Coyote RDMA API (QP owned by the exporter's cThread; staging = a small getMem buffer of the QP owner), remote export/import; move staging from the global CSR into the window table if hosts have multiple QP owners | pending |
@@ -346,6 +346,27 @@ nix-shell -p cmake gcc boost --run 'cmake .. && make -j8'
 
 Before first hardware run, do the Phase 5.2 gate tests (G1/G2/G4, see
 "Gates to verify first" above) on stock examples.
+
+### loomd control daemon (Phase 5.3)
+
+`loomd.hpp` is a Unix-socket front end over any OrchClient backend
+(production: InProcOrchestrator through the daemon's cThread; tests: a
+fake). `loom_sock.hpp` implements OrchClient over the socket - roles and
+data-plane code cannot tell the transports apart (`roles_test.hpp` holds
+the shared flow). `loomd_main.cpp` is the standalone daemon for
+hardware; in simulation a separate daemon process would spawn its own
+simulator, so `roles_sock` runs the daemon as a thread over a REAL
+socket instead (protocol/daemon are the production code paths; only
+process isolation is degenerate).
+
+```bash
+cd examples/loom/sw/build_sim
+./test_loomd_proto        # FPGA-free: no cThread, runs anywhere -> 13x PASS
+# full flow over the socket, in sim (tmux + xilinx-shell as usual):
+#   COYOTE_SIM_DIR=... ./roles_sock  -> LOOM ROLES-SOCK TEST PASS
+# hardware (5.4+): ./loomd [sock] in one process, apps connect via
+#   SockOrchClient in others
+```
 
 ### Switching between the C++ and Python sim harnesses
 
