@@ -161,7 +161,9 @@ nix-shell -p cmake gcc boost --run 'cmake .. -DEN_SIM=ON && make -j8'
 tmux new-session -d -s loom_run \
   "xilinx-shell -c 'export COYOTE_SIM_DIR=$PWD/../../hw/build_sim/; ./test' \
    > run_test.log 2>&1"
-tail -f run_test.log     # expect: 6x PASS, counter dump, LOOM TEST PASS
+tail -f run_test.log     # expect: 13x PASS (2 windows, interleaved stores/
+                         # DMAs, cross-window ordering, counter relations),
+                         # then LOOM TEST PASS
 # waveform: hw/build_sim/sim/sim_dump.vcd
 ```
 

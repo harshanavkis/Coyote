@@ -3,16 +3,22 @@
  * (-DEN_SIM=ON, run with COYOTE_SIM_DIR=<hw build>) and hardware.
  *
  * Single cThread (the simulation backend supports exactly one): its own
- * buffers play both the issuer's source and the exporter's destination,
+ * buffers play both the issuer's source and the exporters' destinations,
  * so pid_src == pid_dst == ctid. Cross-pid writes are a hardware gate
  * (G1), exercised in Phase 5 with two processes.
  *
  * Sequence:
- *   1. program window 1 (local) -> destination buffer; set completion word
- *   2. small aperture store -> poll destination
- *   3. bulk DMA (4 KB) -> poll completion word, verify contents
- *   4. ordering: DMA + immediate flag store -> flag implies completion
- *   5. dump debug counters
+ *   1. program windows 1, 2 (local) -> dst1, dst2; set completion word
+ *   2. small aperture stores on both windows -> poll both destinations
+ *   3. bulk DMA on both windows -> poll completion, verify contents
+ *   4. cross-window global ordering: DMA on win 1, flag store on win 2;
+ *      the flag implies the DMA completed (single order FIFO)
+ *   5. quiesce, then check counter relations
+ *
+ * Note (sim): the TB's EN_RANDOMIZATION pads every ctrl write with extra
+ * writes in the rest of its 64 B line - polled locations are kept on
+ * lines of their own, and counter checks use relations between counters
+ * rather than absolute store counts.
  */
 
 #include <cstdint>
@@ -50,41 +56,60 @@ int main() {
     const uint32_t pid = t.getCtid();
     printf("ctid %d\n", pid);
 
-    auto *dst = static_cast<uint64_t *>(t.getMem({coyote::CoyoteAllocType::HPF, BUF_SIZE}));
-    auto *src = static_cast<uint64_t *>(t.getMem({coyote::CoyoteAllocType::HPF, BUF_SIZE}));
-    auto *cpl = static_cast<uint64_t *>(t.getMem({coyote::CoyoteAllocType::REG, 4096}));
-    if (!dst || !src || !cpl) { printf("FAIL: getMem\n"); return 1; }
-    memset(dst, 0, BUF_SIZE);
+    auto *dst1 = static_cast<uint64_t *>(t.getMem({coyote::CoyoteAllocType::HPF, BUF_SIZE}));
+    auto *dst2 = static_cast<uint64_t *>(t.getMem({coyote::CoyoteAllocType::HPF, BUF_SIZE}));
+    auto *src  = static_cast<uint64_t *>(t.getMem({coyote::CoyoteAllocType::HPF, BUF_SIZE}));
+    auto *cpl  = static_cast<uint64_t *>(t.getMem({coyote::CoyoteAllocType::REG, 4096}));
+    if (!dst1 || !dst2 || !src || !cpl) { printf("FAIL: getMem\n"); return 1; }
+    memset(dst1, 0, BUF_SIZE);
+    memset(dst2, 0, BUF_SIZE);
     memset(cpl, 0, 4096);
     for (uint64_t i = 0; i < BUF_SIZE / 8; i++) src[i] = 0xA5A5'0000'0000'0000ULL | i;
 
-    // 1. Window 1 -> dst (local route, this cThread's pid); completion word
-    loom::program_window(t, 1, false, pid, dst, BUF_SIZE);
+    // 1. Two local windows + completion word
+    loom::program_window(t, 1, false, pid, dst1, BUF_SIZE);
+    loom::program_window(t, 2, false, pid, dst2, BUF_SIZE);
     loom::set_completion(t, pid, cpl);
 
-    // 2. Small store: *(P + 0x40) = v  ->  dst[8]
+    // 2. Small stores, one per window (distinct 64 B lines)
     loom::aperture_store(t, 1, 0x40, 0xDEAD'BEEF'0000'0001ULL);
-    check(poll64(&dst[8], 0xDEAD'BEEF'0000'0001ULL), "small store lands at dst+0x40");
+    loom::aperture_store(t, 2, 0x40, 0xDEAD'BEEF'0000'0002ULL);
+    check(poll64(&dst1[8], 0xDEAD'BEEF'0000'0001ULL), "win1 small store lands");
+    check(poll64(&dst2[8], 0xDEAD'BEEF'0000'0002ULL), "win2 small store lands");
 
-    // 3. Bulk DMA: copy(P + 0x10000, src, 4 KB)
+    // 3. Bulk DMA on both windows
     loom::dma(t, 1, 0x10000, src, DMA_BYTES, pid);
-    check(poll64(&cpl[0], 1), "DMA completion count 1");
-    check(memcmp(reinterpret_cast<uint8_t *>(dst) + 0x10000, src, DMA_BYTES) == 0,
-          "DMA payload matches source");
+    loom::dma(t, 2, 0x10000, src, DMA_BYTES, pid);
+    check(poll64(&cpl[0], 2), "DMA completion count 2");
+    check(memcmp(reinterpret_cast<uint8_t *>(dst1) + 0x10000, src, DMA_BYTES) == 0,
+          "win1 DMA payload matches source");
+    check(memcmp(reinterpret_cast<uint8_t *>(dst2) + 0x10000, src, DMA_BYTES) == 0,
+          "win2 DMA payload matches source");
 
-    // 4. Ordering: descriptor then flag store; flag implies completion done
+    // 4. Cross-window global ordering: descriptor (win 1), flag (win 2)
     loom::dma(t, 1, 0x20000, src, DMA_BYTES, pid);
-    loom::aperture_store(t, 1, 0x800, 0xF1A6ULL);
-    check(poll64(&dst[0x800 / 8], 0xF1A6ULL), "flag store lands");
-    check(cpl[0] == 2, "flag implies DMA completed (order point)");
-    check(memcmp(reinterpret_cast<uint8_t *>(dst) + 0x20000, src, DMA_BYTES) == 0,
+    loom::aperture_store(t, 2, 0x800, 0xF1A6ULL);
+    check(poll64(&dst2[0x800 / 8], 0xF1A6ULL), "cross-window flag lands");
+    check(cpl[0] == 3, "flag implies DMA completed (global order point)");
+    check(memcmp(reinterpret_cast<uint8_t *>(dst1) + 0x20000, src, DMA_BYTES) == 0,
           "ordering-DMA payload matches source");
 
-    // 5. Debug counters
+    // 5. Quiesce (counters stable across two reads), then relations
+    uint64_t c0[8], c1[8];
+    for (int tries = 0; tries < 60; tries++) {
+        for (int i = 0; i < 8; i++) c0[i] = loom::csr_read(t, loom::DBG_BASE + 8 * i);
+        usleep(200000);
+        for (int i = 0; i < 8; i++) c1[i] = loom::csr_read(t, loom::DBG_BASE + 8 * i);
+        if (memcmp(c0, c1, sizeof(c0)) == 0) break;
+    }
     const char *names[8] = {"stores", "descs", "local_wr", "rdma_wr",
                             "rx_fwd", "drops", "fifo_ovfl", "compl"};
-    for (int i = 0; i < 8; i++)
-        printf("dbg[%s] = %lu\n", names[i], loom::csr_read(t, loom::DBG_BASE + 8 * i));
+    for (int i = 0; i < 8; i++) printf("dbg[%s] = %lu\n", names[i], c1[i]);
+    check(c1[1] == 3, "counters: 3 descriptors");
+    check(c1[7] == 3, "counters: 3 completions");
+    check(c1[2] == c1[0] + c1[1], "counters: local_wr == stores + descs");
+    check(c1[3] == 0 && c1[4] == 0, "counters: no rdma/rx traffic");
+    check(c1[5] == 0 && c1[6] == 0, "counters: no drops, no overflow");
 
     printf(failures == 0 ? "LOOM TEST PASS\n" : "LOOM TEST FAIL (%d)\n", failures);
     return failures == 0 ? 0 : 1;
