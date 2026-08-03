@@ -185,9 +185,14 @@ assign busy   = (state != ST_IDLE);
 wire [28:0] end_off = l_is_desc ? ({1'b0, l_off} + {1'b0, l_len})
                                 : ({1'b0, l_off} + 29'd8);
 // Reads are additionally local-only for now: an rdma-route window load
-// is answered with poison until the two-host phase implements RDMA READ
+// is answered with poison until the two-host phase implements RDMA READ.
+// Rdma bulk additionally requires 64 B-multiple lengths: the HLS TX
+// merge path for a partial last word is unexercised upstream (the
+// append_payload alignment TODO), so we exclude it by contract instead
+// of trusting it - local DMA stays byte-granular (XDMA C2H descriptors)
 wire ok = l_valid && (l_is_desc ? (l_len != 0) : 1'b1)
                   && (l_is_read ? !l_route : 1'b1)
+                  && ((l_is_desc && l_route) ? (l_len[5:0] == 6'b0) : 1'b1)
                   && (end_off <= {1'b0, l_lim});
 
 // Read target: the 64 B line containing (base + off), and the lane in it

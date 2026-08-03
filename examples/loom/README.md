@@ -58,11 +58,21 @@ window 1 -> `{local, pid 1, buf_B, 4MB}`, window 2 -> `{rdma, qp, buf_C, 4MB}`.
 Every address is some process's ordinary VA: A's pointers in, exporter's VA
 out; the wire carries the exporter's VA (offset in affine encoding).
 
-## Gates to verify first
+## Gates (all closed from source, 2026-08-03; hardware owes only
+## bring-up validation and performance numbers)
 
-1. Cross-pid write: `sq_wr` under another attached cThread's pid lands in
-   that process's buffer.
-2. Sub-line writes: alignment/keep semantics of an 8 B `LOCAL_WRITE`.
+1. Cross-pid write - **CLOSED** (`hw/hdl/mmu/tlb_controller.sv:400`):
+   a TLB hit requires `tag match && entry.pid == request.pid` - entries
+   are pid-tagged and coexist; the request's pid IS the address-space
+   selector and nothing checks who set it (perf_rdma forwards foreign
+   pids routinely; 08_multithreading runs multiple cThreads' DMAs on
+   one vFPGA). Residual hardware item: none functional (TLB
+   pre-population at getMem is a performance behavior).
+2. Sub-line writes - **CLOSED** (`hw/hdl/static/xdma_wrapper.sv:49`):
+   host writes drive XDMA descriptor-bypass directly with
+   `{c2h_addr, c2h_len}` - byte-granular descriptors, payload consumed
+   from stream lane 0 (XDMA C2H contract). An 8 B LOCAL_WRITE = a
+   {PA, 8} descriptor + our LSB-aligned beat.
 3. RX interposition - RESOLVED FROM SOURCE (09_perf_rdma/hw/src/
    vfpga_top.svh): the shell's contract is that an incoming RDMA WRITE
    surfaces as rq_wr (request) + axis_rrsp_recv (payload) and USER
@@ -82,7 +92,11 @@ out; the wire carries the exporter's VA (offset in affine encoding).
    works by construction; nothing deferred to hardware beyond ordinary
    bring-up. (No verbs MR registration exists anywhere in this path;
    validity = a TLB entry under the QP owner's pid at write-issue time.)
-4. QP selection from user logic when more than one binding/QP exists.
+4. QP selection - **CLOSED** (`sw/src/cThread.cpp:178`):
+   `local.qpn = (vfid << PID_BITS) | ctid` - the QPN literally encodes
+   the cThread id, one QP per cThread by construction; the request's
+   pid field selects the QP because they are the same number. Our
+   engine's `wr_req.pid = entry.pid (QP owner)` is the mechanism itself.
 5. Minimum RDMA payload, shell-side evidence (checked in the Coyote
    sources, 2026-08-03): there is NO explicit `len >= 64` check anywhere
    in the TX path - `rdma_req_parser.sv` handles any length (len <= PMTU

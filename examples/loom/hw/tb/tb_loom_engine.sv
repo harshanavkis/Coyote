@@ -414,7 +414,13 @@ initial begin
     check(wrq.size() == 1 && wrq[0].vaddr == BASE_B + 48'hFF8, "bounds: store at window end");
     wrq.delete(); hostq.delete();
 
-    // --- 9. Length not a multiple of 64 B ---
+    // --- 8b. Rdma bulk with non-64B-multiple length: dropped by contract ---
+    descriptor(4'd2, 28'h300, {16'b0, SRC_VA}, 28'd100, 6'd2, {16'b0, CPL_VA});
+    wait_idle();
+    check(wrq.size() == 0 && rdq.size() == 0 && netq.size() == 0,
+          "rdma oddlen: dropped, nothing issued");
+
+    // --- 9. Length not a multiple of 64 B (LOCAL: byte-granular, allowed) ---
     descriptor(4'd1, 28'h500, {16'b0, SRC_VA}, 28'd100, 6'd2, {16'b0, CPL_VA});
     fork send_beats(2, 64'h9A00); join_none
     wait_idle();
