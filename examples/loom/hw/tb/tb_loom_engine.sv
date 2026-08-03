@@ -315,19 +315,14 @@ initial begin
     if (wrq.size() == 2) begin
         r = wrq.pop_front();
         check(r.opcode == APP_WRITE && r.strm == STRM_RDMA && r.pid == 6'd3 &&
-              r.vaddr == STAGING && r.len == 64 + 128 && r.remote,
-              "dma rdma: wire len = header + payload, staging vaddr");
+              r.vaddr == BASE_C + 48'h200 && r.len == 128 && r.remote,
+              "dma rdma: DIRECT write, RETH = true target");
         r = wrq.pop_front();
         check(r.vaddr == CPL_VA, "dma rdma: completion wr_req");
     end else wrq.delete();
-    check(netq.size() == 3, "dma rdma: header + 2 payload beats");
-    if (netq.size() == 3) begin
-        check(netq[0].data == {28'b0, 28'd128, 8'd1} &&
-              netq[0].q1 == {16'b0, BASE_C + 48'h200} && !netq[0].last,
-              "dma rdma: header beat");
-        check(netq[1].data == 64'hBB00 && netq[2].data == 64'hBB01 &&
-              netq[2].last, "dma rdma: payload beats after header");
-    end
+    check(netq.size() == 2 && netq[0].data == 64'hBB00 &&
+          netq[1].data == 64'hBB01 && netq[1].last,
+          "dma rdma: raw payload beats, no framing");
     netq.delete();
     check(hostq.size() == 1 && hostq[0].data == 64'd2, "dma rdma: completion value 2");
     hostq.delete();

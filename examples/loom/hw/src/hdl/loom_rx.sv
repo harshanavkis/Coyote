@@ -3,12 +3,16 @@ import lynxTypes::*;
 /**
  * loom_rx
  *
- * Receive side: parses incoming Loom wire MESSAGES and issues the exact
- * local write they describe. Every message arrives as an RDMA WRITE to
- * this host's staging vaddr (data-meaningless; jigsaw's remote_vaddr
- * pattern) - the request surfaces on rq_wr {pid = QP owner, staging
- * vaddr, wire len} and the payload on axis_rrsp_recv. The first beat is
- * the header:
+ * Receive side, hybrid dispatch on the incoming RETH vaddr:
+ *
+ *   vaddr == STAGING: a Loom inline MESSAGE (sub-64 B store envelope).
+ *     Parse the header beat and issue the EXACT write it describes.
+ *   vaddr != STAGING: a DIRECT RDMA WRITE (bulk) - forward verbatim as
+ *     sq_wr {LOCAL_WRITE, pid, vaddr, len} + all beats untouched. (If
+ *     the stock shell already lands these without user logic - gate G3
+ *     - this path simply never fires; both are correct.)
+ *
+ * Message header (first beat, staging only):
  *
  *   lane0 = {reserved, len[27:0], op[7:0]}     (keep in sync w/ loom_engine)
  *   lane1 = target VA (the exporter's own VA + offset)
@@ -39,6 +43,9 @@ module loom_rx (
     input  req_t                        rq_req,
     input  logic                        rq_valid,
     output logic                        rq_ready,
+
+    // Staging vaddr (from loom_ctrl): selects message-parse vs direct
+    input  logic [VADDR_BITS-1:0]       rdma_staging_va,
 
     // Write requests out (to sq_wr via arbiter)
     output req_t                        wr_req,
@@ -83,6 +90,7 @@ logic [27:0]           l_len;
 logic [VADDR_BITS-1:0] l_va;
 logic [63:0]           l_inline;
 logic                  l_hdr_last;   // single-beat message?
+logic                  l_direct;     // vaddr != staging: verbatim forward
 
 // Accept a request only when granted, so a transaction never starts while
 // the engine owns the shared write path
@@ -94,12 +102,23 @@ always_ff @(posedge aclk) begin
     if (!aresetn) begin
         state <= ST_IDLE;
         l_pid <= 0; l_op <= 0; l_len <= 0; l_va <= 0; l_inline <= 0;
-        l_hdr_last <= 0;
+        l_hdr_last <= 0; l_direct <= 0;
     end else begin
         case (state)
             ST_IDLE: if (rq_valid && grant) begin
                 l_pid <= rq_req.pid;
-                state <= ST_HDR;
+                if (rq_req.vaddr[VADDR_BITS-1:0] == rdma_staging_va) begin
+                    l_direct <= 1'b0;
+                    state    <= ST_HDR;          // Loom message: parse
+                end else begin
+                    // Direct bulk write: take target and length from the
+                    // request itself, forward every beat untouched
+                    l_direct <= 1'b1;
+                    l_va     <= rq_req.vaddr[VADDR_BITS-1:0];
+                    l_len    <= rq_req.len[27:0];
+                    l_op     <= MSG_OP_WRITE;
+                    state    <= ST_WR_REQ;
+                end
             end
 
             // Parse the header beat

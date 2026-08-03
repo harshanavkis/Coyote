@@ -86,6 +86,25 @@ out; the wire carries the exporter's VA (offset in affine encoding).
 Shell config (when hw is added): `EN_STRM 1, N_STRM_AXI 1, EN_RDMA 1,
 N_REGIONS 1`; cf. `examples/jigsaw_baseline_rdma`.
 
+## Deferred optimization TODOs (owner decision points)
+
+- **Write-combining aperture mapping (AVX-512 stores).** The ctrl region
+  is mapped `pgprot_noncached` (driver `vfpga_ops.c:595`): UC serializes
+  an AVX-512 store into 8 B strongly-ordered accesses, so 64 B never
+  arrives as one unit and small-store issue rate pays ~8 UC round trips.
+  Two pieces would be needed, because AXI4-Lite itself is single-beat
+  at bus width (8 B, no bursts - a 64 B TLP is chopped into 8 beats by
+  the XDMA bridge regardless of mapping type):
+  (1) a ONE-LINE driver change (`pgprot_writecombine` for `MMAP_CTRL`)
+  so the CPU emits 64 B TLPs at all - breaches the "vFPGA + user space
+  only" rule, needs explicit owner sign-off;
+  (2) a line-reassembly buffer in loom_ctrl (8 consecutive beats -> one
+  64 B store; pure user logic, allowed) with the inline message kept as
+  the fallback for WC partial flushes.
+  Payoff: much better small-store issue rate, and a 64 B-line *direct*
+  remote-store fast path (NCCL-LL-style producer-owned lines). Revisit
+  at Phase 5.5; until then, latency measurements include UC store costs.
+
 ## Status
 
 | Phase | Content | State |
@@ -99,6 +118,7 @@ N_REGIONS 1`; cf. `examples/jigsaw_baseline_rdma`.
 | 5.1a | single-process software: client/server role split (OrchClient iface, in-process transport) | done, ROLES TEST PASS (sim) |
 | 5.2 | aperture reads, local path (READ order-FIFO entry, held-open AXI-Lite read, 64B line pull + lane select, poison on invalid) + TBs + Python sim test | done, all pass |
 | 5.2b | rdma wire-message format: 64B header ⟨op·len·vaddr⟩ (+inline data for stores), RETH = staging vaddr (CSR 14), loom_rx parses + issues exact writes | done, all pass |
+| 5.2c | hybrid wire scheme: bulk reverts to DIRECT RDMA WRITE (RETH = true target, zero overhead; op·len·vaddr = RDMA's own headers); inline message kept only for sub-64B stores; loom_rx dispatches on staging-vaddr compare | done, all pass |
 | 5.3 | multi-process split: libloom + loomd control daemon (Unix socket) | pending |
 | 5.4 | hardware gate tests G1/G2/G4 on stock examples | pending |
 | 5.5 | synthesize + run on U280 (cross-pid); measure the sim's FPGA-owned constants: T3 per-stage latencies (needs stage cycle counters), T2 coalescing curve (needs coalescer RTL, on/off), substrate floors, B2 rdma-init, local read RTT | pending |

@@ -46,6 +46,7 @@ localparam [47:0] TARGET  = 48'h7f9e_8860_0000;
 loom_rx dut (
     .aclk(aclk), .aresetn(aresetn),
     .rq_req(rq_req), .rq_valid(rq_valid), .rq_ready(rq_ready),
+    .rdma_staging_va(STAGING),
     .wr_req(wr_req), .wr_valid(wr_valid), .wr_ready(wr_ready),
     .s_tdata(s_tdata), .s_tkeep(s_tkeep), .s_tvalid(s_tvalid),
     .s_tready(s_tready), .s_tlast(s_tlast),
@@ -73,10 +74,11 @@ task check(input bit cond, input string msg);
     end
 endtask
 
-task incoming(input [PID_BITS-1:0] pid, input [27:0] wire_len);
+task incoming(input [PID_BITS-1:0] pid, input [27:0] wire_len,
+              input [47:0] vaddr = STAGING);
     @(negedge aclk);
     rq_req = '0;
-    rq_req.pid = pid; rq_req.vaddr = STAGING; rq_req.len = wire_len;
+    rq_req.pid = pid; rq_req.vaddr = {16'b0, vaddr}; rq_req.len = wire_len;
     rq_valid = 1;
     do @(posedge aclk); while (!rq_ready);
     @(negedge aclk);
@@ -176,6 +178,22 @@ initial begin
     send_msg_beat(64'hBAD1, 64'b0, 64'b0, 1'b1);
     wait_idle();
     check(wrq.size() == 0 && outq.size() == 0, "unknown op: no write, drained");
+
+    // --- 5b. DIRECT write (vaddr != staging): verbatim forward ---
+    incoming(6'd3, 28'd128, TARGET + 48'h300);
+    send_msg_beat(64'hD1D1_0000, 64'hAAAA, 64'hBBBB, 1'b0);
+    send_msg_beat(64'hD1D1_0001, 64'b0, 64'b0, 1'b1);
+    wait_idle();
+    check(wrq.size() == 1, "direct: one wr_req");
+    if (wrq.size() > 0) begin
+        r = wrq.pop_front();
+        check(r.pid == 6'd3 && r.vaddr == TARGET + 48'h300 && r.len == 128,
+              "direct: request forwarded verbatim");
+    end
+    check(outq.size() == 2 && outq[0].data == 64'hD1D1_0000 && !outq[0].last &&
+          outq[1].data == 64'hD1D1_0001 && outq[1].last,
+          "direct: ALL beats forwarded incl. the first");
+    outq.delete();
 
     // --- 6. Back-to-back inline messages ---
     incoming(6'd0, 28'd64);

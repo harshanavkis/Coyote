@@ -226,6 +226,7 @@ initial begin
     // Windows 1, 2 local; completion disabled (COMPL_VA = 0)
     program_win(4'd1, 1'b0, 6'd1, {16'b0, BASE_B}, 64'h40_0000);
     program_win(4'd2, 1'b0, 6'd2, {16'b0, BASE_B + 48'h100_0000}, 64'h40_0000);
+    axil_write(16'd112, 64'h7f00_0000_0000);   // staging vaddr (rx dispatch)
 
     // --- T1: smoke through the full top ---
     axil_write(16'h1040, 64'h1111);

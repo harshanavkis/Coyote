@@ -181,6 +181,7 @@ loom_engine inst_loom_engine (
 loom_rx inst_loom_rx (
     .aclk(aclk), .aresetn(aresetn),
     .rq_req(rq_wr.data), .rq_valid(rq_wr.valid), .rq_ready(rq_wr.ready),
+    .rdma_staging_va(rdma_staging_va),
     .wr_req(rx_wr_req), .wr_valid(rx_wr_valid),
     .wr_ready(sq_wr.ready && rx_grant),
     .s_tdata(axis_rrsp_recv[0].tdata), .s_tkeep(axis_rrsp_recv[0].tkeep),

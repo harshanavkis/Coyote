@@ -76,13 +76,12 @@ Transaction-serialized consumer of the order FIFO.
 
 ### loom_rx — the receive side
 
-Accepts one incoming wire message at a time — request on `rq_wr`
-`{pid = QP owner, staging vaddr, wire len}`, payload on `axis_rrsp_recv`
-— parses the header beat `⟨op · len · target VA⟩` and issues exactly
-what it describes: the inline write (data lane of the header beat,
-exact length) or the header-stripped payload stream, as a local write
-under the QP owner's pid. Unknown ops drain harmlessly. It only starts
-when granted the shared write path.
+Hybrid dispatch on one compare: an incoming write whose RETH vaddr
+equals the STAGING address is a Loom inline message — parse the header
+beat `⟨op · len · target VA⟩` and issue the exact (8 B) write it
+describes; any other vaddr is a direct bulk write — forward request and
+every beat verbatim. Local writes run under the QP owner's pid; unknown
+ops drain harmlessly; starts only when granted the shared write path.
 
 ### The arbiter (vfpga_top)
 
@@ -104,7 +103,7 @@ by an explicit grant. Mutual exclusion is assertion-tested in
 | per-descriptor completion write (incrementing count to a memory word) | CE **semaphore release**: the engine writes a monotonic fence value to the address the command names; `cudaStreamSynchronize`/events spin on that word | our descriptor carries its fence VA like a CE command carries its release address |
 | polling the destination / fence in ordinary memory | polling mapped fence memory (spin) — the GPU fast path | never a register read on the data path |
 | order FIFO + serialized engine | ordering of one issuer's stores and CE ops through one fabric port / stream | our single global FIFO is *stricter* than required (orders across issuers too); per-binding relaxation is future work alongside per-destination queues |
-| 64 B wire message ⟨op·len·vaddr⟩ at a staging RETH vaddr | an RNIC's inline-send / message descriptor; NCCL's LL protocol likewise packs flag+data into fixed-size lines | the target VA in the header is the exporter's process-local VA, meaningless anywhere else; the staging vaddr is pure transport plumbing |
+| bulk: direct RDMA WRITE (RETH = exporter VA + off); sub-64 B stores: 64 B inline message at a staging RETH vaddr | direct: an RNIC's ordinary virtually-addressed write; inline: RNIC inline-send / NCCL LL fixed-size lines | op·len·vaddr on the wire is RDMA's own BTH/RETH for bulk; the inline header exists only because a RETH cannot say "envelope 64, true write 8" |
 | debug counters (stores, descs, writes, drops, fences) | engine performance counters | read via CSRs off the data path |
 
 ## Deliberate simplifications (and where they go next)
