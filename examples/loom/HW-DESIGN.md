@@ -108,6 +108,39 @@ by an explicit grant. Mutual exclusion is assertion-tested in
 | staging buffer: small ordinary getMem of the QP owner, address exchanged at QP setup | NCCL per-connection transport buffer (plain cudaMalloc, address exchanged at connect/accept, remote LL/FIFO writes land there for interpretation) | shell contract (per 09_perf_rdma): incoming writes surface to USER LOGIC (rq_wr + rrsp_recv) and land only if user logic issues the write - so the shell never writes staging memory itself; the staging vaddr is addressing, its allocation exists so the vaddr is honest/mappable and future-proof |
 | debug counters (stores, descs, writes, drops, fences) | engine performance counters | read via CSRs off the data path |
 
+## Deployment topology (target process architecture)
+
+There is ONE real deployment shape - the two-host client/server
+topology; everything else is a degenerate of it:
+
+```
+CLIENT side (host 1)                    SERVER side (host 2)
+  loomd  (control daemon, owns            loomd  (control daemon, owns
+         the CSR page via its cThread)          the CSR page)
+  app_import x2 (importer processes,      app_export x2 (exporter processes,
+         own cThreads; stores/copies/            own cThreads; allocate,
+         reads via their windows)                export, poll their buffers)
+         |___ SockOrchClient (Unix socket) to their side's loomd ___|
+              loomd <-> loomd TCP (6.x): cross-host handle
+              resolution + QP setup (QPs owned by exporter cThreads)
+```
+
+- **Hardware bring-up configuration** (Phase 5.4/5.5, local route): the
+  SAME binaries on one host - one loomd (one vFPGA = one CSR-page
+  owner) + the exporter and importer processes together; client and
+  server sides collapse onto the single host. A stepping stone, not a
+  separate variant.
+- **Simulation degenerate**: the mock backend allows one cThread per
+  process (each spawns its own simulator), so true process splits
+  cannot run in sim - the threaded harnesses (`roles`, `roles_sock`)
+  exist solely to exercise the protocol, daemon, and data-plane logic
+  there. They are NOT the deployment shape.
+
+Binaries: `loomd` (exists) + `app_export`/`app_import` (to be written,
+Phase 5.4a; two instances each per side; handle exchange between
+exporter and importer via a simple side channel, as real IPC handles
+travel).
+
 ## Deliberate simplifications (and where they go next)
 
 - Aperture ops are <= 8 B (one AXI-Lite beat); larger transfers use the

@@ -153,6 +153,7 @@ N_REGIONS 1`; cf. `examples/jigsaw_baseline_rdma`.
 | 5.3 | loomd control daemon: socket<->OrchClient adapter, SockOrchClient, standalone loomd binary; FPGA-free protocol test + full flow over a real socket in sim | done, all pass |
 | 5.4 | hardware gate tests G1/G2/G4 on stock examples | pending |
 | 5.5 | synthesize + run on U280 (cross-pid); measure the sim's FPGA-owned constants: T3 per-stage latencies (needs stage cycle counters), T2 coalescing curve (needs coalescer RTL, on/off), substrate floors, B2 rdma-init, local read RTT | pending |
+| 5.4a | deployment binaries: app_export/app_import (per side: loomd + 2 app processes; single-host bring-up = same binaries, one loomd) | pending |
 | 6.1 | loomd-loomd TCP, QP setup via Coyote RDMA API (QP owned by the exporter's cThread; staging = a small getMem buffer of the QP owner), remote export/import; move staging from the global CSR into the window table if hosts have multiple QP owners | pending |
 | 6.2 | two-host run (resolves G3), remote measurements incl. remote reads via shell RDMA READ (T6 remote RTT) | pending |
 
@@ -291,7 +292,11 @@ payloads below 2^63); the RDMA-REMOTE segment must be allocated first
 (remote_rdma_write); live register reads need a long simulation window
 (the test sets 1 ms; the 4 us default closes before responses arrive).
 
-### Software demos, SINGLE-PROCESS variant (orchestrator + XPU roles in one binary)
+### Simulation harnesses (NOT the deployment shape - see HW-DESIGN
+### "Deployment topology"; sim allows one cThread per process, so true
+### process splits cannot run here)
+
+#### Single-binary harnesses
 
 Two binaries, no sockets, no daemon - everything in one process:
 
@@ -351,7 +356,7 @@ nix-shell -p cmake gcc boost --run 'cmake .. && make -j8'
 Before first hardware run, do the Phase 5.2 gate tests (G1/G2/G4, see
 "Gates to verify first" above) on stock examples.
 
-### Software demos, MULTI-PROCESS / client-server variant (loomd, Phase 5.3)
+#### Socket harness (loomd on a thread, real Unix socket)
 
 `loomd.hpp` is a Unix-socket front end over any OrchClient backend
 (production: InProcOrchestrator through the daemon's cThread; tests: a
@@ -383,17 +388,17 @@ tail -f run_roles_sock.log
 # expect: "two clients connected", 12x PASS, LOOM ROLES-SOCK TEST PASS
 ```
 
-Hardware two-process mode (Phase 5.4+, NOT yet validated): the daemon
-runs standalone and clients connect from other processes -
-`roles_sock` skips its internal daemon when LOOMD_SOCK is set:
+### Deployment (hardware, Phase 5.4a+ - binaries to be written)
 
-```bash
-# terminal 1: control daemon (owns the CSR page via its own cThread)
-./loomd /tmp/loomd.sock
-
-# terminal 2: application (cThread per role; connects as a pure client)
-LOOMD_SOCK=/tmp/loomd.sock ./roles_sock
-```
+The real topology (HW-DESIGN "Deployment topology"): per side, one
+`loomd` + two app processes; two hosts for the remote route. Planned
+binaries: `app_export` / `app_import` (two instances each, connecting
+via `LOOMD_SOCK`), with the single-host bring-up configuration running
+the same binaries under one loomd (local route). Until they exist, the
+only hardware-runnable multi-process check is the stopgap:
+`./loomd /tmp/loomd.sock` in one terminal and
+`LOOMD_SOCK=/tmp/loomd.sock ./roles_sock` in another (client roles
+still bundled in one process).
 
 ### Switching between the C++ and Python sim harnesses
 
