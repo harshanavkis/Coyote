@@ -158,8 +158,8 @@ N_REGIONS 1`; cf. `examples/jigsaw_baseline_rdma`.
 | 5.4 | hardware gate tests G1/G2/G4 on stock examples | pending |
 | 5.5 | synthesize + run on U280 (cross-pid); measure the sim's FPGA-owned constants: T3 per-stage latencies (stage counters in RTL since 5.3b - read deltas, divide by op counts, scale by clock), T2 coalescing curve (needs coalescer RTL, on/off), substrate floors, B2 rdma-init, local read RTT | pending |
 | 5.4a | deployment binaries: app_export/app_import (per side: loomd + 2 app processes; single-host bring-up = same binaries, one loomd) | pending (AFTER 6.2a, owner reorder) |
-| 6.1 | loomd-loomd TCP, QP setup via Coyote RDMA API (QP owned by the exporter's cThread; staging = a small getMem buffer of the QP owner), remote export/import; move staging from the global CSR into the window table if hosts have multiple QP owners | pending |
-| 6.2a | two-host BUNDLED configuration: one process per host (daemon thread + that side's app roles), loomd-loomd TCP + QP setup + real wire - the cross-host bring-up vehicle (2 processes total) | **next** (owner reorder: before 5.4a; code + FPGA-free smoke tests now, execution needs two hosts) |
+| 6.1 | loomd-loomd TCP, QP setup via Coyote RDMA API (QP owned by the exporter's cThread; staging = a small getMem buffer of the QP owner), remote export/import; move staging from the global CSR into the window table if hosts have multiple QP owners | partial: peering protocol + QP setup + staging exchange shipped with 6.2a (`sw-bundled/`); per-binding QPs + per-window staging pending |
+| 6.2a | two-host BUNDLED configuration: one process per host (daemon thread + that side's app roles), loomd-loomd TCP + QP setup + real wire - the cross-host bring-up vehicle (2 processes total) | code DONE (`sw-bundled/`: loom_peer/loom_bundle/loom_host), FPGA-free peering test 17x PASS; EXECUTION pending two-host testbed |
 | 6.2b | two-host FULL deployment topology (per side: loomd + 2 app processes); remote measurements incl. remote reads via shell RDMA READ (T6 remote RTT) | pending |
 
 ## Running
@@ -397,6 +397,62 @@ tail -f run_roles_sock.log
 # expect: "two clients connected", 12x PASS, LOOM ROLES-SOCK TEST PASS
 ```
 
+### 6.2a: the bundled two-host binary (sw-bundled/)
+
+`sw-bundled/` is the cross-host bring-up vehicle: ONE process per host
+carrying the daemon role (BundledOrchestrator backend + local loomd on
+a Unix socket + loomd<->loomd TCP peering) and that side's app roles as
+threads - two processes total across the cluster. New pieces:
+
+- `loom_peer.hpp` - the 6.1 control plane: fixed-size TCP protocol
+  between the two daemons. Hello at accept carries the exporter side's
+  RDMA staging VA (the importer programs it into RDMA_STAGING_VA);
+  RESOLVE turns a handle into {exporter ctid, VA, len} cross-host;
+  DONE is the end-of-run barrier.
+- `loom_bundle.hpp` - `BundledOrchestrator`: OrchClient whose imports
+  go remote when a peer is attached (window programmed route=rdma,
+  pid = the LOCAL QP-owner ctid, base = the exporter's VA), and whose
+  export registry doubles as the peering resolver on the server side.
+- `loom_host.cpp` - the binary. QP setup rides Coyote's
+  `cThread::initRDMA` (server side first, then client with the server
+  IP; ONE RC connection between the two data cThreads carries both
+  windows for bring-up - per-binding QPs are 6.1/6.2b). Client flow =
+  the roles flow across hosts: remote imports, inline-message stores,
+  direct bulk with fence, the cross-host order point (flag after copy
+  on the same QP; RC in-order delivery extends the FIFO guarantee),
+  release + source-side drop. Server verifies the landings.
+
+Build (compiles everywhere; EXECUTION needs the two-host testbed - the
+sim has no networking, the binary refuses under COYOTE_SIM_DIR):
+
+```bash
+cd examples/loom/sw-bundled && mkdir -p build && cd build
+nix-shell -p cmake gcc boost --run 'cmake .. && make -j8'
+```
+
+FPGA-free peering protocol test (no cThread, runs on any machine):
+
+```bash
+./test_peering    # expect 17x PASS, LOOM PEERING TEST PASS
+```
+
+Two-host run (hardware; server side first):
+
+```bash
+# host 2 (exporter side):
+./loom_host --server                 # waits in the QP exchange
+# host 1 (importer side):
+./loom_host --client <host2_ip>
+# expect: LOOM HOST CLIENT PASS (7x) / LOOM HOST SERVER PASS (6x)
+# options: --qp-port (default 18488), --peer-port (default 18489),
+#          --sock <local loomd Unix socket path>
+```
+
+Known scope limits (deliberate, documented in loom_host.cpp): one RC
+connection, both exported segments owned by the server's data cThread,
+and the global staging CSR serves the asymmetric topology only (client
+TX / server RX; symmetric traffic needs per-window staging, 6.1).
+
 ### Deployment (hardware, Phase 5.4a+ - binaries to be written)
 
 The real topology (HW-DESIGN "Deployment topology"): per side, one
@@ -404,10 +460,11 @@ The real topology (HW-DESIGN "Deployment topology"): per side, one
 binaries: `app_export` / `app_import` (two instances each, connecting
 via `LOOMD_SOCK`), with the single-host bring-up configuration running
 the same binaries under one loomd (local route). Until they exist, the
-only hardware-runnable multi-process check is the stopgap:
+hardware-runnable multi-process check is the stopgap:
 `./loomd /tmp/loomd.sock` in one terminal and
 `LOOMD_SOCK=/tmp/loomd.sock ./roles_sock` in another (client roles
-still bundled in one process).
+still bundled in one process); the cross-host configuration is the
+6.2a bundled binary above.
 
 ### Switching between the C++ and Python sim harnesses
 
