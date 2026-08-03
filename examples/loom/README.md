@@ -35,6 +35,9 @@ logic and user-space software; the shell and driver stay stock.
 
 ## Workflow (VAs only)
 
+The full worked example (concrete addresses, all four flows, translation
+chain) is in [WORKFLOW.md](WORKFLOW.md). Summary:
+
 Processes A, B on host 1 (pids 0, 1); C on host 2 (pid 0).
 `buf_B`/`buf_C` are `getMem` buffers at B's/C's own VAs. Daemon programs:
 window 1 -> `{local, pid 1, buf_B, 4MB}`, window 2 -> `{rdma, qp, buf_C, 4MB}`.
