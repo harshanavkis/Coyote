@@ -41,6 +41,19 @@ import lynxTypes::*;
  *   36 rx writes forwarded    37 bounds/invalid drops
  *   38 order-FIFO overflows   39 completions written
  *   40 reads captured
+ *   48-63 (RO) stage cycle counters (T3 per-stage latencies):
+ *   48 free-running cycle counter
+ *   49 queue-wait accumulator: sum over popped entries of their order-FIFO
+ *      residency in cycles (push timestamp carried in the entry) - t-queue
+ *   50-56 engine stage accumulators (cycles): 50 lookup (pop + check,
+ *      2/entry - t-lookup incl. the bounds check, i.e. the user-logic part
+ *      of t-translate), 51 store-local (t-forward), 52 store-rdma
+ *      (t-encap), 53 dma-local, 54 dma-rdma, 55 read (aligned-line pull
+ *      service incl. the shell round trip), 56 fence
+ *   57-63 matching completed-op counts (57 = entries popped, the divisor
+ *      for 49/50; drops are popped but never complete, so 58-63 count
+ *      only successful ops). Averages = acc/cnt, computed by software;
+ *      never cleared (deltas).
  *
  * Aperture READS (loads through a window) are captured too: the read is
  * pushed into the same order FIFO (kind READ) and the AXI-Lite read
@@ -92,7 +105,11 @@ module loom_ctrl (
     input  logic                        cnt_rdma_wr,
     input  logic                        cnt_rx_fwd,
     input  logic                        cnt_drop,
-    input  logic                        cnt_compl
+    input  logic                        cnt_compl,
+
+    // Stage cycle counters (accumulated in loom_engine, read out here)
+    input  logic [63:0]                 stage_acc [7],
+    input  logic [63:0]                 stage_cnt [7]
 );
 
 // -------------------------------------------------------------------------
@@ -116,10 +133,17 @@ localparam integer R_DMA_COMPL_VA = 13;
 localparam integer R_RDMA_STAGING = 14;
 localparam integer R_DBG_BASE    = 32;
 localparam integer N_DBG         = 9;
+localparam integer R_CYC         = 48;
+localparam integer R_QUEUE_ACC   = 49;
+localparam integer R_STG_ACC     = 50;   // 7 words: 50-56
+localparam integer R_STG_CNT     = 57;   // 7 words: 57-63
+localparam integer N_STG         = 7;
 
-// Order FIFO entry: {kind(2), win(4), off(28), len(28), pid(PID_BITS), compl_va(VADDR_BITS), payload(64)}
-// kind: 00 = STORE, 01 = DESC, 10 = READ
-localparam integer ENTRY_W    = 2 + 4 + 28 + 28 + PID_BITS + VADDR_BITS + 64;
+// Order FIFO entry: {ts(32), kind(2), win(4), off(28), len(28), pid(PID_BITS), compl_va(VADDR_BITS), payload(64)}
+// kind: 00 = STORE, 01 = DESC, 10 = READ. ts = push-time cycle count
+// (low 32 bits of the free-running counter; wrap-safe 32-bit subtraction
+// at pop time gives the entry's FIFO residency for the t-queue stat).
+localparam integer ENTRY_W    = 32 + 2 + 4 + 28 + 28 + PID_BITS + VADDR_BITS + 64;
 localparam [1:0] KIND_STORE = 2'b00, KIND_DESC = 2'b01, KIND_READ = 2'b10;
 localparam integer FIFO_AW    = 6;
 localparam integer FIFO_DEPTH = 1 << FIFO_AW;
@@ -272,18 +296,23 @@ wire push_desc  = trigger_pulse && !fifo_full_i;
 wire push_read  = ar_hs && ar_is_aperture;
 wire push_drop  = ((ctrl_reg_wren && wr_is_aperture) || trigger_pulse) && fifo_full_i;
 
+// Free-running cycle counter (RO word 48; also the source of the push
+// timestamps and, on hardware, of software-side interval measurements)
+logic [63:0] cycle_cnt;
+wire  [31:0] ts_now = cycle_cnt[31:0];
+
 // STORE: len-field slot carries wstrb in its low 8 bits (engine currently
 // assumes full 8 B stores; wstrb kept for a later sub-word extension)
-wire [ENTRY_W-1:0] store_entry = {KIND_STORE, wr_win, {16'b0, wr_win_off},
+wire [ENTRY_W-1:0] store_entry = {ts_now, KIND_STORE, wr_win, {16'b0, wr_win_off},
                                   {20'b0, axi_ctrl.wstrb},
                                   {PID_BITS{1'b0}}, {VADDR_BITS{1'b0}},
                                   axi_ctrl.wdata};
-wire [ENTRY_W-1:0] desc_entry  = {KIND_DESC, r_dma_dst[63:60], r_dma_dst[27:0],
+wire [ENTRY_W-1:0] desc_entry  = {ts_now, KIND_DESC, r_dma_dst[63:60], r_dma_dst[27:0],
                                   r_dma_len[27:0], r_dma_src_pid[PID_BITS-1:0],
                                   r_dma_compl_va[VADDR_BITS-1:0],
                                   {{(64-VADDR_BITS){1'b0}}, r_dma_src_va[VADDR_BITS-1:0]}};
 // READ entry: window + offset only (uses the AR address at handshake time)
-wire [ENTRY_W-1:0] read_entry  = {KIND_READ, axi_ctrl.araddr[15:12],
+wire [ENTRY_W-1:0] read_entry  = {ts_now, KIND_READ, axi_ctrl.araddr[15:12],
                                   {16'b0, axi_ctrl.araddr[11:0]},
                                   28'b0, {PID_BITS{1'b0}}, {VADDR_BITS{1'b0}}, 64'b0};
 
@@ -315,6 +344,7 @@ end
 // rptr), so the engine sees a valid head in the same cycle fifo_empty
 // deasserts.
 wire [ENTRY_W-1:0] head = fifo_mem[rptr[FIFO_AW-1:0]];
+wire [31:0] head_ts = head[ENTRY_W-1 -: 32];
 
 assign fifo_payload  = head[63:0];
 assign fifo_compl_va = head[64 +: VADDR_BITS];
@@ -339,6 +369,23 @@ assign fifo_empty   = fifo_empty_i;
 // hardware (a store that "vanished" shows up as either a drop or an
 // overflow here before any ILA is needed).
 // -------------------------------------------------------------------------
+// Queue-wait accumulator: at pop time, the wrap-safe 32-bit difference
+// between now and the entry's push timestamp is its FIFO residency. The
+// sum over all pops (divided by the engine's pop count, stage_cnt[0])
+// is the t-queue average.
+logic [63:0] queue_acc;
+
+always_ff @(posedge aclk) begin
+    if (!aresetn) begin
+        cycle_cnt <= 0;
+        queue_acc <= 0;
+    end else begin
+        cycle_cnt <= cycle_cnt + 1;
+        if (fifo_pop && !fifo_empty_i)
+            queue_acc <= queue_acc + {32'b0, ts_now - head_ts};
+    end
+end
+
 always_ff @(posedge aclk) begin
     if (!aresetn) begin
         for (int i = 0; i < N_DBG; i++) dbg[i] <= 0;
@@ -381,6 +428,14 @@ always_ff @(posedge aclk) begin
             default:
                 if (rd_idx >= R_DBG_BASE && rd_idx < R_DBG_BASE + N_DBG)
                     axi_rdata <= dbg[rd_idx - R_DBG_BASE];
+                else if (rd_idx == R_CYC)
+                    axi_rdata <= cycle_cnt;
+                else if (rd_idx == R_QUEUE_ACC)
+                    axi_rdata <= queue_acc;
+                else if (rd_idx >= R_STG_ACC && rd_idx < R_STG_ACC + N_STG)
+                    axi_rdata <= stage_acc[rd_idx - R_STG_ACC];
+                else if (rd_idx >= R_STG_CNT && rd_idx < R_STG_CNT + N_STG)
+                    axi_rdata <= stage_cnt[rd_idx - R_STG_CNT];
         endcase
     end
 end

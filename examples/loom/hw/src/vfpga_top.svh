@@ -38,6 +38,10 @@ logic [LEN_BITS-1:0]    lu_len;
 
 logic cnt_local_wr, cnt_rdma_wr, cnt_rx_fwd, cnt_drop, cnt_compl;
 
+// Stage cycle counters: engine -> ctrl (RO CSR words 50-63)
+logic [63:0] stage_acc [7];
+logic [63:0] stage_cnt [7];
+
 // Aperture-read response: engine -> ctrl (completes the held-open AXI read)
 logic [63:0] rd_resp_data;
 logic        rd_resp_valid;
@@ -134,7 +138,8 @@ loom_ctrl inst_loom_ctrl (
     .rdma_staging_va(rdma_staging_va),
     .rd_resp_data(rd_resp_data), .rd_resp_valid(rd_resp_valid),
     .cnt_local_wr(cnt_local_wr), .cnt_rdma_wr(cnt_rdma_wr),
-    .cnt_rx_fwd(cnt_rx_fwd), .cnt_drop(cnt_drop), .cnt_compl(cnt_compl)
+    .cnt_rx_fwd(cnt_rx_fwd), .cnt_drop(cnt_drop), .cnt_compl(cnt_compl),
+    .stage_acc(stage_acc), .stage_cnt(stage_cnt)
 );
 
 loom_table inst_loom_table (
@@ -175,6 +180,7 @@ loom_engine inst_loom_engine (
     .rd_resp_data(rd_resp_data), .rd_resp_valid(rd_resp_valid),
     .cnt_local_wr(cnt_local_wr), .cnt_rdma_wr(cnt_rdma_wr),
     .cnt_drop(cnt_drop), .cnt_compl(cnt_compl),
+    .stage_acc(stage_acc), .stage_cnt(stage_cnt),
     .busy(eng_busy)
 );
 

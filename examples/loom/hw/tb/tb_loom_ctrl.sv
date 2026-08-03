@@ -37,6 +37,11 @@ logic [VADDR_BITS-1:0] rdma_staging_va;
 
 logic cnt_local_wr, cnt_rdma_wr, cnt_rx_fwd, cnt_drop, cnt_compl;
 
+// Stage counter inputs: driven with distinct constants so the CSR read
+// mux (words 50-63) can be checked without an engine
+logic [63:0] stage_acc [7];
+logic [63:0] stage_cnt [7];
+
 int errors = 0;
 int commit_pulses = 0;
 
@@ -53,7 +58,8 @@ loom_ctrl dut (
     .rdma_staging_va(rdma_staging_va),
     .rd_resp_data(rd_resp_data), .rd_resp_valid(rd_resp_valid),
     .cnt_local_wr(cnt_local_wr), .cnt_rdma_wr(cnt_rdma_wr),
-    .cnt_rx_fwd(cnt_rx_fwd), .cnt_drop(cnt_drop), .cnt_compl(cnt_compl)
+    .cnt_rx_fwd(cnt_rx_fwd), .cnt_drop(cnt_drop), .cnt_compl(cnt_compl),
+    .stage_acc(stage_acc), .stage_cnt(stage_cnt)
 );
 
 always @(posedge aclk) if (tbl_commit) commit_pulses++;
@@ -117,6 +123,10 @@ initial begin
     fifo_pop = 0;
     rd_resp_data = 0; rd_resp_valid = 0;
     cnt_local_wr = 0; cnt_rdma_wr = 0; cnt_rx_fwd = 0; cnt_drop = 0; cnt_compl = 0;
+    for (int i = 0; i < 7; i++) begin
+        stage_acc[i] = 64'hA000 + 64'(i);
+        stage_cnt[i] = 64'hC000 + 64'(i);
+    end
 
     repeat (5) @(negedge aclk);
     aresetn = 1;
@@ -285,6 +295,33 @@ initial begin
     // --- 14. Reads-captured counter (idx 40) ---
     axil_read(16'd320, rdata);
     check(rdata == 64'd2, $sformatf("reads captured = %0d, expected 2", rdata));
+
+    // --- 15. Free-running cycle counter (word 48) ---
+    begin
+        logic [63:0] cyc0, cyc1;
+        axil_read(16'(48 * 8), cyc0);
+        repeat (10) @(posedge aclk);
+        axil_read(16'(48 * 8), cyc1);
+        check(cyc1 > cyc0, "cycle counter advances");
+    end
+
+    // --- 16. Queue-wait accumulator (word 49): known FIFO residency ---
+    begin
+        logic [63:0] q0, q1;
+        axil_read(16'(49 * 8), q0);
+        axil_write(16'h1040, 64'h51A6_0001);       // push one store
+        repeat (40) @(posedge aclk);               // let it sit
+        pop_one();
+        axil_read(16'(49 * 8), q1);
+        check(q1 - q0 >= 64'd40 && q1 - q0 <= 64'd120,
+              $sformatf("queue-wait delta %0d, expected ~40-120", q1 - q0));
+    end
+
+    // --- 17. Stage counter read mux (words 50-63, values from ports) ---
+    axil_read(16'(53 * 8), rdata);
+    check(rdata == 64'hA003, "stage_acc[3] read mux");
+    axil_read(16'(63 * 8), rdata);
+    check(rdata == 64'hC006, "stage_cnt[6] read mux");
 
     if (errors == 0) $display("TB PASS (tb_loom_ctrl)");
     else             $display("TB FAIL (tb_loom_ctrl): %0d errors", errors);

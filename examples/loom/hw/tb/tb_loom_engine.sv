@@ -46,6 +46,10 @@ logic [63:0] rd_resp_data;
 logic        rd_resp_valid;
 logic [VADDR_BITS-1:0] rdma_staging_va;
 
+// Stage cycle counters: engine -> ctrl
+logic [63:0] stage_acc [7];
+logic [63:0] stage_cnt [7];
+
 // Shell-side mocks
 req_t rd_req, wr_req;
 logic rd_valid, wr_valid;
@@ -76,7 +80,8 @@ loom_ctrl inst_ctrl (
     .rdma_staging_va(rdma_staging_va),
     .rd_resp_data(rd_resp_data), .rd_resp_valid(rd_resp_valid),
     .cnt_local_wr(cnt_local_wr), .cnt_rdma_wr(cnt_rdma_wr),
-    .cnt_rx_fwd(1'b0), .cnt_drop(cnt_drop), .cnt_compl(cnt_compl)
+    .cnt_rx_fwd(1'b0), .cnt_drop(cnt_drop), .cnt_compl(cnt_compl),
+    .stage_acc(stage_acc), .stage_cnt(stage_cnt)
 );
 
 loom_table inst_table (
@@ -111,6 +116,7 @@ loom_engine inst_engine (
     .rd_resp_data(rd_resp_data), .rd_resp_valid(rd_resp_valid),
     .cnt_local_wr(cnt_local_wr), .cnt_rdma_wr(cnt_rdma_wr),
     .cnt_drop(cnt_drop), .cnt_compl(cnt_compl),
+    .stage_acc(stage_acc), .stage_cnt(stage_cnt),
     .busy(busy)
 );
 
@@ -524,6 +530,60 @@ initial begin
         axil_read(16'h2040, rd_out);                 // window 2: rdma route
         check(rd_out == 64'hFFFF_FFFF_FFFF_FFFF, "poison on rdma window");
         check(rdq.size() == 0, "poison reads issue no pull");
+    end
+
+    // --- 15. Stage cycle counters (T3) ---
+    begin
+        logic [63:0] a0, a1, c0, c1, v;
+        // 15a. Unstalled local store: exactly 1 cycle ST_WR_REQ + 1 cycle
+        // ST_WR_DATA -> acc[1] += 2, cnt[1] += 1
+        axil_read(16'(51 * 8), a0);
+        axil_read(16'(58 * 8), c0);
+        axil_write(16'h1040, 64'h57A6_0001);
+        wait_idle();
+        axil_read(16'(51 * 8), a1);
+        axil_read(16'(58 * 8), c1);
+        check(a1 - a0 == 64'd2, $sformatf("stage: local store acc delta %0d, expected 2", a1 - a0));
+        check(c1 - c0 == 64'd1, "stage: local store cnt delta 1");
+        // 15b. Unstalled rdma store: same 2-cycle shape on the encap class
+        axil_read(16'(52 * 8), a0);
+        axil_read(16'(59 * 8), c0);
+        axil_write(16'h2040, 64'h57A6_0002);
+        wait_idle();
+        axil_read(16'(52 * 8), a1);
+        axil_read(16'(59 * 8), c1);
+        check(a1 - a0 == 64'd2, $sformatf("stage: rdma store acc delta %0d, expected 2", a1 - a0));
+        check(c1 - c0 == 64'd1, "stage: rdma store cnt delta 1");
+        // 15c. Stalled store: the wait accumulates into the store stage
+        axil_read(16'(51 * 8), a0);
+        wr_ready = 0;
+        axil_write(16'h1048, 64'h57A6_0003);
+        repeat (20) @(posedge aclk);
+        @(negedge aclk); wr_ready = 1;
+        wait_idle();
+        axil_read(16'(51 * 8), a1);
+        check(a1 - a0 >= 64'd20, $sformatf("stage: stalled store acc delta %0d, expected >= 20", a1 - a0));
+        wrq.delete(); hostq.delete(); netq.delete();
+        // 15d. Global invariants over the whole TB run
+        axil_read(16'(50 * 8), a0);              // lookup acc
+        axil_read(16'(57 * 8), c0);              // entries popped
+        check(a0 == 2 * c0, $sformatf("stage: lookup acc %0d == 2 * pops %0d", a0, c0));
+        axil_read(16'(49 * 8), v);               // queue-wait acc
+        check(v > 0, "stage: queue-wait accumulated");
+        axil_read(16'((32 + 2) * 8), v);         // dbg local_wr
+        axil_read(16'(58 * 8), a0);
+        axil_read(16'(60 * 8), a1);
+        check(v == a0 + a1, "stage: local_wr == store-local + dma-local counts");
+        axil_read(16'((32 + 3) * 8), v);         // dbg rdma_wr
+        axil_read(16'(59 * 8), a0);
+        axil_read(16'(61 * 8), a1);
+        check(v == a0 + a1, "stage: rdma_wr == store-rdma + dma-rdma counts");
+        axil_read(16'((32 + 7) * 8), v);         // dbg completions
+        axil_read(16'(63 * 8), a0);
+        check(v == a0, "stage: completions == fence count");
+        axil_read(16'((32 + 8) * 8), v);         // dbg reads captured
+        axil_read(16'(62 * 8), a0);
+        check(v == a0, "stage: reads captured == reads answered");
     end
 
     if (errors == 0) $display("TB PASS (tb_loom_engine)");

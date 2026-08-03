@@ -107,6 +107,7 @@ by an explicit grant. Mutual exclusion is assertion-tested in
 | reachability = a TLB entry under the owner's pid (no MR registration, no keys) | GPU scale-up model: a peer write is valid iff the owning GPU's MMU translates it; nothing registered with the fabric, no key on any bus | deliberately NOT the verbs model - matches the design's "no addresses, keys, or QPs visible" claim; bounds at the source switch, translation at the destination |
 | staging buffer: small ordinary getMem of the QP owner, address exchanged at QP setup | NCCL per-connection transport buffer (plain cudaMalloc, address exchanged at connect/accept, remote LL/FIFO writes land there for interpretation) | shell contract (per 09_perf_rdma): incoming writes surface to USER LOGIC (rq_wr + rrsp_recv) and land only if user logic issues the write - so the shell never writes staging memory itself; the staging vaddr is addressing, its allocation exists so the vaddr is honest/mappable and future-proof |
 | debug counters (stores, descs, writes, drops, fences) | engine performance counters | read via CSRs off the data path |
+| stage cycle counters (free-running clock, order-FIFO residency, per-stage cycle sums + op counts) | GPU/NIC pipeline profiling counters (SM clock64 / RNIC port latency histograms) | words 48-63; feed the T3 per-stage latency constants (t-queue, t-lookup, t-forward, t-encap) as acc/cnt deltas scaled by the vFPGA clock; measurement runs use homogeneous traffic per class |
 
 ## Deployment topology (target process architecture)
 

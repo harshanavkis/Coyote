@@ -41,6 +41,26 @@ constexpr uint32_t DMA_COMPL_VA = 0x68;
 constexpr uint32_t RDMA_STAGING_VA = 0x70;  // RETH vaddr for outgoing wire messages
 constexpr uint32_t DBG_BASE    = 0x100;  // 8 x RO counters (see loom_ctrl.sv)
 
+// Stage cycle counters (RO, words 48-63; see loom_ctrl.sv header). Feed
+// the T3 per-stage latency measurements: average cycles = acc / cnt,
+// scaled by the vFPGA clock period.
+constexpr uint32_t STG_CYC       = 0x180;  // free-running cycle counter
+constexpr uint32_t STG_QUEUE_ACC = 0x188;  // order-FIFO residency sum (t-queue)
+constexpr uint32_t STG_ACC_BASE  = 0x190;  // 7 words, cycles per stage
+constexpr uint32_t STG_CNT_BASE  = 0x1C8;  // 7 words, completed-op counts
+constexpr int      STG_N         = 7;
+
+// Stage indices for STG_ACC_BASE/STG_CNT_BASE
+enum Stage : int {
+    STG_LOOKUP      = 0,  // pop + check, 2 cycles/entry (t-lookup; cnt = pops)
+    STG_STORE_LOCAL = 1,  // t-forward
+    STG_STORE_RDMA  = 2,  // t-encap
+    STG_DMA_LOCAL   = 3,
+    STG_DMA_RDMA    = 4,
+    STG_READ        = 5,  // aligned-line pull service (shell round trip)
+    STG_FENCE       = 6,
+};
+
 // Aperture: windows 1..15, 4 KB each (byte 0x1000-0xFFFF)
 constexpr uint32_t aperture(uint32_t win, uint32_t off) {
     return (win << 12) | off;
@@ -110,6 +130,30 @@ inline void dma(coyote::cThread &t, uint32_t win, uint32_t seg_off,
     csr_write(t, DMA_SRC_PID,  src_pid);
     csr_write(t, DMA_COMPL_VA, reinterpret_cast<uint64_t>(compl_va));
     csr_write(t, DMA_TRIGGER,  1);
+}
+
+// Snapshot of the stage cycle counters. Counters are never cleared;
+// measure an interval by taking two snapshots and differencing.
+struct StageStats {
+    uint64_t cyc;               // free-running cycle counter
+    uint64_t queue_acc;         // FIFO-residency cycle sum (divisor: cnt[STG_LOOKUP])
+    uint64_t acc[STG_N];        // per-stage cycle sums
+    uint64_t cnt[STG_N];        // per-stage completed-op counts
+};
+
+inline StageStats read_stage_stats(coyote::cThread &t) {
+    StageStats s;
+    s.cyc       = csr_read(t, STG_CYC);
+    s.queue_acc = csr_read(t, STG_QUEUE_ACC);
+    for (int i = 0; i < STG_N; i++) s.acc[i] = csr_read(t, STG_ACC_BASE + 8 * i);
+    for (int i = 0; i < STG_N; i++) s.cnt[i] = csr_read(t, STG_CNT_BASE + 8 * i);
+    return s;
+}
+
+// Average cycles per op for one stage over the interval [a, b]
+inline double stage_avg(const StageStats &a, const StageStats &b, Stage st) {
+    uint64_t ops = b.cnt[st] - a.cnt[st];
+    return ops ? double(b.acc[st] - a.acc[st]) / double(ops) : 0.0;
 }
 
 } // namespace loom

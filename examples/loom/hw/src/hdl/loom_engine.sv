@@ -118,6 +118,13 @@ module loom_engine (
     output logic                        cnt_drop,
     output logic                        cnt_compl,
 
+    // Stage cycle counters (to loom_ctrl, RO CSR words 50-63): per-stage
+    // cycle accumulators and completed-op counts for the T3 latency
+    // measurements. Index: 0 lookup, 1 store-local, 2 store-rdma,
+    // 3 dma-local, 4 dma-rdma, 5 read, 6 fence.
+    output logic [63:0]                 stage_acc [7],
+    output logic [63:0]                 stage_cnt [7],
+
     output logic                        busy
 );
 
@@ -460,5 +467,59 @@ assign cnt_local_wr = ((state == ST_WR_DATA) && !l_route && m_host_tready) ||
 assign cnt_rdma_wr  = ((state == ST_WR_DATA) && l_route && m_net_tready) ||
                       (stream_net && s_tvalid && s_tlast && m_net_tready);
 assign cnt_compl    = (state == ST_CP_DATA) && m_host_tready;
+
+// -------------------------------------------------------------------------
+// Stage cycle counters (T3)
+//
+// Every cycle the FSM spends outside ST_IDLE/ST_CHECK is attributed to
+// the class of the transaction in flight (fence cycles to the fence
+// class, not the underlying descriptor's). The lookup accumulator gets
+// exactly 2 cycles per popped entry - the pop/latch cycle and the
+// ST_CHECK cycle - covering the table lookup and the bounds check (the
+// user-logic part of translation); acc[0] == 2*cnt[0] is a testable
+// invariant. Counts increment on the same completion conditions as the
+// debug counter pulses, so dropped entries are popped (cnt[0]) but never
+// counted as completed ops. With no backpressure a store spends exactly
+// one cycle in ST_WR_REQ and one in ST_WR_DATA, so acc[1] (or [2])
+// advances by 2 per store; stall cycles accumulate into the stage where
+// the transaction waits, which is precisely what T3 wants attributed.
+// -------------------------------------------------------------------------
+wire in_fence = (state == ST_CP_REQ) || (state == ST_CP_DATA);
+wire [2:0] work_class = in_fence  ? 3'd6 :
+                        l_is_read ? 3'd5 :
+                        l_is_desc ? (l_route ? 3'd4 : 3'd3) :
+                                    (l_route ? 3'd2 : 3'd1);
+wire in_work = (state != ST_IDLE) && (state != ST_CHECK);
+
+always_ff @(posedge aclk) begin
+    if (!aresetn) begin
+        for (int i = 0; i < 7; i++) begin
+            stage_acc[i] <= 0;
+            stage_cnt[i] <= 0;
+        end
+    end else begin
+        if (fifo_pop) begin
+            stage_acc[0] <= stage_acc[0] + 1;
+            stage_cnt[0] <= stage_cnt[0] + 1;
+        end
+        if (state == ST_CHECK)
+            stage_acc[0] <= stage_acc[0] + 1;
+        if (in_work)
+            stage_acc[work_class] <= stage_acc[work_class] + 1;
+
+        if ((state == ST_WR_DATA) && !l_route && m_host_tready)
+            stage_cnt[1] <= stage_cnt[1] + 1;
+        if ((state == ST_WR_DATA) && l_route && m_net_tready)
+            stage_cnt[2] <= stage_cnt[2] + 1;
+        if (stream_local && s_tvalid && s_tlast && m_host_tready)
+            stage_cnt[3] <= stage_cnt[3] + 1;
+        if (stream_net && s_tvalid && s_tlast && m_net_tready)
+            stage_cnt[4] <= stage_cnt[4] + 1;
+        if (state == ST_RD_RESP)
+            stage_cnt[5] <= stage_cnt[5] + 1;
+        if (cnt_compl)
+            stage_cnt[6] <= stage_cnt[6] + 1;
+    end
+end
 
 endmodule

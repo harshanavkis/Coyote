@@ -70,6 +70,12 @@ class LoomLocalRead(FPGATestCase):
         val = self._read(0x5000, stop)
         self.assertIn(val, (POISON, -1), "poison on invalid window")
 
+        # Stage cycle counters (T3): all three reads answered (poison
+        # included), read-stage cycles accumulated (the two real reads
+        # include the shell line-pull round trip)
+        self.assertEqual(self.read_register(62, stop), 3, "stage read cnt")
+        self.assertGreaterEqual(self.read_register(55, stop), 3, "stage read acc")
+
         self.finish_fpga_simulation()
 
 

@@ -110,6 +110,26 @@ int main() {
     check(c1[3] == 0 && c1[4] == 0, "counters: no rdma/rx traffic");
     check(c1[5] == 0 && c1[6] == 0, "counters: no drops, no overflow");
 
+    // 6. Stage cycle counters (T3): structural relations only - absolute
+    // cycle values are meaningful on hardware, not in XSIM
+    {
+        loom::StageStats s = loom::read_stage_stats(t);
+        uint64_t cyc2 = loom::csr_read(t, loom::STG_CYC);
+        printf("stage: cyc=%lu queue_acc=%lu pops=%lu\n", s.cyc, s.queue_acc,
+               s.cnt[loom::STG_LOOKUP]);
+        for (int i = 0; i < loom::STG_N; i++)
+            printf("stage[%d]: acc=%lu cnt=%lu\n", i, s.acc[i], s.cnt[i]);
+        check(cyc2 > s.cyc, "stage: cycle counter advances");
+        check(s.acc[loom::STG_LOOKUP] == 2 * s.cnt[loom::STG_LOOKUP],
+              "stage: lookup acc == 2 * pops");
+        check(s.cnt[loom::STG_STORE_LOCAL] + s.cnt[loom::STG_DMA_LOCAL] == c1[2],
+              "stage: store-local + dma-local counts == local_wr");
+        check(s.cnt[loom::STG_FENCE] == c1[7], "stage: fence count == completions");
+        check(s.queue_acc > 0, "stage: queue-wait accumulated");
+        check(s.acc[loom::STG_STORE_LOCAL] >= 2 * s.cnt[loom::STG_STORE_LOCAL],
+              "stage: store-local acc >= 2 cycles per op");
+    }
+
     printf(failures == 0 ? "LOOM TEST PASS\n" : "LOOM TEST FAIL (%d)\n", failures);
     return failures == 0 ? 0 : 1;
 }

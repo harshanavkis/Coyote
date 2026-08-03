@@ -10,7 +10,10 @@ logic and user-space software; the shell and driver stay stock.
 ## Ctrl-region layout (64 KB, AXI4-Lite)
 
 - `0x0000-0x0FFF` — CSR page: window-table programming, DMA descriptor
-  staging (incl. per-descriptor fence VA) + trigger, RO debug counters.
+  staging (incl. per-descriptor fence VA) + trigger, RO debug counters
+  (words 32-40) and stage cycle counters for T3 (words 48-63: free-running
+  cycle counter, order-FIFO residency accumulator, per-stage cycle
+  accumulators + completed-op counts; see `loom_ctrl.sv` header).
 - `0x1000-0xFFFF` — aperture: 15 windows of 4 KB. Window = `addr[15:12]`,
   offset = `addr[11:0]`. Every write beat here is captured as a small-write
   transaction (posted).
@@ -151,8 +154,9 @@ N_REGIONS 1`; cf. `examples/jigsaw_baseline_rdma`.
 | 5.2b | rdma wire-message format: 64B header ⟨op·len·vaddr⟩ (+inline data for stores), RETH = staging vaddr (CSR 14), loom_rx parses + issues exact writes | done, all pass |
 | 5.2c | hybrid wire scheme: bulk reverts to DIRECT RDMA WRITE (RETH = true target, zero overhead; op·len·vaddr = RDMA's own headers); inline message kept only for sub-64B stores; loom_rx dispatches on staging-vaddr compare | done, all pass |
 | 5.3 | loomd control daemon: socket<->OrchClient adapter, SockOrchClient, standalone loomd binary; FPGA-free protocol test + full flow over a real socket in sim | done, all pass |
+| 5.3b | stage cycle counters (T3 enabler, owner move-up 2026-08-03): free-running cycle counter + order-FIFO residency accumulator (t-queue) + per-stage cycle accumulators/op counts in the engine (lookup, store-local = t-forward, store-rdma = t-encap, dma-local/rdma, read, fence), RO CSR words 48-63; sw readout (`StageStats`/`stage_avg`) | done, all sims pass |
 | 5.4 | hardware gate tests G1/G2/G4 on stock examples | pending |
-| 5.5 | synthesize + run on U280 (cross-pid); measure the sim's FPGA-owned constants: T3 per-stage latencies (needs stage cycle counters), T2 coalescing curve (needs coalescer RTL, on/off), substrate floors, B2 rdma-init, local read RTT | pending |
+| 5.5 | synthesize + run on U280 (cross-pid); measure the sim's FPGA-owned constants: T3 per-stage latencies (stage counters in RTL since 5.3b - read deltas, divide by op counts, scale by clock), T2 coalescing curve (needs coalescer RTL, on/off), substrate floors, B2 rdma-init, local read RTT | pending |
 | 5.4a | deployment binaries: app_export/app_import (per side: loomd + 2 app processes; single-host bring-up = same binaries, one loomd) | pending (AFTER 6.2a, owner reorder) |
 | 6.1 | loomd-loomd TCP, QP setup via Coyote RDMA API (QP owned by the exporter's cThread; staging = a small getMem buffer of the QP owner), remote export/import; move staging from the global CSR into the window table if hosts have multiple QP owners | pending |
 | 6.2a | two-host BUNDLED configuration: one process per host (daemon thread + that side's app roles), loomd-loomd TCP + QP setup + real wire - the cross-host bring-up vehicle (2 processes total) | **next** (owner reorder: before 5.4a; code + FPGA-free smoke tests now, execution needs two hosts) |
@@ -210,13 +214,17 @@ Coverage (hardened in Phase 4.5):
 - `tb_loom_ctrl`: CSR readback (all RW regs), commit pulse, aperture
   capture fields incl. sub-word wstrb, descriptor enqueue, arrival
   ordering, overflow drops, FIFO wraparound (rolling 5-in/5-out across
-  the 64-entry boundary), counters.
+  the 64-entry boundary), counters, stage-counter plumbing (cycle
+  counter advances, queue-wait accumulator vs. a known FIFO residency,
+  words 50-63 read mux).
 - `tb_loom_engine` (composite ctrl+table+engine, shell mocked):
   local/rdma stores, DMA local/rdma with completion values,
   descriptor-then-flag ordering, backpressure matrix (wr_ready, host and
   net tready, mid-stream), bounds edges (end==lim vs end==lim+8, store at
-  window end), non-64B-multiple lengths, completion-disabled path, and a
-  60-op soak checked against exact counter deltas.
+  window end), non-64B-multiple lengths, completion-disabled path, a
+  60-op soak checked against exact counter deltas, and stage cycle
+  counters (exact 2-cycle unstalled stores, stall attribution,
+  acc==2*pops lookup invariant, count relations vs. debug counters).
 - `tb_loom_rx`: grant gating, forwarding, backpressure, back-to-back.
 - `tb_loom_top`: the generated `design_user_logic_c0_0` wrapper as DUT
   (vfpga_top.svh verbatim) - engine/rx arbitration: continuous mutual-
@@ -237,9 +245,9 @@ nix-shell -p cmake gcc boost --run 'cmake .. -DEN_SIM=ON && make -j8'
 tmux new-session -d -s loom_run \
   "xilinx-shell -c 'export COYOTE_SIM_DIR=$PWD/../../hw/build_sim/; ./test' \
    > run_test.log 2>&1"
-tail -f run_test.log     # expect: 13x PASS (2 windows, interleaved stores/
-                         # DMAs, cross-window ordering, counter relations),
-                         # then LOOM TEST PASS
+tail -f run_test.log     # expect: 19x PASS (2 windows, interleaved stores/
+                         # DMAs, cross-window ordering, counter relations,
+                         # stage-cycle-counter relations), then LOOM TEST PASS
 # waveform: hw/build_sim/sim/sim_dump.vcd
 ```
 
@@ -302,7 +310,7 @@ payloads below 2^63); the RDMA-REMOTE segment must be allocated first
 Two binaries, no sockets, no daemon - everything in one process:
 
 - `./test` - the monolithic regression (one cThread doing everything;
-  run instructions in the integration-sim section above; 13x PASS,
+  run instructions in the integration-sim section above; 19x PASS,
   `LOOM TEST PASS`).
 - `./roles` - the role-split demo: `loom_orch.hpp` (OrchClient
   interface + InProcOrchestrator, the only code touching the CSR page),
@@ -408,5 +416,19 @@ The two harnesses compile the XSIM project with different defines
 harness crash at t=0 (XSIM kernel FATAL). After switching, clean once:
 
 ```bash
+rm -rf examples/loom/hw/build_sim/sim/example_loom.sim
+```
+
+### After editing `hw/src/vfpga_top.svh`
+
+The setup step copies `vfpga_top.svh` into `hw/build_sim/sim/`, and the
+generated `user_logic_c0_0.sv` wrapper resolves its `include` against
+that copy - the integration sims silently build the stale version
+(symptom: modules referenced in place are current, but top-level wiring
+changes never take effect). After editing, refresh the copy and clean
+the snapshot:
+
+```bash
+cp examples/loom/hw/src/vfpga_top.svh examples/loom/hw/build_sim/sim/
 rm -rf examples/loom/hw/build_sim/sim/example_loom.sim
 ```

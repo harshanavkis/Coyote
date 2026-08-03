@@ -70,6 +70,15 @@ class LoomRdmaTx(FPGATestCase):
         self.assertEqual(self.read_register(34, stop), 0, "dbg[local_wr]")
         self.assertEqual(self.read_register(37, stop), 0, "dbg[drops]")
 
+        # Stage cycle counters (T3): exactly one entry popped, 2 lookup
+        # cycles, one completed store-rdma op with >= 2 cycles (2 when
+        # the shell accepts without stalls), nonzero FIFO residency
+        self.assertEqual(self.read_register(57, stop), 1, "stage pops")
+        self.assertEqual(self.read_register(50, stop), 2, "stage lookup acc")
+        self.assertEqual(self.read_register(59, stop), 1, "stage store-rdma cnt")
+        self.assertGreaterEqual(self.read_register(52, stop), 2, "stage store-rdma acc")
+        self.assertGreaterEqual(self.read_register(49, stop), 1, "stage queue-wait acc")
+
         self.finish_fpga_simulation()
 
     @unittest.skip(
