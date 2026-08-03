@@ -74,6 +74,7 @@ N_REGIONS 1`; cf. `examples/jigsaw_baseline_rdma`.
 | 2 | loom_engine (store + DMA branches, completion) + block TB | done, TBs pass |
 | 3 | loom_rx + block TB | done, TBs pass |
 | 4 | vfpga_top wiring + Coyote integration sim (EN_SIM) | done, LOOM TEST PASS |
+| 4.5 | test hardening: tb_loom_top (arbitration), engine/ctrl corner cases, extended integration sim, Python RDMA TX test | done, all pass |
 | 5 | hardware bring-up, local paths | pending |
 | 6 | hardware, RDMA path (two hosts) | pending |
 
