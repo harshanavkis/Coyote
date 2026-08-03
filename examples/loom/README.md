@@ -63,12 +63,19 @@ out; the wire carries the exporter's VA (offset in affine encoding).
 1. Cross-pid write: `sq_wr` under another attached cThread's pid lands in
    that process's buffer.
 2. Sub-line writes: alignment/keep semantics of an 8 B `LOCAL_WRITE`.
-3. RX interposition: where incoming RDMA writes surface (`rq_wr` +
-   `axis_rrsp_recv`, per jigsaw) vs. direct-to-memory. Also confirm that
-   incoming writes to ANY TLB-mapped vaddr of the QP owner's pid land
-   (Coyote has no verbs-style MR registration - validity = a TLB entry;
-   the hybrid needs two reachable regions per QP owner: the exporter's
-   buffer for direct bulk and its small staging buffer for messages).
+3. RX interposition - LOAD-BEARING for the inline-message path. Three
+   possible stock-shell behaviors for an incoming write: (b) surfaces
+   request+payload to user logic only -> our design works as-is;
+   (c) writes memory AND notifies user logic -> works, staging memory
+   harmlessly scribbled; (a) writes memory silently -> loom_rx never
+   fires and inline messages are DEAD until we adopt jigsaw's exact
+   configuration (which provably delivers messages to user logic on
+   this shell). G3 = determine which behavior/knobs apply. Corollaries:
+   the staging buffer must be REAL TLB-mapped memory (under (a)/(c) the
+   shell writes it; unmapped would fault), and confirm writes to ANY
+   TLB-mapped vaddr of the QP owner land (no verbs-style MR
+   registration - validity = a TLB entry; the hybrid needs two
+   reachable regions per QP owner: exporter buffer + staging buffer).
 4. QP selection from user logic when more than one binding/QP exists.
 5. Minimum RDMA payload, shell-side evidence (checked in the Coyote
    sources, 2026-08-03): there is NO explicit `len >= 64` check anywhere

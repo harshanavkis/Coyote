@@ -6,10 +6,40 @@ tables; the vFPGA tables and the Coyote shell TLB carry transactions
 between address spaces. No physical address appears anywhere, and none
 crosses a host boundary.
 
-## Setup
+## Setup phase (everything that happens before the first byte moves)
 
 Processes A, B on host 1; C on host 2. All are cThreads of their host's
 single vFPGA. Coyote pids: A=0, B=1 (host 1); C=0 (host 2).
+
+The control-plane sequence, in order:
+
+1. **Attach**: each participating process opens the vFPGA (a cThread)
+   and mmaps the ctrl region. The ctid it receives is its identity
+   toward the shell TLB for everything below.
+2. **Memory "registration"**: allocating with `getMem` pins the pages
+   and installs shell-TLB entries under the caller's ctid - that IS the
+   registration step (Coyote has no verbs MR/rkey machinery; a buffer
+   is remotely reachable iff its owner's TLB translates it, the GPU-MMU
+   model). Exporters register their data buffers this way; every QP
+   owner additionally allocates a small **staging buffer** (real,
+   TLB-mapped memory - the landing zone for inline messages).
+3. **QP setup** (remote bindings only): the exporter's cThread creates
+   the RC QP - it must be the exporter's, because only its ctid makes
+   its buffers TLB-reachable for incoming writes. The endpoints
+   exchange QP metadata out of band (Coyote's TCP exchange: QPNs, PSNs)
+   plus the staging vaddr, exactly like NCCL peers exchange transport-
+   buffer addresses at connect/accept. In 6.1 the loomd daemons
+   coordinate this exchange.
+4. **Switch programming** (control plane only - loomd/orchestrator
+   role): window-table entries `{route local|rdma, pid, VA base, len}`
+   per binding, and the staging CSR (per host; moves into the window
+   table when hosts have multiple QP owners).
+5. **Handle exchange** (application level): the exporter passes the
+   opaque handle to the importer over any channel it likes; the
+   importer resolves it through the control plane and receives its
+   window pointer.
+
+After step 5, no software touches a transfer.
 
 - B: `buf_B = getMem(4MB)` at `0x7f1b_d420_0000` (B's own VA) — host-1
   shell TLB maps (pid 1, that VA).
