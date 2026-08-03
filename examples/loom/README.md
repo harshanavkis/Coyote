@@ -178,3 +178,32 @@ Sim-backend notes (learned the hard way):
   last). Counters read immediately after a poll may still be draining.
 - Poll destination/completion *memory*, never CSRs, while a DMA is in
   flight (sim CSR reads block behind the generator).
+
+### Python RDMA unit test (Phase 4.5)
+
+The Coyote Python sim framework (`sim/unit_test`) drives the same XSIM
+project non-interactively and provides barebones RDMA mocks. Our test
+verifies the TX rdma path end-to-end into the TB's RDMA-REMOTE mock,
+asserted via the loom debug counters (exact counts: randomization is
+disabled through the framework's own knob):
+
+```bash
+cd examples/loom/hw/unit-tests
+tmux new-session -d -s loom_py \
+  "xilinx-shell -c 'nix-shell -p python3 --run \
+   \"PYTHONPATH=../build_sim python3 -m unittest test_loom_rdma -v\"' \
+   > pytest_run.log 2>&1"
+tail -f pytest_run.log     # expect: test_tx_store_takes_rdma_path ... ok
+                           #         OK (skipped=1)
+```
+
+The RX test is skipped by design: the stock TB delivers only the rq_wr
+request of an incoming RDMA write and discards the payload
+(memory_simulation.svh, rdmaLocalWrite), so a forwarder waiting on
+axis_rrsp_recv cannot complete in simulation. RX data-path coverage:
+tb_loom_rx (block level) + hardware gate G3 (Phase 6).
+
+Framework quirks: register values are packed as signed 64-bit (keep test
+payloads below 2^63); the RDMA-REMOTE segment must be allocated first
+(remote_rdma_write); live register reads need a long simulation window
+(the test sets 1 ms; the 4 us default closes before responses arrive).
