@@ -28,16 +28,30 @@ The control-plane sequence, in order:
    its buffers TLB-reachable for incoming writes. The endpoints
    exchange QP metadata out of band (Coyote's TCP exchange: QPNs, PSNs)
    plus the staging vaddr, exactly like NCCL peers exchange transport-
-   buffer addresses at connect/accept. In 6.1 the loomd daemons
-   coordinate this exchange.
+   buffer addresses at connect/accept. IMPLEMENTED (6.2a,
+   `sw-bundled/loom_host.cpp`): each side's data cThread calls
+   `initRDMA` (exporter side first, importer side with the exporter's
+   IP - Coyote's own out-of-band TCP does the QP exchange), and the
+   loomd<->loomd peering hello (`loom_peer.hpp`) carries the exporter
+   side's staging VA to the importer, which programs it into its
+   RDMA_STAGING_VA CSR. Bring-up scope: one RC connection between the
+   two data cThreads; per-binding QPs are 6.1/6.2b.
 4. **Switch programming** (control plane only - loomd/orchestrator
    role): window-table entries `{route local|rdma, pid, VA base, len}`
    per binding, and the staging CSR (per host; moves into the window
-   table when hosts have multiple QP owners).
+   table when hosts have multiple QP owners - until then the global CSR
+   serves the asymmetric topology only: importer side TX, exporter side
+   RX). For a remote binding the importer's daemon programs
+   `{rdma, pid = LOCAL QP-owner ctid, base = exporter VA, len}` - the
+   pid selects whose RC connection carries the write; translation
+   happens at the exporter's TLB (`loom_bundle.hpp`).
 5. **Handle exchange** (application level): the exporter passes the
    opaque handle to the importer over any channel it likes; the
    importer resolves it through the control plane and receives its
-   window pointer.
+   window pointer. IMPLEMENTED (6.2a): cross-host resolution is the
+   peering RESOLVE - the importer side's daemon asks the exporter
+   side's daemon to turn the handle into `{exporter ctid, VA, len}`,
+   then programs the window as in step 4.
 
 After step 5, no software touches a transfer.
 
@@ -145,7 +159,21 @@ Stores, descriptors AND reads share one arrival-ordered FIFO, so
 `copy(P_B+off, src, len); *(P_B+flag) = 1` can never show the flag before
 the data (the flag store sits behind the descriptor), and a load issued
 after either observes their effects: the engine is
-transaction-serialized.
+transaction-serialized. Across hosts the guarantee extends over the RC
+connection: both windows of the 6.2a flow ride one QP, so a flag stored
+after a bulk copy is delivered after the copy's payload at the far side.
+
+## Observability (stage cycle counters, 5.3b)
+
+Every flow above is timed by the RO stage counters (CSR words 48-63,
+see `loom_ctrl.sv`): word 49 accumulates each entry's order-FIFO
+residency (t-queue), word 50 the lookup/check cycles (t-lookup, exactly
+2 per entry), and words 51-56 the per-class engine cycles - Flow 1
+lands in store-local (t-forward), Flow 2 in store-rdma (t-encap),
+Flows 3/4 in dma-local/dma-rdma, Flow 5 in read, fences in their own
+class - with completed-op counts in words 57-63. Averages are acc/cnt
+deltas; the T3 measurement runs read them after homogeneous traffic
+per class.
 
 ## The translation chain in one table
 
