@@ -66,12 +66,22 @@ out; the wire carries the exporter's VA (offset in affine encoding).
 3. RX interposition: where incoming RDMA writes surface (`rq_wr` +
    `axis_rrsp_recv`, per jigsaw) vs. direct-to-memory.
 4. QP selection from user logic when more than one binding/QP exists.
-5. Minimum RDMA payload: jigsaw needed 64 B (it pads every network
-   message to one full beat, `rdma_wr_len = 64`). Our 8 B `APP_WRITE`
-   remote stores likely violate this; naive padding would clobber 56
-   neighbor bytes at the destination. Expected fix (Phase 6): 64 B wire
-   message = header + payload, far-side loom_rx issues the exact 8 B
-   local write. Verify the constraint on hardware first.
+5. Minimum RDMA payload, shell-side evidence (checked in the Coyote
+   sources, 2026-08-03): there is NO explicit `len >= 64` check anywhere
+   in the TX path - `rdma_req_parser.sv` handles any length (len <= PMTU
+   -> WRITE_ONLY with plen = len) and the transport's header math
+   (`udpLen = 12+16+payloadLen+4`) is length-agnostic. BUT sub-64 B
+   writes sit outside the exercised envelope: Coyote's own perf example
+   floors at 64 B (`MIN_TRANSFER_SIZE_DEFAULT = 64`), the header/payload
+   merge in `ib_transport_protocol.cpp:append_payload` carries an
+   explicit "TODO align this stuff!!", and the sub-word keep helper is
+   `lenToKeep(ap_uint<6>)` (< 64 only). jigsaw's unconditional padding
+   (`rdma_wr_len = 64`) corroborates empirically. Treat 64 B as the
+   de-facto minimum until this gate tests an 8 B `APP_WRITE` on
+   hardware. If it fails (expected): Phase-6 fix is a 64 B wire message
+   (header + payload); the far-side loom_rx issues the exact 8 B local
+   write - naive padding is NOT an option (it would clobber 56 neighbor
+   bytes at the destination).
 
 Shell config (when hw is added): `EN_STRM 1, N_STRM_AXI 1, EN_RDMA 1,
 N_REGIONS 1`; cf. `examples/jigsaw_baseline_rdma`.
