@@ -59,9 +59,10 @@ The CPU configures the DMA engine, then the engine moves the data:
    streams in on `axis_host_recv`, TLB translating A's pages.
 3. Write side: `sq_wr {LOCAL_WRITE, pid 1, vaddr buf_B+0x10000, len}` —
    the stream is forwarded through. A host-to-host copy through the vFPGA.
-4. Descriptor retires when the last beat is accepted; the engine writes an
-   incrementing count to `(COMPL_PID, COMPL_VA)` — a word in A's own
-   memory that the library polls (never poll CSRs during DMA).
+4. Descriptor retires when the last beat is accepted; the engine releases
+   the descriptor's fence: an incrementing count written to the completion
+   VA the descriptor carried (a word in A's own memory, written under A's
+   pid) - the library polls it (never poll CSRs during DMA).
 
 ## Flow 4 — bulk, remote: `copy(P_C + 0x10000, src, 1MB)`
 

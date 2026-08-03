@@ -112,7 +112,8 @@ logic [63:0] compl_cnt;
 assign lu_idx = fifo_win;
 assign busy   = (state != ST_IDLE);
 
-// Bounds: end offset of the access within the segment
+// Bounds check: the access must end inside the window's segment. Stores
+// are fixed 8 B; descriptors use their full length (and len==0 is invalid)
 wire [28:0] end_off = l_is_desc ? ({1'b0, l_off} + {1'b0, l_len})
                                 : ({1'b0, l_off} + 29'd8);
 wire ok = l_valid && (l_is_desc ? (l_len != 0) : 1'b1)
@@ -127,6 +128,8 @@ always_ff @(posedge aclk) begin
         l_valid <= 0; l_route <= 0; l_pid <= 0; l_base <= 0; l_lim <= 0;
     end else begin
         case (state)
+            // Latch the FIFO head and its table hit in one shot; fifo_pop
+            // (combinational below) retires the entry in this same cycle
             ST_IDLE: if (!fifo_empty) begin
                 l_is_desc <= fifo_is_desc;
                 l_off     <= fifo_off;
@@ -142,16 +145,21 @@ always_ff @(posedge aclk) begin
                 state     <= ST_CHECK;
             end
 
+            // Validation gate: invalid window or out-of-bounds access is
+            // dropped here and never reaches the shell
             ST_CHECK:
                 if (!ok)            state <= ST_IDLE;        // cnt_drop pulses below
                 else if (l_is_desc) state <= ST_RD_REQ;
                 else                state <= ST_WR_REQ;
+
+            // ---- STORE: one write request, then one data beat ----
 
             ST_WR_REQ:    if (wr_ready) state <= ST_WR_DATA;
             ST_WR_DATA:
                 if (( l_route && m_net_tready) ||
                     (!l_route && m_host_tready)) state <= ST_IDLE;
 
+            // ---- DESC: pull request, write request, stream, fence ----
             ST_RD_REQ:    if (rd_ready) state <= ST_DMA_WR_REQ;
             ST_DMA_WR_REQ: if (wr_ready) state <= ST_STREAM;
             ST_STREAM:
@@ -159,6 +167,8 @@ always_ff @(posedge aclk) begin
                     (( l_route && m_net_tready) || (!l_route && m_host_tready)))
                     state <= (l_compl_va != 0) ? ST_CP_REQ : ST_IDLE;
 
+            // Fence release: skipped entirely when the descriptor's
+            // completion VA is 0
             ST_CP_REQ:    if (wr_ready) state <= ST_CP_DATA;
             ST_CP_DATA:
                 if (m_host_tready) begin

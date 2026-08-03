@@ -5,7 +5,7 @@ import lynxTypes::*;
  *
  * AXI4-Lite slave for the Loom vFPGA. The 64 KB user ctrl region is split:
  *   - byte 0x0000-0x0FFF: CSR page (table programming, DMA descriptor
- *     staging, completion config, RO debug counters)
+ *     staging incl. per-descriptor fence VA, RO debug counters)
  *   - byte 0x1000-0xFFFF: aperture, 15 windows of 4 KB. Window index =
  *     byte_addr[15:12] (1..15), offset within window = byte_addr[11:0].
  *     Every write beat landing here is captured as a small-write
@@ -116,6 +116,8 @@ logic ctrl_reg_wren, ctrl_reg_rden;
 assign ctrl_reg_wren = axi_wready && axi_ctrl.wvalid && axi_awready && axi_ctrl.awvalid;
 assign ctrl_reg_rden = axi_arready && axi_ctrl.arvalid && ~axi_rvalid;
 
+// Address decode: any write with a nonzero window index (addr[15:12]) is
+// an aperture store; window 0 is the CSR page
 wire        wr_is_aperture = |axi_awaddr[15:12];
 wire [3:0]  wr_win         = axi_awaddr[15:12];
 wire [11:0] wr_win_off     = axi_awaddr[11:0];
@@ -129,6 +131,9 @@ logic [63:0] r_tbl_idx, r_tbl_cfg, r_tbl_pid, r_tbl_base, r_tbl_len;
 logic [63:0] r_dma_dst, r_dma_src_va, r_dma_len, r_dma_src_pid, r_dma_compl_va;
 logic [63:0] dbg [N_DBG];
 
+// COMMIT/TRIGGER act on write pulses (not stored values) and require the
+// low byte strobe - this also makes them immune to strobe-less padding
+// writes some environments generate
 wire csr_wr        = ctrl_reg_wren && !wr_is_aperture;
 wire commit_pulse  = csr_wr && (wr_idx == R_TBL_COMMIT)  && axi_ctrl.wstrb[0] && axi_ctrl.wdata[0];
 wire trigger_pulse = csr_wr && (wr_idx == R_DMA_TRIGGER) && axi_ctrl.wstrb[0] && axi_ctrl.wdata[0];
@@ -172,6 +177,9 @@ logic [FIFO_AW:0]   wptr, rptr;
 wire fifo_full_i  = (wptr[FIFO_AW] != rptr[FIFO_AW]) && (wptr[FIFO_AW-1:0] == rptr[FIFO_AW-1:0]);
 wire fifo_empty_i = (wptr == rptr);
 
+// Push rules: aperture write beats and descriptor triggers enter the same
+// FIFO in arrival order; a full FIFO drops (counted) rather than stalls
+// the AXI-Lite bridge (posted-write semantics toward the host)
 wire push_store = ctrl_reg_wren && wr_is_aperture && !fifo_full_i;
 wire push_desc  = trigger_pulse && !fifo_full_i;
 wire push_drop  = ((ctrl_reg_wren && wr_is_aperture) || trigger_pulse) && fifo_full_i;

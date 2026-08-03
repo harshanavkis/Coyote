@@ -8,7 +8,7 @@
  * (G1), exercised in Phase 5 with two processes.
  *
  * Sequence:
- *   1. program windows 1, 2 (local) -> dst1, dst2; set completion word
+ *   1. program windows 1, 2 (local) -> dst1, dst2
  *   2. small aperture stores on both windows -> poll both destinations
  *   3. bulk DMA on both windows -> poll completion, verify contents
  *   4. cross-window global ordering: DMA on win 1, flag store on win 2;
@@ -66,7 +66,7 @@ int main() {
     memset(cpl, 0, 4096);
     for (uint64_t i = 0; i < BUF_SIZE / 8; i++) src[i] = 0xA5A5'0000'0000'0000ULL | i;
 
-    // 1. Two local windows + completion word
+    // 1. Two local windows (the fence VA rides in each descriptor)
     loom::program_window(t, 1, false, pid, dst1, BUF_SIZE);
     loom::program_window(t, 2, false, pid, dst2, BUF_SIZE);
 

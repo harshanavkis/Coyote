@@ -75,8 +75,12 @@ always_ff @(posedge aclk) begin
                 if (!fifo_empty)      arb <= ARB_ENG;   // engine priority
                 else if (rx_req_arb)  arb <= ARB_RX;
             end
+            // Engine keeps the path while it has queued work; releasing
+            // requires both an empty FIFO and a finished transaction
             ARB_ENG:
                 if (fifo_empty && !eng_busy) arb <= ARB_IDLE;
+            // rx_started distinguishes "granted but not yet begun" from
+            // "finished": leave only after busy has risen and fallen
             ARB_RX: begin
                 if (rx_busy) rx_started <= 1'b1;
                 if (rx_started && !rx_busy) arb <= ARB_IDLE;

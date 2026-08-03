@@ -10,7 +10,7 @@ logic and user-space software; the shell and driver stay stock.
 ## Ctrl-region layout (64 KB, AXI4-Lite)
 
 - `0x0000-0x0FFF` — CSR page: window-table programming, DMA descriptor
-  staging + trigger, completion config, RO debug counters.
+  staging (incl. per-descriptor fence VA) + trigger, RO debug counters.
 - `0x1000-0xFFFF` — aperture: 15 windows of 4 KB. Window = `addr[15:12]`,
   offset = `addr[11:0]`. Every write beat here is captured as a small-write
   transaction (posted).
@@ -31,8 +31,9 @@ Detailed hardware description and the GPU-equivalence argument:
   - Store, rdma: `sq_wr {APP_WRITE, STRM_RDMA, pid = QP owner, base+off, 8}`
     + beat on `axis_rreq_send` (RETH vaddr = exporter's VA).
   - Descriptor: pull `sq_rd {src_pid, src_va, len}` via `axis_host_recv`,
-    forward the stream to the local or rdma write side; on the last beat,
-    write an incrementing completion count to `(COMPL_PID, COMPL_VA)`.
+    forward the stream to the local or rdma write side; then release the
+    descriptor's fence: an incrementing count written to the descriptor's
+    completion VA under `src_pid` (CE semaphore-release model).
 - **loom_rx** — incoming RDMA writes: forward `(pid, vaddr, len)` from
   `rq_wr` + payload to a local `sq_wr` write.
 
