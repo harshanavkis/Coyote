@@ -449,8 +449,21 @@ macro(validation_checks_hw)
         ## ! u280 has both DDR and HBM, HBM enabled by default; if DDR is required add u280 in DDR_DEV and remove it from HBM_DEV
         ## ! v80 has both DDR and HBM, HBM is enabled by default and supported; DDR not supported yet
         ##
-        set(DDR_DEV "u250" "u280")
-        set(HBM_DEV "u55c")
+        # LOOM LOCAL CHANGE: u280 moved from DDR_DEV to HBM_DEV.
+        # Rationale (see the comment above, which already states HBM is the
+        # intended u280 default): shell_top emits BOTH the DDR (c0_*) and
+        # HBM (hbm_clk_*) port blocks for u280 gated only on the device,
+        # and link.tcl adds the whole constraints/u280/dynamic/impl dir, so
+        # u280_shell_hbm.xdc and u280_shell_ddr_0.xdc both claim the board's
+        # single 100 MHz reference clock (BJ43/BJ44). With the DDR path the
+        # dangling hbm_clk port wins the pins and the DDR4 MIG's c0_sys_clk
+        # is left unplaced -> "[Mig 66-99] ... is/are not placed" and
+        # opt_design fails. Any u280 build with EN_RDMA/EN_TCP hits this,
+        # because those force EN_DCARD=1 when AV_DDR. On the HBM path the
+        # HBM BD owns those pins legitimately and the leftover DDR ports are
+        # dangling with no MIG to complain.
+        set(DDR_DEV "u250")
+        set(HBM_DEV "u55c" "u280")
 
         list(FIND DDR_DEV ${FDEV_NAME} TMP_DEV)
         if(NOT TMP_DEV EQUAL -1)
