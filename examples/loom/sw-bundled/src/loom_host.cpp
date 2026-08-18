@@ -262,7 +262,7 @@ int main(int argc, char **argv) {
             return 2;
         }
     }
-    if (server == ip.empty()) {   // exactly one of --server / --client
+    if (server != ip.empty()) {   // exactly one of --server / --client
         printf("usage: %s --server | --client <server_ip> "
                "[--qp-port N] [--peer-port N] [--sock PATH]\n", argv[0]);
         return 2;
