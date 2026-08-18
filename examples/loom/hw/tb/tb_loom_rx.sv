@@ -436,6 +436,28 @@ initial begin
     check(wrq.size() == 0, "malformed headers: nothing written");
     check(drop_pulses == 5, "malformed headers: every one counted");
 
+    // --- 12. Direct write whose length is not a whole number of beats ---
+    // Every length used above is a multiple of 64, so the rounding in
+    // beats_of has never mattered - a plain `len >> 6` would pass all of
+    // them. loom_engine cannot emit such a write (it drops rdma bulk with
+    // len[5:0] != 0 at the source) but the RX takes its length from the
+    // wire, where nothing enforces that, so a sender that disagrees with us
+    // must cost one dropped write and not the framing of everything after
+    dut_reset();
+    incoming(6'd6, 28'd100, TARGET + 48'hB00);
+    send_msg_beat(64'hDEAD_0000, 64'b0, 64'b0, 1'b0);
+    send_msg_beat(64'hDEAD_0001, 64'b0, 64'b0, 1'b1);
+    wait_quiet(200, "12: direct write of 100 B");
+    incoming(6'd6, 28'd64, STAGING);
+    send_msg_beat({28'b0, 28'd8, OP_INL}, {16'b0, TARGET + 48'hC00},
+                  64'hCC, 1'b1);
+    wait_quiet(200, "12: message after a 100 B direct write");
+    dump_wrq("case 12");
+    check(wrq.size() == 2, "odd length: one write each");
+    if (wrq.size() == 2)
+        check(wrq[0].len == 100 && wrq[1].vaddr == TARGET + 48'hC00,
+              "odd length: both beats consumed, next header parsed clean");
+
     if (errors == 0) $display("TB PASS (tb_loom_rx)");
     else             $display("TB FAIL (tb_loom_rx): %0d errors", errors);
     $finish;

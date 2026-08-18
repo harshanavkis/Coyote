@@ -449,6 +449,27 @@ initial begin
           mem[(BASE1 + 48'h80) >> 3] == 64'hAF7E_0001,
           "store after a fragmented copy parses its own header");
 
+    // --- Boundary sizes. 4096 and 12288 are both whole multiples of PMTU,
+    //     so nothing above exercises the minimum transfer or an uneven final
+    //     fragment - and the short last fragment is where the beat budget has
+    //     to land exactly, on a request whose rq_wr.last is high but which
+    //     carries a single beat
+    copy(4'd1, 28'h40000, {16'b0, SRC_VA}, 28'd64, {16'b0, CPL_VA});
+    settle();
+    check_payload(BASE1 + 48'h40000, 8, "minimum bulk: 64 B, one beat, lands");
+
+    copy(4'd1, 28'h50000, {16'b0, SRC_VA}, 28'd4160, {16'b0, CPL_VA});
+    settle();
+    check_payload(BASE1 + 48'h50000, 520,
+                  "PMTU+64 copy lands (short final fragment)");
+    check(fences == 5, "every copy released its fence");
+
+    store(4'd1, 12'hC0, 64'hB0DA_0001);
+    settle();
+    check(mem.exists((BASE1 + 48'hC0) >> 3) &&
+          mem[(BASE1 + 48'hC0) >> 3] == 64'hB0DA_0001,
+          "store after an unevenly fragmented copy parses its own header");
+
     check(rx_drop === 1'b0, "no header was ever rejected on the far side");
 
     if (errors == 0) $display("TB PASS (tb_loom_loopback)");
