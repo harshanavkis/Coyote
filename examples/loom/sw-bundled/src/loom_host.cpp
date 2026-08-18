@@ -56,9 +56,33 @@ namespace {
 constexpr uint64_t BUF_SIZE      = 2ULL * 1024 * 1024;
 constexpr uint64_t DMA_BYTES     = 4096;        // rdma bulk: len % 64 == 0
 constexpr uint32_t STAGING_BYTES = 4096;
-constexpr int      POLL_SECS     = 120;
+// Bring-up: a poll that is going to fail should fail fast enough that the
+// counter dump after it is worth reading. LOOM_POLL_SECS overrides.
+int poll_secs() {
+    const char *e = getenv("LOOM_POLL_SECS");
+    return e ? atoi(e) : 20;
+}
 
 int failures = 0;
+
+// The vFPGA's own account of what it did, which is the only first-hand
+// evidence when a write does not arrive: dbg[4] counts transactions loom_rx
+// forwarded (this test should produce exactly 5 - three wire messages and
+// two direct bulk writes), dbg[9] counts headers it refused to translate,
+// and on the issuing side dbg[0]/dbg[3]/dbg[5] say what the engine captured,
+// put on the wire, and dropped.
+void dump_counters(coyote::cThread &t, const char *tag) {
+    static const char *name[10] = {
+        "stores", "descs", "local_wr", "rdma_wr", "rx_fwd",
+        "drops", "fifo_ovfl", "compl", "reads", "rx_hdr_reject"
+    };
+    printf("counters [%s]:", tag);
+    for (int i = 0; i < 10; i++)
+        printf(" %s=%lu", name[i],
+               (unsigned long) loom::csr_read(t, loom::DBG_BASE + 8 * i));
+    printf("\n");
+    fflush(stdout);
+}
 
 void check(bool ok, const char *msg) {
     printf("%s: %s\n", ok ? "PASS" : "FAIL", msg);
@@ -66,7 +90,7 @@ void check(bool ok, const char *msg) {
 }
 
 bool poll64(volatile uint64_t *addr, uint64_t want) {
-    for (int i = 0; i < POLL_SECS * 100; i++) {
+    for (int i = 0; i < poll_secs() * 100; i++) {
         if (*addr == want) return true;
         usleep(10000);
     }
@@ -130,20 +154,42 @@ int run_server(uint16_t qp_port, uint16_t peer_port, const std::string &sock) {
     printf("server: peering on port %u, loomd on %s\n", peer.port(), sock.c_str());
 
     // Verify the client's traffic as it lands
+    dump_counters(t_ctrl, "server idle");
     check(poll64(&dst1[8], 0xB00B'0000'0000'0001ULL), "store via w1 lands");
+    dump_counters(t_ctrl, "after store w1");
     check(poll64(&dst2[8], 0xB00B'0000'0000'0002ULL), "store via w2 lands");
+    dump_counters(t_ctrl, "after store w2");
     check(poll_payload(&dst1[0x10000 / 8]), "bulk payload @0x10000 matches");
+    dump_counters(t_ctrl, "after bulk @0x10000");
     // Ordering: when the flag (issued AFTER the second copy) is visible,
     // the second copy's payload must already be complete - RC in-order
     // delivery extends the order-FIFO guarantee across hosts
     check(poll64(&dst2[0x800 / 8], 0xF1A6ULL), "ordering flag lands");
+    dump_counters(t_ctrl, "after ordering flag");
     check(payload_matches(&dst1[0x20000 / 8]),
           "flag implies bulk payload @0x20000 complete (cross-host order)");
 
+    // Where did the second copy actually land? A framing slip shows up as a
+    // shift, so report the first mismatching word rather than just "no"
+    {
+        const uint64_t *p = &dst1[0x20000 / 8];
+        for (uint64_t i = 0; i < DMA_BYTES / 8; i++)
+            if (p[i] != src_word(i)) {
+                printf("  @0x20000 first mismatch at word %lu: got %016lx, "
+                       "want %016lx\n", (unsigned long) i,
+                       (unsigned long) p[i], (unsigned long) src_word(i));
+                break;
+            }
+        printf("  dst2[0x800] = %016lx (flag), dst2[0x40] = %016lx\n",
+               (unsigned long) dst2[0x800 / 8], (unsigned long) dst2[8]);
+        fflush(stdout);
+    }
+
     // End-of-run barrier, then teardown
-    for (int i = 0; i < POLL_SECS * 100 && peer.doneCount() < 1; i++)
+    for (int i = 0; i < poll_secs() * 100 && peer.doneCount() < 1; i++)
         usleep(10000);
     check(peer.doneCount() >= 1, "client DONE received");
+    dump_counters(t_ctrl, "server final");
 
     t_data.connSync(false);
     peer.stop(); peer_thr.join();
@@ -209,9 +255,11 @@ int run_client(const std::string &ip, uint16_t qp_port, uint16_t peer_port,
 
     // Ordering across hosts: copy, then flag through the other window;
     // both ride the same QP, RC keeps them in order at the far side
+    dump_counters(t_ctrl, "client before ordering copy");
     A.copy(w1, 0x20000, src, DMA_BYTES, fence);
     A.store(w2, 0x800, 0xF1A6ULL);
     check(poll64(&fence[0], 2), "fence 2 after ordering copy");
+    dump_counters(t_ctrl, "client after ordering copy + flag store");
 
     // Release: window invalidated at the SOURCE - the engine drops the
     // store before anything reaches the wire (counted in dbg[drops])
@@ -219,11 +267,12 @@ int run_client(const std::string &ip, uint16_t qp_port, uint16_t peer_port,
     orch.releaseWindow(w2);
     A.store(w2, 0x40, 0xDEADULL);
     bool dropped = false;
-    for (int i = 0; i < POLL_SECS * 10 && !dropped; i++) {
+    for (int i = 0; i < poll_secs() * 10 && !dropped; i++) {
         dropped = loom::csr_read(t_ctrl, loom::DBG_BASE + 8 * 5) >= drops0 + 1;
         if (!dropped) usleep(10000);
     }
     check(dropped, "store to released window dropped at source");
+    dump_counters(t_ctrl, "client final");
 
     check(peer.done(), "DONE barrier acknowledged");
     t_data.connSync(true);
