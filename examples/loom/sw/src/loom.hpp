@@ -39,7 +39,7 @@ constexpr uint32_t DMA_SRC_PID = 0x58;
 constexpr uint32_t DMA_TRIGGER = 0x60;
 constexpr uint32_t DMA_COMPL_VA = 0x68;
 constexpr uint32_t RDMA_STAGING_VA = 0x70;  // RETH vaddr for outgoing wire messages
-constexpr uint32_t DBG_BASE    = 0x100;  // 8 x RO counters (see loom_ctrl.sv)
+constexpr uint32_t DBG_BASE    = 0x100;  // 10 x RO counters (see loom_ctrl.sv)
 
 // Stage cycle counters (RO, words 48-63; see loom_ctrl.sv header). Feed
 // the T3 per-stage latency measurements: average cycles = acc / cnt,

@@ -31,9 +31,10 @@ import lynxTypes::*;
  * VA in exactly the right address space.
  *
  * Transaction-serialized like the engine; starts only when granted the
- * shared {sq_wr, axis_host_send} path (top-level arbiter). Unknown ops
- * drain the message without writing anything (counted as forwarded for
- * now; a dedicated counter can come with the two-host phase).
+ * shared {sq_wr, axis_host_send} path (top-level arbiter). A request owns
+ * exactly ceil(len/64) beats of the payload stream - that, not tlast, is
+ * what ends a transaction - and a header that does not match the contract
+ * is drained and counted (cnt_rx_drop) instead of being translated.
  */
 module loom_rx (
     input  logic                        aclk,
@@ -71,8 +72,9 @@ module loom_rx (
     input  logic                        grant,     // exclusive ownership while high
     output logic                        busy,
 
-    // Debug counter pulse (to loom_ctrl)
-    output logic                        cnt_rx_fwd
+    // Debug counter pulses (to loom_ctrl)
+    output logic                        cnt_rx_fwd,
+    output logic                        cnt_rx_drop
 );
 
 // Wire-message header ops (keep in sync with loom_engine.sv)
@@ -89,8 +91,41 @@ logic [7:0]            l_op;
 logic [27:0]           l_len;
 logic [VADDR_BITS-1:0] l_va;
 logic [63:0]           l_inline;
-logic                  l_hdr_last;   // single-beat message?
-logic                  l_direct;     // vaddr != staging: verbatim forward
+logic [22:0]           l_beats;      // beats of this request still on the stream
+
+// Where a transaction ends is decided by the REQUEST's length, not by
+// tlast. rq_wr.last is low whenever the shell ends the stream WITHOUT a
+// tlast (see req_t in lynx_pkg), and ib_transport_protocol emits exactly
+// that for every RDMA_WRITE_FIRST/MIDDLE fragment; waiting for a tlast then
+// runs into the next message's beats, and from there every parse reads
+// payload as a header - which is how a store's target becomes whatever
+// happened to sit in lane 1. tlast still ends a transaction early when it
+// arrives first; whatever the request still owns after the write is drained
+// rather than left behind for the next parse to trip over.
+function automatic logic [22:0] beats_of(input logic [27:0] len);
+    logic [28:0] padded;
+    padded   = {1'b0, len} + 29'd63;
+    beats_of = padded[28:6];
+endfunction
+
+// Last beat this transaction may take off the stream
+wire stream_end = s_tlast || (l_beats <= 23'd1);
+
+// Header contract. The exporter hands the parsed target straight to the
+// shell TLB under the QP owner's pid, so a header this side does not
+// recognize must never become a write: whatever sits in lane 1 would be
+// written to. loom_engine only ever emits the two forms below, so anything
+// else is a beat that is not a header (or a sender that disagrees with us),
+// and is dropped and counted rather than translated.
+//   inline: lane0 == {28'b0, 28'd8, op2}, target 8 B aligned
+//   write:  lane0 == {28'b0, len, op1}, len a nonzero multiple of 64 B
+wire [27:0] hdr_len = s_tdata[35:8];
+wire [7:0]  hdr_op  = s_tdata[7:0];
+wire hdr_ok = (s_tdata[63:36] == 28'b0) &&
+              ((hdr_op == MSG_OP_WRITE_INLINE &&
+                hdr_len == 28'd8 && s_tdata[64 +: 3] == 3'b0) ||
+               (hdr_op == MSG_OP_WRITE &&
+                hdr_len != 28'd0 && hdr_len[5:0] == 6'b0));
 
 // Accept a request only when granted, so a transaction never starts while
 // the engine owns the shared write path
@@ -102,22 +137,21 @@ always_ff @(posedge aclk) begin
     if (!aresetn) begin
         state <= ST_IDLE;
         l_pid <= 0; l_op <= 0; l_len <= 0; l_va <= 0; l_inline <= 0;
-        l_hdr_last <= 0; l_direct <= 0;
+        l_beats <= 0;
     end else begin
         case (state)
             ST_IDLE: if (rq_valid && grant) begin
-                l_pid <= rq_req.pid;
+                l_pid   <= rq_req.pid;
+                l_beats <= beats_of(rq_req.len[27:0]);
                 if (rq_req.vaddr[VADDR_BITS-1:0] == rdma_staging_va) begin
-                    l_direct <= 1'b0;
-                    state    <= ST_HDR;          // Loom message: parse
+                    state <= ST_HDR;             // Loom message: parse
                 end else begin
                     // Direct bulk write: take target and length from the
                     // request itself, forward every beat untouched
-                    l_direct <= 1'b1;
-                    l_va     <= rq_req.vaddr[VADDR_BITS-1:0];
-                    l_len    <= rq_req.len[27:0];
-                    l_op     <= MSG_OP_WRITE;
-                    state    <= ST_WR_REQ;
+                    l_va  <= rq_req.vaddr[VADDR_BITS-1:0];
+                    l_len <= rq_req.len[27:0];
+                    l_op  <= MSG_OP_WRITE;
+                    state <= ST_WR_REQ;
                 end
             end
 
@@ -127,25 +161,35 @@ always_ff @(posedge aclk) begin
                 l_len    <= s_tdata[35:8];
                 l_va     <= s_tdata[64 +: VADDR_BITS];
                 l_inline <= s_tdata[128 +: 64];
-                l_hdr_last <= s_tlast;
-                if (s_tdata[7:0] == MSG_OP_WRITE ||
-                    s_tdata[7:0] == MSG_OP_WRITE_INLINE)
+                l_beats  <= l_beats - 23'd1;
+                if (hdr_ok)
                     state <= ST_WR_REQ;
                 else
-                    // Unknown op: drain the rest of the message, write nothing
-                    state <= s_tlast ? ST_IDLE : ST_DRAIN;
+                    // Not a header we recognize: drain what the request
+                    // still owns and write nothing (cnt_rx_drop pulses below)
+                    state <= stream_end ? ST_IDLE : ST_DRAIN;
             end
 
             ST_WR_REQ: if (wr_ready)
                 state <= (l_op == MSG_OP_WRITE_INLINE) ? ST_INLINE_DATA : ST_STREAM;
 
-            // One constructed beat: the inline data moved to lane 0
-            ST_INLINE_DATA: if (m_tready) state <= ST_IDLE;
+            // One constructed beat: the inline data moved to lane 0. A
+            // message that was not a single beat still owns the rest of
+            // its request, so those beats are drained here instead of
+            // being left for the next parse to read as a header
+            ST_INLINE_DATA: if (m_tready)
+                state <= (l_beats != 0) ? ST_DRAIN : ST_IDLE;
 
             // Forward the remaining payload beats
-            ST_STREAM: if (s_tvalid && s_tlast && m_tready) state <= ST_IDLE;
+            ST_STREAM: if (s_tvalid && m_tready) begin
+                l_beats <= l_beats - 23'd1;
+                if (stream_end) state <= ST_IDLE;
+            end
 
-            ST_DRAIN: if (s_tvalid && s_tlast) state <= ST_IDLE;
+            ST_DRAIN: if (s_tvalid) begin
+                l_beats <= l_beats - 23'd1;
+                if (stream_end) state <= ST_IDLE;
+            end
 
             default: state <= ST_IDLE;
         endcase
@@ -179,12 +223,16 @@ always_comb begin
     end else begin
         m_tdata  = s_tdata;
         m_tkeep  = s_tkeep;
-        m_tlast  = s_tlast;
+        // The write we issued must be terminated even when the incoming
+        // stream carries no tlast of its own (rq_wr.last low): the beat
+        // budget ends the transaction, so it ends the stream too
+        m_tlast  = stream_end;
         m_tvalid = (state == ST_STREAM) && s_tvalid;
     end
 end
 
-assign cnt_rx_fwd = ((state == ST_INLINE_DATA) && m_tready) ||
-                    ((state == ST_STREAM) && s_tvalid && s_tlast && m_tready);
+assign cnt_rx_fwd  = ((state == ST_INLINE_DATA) && m_tready) ||
+                     ((state == ST_STREAM) && s_tvalid && m_tready && stream_end);
+assign cnt_rx_drop = (state == ST_HDR) && s_tvalid && !hdr_ok;
 
 endmodule

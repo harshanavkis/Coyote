@@ -16,7 +16,7 @@ user logic and user-space software; the shell and driver stay stock.
 
 - `0x0000-0x0FFF` — CSR page: window-table programming, DMA descriptor
   staging (incl. per-descriptor fence VA) + trigger, RO debug counters
-  (words 32-40), stage cycle counters for T3 (words 48-63). Register map
+  (words 32-41), stage cycle counters for T3 (words 48-63). Register map
   in the `loom_ctrl.sv` header.
 - `0x1000-0xFFFF` — aperture: 15 windows of 4 KB. Window = `addr[15:12]`,
   offset = `addr[11:0]`. Every write beat is captured as a posted

@@ -35,7 +35,7 @@ logic [63:0]           rd_resp_data;
 logic                  rd_resp_valid;
 logic [VADDR_BITS-1:0] rdma_staging_va;
 
-logic cnt_local_wr, cnt_rdma_wr, cnt_rx_fwd, cnt_drop, cnt_compl;
+logic cnt_local_wr, cnt_rdma_wr, cnt_rx_fwd, cnt_rx_drop, cnt_drop, cnt_compl;
 
 // Stage counter inputs: driven with distinct constants so the CSR read
 // mux (words 50-63) can be checked without an engine
@@ -58,7 +58,8 @@ loom_ctrl dut (
     .rdma_staging_va(rdma_staging_va),
     .rd_resp_data(rd_resp_data), .rd_resp_valid(rd_resp_valid),
     .cnt_local_wr(cnt_local_wr), .cnt_rdma_wr(cnt_rdma_wr),
-    .cnt_rx_fwd(cnt_rx_fwd), .cnt_drop(cnt_drop), .cnt_compl(cnt_compl),
+    .cnt_rx_fwd(cnt_rx_fwd), .cnt_rx_drop(cnt_rx_drop),
+    .cnt_drop(cnt_drop), .cnt_compl(cnt_compl),
     .stage_acc(stage_acc), .stage_cnt(stage_cnt)
 );
 
@@ -122,7 +123,8 @@ initial begin
     axi_ctrl.awaddr = 0; axi_ctrl.wdata = 0; axi_ctrl.wstrb = 0; axi_ctrl.araddr = 0;
     fifo_pop = 0;
     rd_resp_data = 0; rd_resp_valid = 0;
-    cnt_local_wr = 0; cnt_rdma_wr = 0; cnt_rx_fwd = 0; cnt_drop = 0; cnt_compl = 0;
+    cnt_local_wr = 0; cnt_rdma_wr = 0; cnt_rx_fwd = 0; cnt_rx_drop = 0;
+    cnt_drop = 0; cnt_compl = 0;
     for (int i = 0; i < 7; i++) begin
         stage_acc[i] = 64'hA000 + 64'(i);
         stage_cnt[i] = 64'hC000 + 64'(i);

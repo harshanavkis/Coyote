@@ -66,7 +66,19 @@ Consulted once per transaction; nothing on the data path computes a route.
 vaddr equals STAGING is a Loom inline message: parse `⟨op · len · target
 VA⟩` and issue exactly the write it describes. Any other vaddr is direct
 bulk: forward request and every beat verbatim. Writes run under the QP
-owner's pid; unknown ops drain harmlessly.
+owner's pid.
+
+Two rules keep a parsed target from ever being garbage, because this side
+hands it straight to the shell TLB. **Transactions are bounded by the
+request's length** (`ceil(len/64)` beats), not by `tlast`: `rq_wr.last` is
+low whenever the shell ends a stream without one (`req_t` in `lynx_pkg`,
+which `ib_transport_protocol` emits for every `RDMA_WRITE_FIRST/MIDDLE`),
+so a tlast-only rule reads the next message's payload as a header. Beats a
+request still owns after its write are drained, never left behind.
+**Headers are checked against the contract** `loom_engine` emits — inline
+is `len == 8` with an 8 B-aligned target, bulk is a nonzero 64 B multiple,
+reserved bits zero — and anything else is dropped and counted (CSR word
+41) rather than translated.
 
 **The arbiter (vfpga_top)** — `loom_engine` and `loom_rx` share `sq_wr`
 and `axis_host_send[0]`. A registered arbiter grants the pair for whole

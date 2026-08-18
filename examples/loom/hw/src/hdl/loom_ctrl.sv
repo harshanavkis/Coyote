@@ -40,7 +40,7 @@ import lynxTypes::*;
  *   34 local writes issued    35 rdma writes issued
  *   36 rx writes forwarded    37 bounds/invalid drops
  *   38 order-FIFO overflows   39 completions written
- *   40 reads captured
+ *   40 reads captured          41 rx headers rejected
  *   48-63 (RO) stage cycle counters (T3 per-stage latencies):
  *   48 free-running cycle counter
  *   49 queue-wait accumulator: sum over popped entries of their order-FIFO
@@ -104,6 +104,7 @@ module loom_ctrl (
     input  logic                        cnt_local_wr,
     input  logic                        cnt_rdma_wr,
     input  logic                        cnt_rx_fwd,
+    input  logic                        cnt_rx_drop,
     input  logic                        cnt_drop,
     input  logic                        cnt_compl,
 
@@ -132,7 +133,7 @@ localparam integer R_DMA_TRIGGER = 12;
 localparam integer R_DMA_COMPL_VA = 13;
 localparam integer R_RDMA_STAGING = 14;
 localparam integer R_DBG_BASE    = 32;
-localparam integer N_DBG         = 9;
+localparam integer N_DBG         = 10;
 localparam integer R_CYC         = 48;
 localparam integer R_QUEUE_ACC   = 49;
 localparam integer R_STG_ACC     = 50;   // 7 words: 50-56
@@ -399,6 +400,7 @@ always_ff @(posedge aclk) begin
         if (push_drop)    dbg[6] <= dbg[6] + 1;
         if (cnt_compl)    dbg[7] <= dbg[7] + 1;
         if (push_read)    dbg[8] <= dbg[8] + 1;
+        if (cnt_rx_drop)  dbg[9] <= dbg[9] + 1;
     end
 end
 

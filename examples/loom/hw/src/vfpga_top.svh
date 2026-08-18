@@ -36,7 +36,7 @@ logic [PID_BITS-1:0]    lu_pid;
 logic [VADDR_BITS-1:0]  lu_base;
 logic [LEN_BITS-1:0]    lu_len;
 
-logic cnt_local_wr, cnt_rdma_wr, cnt_rx_fwd, cnt_drop, cnt_compl;
+logic cnt_local_wr, cnt_rdma_wr, cnt_rx_fwd, cnt_rx_drop, cnt_drop, cnt_compl;
 
 // Stage cycle counters: engine -> ctrl (RO CSR words 50-63)
 logic [63:0] stage_acc [7];
@@ -138,7 +138,8 @@ loom_ctrl inst_loom_ctrl (
     .rdma_staging_va(rdma_staging_va),
     .rd_resp_data(rd_resp_data), .rd_resp_valid(rd_resp_valid),
     .cnt_local_wr(cnt_local_wr), .cnt_rdma_wr(cnt_rdma_wr),
-    .cnt_rx_fwd(cnt_rx_fwd), .cnt_drop(cnt_drop), .cnt_compl(cnt_compl),
+    .cnt_rx_fwd(cnt_rx_fwd), .cnt_rx_drop(cnt_rx_drop),
+    .cnt_drop(cnt_drop), .cnt_compl(cnt_compl),
     .stage_acc(stage_acc), .stage_cnt(stage_cnt)
 );
 
@@ -196,7 +197,7 @@ loom_rx inst_loom_rx (
     .m_tdata(rx_tdata), .m_tkeep(rx_tkeep), .m_tvalid(rx_tvalid),
     .m_tready(axis_host_send[0].tready && rx_grant), .m_tlast(rx_tlast),
     .req(rx_req_arb), .grant(rx_grant), .busy(rx_busy),
-    .cnt_rx_fwd(cnt_rx_fwd)
+    .cnt_rx_fwd(cnt_rx_fwd), .cnt_rx_drop(cnt_rx_drop)
 );
 
 // ---------------------------------------------------------------------------
