@@ -80,7 +80,8 @@ loom_ctrl inst_ctrl (
     .rdma_staging_va(rdma_staging_va),
     .rd_resp_data(rd_resp_data), .rd_resp_valid(rd_resp_valid),
     .cnt_local_wr(cnt_local_wr), .cnt_rdma_wr(cnt_rdma_wr),
-    .cnt_rx_fwd(1'b0), .cnt_drop(cnt_drop), .cnt_compl(cnt_compl),
+    .cnt_rx_fwd(1'b0), .cnt_rx_drop(1'b0), .cnt_drop(cnt_drop),
+    .cnt_compl(cnt_compl),
     .stage_acc(stage_acc), .stage_cnt(stage_cnt)
 );
 

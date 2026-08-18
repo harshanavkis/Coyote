@@ -99,11 +99,23 @@ examples/loom/hw/tb/run_tbs.sh      # expect PASS x5, logs in hw/tb/work/
 
 Re-execs itself inside `xilinx-shell`, compiles `lynx_pkg.sv` +
 `axi_intf.sv` + the loom modules, runs `tb_loom_table`, `tb_loom_ctrl`,
-`tb_loom_engine`, `tb_loom_rx`, `tb_loom_top`. Between them they cover CSR
-readback, aperture capture incl. sub-word `wstrb`, arrival ordering, FIFO
-wraparound and overflow, backpressure and bounds edges, exact stage-counter
-relations (2-cycle unstalled stores, `acc == 2*pops`), and engine/rx
-arbitration (mutual-exclusion assertions, starvation recovery, soaks).
+`tb_loom_engine`, `tb_loom_rx`, `tb_loom_top`, `tb_loom_loopback`. Between
+them they cover CSR readback, aperture capture incl. sub-word `wstrb`,
+arrival ordering, FIFO wraparound and overflow, backpressure and bounds
+edges, exact stage-counter relations (2-cycle unstalled stores,
+`acc == 2*pops`), engine/rx arbitration (mutual-exclusion assertions,
+starvation recovery, soaks), and both routes end to end.
+
+`tb_loom_loopback` is the two-host data plane in one simulation: the real
+ctrl/table/engine drive rdma windows, a model of the shell's RDMA path
+fragments each request at PMTU the way `ib_transport_protocol` does
+(`rq_wr.last` low on every fragment but the last, one `tlast` per message),
+and the real `loom_rx` lands the result in a modelled host memory checked
+against what software asked for. It runs `loom_host`'s sequence operation
+for operation, plus a copy larger than PMTU. It exists because the header
+ENCODE and DECODE are two hand-written layouts in two files: each block TB
+checks its own side against literals it writes itself, so both can agree on
+the same misunderstanding and still pass.
 
 ### Coyote integration sim
 
@@ -155,7 +167,8 @@ read parks the generator that must service the engine's pull.
 The RX test is skipped by design: the stock TB delivers only the `rq_wr`
 request of an incoming write and discards the payload
 (`memory_simulation.svh`, `rdmaLocalWrite`), so a forwarder waiting on
-`axis_rrsp_recv` cannot complete. RX coverage is `tb_loom_rx` + gate G3.
+`axis_rrsp_recv` cannot complete. RX coverage is `tb_loom_rx` +
+`tb_loom_loopback` + gate G3.
 
 Framework quirks: register values pack as signed 64-bit (keep payloads
 below 2^63); the RDMA-REMOTE segment must be allocated

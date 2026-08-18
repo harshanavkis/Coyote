@@ -176,6 +176,9 @@ task axil_read(input [15:0] addr, output [63:0] data);
     @(negedge aclk);
 endtask
 
+localparam [47:0] STAGING_VA = 48'h7d24_8ca0_0000;   // T7: rdma route
+localparam [47:0] SRC_VA_T   = 48'h7f6a_2000_0000;
+
 task program_win(input [3:0] idx, input route,
                  input [PID_BITS-1:0] pid, input [63:0] base, input [63:0] len);
     axil_write(16'd0,  {60'b0, idx});
@@ -192,6 +195,17 @@ task descriptor(input [3:0] win, input [27:0] off, input [27:0] len);
     axil_write(16'd80,  {36'b0, len});
     axil_write(16'd88,  64'd0);
     axil_write(16'd104, 64'd0);          // fence VA = 0: no completion
+    axil_write(16'd96,  64'd1);
+endtask
+
+// descriptor() with a per-descriptor fence VA
+task descriptor_compl(input [3:0] win, input [27:0] off, input [27:0] len,
+                      input [63:0] compl);
+    axil_write(16'd64,  {win, 32'b0, off});
+    axil_write(16'd72,  {16'b0, SRC_VA_T});
+    axil_write(16'd80,  {36'b0, len});
+    axil_write(16'd88,  64'd1);
+    axil_write(16'd104, compl);
     axil_write(16'd96,  64'd1);
 endtask
 
@@ -317,6 +331,46 @@ initial begin
         check(rd_out == 64'hD0D0_0000, $sformatf("T6: read got %h", rd_out));
         axil_read(16'((32 + 8) * 8), rdata);
         check(rdata == 64'd1, "T6: reads-captured counter");
+    end
+
+    // --- T7: rdma route through the wrapper ---
+    // Everything above is local route, so the top-level rdma path - the
+    // engine's net stream out through vfpga_top's muxes while the arbiter
+    // holds the pair - had never carried a beat. On the importer side of
+    // the two-host setup every window is rdma routed, so this is that
+    // host's entire data plane
+    begin
+        int net_before, host_before;
+        net_before  = net_beats;
+        host_before = host_beats;
+        wrq.delete();
+
+        axil_write(16'd112, {16'b0, STAGING_VA});          // staging CSR
+        program_win(4'd3, 1'b1, 6'd4, {16'b0, BASE_B}, 64'h40_0000);
+
+        axil_write(16'h3040, 64'hFEED_0000_0000_0001);     // store -> message
+        wait_quiesce();
+        check(net_beats == net_before + 1,
+              "T7: rdma store put one message beat on the net stream");
+        check(host_beats == host_before, "T7: rdma store touched no host beat");
+        check(wrq.size() == 1 && wrq[0].strm == STRM_RDMA &&
+              wrq[0].vaddr == STAGING_VA && wrq[0].len == 64,
+              "T7: rdma store request is a 64 B write at the staging vaddr");
+
+        // Bulk on the rdma route: pulled from the host, pushed to the net,
+        // with the fence landing back on the host stream
+        wrq.delete();
+        net_before  = net_beats;
+        host_before = host_beats;
+        descriptor_compl(4'd3, 28'h1000, 28'd256, {16'b0, BASE_B + 48'h3000});
+        wait_quiesce();
+        check(net_beats == net_before + 4,
+              "T7: rdma bulk streamed its 4 beats to the net");
+        check(host_beats == host_before + 1, "T7: fence beat went to the host");
+        check(wrq.size() == 2 && wrq[0].strm == STRM_RDMA &&
+              wrq[0].vaddr == BASE_B + 48'h1000 && wrq[0].len == 256 &&
+              wrq[1].strm == STRM_HOST && wrq[1].len == 8,
+              "T7: bulk request goes out rdma, fence stays local");
     end
 
     if (errors == 0) $display("TB PASS (tb_loom_top)");
