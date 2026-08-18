@@ -290,12 +290,23 @@ wire fifo_empty_i = (wptr == rptr);
 // Push rules: aperture write beats and descriptor triggers enter the same
 // FIFO in arrival order; a full FIFO drops (counted) rather than stalls
 // the AXI-Lite bridge (posted-write semantics toward the host)
-wire push_store = ctrl_reg_wren && wr_is_aperture && !fifo_full_i;
+// A beat with no write strobes modifies nothing by AXI semantics, so it is
+// not a store. This matters because a host ctrl write arrives as a burst
+// covering its whole 64 B line - the sim models it too ("Write burst which
+// happens in real hardware", ctrl_simulation.svh) - and without this gate
+// one 8 B aperture store became eight FIFO entries and eight wire messages,
+// the extra seven landing 8 B writes at +8..+56 of the target. Hardware
+// showed them: dst2[0x800..0x838] came back as the stored value followed by
+// five zeros and two words of bus garbage. The CSR page survived the same
+// burst only because COMMIT/TRIGGER demand wstrb[0] && wdata[0] below.
+wire push_store = ctrl_reg_wren && wr_is_aperture && (|axi_ctrl.wstrb) &&
+                  !fifo_full_i;
 wire push_desc  = trigger_pulse && !fifo_full_i;
 // Reads are pushed at the AR handshake; arready is only granted when the
 // FIFO has room (see the arready block), so a read can never be dropped
 wire push_read  = ar_hs && ar_is_aperture;
-wire push_drop  = ((ctrl_reg_wren && wr_is_aperture) || trigger_pulse) && fifo_full_i;
+wire push_drop  = ((ctrl_reg_wren && wr_is_aperture && (|axi_ctrl.wstrb)) ||
+                   trigger_pulse) && fifo_full_i;
 
 // Free-running cycle counter (RO word 48; also the source of the push
 // timestamps and, on hardware, of software-side interval measurements)
