@@ -65,6 +65,12 @@ int poll_secs() {
 
 int failures = 0;
 
+// Bring-up switch: run the store path with no bulk copy in front of it.
+// The far side stops forwarding at the transaction after the first copy, so
+// this splits "the store path is broken" from "a preceding direct write
+// wedges the receiver". Both sides must be started with it set.
+bool skip_bulk() { return getenv("LOOM_SKIP_BULK") != nullptr; }
+
 // The vFPGA's own account of what it did, which is the only first-hand
 // evidence when a write does not arrive: dbg[4] counts transactions loom_rx
 // forwarded (this test should produce exactly 5 - three wire messages and
@@ -159,15 +165,18 @@ int run_server(uint16_t qp_port, uint16_t peer_port, const std::string &sock) {
     dump_counters(t_ctrl, "after store w1");
     check(poll64(&dst2[8], 0xB00B'0000'0000'0002ULL), "store via w2 lands");
     dump_counters(t_ctrl, "after store w2");
-    check(poll_payload(&dst1[0x10000 / 8]), "bulk payload @0x10000 matches");
-    dump_counters(t_ctrl, "after bulk @0x10000");
+    if (!skip_bulk()) {
+        check(poll_payload(&dst1[0x10000 / 8]), "bulk payload @0x10000 matches");
+        dump_counters(t_ctrl, "after bulk @0x10000");
+    }
     // Ordering: when the flag (issued AFTER the second copy) is visible,
     // the second copy's payload must already be complete - RC in-order
     // delivery extends the order-FIFO guarantee across hosts
     check(poll64(&dst2[0x800 / 8], 0xF1A6ULL), "ordering flag lands");
     dump_counters(t_ctrl, "after ordering flag");
-    check(payload_matches(&dst1[0x20000 / 8]),
-          "flag implies bulk payload @0x20000 complete (cross-host order)");
+    if (!skip_bulk())
+        check(payload_matches(&dst1[0x20000 / 8]),
+              "flag implies bulk payload @0x20000 complete (cross-host order)");
 
     // Where did the second copy actually land? A framing slip shows up as a
     // shift, so report the first mismatching word rather than just "no"
@@ -182,6 +191,14 @@ int run_server(uint16_t qp_port, uint16_t peer_port, const std::string &sock) {
             }
         printf("  dst2[0x800] = %016lx (flag), dst2[0x40] = %016lx\n",
                (unsigned long) dst2[0x800 / 8], (unsigned long) dst2[8]);
+        // One aperture store becomes eight wire messages: the real one plus
+        // seven padding writes to +8..+56 of the same 64 B line. Whether
+        // those carry zeros or garbage decides whether every peer store is
+        // clobbering its neighbours (which G5 claims it does not)
+        printf("  dst2[0x800..0x838] =");
+        for (int i = 0; i < 8; i++)
+            printf(" %016lx", (unsigned long) dst2[0x800 / 8 + i]);
+        printf("\n");
         fflush(stdout);
     }
 
@@ -250,15 +267,23 @@ int run_client(const std::string &ip, uint16_t qp_port, uint16_t peer_port,
     A.store(w2, 0x40, 0xB00B'0000'0000'0002ULL);
 
     // Bulk with fence (direct RDMA WRITE; fence = local posted completion)
-    A.copy(w1, 0x10000, src, DMA_BYTES, fence);
-    check(poll64(&fence[0], 1), "fence 1 after copy (posted completion)");
+    if (!skip_bulk()) {
+        A.copy(w1, 0x10000, src, DMA_BYTES, fence);
+        check(poll64(&fence[0], 1), "fence 1 after copy (posted completion)");
+    } else {
+        printf("LOOM_SKIP_BULK: no copies, stores only\n");
+    }
 
     // Ordering across hosts: copy, then flag through the other window;
     // both ride the same QP, RC keeps them in order at the far side
     dump_counters(t_ctrl, "client before ordering copy");
-    A.copy(w1, 0x20000, src, DMA_BYTES, fence);
-    A.store(w2, 0x800, 0xF1A6ULL);
-    check(poll64(&fence[0], 2), "fence 2 after ordering copy");
+    if (!skip_bulk()) {
+        A.copy(w1, 0x20000, src, DMA_BYTES, fence);
+        A.store(w2, 0x800, 0xF1A6ULL);
+        check(poll64(&fence[0], 2), "fence 2 after ordering copy");
+    } else {
+        A.store(w2, 0x800, 0xF1A6ULL);
+    }
     dump_counters(t_ctrl, "client after ordering copy + flag store");
 
     // Release: window invalidated at the SOURCE - the engine drops the
