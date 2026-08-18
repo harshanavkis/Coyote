@@ -458,6 +458,30 @@ initial begin
         check(wrq[0].len == 100 && wrq[1].vaddr == TARGET + 48'hC00,
               "odd length: both beats consumed, next header parsed clean");
 
+    // --- 13. last=1 request that delivers MORE beats than its length ---
+    // This is the hardware failure. When the shell says it will terminate
+    // the stream, tlast IS the boundary and the length is advisory: on the
+    // two-host run a 4096 B write did not deliver exactly ceil(4096/64)
+    // beats, a length-derived boundary ended the transaction off by a beat,
+    // the write we had asked for was never satisfied, sq_wr backed up and
+    // this module parked in ST_WR_REQ with rx_fwd frozen
+    dut_reset();
+    incoming(6'd7, 28'd128, TARGET + 48'hD00);      // len says 2 beats
+    send_msg_beat(64'hFEED_0000, 64'b0, 64'b0, 1'b0);
+    send_msg_beat(64'hFEED_0001, 64'b0, 64'b0, 1'b0);
+    send_msg_beat(64'hFEED_0002, 64'b0, 64'b0, 1'b1);   // tlast on the third
+    wait_quiet(300, "13: last=1 stream longer than its length");
+    incoming(6'd7, 28'd64, STAGING);
+    send_msg_beat({28'b0, 28'd8, OP_INL}, {16'b0, TARGET + 48'hE00},
+                  64'hEE, 1'b1);
+    wait_quiet(300, "13: message after an over-long stream");
+    dump_wrq("case 13");
+    check(wrq.size() == 2, "over-long stream: both transactions completed");
+    if (wrq.size() == 2)
+        check(wrq[1].vaddr == TARGET + 48'hE00,
+              "over-long stream: tlast is the boundary, next header clean");
+    check(outq.size() == 4, "over-long stream: all three beats forwarded");
+
     if (errors == 0) $display("TB PASS (tb_loom_rx)");
     else             $display("TB FAIL (tb_loom_rx): %0d errors", errors);
     $finish;

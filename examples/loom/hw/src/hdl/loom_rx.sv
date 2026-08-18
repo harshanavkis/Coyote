@@ -92,6 +92,7 @@ logic [27:0]           l_len;
 logic [VADDR_BITS-1:0] l_va;
 logic [63:0]           l_inline;
 logic [22:0]           l_beats;      // beats of this request still on the stream
+logic                  l_req_last;   // shell will terminate this stream with tlast
 
 // Where a transaction ends is decided by the REQUEST's length, not by
 // tlast. rq_wr.last is low whenever the shell ends the stream WITHOUT a
@@ -108,8 +109,19 @@ function automatic logic [22:0] beats_of(input logic [27:0] len);
     beats_of = padded[28:6];
 endfunction
 
-// Last beat this transaction may take off the stream
-wire stream_end = s_tlast || (l_beats <= 23'd1);
+// Last beat this transaction may take off the stream.
+//
+// rq_wr.last is the shell telling us whether it will terminate this stream:
+// high means a tlast is coming and IS the boundary, low means the stream
+// just stops (req_t in lynx_pkg; ib_transport_protocol emits low for every
+// RDMA_WRITE_FIRST/MIDDLE fragment). Deriving the boundary from the length
+// instead is wrong whenever the delivered beat count differs from
+// ceil(len/64) by even one: the transaction ends off by a beat, the write
+// we asked the shell for is never satisfied, sq_wr backs up and this module
+// parks in ST_WR_REQ - which is exactly how the two-host run wedged, with
+// rx_fwd frozen at 17 of 26 and nothing rejected. The count is used ONLY
+// where there is no tlast to wait for, and to bound the drain.
+wire stream_end = l_req_last ? s_tlast : (l_beats <= 23'd1);
 
 // Header contract. The exporter hands the parsed target straight to the
 // shell TLB under the QP owner's pid, so a header this side does not
@@ -137,12 +149,13 @@ always_ff @(posedge aclk) begin
     if (!aresetn) begin
         state <= ST_IDLE;
         l_pid <= 0; l_op <= 0; l_len <= 0; l_va <= 0; l_inline <= 0;
-        l_beats <= 0;
+        l_beats <= 0; l_req_last <= 1'b1;
     end else begin
         case (state)
             ST_IDLE: if (rq_valid && grant) begin
-                l_pid   <= rq_req.pid;
-                l_beats <= beats_of(rq_req.len[27:0]);
+                l_pid      <= rq_req.pid;
+                l_beats     <= beats_of(rq_req.len[27:0]);
+                l_req_last  <= rq_req.last;
                 if (rq_req.vaddr[VADDR_BITS-1:0] == rdma_staging_va) begin
                     state <= ST_HDR;             // Loom message: parse
                 end else begin
@@ -188,7 +201,7 @@ always_ff @(posedge aclk) begin
 
             ST_DRAIN: if (s_tvalid) begin
                 l_beats <= l_beats - 23'd1;
-                if (stream_end) state <= ST_IDLE;
+                if (s_tlast || l_beats <= 23'd1) state <= ST_IDLE;
             end
 
             default: state <= ST_IDLE;
