@@ -21,6 +21,9 @@ add_executable(${EXEC} ${TARGET_DIR}/main.cpp)
 target_link_libraries(${EXEC} PUBLIC Coyote)
 
 # 5.1a role-split demo (client/server structure, in-process transport)
+add_executable(bulk_sweep ${TARGET_DIR}/bulk_sweep.cpp)
+target_link_libraries(bulk_sweep PUBLIC Coyote)
+
 add_executable(roles ${TARGET_DIR}/roles.cpp)
 target_link_libraries(roles PUBLIC Coyote)
 
