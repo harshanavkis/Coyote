@@ -168,6 +168,9 @@ int run_server(uint16_t qp_port, uint16_t peer_port, const std::string &sock) {
     if (!skip_bulk()) {
         check(poll_payload(&dst1[0x10000 / 8]), "bulk payload @0x10000 matches");
         dump_counters(t_ctrl, "after bulk @0x10000");
+        check(poll64(&dst2[0x1000 / 8], 0xB0BE'0000'0000'0001ULL),
+              "probe store after ONE descriptor lands");
+        dump_counters(t_ctrl, "after probe store");
     }
     // Ordering: when the flag (issued AFTER the second copy) is visible,
     // the second copy's payload must already be complete - RC in-order
@@ -189,6 +192,8 @@ int run_server(uint16_t qp_port, uint16_t peer_port, const std::string &sock) {
                        (unsigned long) p[i], (unsigned long) src_word(i));
                 break;
             }
+        printf("  dst2[0x1000] = %016lx (probe)\n",
+               (unsigned long) dst2[0x1000 / 8]);
         printf("  dst2[0x800] = %016lx (flag), dst2[0x40] = %016lx\n",
                (unsigned long) dst2[0x800 / 8], (unsigned long) dst2[8]);
         // One aperture store becomes eight wire messages: the real one plus
@@ -270,6 +275,11 @@ int run_client(const std::string &ip, uint16_t qp_port, uint16_t peer_port,
     if (!skip_bulk()) {
         A.copy(w1, 0x10000, src, DMA_BYTES, fence);
         check(poll64(&fence[0], 1), "fence 1 after copy (posted completion)");
+        // Probe: the same window and the same kind of store as the ordering
+        // flag, but right after a descriptor rather than after two. If this
+        // one lands and the flag does not, position in the sequence is not
+        // what matters; if both fail, any store following a descriptor does
+        A.store(w2, 0x1000, 0xB0BE'0000'0000'0001ULL);
     } else {
         printf("LOOM_SKIP_BULK: no copies, stores only\n");
     }
