@@ -68,6 +68,7 @@ always @(posedge aclk) if (tbl_commit) commit_pulses++;
 // CSR word indices (byte address = idx * 8)
 localparam int R_TBL_IDX = 0, R_TBL_CFG = 1, R_TBL_PID = 2, R_TBL_BASE = 3,
                R_TBL_LEN = 4, R_TBL_COMMIT = 5, R_DMA_DST = 8,
+               R_RDMA_STAGING_TB = 16,
                R_DMA_SRC_VA = 9, R_DMA_LEN = 10, R_DMA_SRC_PID = 11,
                R_DMA_TRIGGER = 12, R_DMA_COMPL_VA = 13, R_DBG = 32;
 
@@ -236,7 +237,7 @@ initial begin
 
     // --- 11. Full RW CSR readback ---
     begin
-        int idx_list[11] = '{0, 1, 2, 3, 4, 8, 9, 10, 11, 13, 14};
+        int idx_list[11] = '{0, 1, 2, 3, 4, 8, 9, 10, 11, 13, 16};
         foreach (idx_list[j]) begin
             axil_write(16'(idx_list[j] * 8), 64'hC0DE_0000_0000_0000 + 64'(idx_list[j]));
         end
@@ -324,6 +325,27 @@ initial begin
     check(rdata == 64'hA003, "stage_acc[3] read mux");
     axil_read(16'(63 * 8), rdata);
     check(rdata == 64'hC006, "stage_cnt[6] read mux");
+
+    // --- 18. A descriptor staging burst must not reach RDMA_STAGING_VA ---
+    // A host ctrl write covers its whole 64 B line forward from the target
+    // (sim/hw/ctrl_simulation.svh models it, "Write burst which happens in
+    // real hardware"). While this register sat at word 14 it was inside the
+    // burst of every write at word 8, so dma() zeroed it, the next store
+    // went out with RETH = 0, and the far side wrote eight bytes at VA 0.
+    // At word 16 it is the first word of its own line and out of reach.
+    begin
+        logic [47:0] staged;
+        staged = 48'h7abc_1234_5000;
+        axil_write(16'(R_RDMA_STAGING_TB * 8), {16'b0, staged});
+        check(rdma_staging_va == staged, "18: staging vaddr programmed");
+
+        // The burst a single dma() write produces: word 8 and the rest of
+        // its line, exactly as the hardware presents it
+        for (int w = R_DMA_DST; w < R_DMA_DST + 8; w++)
+            axil_write(16'(w * 8), 64'h0);
+        check(rdma_staging_va == staged,
+              "18: staging vaddr survives a descriptor-line burst");
+    end
 
     if (errors == 0) $display("TB PASS (tb_loom_ctrl)");
     else             $display("TB FAIL (tb_loom_ctrl): %0d errors", errors);

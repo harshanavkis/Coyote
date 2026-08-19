@@ -245,7 +245,7 @@ initial begin
     // Setup: two windows + completion config
     program_win(4'd1, 1'b0, 6'd1, {16'b0, BASE_B}, 64'h40_0000);
     program_win(4'd2, 1'b1, 6'd3, {16'b0, BASE_C}, 64'h40_0000);
-    axil_write(16'd112, {16'b0, STAGING});   // RDMA staging vaddr (reg 14)
+    axil_write(16'd128, {16'b0, STAGING});   // RDMA staging vaddr (reg 16)
 
     // --- 1. Local store ---
     axil_write(16'h1040, 64'hDEAD_BEEF_0000_0001);

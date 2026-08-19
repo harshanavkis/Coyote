@@ -38,7 +38,10 @@ constexpr uint32_t DMA_LEN     = 0x50;
 constexpr uint32_t DMA_SRC_PID = 0x58;
 constexpr uint32_t DMA_TRIGGER = 0x60;
 constexpr uint32_t DMA_COMPL_VA = 0x68;
-constexpr uint32_t RDMA_STAGING_VA = 0x70;  // RETH vaddr for outgoing wire messages
+// Word 16, on its own 64 B line. NOT word 14 (0x70): a host ctrl write
+// covers its whole line forward from the target, so there it sat inside the
+// burst of every descriptor staging write at 0x40 - see loom_ctrl.sv.
+constexpr uint32_t RDMA_STAGING_VA = 0x80;  // RETH vaddr for outgoing wire messages
 constexpr uint32_t DBG_BASE    = 0x100;  // 10 x RO counters (see loom_ctrl.sv)
 
 // Stage cycle counters (RO, words 48-63; see loom_ctrl.sv header). Feed
@@ -121,24 +124,7 @@ inline uint64_t aperture_read(coyote::cThread &t, uint32_t win, uint32_t off) {
 // Program the RDMA staging vaddr (per-host; exchanged at QP setup). All
 // outgoing rdma wire messages carry this as the RETH vaddr; the true
 // target rides the message header (op-len-vaddr).
-//
-// RDMA_STAGING_VA (0x70) shares a 64 B line with the descriptor staging
-// registers (0x40-0x68), and a host ctrl write covers its whole line
-// forward from the target. So every dma() below, which starts by writing
-// DMA_DST at 0x40, bursts straight through 0x70 and zeroes this register.
-// The next store then leaves with RETH = 0; the far side sees a vaddr that
-// is not its staging address, takes the direct path, and writes eight bytes
-// at VA 0 - which is a page the driver cannot pin, and the host dies at
-// teardown in tlb_put_user_pages_ctid. Keep a shadow copy and re-assert it
-// after each descriptor. The durable fix is to move the register out of
-// that line, which needs a bitstream.
-inline uint64_t &staging_shadow() {
-    static uint64_t v = 0;      // one vFPGA per process
-    return v;
-}
-
 inline void set_rdma_staging(coyote::cThread &t, const void *va) {
-    staging_shadow() = reinterpret_cast<uint64_t>(va);
     csr_write(t, RDMA_STAGING_VA, reinterpret_cast<uint64_t>(va));
 }
 
@@ -155,10 +141,6 @@ inline void dma(coyote::cThread &t, uint32_t win, uint32_t seg_off,
     csr_write(t, DMA_SRC_PID,  src_pid);
     csr_write(t, DMA_COMPL_VA, reinterpret_cast<uint64_t>(compl_va));
     csr_write(t, DMA_TRIGGER,  1);
-    // Restore what the staging writes above burst over (see
-    // set_rdma_staging). Safe after the trigger: descriptors carry their
-    // target in the RETH and never read this register; only stores do.
-    if (staging_shadow()) csr_write(t, RDMA_STAGING_VA, staging_shadow());
 }
 
 // Snapshot of the stage cycle counters. Counters are never cleared;

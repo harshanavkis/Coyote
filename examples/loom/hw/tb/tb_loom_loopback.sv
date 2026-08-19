@@ -393,7 +393,7 @@ initial begin
     repeat (2) @(negedge aclk);
 
     // attachPeer: staging CSR from the exporter's hello, then two imports
-    axil_write(16'd112, {16'b0, STAGING});
+    axil_write(16'd128, {16'b0, STAGING});
     import_win(4'd1, {16'b0, BASE1}, 64'h20_0000);
     import_win(4'd2, {16'b0, BASE2}, 64'h20_0000);
 

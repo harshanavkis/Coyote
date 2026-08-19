@@ -28,7 +28,7 @@ import lynxTypes::*;
  *   11 DMA_SRC_PID  (RW) issuer's cThread pid (used for the pull)
  *   12 DMA_TRIGGER  (W)  write 1 -> enqueue descriptor into the order FIFO
  *   13 DMA_COMPL_VA (RW) per-descriptor completion (fence) VA; 0 = none.
- *   14 RDMA_STAGING_VA (RW) RETH vaddr used for ALL outgoing rdma
+ *   16 RDMA_STAGING_VA (RW) RETH vaddr used for ALL outgoing rdma
  *                        messages (per-host staging address, exchanged at
  *                        QP setup; the true target rides the message
  *                        header - the wire carries op-len-vaddr).
@@ -131,7 +131,14 @@ localparam integer R_DMA_LEN     = 10;
 localparam integer R_DMA_SRC_PID = 11;
 localparam integer R_DMA_TRIGGER = 12;
 localparam integer R_DMA_COMPL_VA = 13;
-localparam integer R_RDMA_STAGING = 14;
+// Word 16 = the first word of an otherwise empty 64 B line, deliberately
+// NOT word 14. A host ctrl write covers its whole line forward from the
+// target, so at word 14 this register sat inside the burst of every
+// descriptor staging write at word 8: dma() zeroed it, the next store left
+// with RETH = 0, and the far side wrote eight bytes at VA 0. Bursts stop at
+// a line boundary, so from here only a write to this register can reach it,
+// and the rest of its line (17-23) is unused.
+localparam integer R_RDMA_STAGING = 16;
 localparam integer R_DBG_BASE    = 32;
 localparam integer N_DBG         = 10;
 localparam integer R_CYC         = 48;
