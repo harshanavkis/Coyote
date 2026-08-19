@@ -192,6 +192,28 @@ int run_server(uint16_t qp_port, uint16_t peer_port, const std::string &sock) {
                        (unsigned long) p[i], (unsigned long) src_word(i));
                 break;
             }
+        // Did the write land at the WRONG address rather than nowhere? If
+        // the value turns up at some other offset, the transformation is
+        // readable; if it turns up in neither buffer it went outside them,
+        // which is consistent with the page-0 fault
+        auto scan = [](const char *nm, const uint64_t *b, uint64_t want) {
+            for (uint64_t i = 0; i < BUF_SIZE / 8; i++)
+                if (b[i] == want) {
+                    printf("  found %016lx in %s at byte offset 0x%lx\n",
+                           (unsigned long) want, nm, (unsigned long) (i * 8));
+                    return;
+                }
+            printf("  %016lx NOT PRESENT anywhere in %s\n",
+                   (unsigned long) want, nm);
+        };
+        scan("dst1", dst1, 0xF1A6ULL);
+        scan("dst2", dst2, 0xF1A6ULL);
+        if (!skip_bulk()) {
+            scan("dst1", dst1, 0xB0BE'0000'0000'0001ULL);
+            scan("dst2", dst2, 0xB0BE'0000'0000'0001ULL);
+        }
+        printf("  dst1 = %p, dst2 = %p, staging = %p\n", (void *) dst1,
+               (void *) dst2, staging);
         printf("  dst2[0x1000] = %016lx (probe)\n",
                (unsigned long) dst2[0x1000 / 8]);
         printf("  dst2[0x800] = %016lx (flag), dst2[0x40] = %016lx\n",
