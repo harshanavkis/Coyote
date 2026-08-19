@@ -281,6 +281,34 @@ the hardware multi-process stopgap is `./loomd /tmp/loomd.sock` plus
 `LOOMD_SOCK=/tmp/loomd.sock ./roles_sock`, and the cross-host vehicle is
 the 6.2a bundled binary above.
 
+### The ctrl write burst
+
+A host write to the ctrl region covers its whole 64 B line, forward from the
+target word - `sim/hw/ctrl_simulation.svh` models it ("Write burst which
+happens in real hardware"). Three consequences the design lives with:
+
+- **A multi-register staging sequence must be written in ascending order and
+  end with the meaningful write.** Each write clobbers only registers written
+  later, which are then written correctly. `program_window` and `dma()` both
+  do this, and `COMMIT`/`TRIGGER` additionally demand `wstrb[0] && wdata[0]`
+  so a padding beat cannot fire them.
+- **A bystander register in the same line is destroyed.** `RDMA_STAGING_VA`
+  was word 14, inside the burst of every `dma()` write at word 8. On hardware
+  that zeroed it, the next store went out with `RETH = 0`, the far side saw a
+  vaddr that was not its staging address, forwarded it verbatim, and wrote
+  eight bytes at VA 0 - which the driver cannot pin, killing the host at
+  teardown in `tlb_put_user_pages_ctid`. It is now word 16, the first word of
+  an otherwise empty line; `tb_loom_ctrl` case 18 drives the burst and
+  asserts it survives.
+- **Aperture pushes are gated on `wstrb`.** A padding beat writes nothing by
+  AXI semantics, so it is not a store; without the gate one 8 B peer store
+  became eight wire messages and clobbered 56 B past its target.
+
+Separately, aperture offsets are 12 bits and hardware does not clamp them: an
+offset of 4096 or more ORs into the window index and the store lands in a
+*different* window. `aperture()` masks it, `aperture_off_ok()` lets callers
+check.
+
 ### Two things that silently break the sim
 
 **Switching between the C++ and Python harnesses.** They compile the XSIM
