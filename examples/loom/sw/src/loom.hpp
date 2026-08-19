@@ -62,9 +62,17 @@ enum Stage : int {
 };
 
 // Aperture: windows 1..15, 4 KB each (byte 0x1000-0xFFFF)
+constexpr uint32_t APERTURE_WIN_SIZE = 4096;
+
+// The offset field is 12 bits. An offset that does not fit is not clamped
+// or refused by the hardware - it ORs into the window index and the store
+// silently lands in a DIFFERENT window, where it is dropped if that window
+// is unprogrammed and, worse, honoured if it is not.
 constexpr uint32_t aperture(uint32_t win, uint32_t off) {
-    return (win << 12) | off;
+    return (win << 12) | (off & (APERTURE_WIN_SIZE - 1));
 }
+
+inline bool aperture_off_ok(uint32_t off) { return off < APERTURE_WIN_SIZE; }
 
 /**
  * setCSR/getCSR take a 64-bit word index in BOTH backends: the real
