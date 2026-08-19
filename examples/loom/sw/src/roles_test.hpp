@@ -93,9 +93,14 @@ inline int run_roles_flow(coyote::cThread &t_orch, loom::Xpu &A, loom::Xpu &B,
     check(poll64(&dst2[8], 0xB00B'0000'0000'0002ULL), "B sees store via w2");
 
     // --- peer copy with fence ---
+    // The engine writes its own running completion count, not 1: compl_cnt
+    // only clears on aresetn, so after any earlier run on the same
+    // bitstream the next fence carries wherever that counter had got to.
+    // Read it and expect the next two.
+    const uint64_t f0 = loom::csr_read(t_orch, loom::DBG_BASE + 8 * 7);
     dump_counters(t_orch, "before copy");
     A.copy(w1, 0x10000, src, DMA_BYTES, fence);
-    check(poll64(&fence[0], 1), "fence 1 after copy");
+    check(poll64(&fence[0], f0 + 1), "fence 1 after copy");
     dump_counters(t_orch, "after copy");
     check(memcmp(reinterpret_cast<uint8_t *>(dst1) + 0x10000, src, DMA_BYTES) == 0,
           "copy payload matches");
@@ -104,7 +109,7 @@ inline int run_roles_flow(coyote::cThread &t_orch, loom::Xpu &A, loom::Xpu &B,
     A.copy(w1, 0x20000, src, DMA_BYTES, fence);
     A.store(w2, 0x800, 0xF1A6ULL);
     check(poll64(&dst2[0x800 / 8], 0xF1A6ULL), "flag lands");
-    check(fence[0] == 2, "flag implies copy fenced (order point)");
+    check(fence[0] == f0 + 2, "flag implies copy fenced (order point)");
     check(memcmp(reinterpret_cast<uint8_t *>(dst1) + 0x20000, src, DMA_BYTES) == 0,
           "ordering-copy payload matches");
 

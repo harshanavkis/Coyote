@@ -49,6 +49,17 @@ void check(bool ok, const char *msg) {
     if (!ok) failures++;
 }
 
+// A store is posted, so the value arrives shortly after the write returns.
+// Poll for it rather than sleeping a fixed amount: it is there in
+// microseconds and a fixed sleep is either wasteful or wrong.
+bool settle(volatile uint64_t *addr, uint64_t want) {
+    for (int i = 0; i < 200000; i++) {          // ~2 s at 10 us
+        if (*addr == want) return true;
+        usleep(10);
+    }
+    return false;
+}
+
 uint64_t lane_val(int lane) {
     return 0x1A2E'0000'0000'0000ULL | uint64_t(lane);
 }
@@ -93,7 +104,7 @@ int main() {
     // --- 1. G2: every lane of a 64 B line, written descending ---
     for (int lane = 7; lane >= 0; lane--)
         loom::aperture_store(t, 1, uint32_t(lane * 8), lane_val(lane));
-    usleep(100000);
+    settle(&dst[0], lane_val(0));               // last one issued
     {
         bool ok = true;
         for (int lane = 0; lane < 8; lane++)
@@ -128,7 +139,7 @@ int main() {
         for (uint32_t off : offs) {
             uint64_t v = 0xC0DE'0000'0000'0000ULL | off;
             loom::aperture_store(t, 1, off, v);
-            usleep(50000);
+            settle(&dst[off / 8], v);
             uint64_t got = loom::aperture_read(t, 1, off);
             if (dst[off / 8] != v || got != v) {
                 printf("  off 0x%x: mem %016lx read %016lx want %016lx\n",
@@ -156,13 +167,18 @@ int main() {
     {
         uint64_t d0 = loom::csr_read(t, loom::DBG_BASE + 8 * 5);
         loom::aperture_store(t, 2, 0xF8, 0xB0'0000'0000'0001ULL);
-        usleep(50000);
+        settle(&small[0xF8 / 8], 0xB0'0000'0000'0001ULL);
         check(small[0xF8 / 8] == 0xB0'0000'0000'0001ULL,
               "bounds: the last word inside the window lands");
 
+        // Expected to be dropped, so there is no value to wait for: poll the
+        // drop counter, which is what actually says the engine has seen it
         loom::aperture_store(t, 2, 0x800, 0xBAD0'0000'0000'0001ULL);
-        usleep(50000);
-        uint64_t d1 = loom::csr_read(t, loom::DBG_BASE + 8 * 5);
+        uint64_t d1 = d0;
+        for (int i = 0; i < 200000 && d1 == d0; i++) {
+            d1 = loom::csr_read(t, loom::DBG_BASE + 8 * 5);
+            if (d1 == d0) usleep(10);
+        }
         check(d1 > d0, "bounds: a store past the window is dropped");
         check(small[0x800 / 8] == 0,
               "bounds: nothing was written past the window");

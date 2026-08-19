@@ -76,7 +76,9 @@ int main() {
     printf("%12s %10s %10s %12s %10s  %s\n",
            "bytes", "cycles", "cyc/KB", "queue_cyc", "beats", "result");
 
-    uint64_t expected_compl = 0;
+    // The fence carries the engine's running completion count, which only
+    // clears on aresetn - so start from whatever earlier runs left behind
+    uint64_t expected_compl = loom::csr_read(t, loom::DBG_BASE + 8 * 7);
     for (uint64_t len : SIZES) {
         if (len > BUF_SIZE) continue;
         memset(dst, 0, len + 64);
