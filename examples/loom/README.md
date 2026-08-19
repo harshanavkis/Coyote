@@ -260,26 +260,83 @@ tmux new-session -d -s loom_bit \
 # sanity: base.tcl should show en_hcard 1, en_dcard 0, ddr_0 0, en_rdma 1
 ```
 
-**Program + driver**, then the software in hardware mode (no `EN_SIM`, no
-`COYOTE_SIM_DIR`):
+**Program + driver**, on every host that will run anything:
 
 ```bash
 cd <coyote-root>
 xilinx-shell -c "vivado -mode batch -source program_fpga.tcl ..."
 sudo bash setup_coyote.sh
-
-cd examples/loom/sw && mkdir -p build_hw && cd build_hw
-nix-shell -p cmake gcc boost --run 'cmake .. && make -j8'
-./test     # same checks as sim
-./roles    # each role gets its OWN cThread -> imports translate under the
-           # exporter's distinct ctid (G1)
 ```
 
+**Build the software** in hardware mode (no `EN_SIM`, no `COYOTE_SIM_DIR`).
+Two trees, built separately, and both are needed on both hosts for the
+two-host test:
+
+```bash
+cd Coyote                                   # shell.nix provides cmake/gcc/boost
+nix-shell --run 'mkdir -p examples/loom/sw/build_hw && cd examples/loom/sw/build_hw \
+                 && cmake .. && make -j8'
+nix-shell --run 'cd examples/loom/sw-bundled/build && cmake .. && make -j8'
+```
+
+#### What to run
+
+Everything in `sw/` is **local route on ONE host** — no QP is ever created
+(`initRDMA` appears nowhere in `sw/`) and every window is programmed with
+`rdma=false`, including `InProcOrchestrator::importBuf`. RDMA lives only in
+`sw-bundled/loom_host`.
+
+| binary | hosts | what it proves |
+|---|---|---|
+| `sw/build_hw/test` | 1 | 19 checks, single cThread: stores, descriptors, fences, ordering, exact counter relations, T3 stage cycles |
+| `sw/build_hw/aperture_test` | 1 | the load/store path: G2 at all 8 lanes, aperture reads, lane select, poison, window bounds |
+| `sw/build_hw/bulk_sweep` | 1 | descriptors from 64 B to 16 MB incl. non-64B lengths, every byte verified; prints the T2 cycle curve |
+| `sw/build_hw/roles` | 1 | role split, a cThread per role, so imports translate under the *exporter's* ctid (G1) |
+| `sw/build_hw/loomd` + `roles_sock` | 1 | the same flow with the control plane in a separate process over a Unix socket |
+| `sw-bundled/build/loom_host` | **2** | the RDMA data plane: wire messages, direct bulk, cross-host ordering |
+
+```bash
+cd examples/loom/sw/build_hw
+sudo ./test
+sudo ./aperture_test
+sudo ./bulk_sweep
+sudo ./roles
+
+# control plane in its own process; kill any stale daemon first, and give
+# it a moment to bind before connecting
+sudo pkill -f 'loomd /tmp/loomd.sock'; rm -f /tmp/loomd.sock
+sudo ./loomd /tmp/loomd.sock & sleep 1
+sudo LOOMD_SOCK=/tmp/loomd.sock ./roles_sock
+```
+
+Two hosts, server first:
+
+```bash
+cd examples/loom/sw-bundled/build
+sudo ./loom_host --server                    # host 2 (exporter)
+sudo ./loom_host --client <server-ip>        # host 1 (importer)
+# LOOM_SKIP_BULK=1 on BOTH sides runs the store path with no copies
+```
+
+`LOOM_POLL_SECS` overrides the poll timeout everywhere (default 20-30 s).
+
+#### Reading a failure
+
+Every binary dumps the ten debug counters (CSR words 32-41). Start there
+before an ILA: `stores`/`descs` say what the control plane captured,
+`local_wr`/`rdma_wr` what the engine issued, `rx_fwd`/`rx_hdr_reject` what
+the far side forwarded and refused, `drops` what failed the validity or
+bounds check. Pair them with `cat /sys/kernel/coyote_sysfs_0/cyt_attr_nstats`
+on both hosts, which says whether the packets ever left or arrived. That
+combination localized every hardware bug found so far in a single run.
+
+One property that trips up expected values: **the fence word carries the
+engine's running completion count**, not a per-descriptor 1. `compl_cnt`
+clears only on `aresetn`, so a test that has to know the value must read
+`dbg[compl]` first and expect the next ones.
+
 Do the 5.4 gate tests (G1/G2/G4) on stock examples before the first run.
-Deployment binaries (`app_export`/`app_import`) are 5.4a; until they exist
-the hardware multi-process stopgap is `./loomd /tmp/loomd.sock` plus
-`LOOMD_SOCK=/tmp/loomd.sock ./roles_sock`, and the cross-host vehicle is
-the 6.2a bundled binary above.
+Deployment binaries (`app_export`/`app_import`) are 5.4a.
 
 ### The ctrl write burst
 
