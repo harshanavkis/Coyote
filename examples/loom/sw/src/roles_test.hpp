@@ -83,7 +83,10 @@ inline int run_roles_flow(coyote::cThread &t_orch, loom::Xpu &A, loom::Xpu &B,
 
     int w1 = A.importBuf(h1);
     int w2 = A.importBuf(h2);
-    check(w1 == 1 && w2 == 2, "import -> windows 1, 2");
+    // Not "1 and 2": a long-lived loomd has already handed out windows to
+    // earlier runs, and which indices are free is its business
+    check(w1 >= 1 && w1 <= 15 && w2 >= 1 && w2 <= 15 && w1 != w2,
+          "import -> two distinct valid windows");
     check(A.importBuf(1234) == loom::NO_WINDOW, "bogus handle refused");
 
     // --- peer stores through both windows ---

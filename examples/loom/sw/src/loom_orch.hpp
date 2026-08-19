@@ -79,10 +79,9 @@ public:
         std::lock_guard<std::mutex> g(m_);
         if (h == BAD_HANDLE || h > segs_.size())
             return NO_WINDOW;                        // unknown handle: refuse
-        if (next_win_ > 15)
-            return NO_WINDOW;                        // aperture exhausted
         const Segment &s = segs_[h - 1];
-        const int win = next_win_++;
+        const int win = alloc_win();
+        if (win == NO_WINDOW) return NO_WINDOW;      // aperture exhausted
         program_window(ctrl_, win, /*rdma=*/false, s.ctid,
                        reinterpret_cast<const void *>(s.va), s.len);
         return win;
@@ -91,6 +90,7 @@ public:
     void releaseWindow(int win) override {
         std::lock_guard<std::mutex> g(m_);
         if (win < 1 || win > 15) return;
+        win_used_[win] = false;                      // reusable again
         // Invalidate: commit an entry with valid=0
         csr_write(ctrl_, TBL_IDX, static_cast<uint64_t>(win));
         csr_write(ctrl_, TBL_CFG, 0);
@@ -101,7 +101,17 @@ private:
     coyote::cThread &ctrl_;
     std::mutex m_;
     std::vector<Segment> segs_;
-    uint32_t next_win_ = 1;
+    bool win_used_[16] = {};   // 0 is the CSR page, never a window
+
+    // Lowest free window. Windows are a fixed resource of 15, and loomd is
+    // long-lived: handing out a fresh index per import and never taking it
+    // back exhausts the aperture after a handful of client runs, which is
+    // exactly what a daemon serving run after run does.
+    int alloc_win() {
+        for (int w = 1; w <= 15; w++)
+            if (!win_used_[w]) { win_used_[w] = true; return w; }
+        return NO_WINDOW;
+    }
 };
 
 } // namespace loom
