@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <cstdio>
 #include <unistd.h>
@@ -21,7 +22,26 @@ namespace loom_test {
 
 constexpr uint64_t BUF_SIZE  = 2ULL * 1024 * 1024;
 constexpr uint64_t DMA_BYTES = 4096;
-constexpr int      POLL_SECS = 600;
+// 600 s made a failing poll look like a hang; override with LOOM_POLL_SECS
+// The engine's own account of the descriptor: descs says it was queued,
+// drops says it was rejected at the bounds/validity check, local_wr says the
+// data write went out, compl says the fence was written. A fence that never
+// arrives is one of those four.
+inline void dump_counters(coyote::cThread &t, const char *tag) {
+    static const char *name[8] = {"stores", "descs", "local_wr", "rdma_wr",
+                                  "rx_fwd", "drops", "fifo_ovfl", "compl"};
+    printf("counters [%s]:", tag);
+    for (int i = 0; i < 8; i++)
+        printf(" %s=%lu", name[i],
+               (unsigned long) loom::csr_read(t, loom::DBG_BASE + 8 * i));
+    printf("\n");
+    fflush(stdout);
+}
+
+inline int poll_secs() {
+    const char *e = getenv("LOOM_POLL_SECS");
+    return e ? atoi(e) : 30;
+}
 
 inline int  failures = 0;
 
@@ -31,7 +51,7 @@ inline void check(bool ok, const char *msg) {
 }
 
 inline bool poll64(volatile uint64_t *addr, uint64_t want) {
-    for (int i = 0; i < POLL_SECS * 100; i++) {
+    for (int i = 0; i < poll_secs() * 100; i++) {
         if (*addr == want) return true;
         usleep(10000);
     }
@@ -73,8 +93,10 @@ inline int run_roles_flow(coyote::cThread &t_orch, loom::Xpu &A, loom::Xpu &B,
     check(poll64(&dst2[8], 0xB00B'0000'0000'0002ULL), "B sees store via w2");
 
     // --- peer copy with fence ---
+    dump_counters(t_orch, "before copy");
     A.copy(w1, 0x10000, src, DMA_BYTES, fence);
     check(poll64(&fence[0], 1), "fence 1 after copy");
+    dump_counters(t_orch, "after copy");
     check(memcmp(reinterpret_cast<uint8_t *>(dst1) + 0x10000, src, DMA_BYTES) == 0,
           "copy payload matches");
 
@@ -93,7 +115,7 @@ inline int run_roles_flow(coyote::cThread &t_orch, loom::Xpu &A, loom::Xpu &B,
     // ">=": the sim TB's randomization padding multiplies one dropped
     // store into several
     bool dropped = false;
-    for (int i = 0; i < POLL_SECS * 10 && !dropped; i++) {
+    for (int i = 0; i < poll_secs() * 10 && !dropped; i++) {
         dropped = loom::csr_read(t_orch, loom::DBG_BASE + 8 * 5) >= drops0 + 1;
         if (!dropped) usleep(10000);
     }
