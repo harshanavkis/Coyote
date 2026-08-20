@@ -100,6 +100,13 @@ constexpr uint64_t BENCH_MAX_BURST = 4ULL * 1024 * 1024;   // bytes in flight
 // Bound the burst by bytes, not by count: 32 x 4 MB is 128 MB staged as
 // fast as the CSR path allows, far past anything the far side sustains.
 int bench_iters(uint64_t len) {
+    // LOOM_BENCH_ITERS=1 issues ONE descriptor per size. Credit pacing only
+    // controls the gap between descriptors; inside a single 256 KB message
+    // the shell still emits 64 back-to-back PMTU packets, and 64 KB - which
+    // works - is 16. If one descriptor on its own fails, the limit is the
+    // burst within a message and no software pacing can reach it.
+    const char *e = getenv("LOOM_BENCH_ITERS");
+    if (e) { int v = atoi(e); return v > 0 ? v : 1; }
     uint64_t n = BENCH_MAX_BURST / (len ? len : 1);
     if (n > BENCH_ITERS) n = BENCH_ITERS;
     return n ? int(n) : 1;
@@ -301,8 +308,16 @@ void run_bench(coyote::cThread &t_ctrl, loom::Xpu &A, int win,
         auto t0 = std::chrono::steady_clock::now();
         for (int k = 0; k < BENCH_STORES; k++)
             A.store(win, 0x100, 0x5709'0000'0000'0000ULL | uint64_t(k));
-        while (loom::csr_read(t_ctrl, loom::DBG_BASE + 8 * 3) < w0 + BENCH_STORES)
-            ;
+        // Bounded: after a size has wrecked the QP these may never retire,
+        // and an unbounded spin here hangs the whole run
+        auto guard = std::chrono::steady_clock::now();
+        while (loom::csr_read(t_ctrl, loom::DBG_BASE + 8 * 3) < w0 + BENCH_STORES) {
+            if (std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - guard).count() > 5.0) {
+                printf("  store rate: gave up waiting for the engine\n");
+                break;
+            }
+        }
         auto t1 = std::chrono::steady_clock::now();
         loom::StageStats b = loom::read_stage_stats(t_ctrl);
         double us = std::chrono::duration<double, std::micro>(t1 - t0).count();
