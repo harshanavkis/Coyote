@@ -213,14 +213,28 @@ wreq_t net_reqs[$];
 logic [AXI_DATA_BITS-1:0] net_beats[$];
 int fences = 0;
 
+// Beat accounting. A request claims `len` bytes; the engine must put
+// exactly ceil(len/64) beats on the net stream for it and no more. On
+// hardware a mismatch does not fail loudly - the shell simply pairs the
+// next transaction's beat with this request, so an inline store message
+// was seen landing verbatim inside a bulk destination, header and all, and
+// every pairing after it is shifted.
+int net_owed = 0;                      // beats the posted requests still owe
+int net_extra = 0;                     // beats nobody asked for
+
 always @(posedge aclk) begin
     if (eng_wr_valid && eng_wr_ready) begin
-        if (eng_wr_req.strm == STRM_RDMA)
+        if (eng_wr_req.strm == STRM_RDMA) begin
             net_reqs.push_back('{eng_wr_req.vaddr, eng_wr_req.len});
-        else
+            net_owed += int((eng_wr_req.len + 63) / 64);
+        end else
             fences++;                       // local completion write
     end
-    if (m_net_tvalid && m_net_tready) net_beats.push_back(m_net_tdata);
+    if (m_net_tvalid && m_net_tready) begin
+        net_beats.push_back(m_net_tdata);
+        if (net_owed > 0) net_owed--;
+        else              net_extra++;      // a beat outside any request
+    end
 end
 
 // Deliver one message: ceil(len/PMTU) fragments, vaddr advancing, last only
@@ -471,6 +485,12 @@ initial begin
           "store after an unevenly fragmented copy parses its own header");
 
     check(rx_drop === 1'b0, "no header was ever rejected on the far side");
+
+    // The engine must have delivered exactly what its requests claimed
+    check(net_extra == 0,
+          $sformatf("no beat outside a request (%0d extra)", net_extra));
+    check(net_owed == 0,
+          $sformatf("no request left short of payload (%0d owed)", net_owed));
 
     if (errors == 0) $display("TB PASS (tb_loom_loopback)");
     else             $display("TB FAIL (tb_loom_loopback): %0d errors", errors);
