@@ -29,6 +29,16 @@ module tb_loom_loopback;
 
 localparam int PMTU = 4096;
 
+// A request merged across packets whose payload is still framed per packet.
+// loom_rx takes stream_end from s_tlast whenever rq_wr.last is high, so such
+// a request ends at the FIRST packet's tlast while the sq_wr it already
+// issued claimed the whole merged length - the far shell then completes that
+// write from the next beats. It shifts the payload AND completes fewer
+// transactions than were issued, which is the pair of symptoms hardware
+// shows. Held OFF because the shell in this tree cannot emit that shape (see
+// the case itself); turn it on the day one does, or to see the hazard.
+localparam bit MERGED_REQ_HAZARD = 0;
+
 // Beats per local-read segment, 0 = one unbroken response. The engine must
 // forward what its request claimed regardless of how the pull is chopped up.
 localparam int PULL_SEG = 4;
@@ -268,6 +278,16 @@ end
 // been simulated. The test sequence sets this between cases.
 int req_pkts = 1;
 
+// Where TLAST falls in the payload stream. The model has always put ONE
+// tlast at the end of a whole message, but hardware assembles the receive
+// payload per PACKET (merge_rx_pkgs), and one memCmd is emitted per packet
+// with PKG_NF on FIRST/MIDDLE and PKG_F on LAST/ONLY - which is what
+// becomes rq_wr.last (roce_stack.sv:232). loom_rx's stream_end reads
+// `l_req_last ? s_tlast : (l_beats <= 1)`, so the two placements take
+// different branches on every fragment but the last, and only one of them
+// has ever been simulated. 1 = a tlast per packet, as the RX path builds it.
+int tlast_per_pkt = 0;
+
 // Frame boundaries the payload driver needs from the request driver: how
 // many beats each fragment carries, and which one ends the message (the
 // single tlast).
@@ -337,7 +357,10 @@ initial forever begin
             rx_s_tdata  = net_beats.pop_front();
             rx_s_tkeep  = {64{1'b1}};
             rx_s_tvalid = 1;
-            rx_s_tlast  = fr.last_frag && (bi == fr.beats - 1);
+            rx_s_tlast  = tlast_per_pkt
+                          ? (((bi % (PMTU/64)) == (PMTU/64 - 1)) ||
+                             (bi == fr.beats - 1))
+                          : ((bi == fr.beats - 1) && fr.last_frag);
             guard = 0;
             do begin @(posedge aclk); guard++; end
             while (!rx_s_tready && guard < 20000);
@@ -359,11 +382,13 @@ logic [47:0] writes[$];               // vaddr of every word written, in order
 
 logic [47:0] wr_cursor;
 logic [27:0] wr_left;
+int rx_txns = 0;                      // loom_rx transactions completed
 initial forever begin
     @(posedge aclk);
     if (rx_wr_valid && rx_wr_ready) begin
         wr_cursor = rx_wr_req.vaddr;
         wr_left   = rx_wr_req.len;
+        rx_txns++;
     end
     if (rx_m_tvalid && rx_m_tready) begin
         for (int l = 0; l < 8 && wr_left > 0; l++) begin
@@ -475,7 +500,7 @@ task check_payload(input [47:0] at, input int words, input string msg);
 endtask
 
 int n_writes_before;
-int landed, ovf;
+int landed, ovf, fwd_before;
 logic [63:0] ovf_before;
 
 initial begin
@@ -661,6 +686,74 @@ initial begin
     check(landed == 240,
           $sformatf("all 240 stores land when issued within the depth (%0d)", landed));
     check(inst_ctrl.dbg[6] == ovf_before, "no overflow when the depth is respected");
+
+    // --- the receive path frames payload per packet, so drive it that way:
+    //     rq_wr.last still only on the final fragment, but a tlast at the
+    //     end of every one. On hardware the corrupt runs completed roughly
+    //     one loom_rx transaction for every three the shell issued, and the
+    //     intact ones matched exactly, so what ends a transaction is where
+    //     the fault has to be
+    tlast_per_pkt = 1;
+    copy(4'd1, 28'h180000, {16'b0, SRC_VA}, 28'd262144, {16'b0, CPL_VA});
+    for (int st = 0; st < 60; st++)
+        store(4'd1, 12'hA00 + 12'(st*8), 64'h7A57_0000 + 64'(st));
+    settle();
+    check_payload(BASE1 + 48'h180000, 32768,
+                  "per-packet tlast: 256 KB bulk lands intact");
+    begin
+        bit all_ok;
+        all_ok = 1;
+        for (int st = 0; st < 60; st++)
+            if (!mem.exists((BASE1 + 48'hA00 + 48'(st*8)) >> 3) ||
+                mem[(BASE1 + 48'hA00 + 48'(st*8)) >> 3] != (64'h7A57_0000 + 64'(st)))
+                all_ok = 0;
+        check(all_ok, "per-packet tlast: every store lands at its own target");
+    end
+    tlast_per_pkt = 0;
+
+    // --- the two together, which is the shape neither knob tested alone:
+    //     the shell merges packets into one rq_wr AND the payload is still
+    //     framed per packet. loom_rx takes stream_end from s_tlast whenever
+    //     rq_wr.last is high, so a merged final request ends at the FIRST
+    //     packet's tlast while the sq_wr it already issued claimed the whole
+    //     merged length - and the far shell completes that write from
+    //     whatever beats come next. That both shifts the payload and
+    //     completes FEWER transactions than the shell issued, which is
+    //     exactly the pair of things hardware showed.
+    // It is OFF because the shell this runs against cannot produce the
+    // shape: m_rdma_wr_req is a straight pass-through of the HLS command
+    // stream (roce_stack.sv:262), one memCmd per packet
+    // (ib_transport_protocol.cpp:628/632/657/661), and PMTU_BYTES is 4096.
+    // Turning it on fails, and the failure is real - it is a hazard waiting
+    // on a shell that merges, not a bug in anything running today.
+    if (MERGED_REQ_HAZARD) begin
+    req_pkts = 2;
+    tlast_per_pkt = 1;
+    fwd_before = rx_txns;
+    copy(4'd1, 28'h1C0000, {16'b0, SRC_VA}, 28'd262144, {16'b0, CPL_VA});
+    for (int st = 0; st < 60; st++)
+        store(4'd1, 12'hC00 + 12'(st*8), 64'hD15C_0000 + 64'(st));
+    settle();
+    check_payload(BASE1 + 48'h1C0000, 32768,
+                  "merged requests + per-packet tlast: bulk lands intact");
+    begin
+        bit all_ok;
+        all_ok = 1;
+        for (int st = 0; st < 60; st++)
+            if (!mem.exists((BASE1 + 48'hC00 + 48'(st*8)) >> 3) ||
+                mem[(BASE1 + 48'hC00 + 48'(st*8)) >> 3] != (64'hD15C_0000 + 64'(st)))
+                all_ok = 0;
+        check(all_ok, "merged requests + per-packet tlast: stores land");
+    end
+    // One loom_rx transaction per request the shell issued is the
+    // invariant hardware violates 3:1 on every corrupt run
+    $display("       rx transactions: %0d completed, %0d requests issued",
+             rx_txns - fwd_before, (262144 + 4096*2 - 1)/(4096*2) + 60);
+    check(rx_txns - fwd_before == (262144 + 4096*2 - 1)/(4096*2) + 60,
+          "one rx transaction per request the shell issued");
+    req_pkts = 1;
+    tlast_per_pkt = 0;
+    end
 
     check(rx_drop === 1'b0, "no header was ever rejected on the far side");
 
