@@ -409,6 +409,16 @@ int run_client(const std::string &ip, uint16_t qp_port, uint16_t peer_port,
     check(w1 == 1 && w2 == 2, "remote import -> rdma windows 1, 2");
     check(A.importBuf(1234) == loom::NO_WINDOW, "bogus handle refused remotely");
 
+    // Remote reads do not exist yet, and the contract is that a load through
+    // an rdma-route window ANSWERS with poison rather than hanging the
+    // issuing CPU: loom_engine's validity check has (l_is_read ? !l_route)
+    // so the read takes the same path an invalid window does. Serving rq_rd
+    // like 09_perf_rdma, and the T6 round trip that follows, are 6.2b. Pin
+    // it here so a half-finished 6.2b cannot quietly turn loads into
+    // something that neither poisons nor returns.
+    check(A.load(w1, 0x40) == loom::READ_POISON,
+          "load through an rdma window answers with poison (remote reads are 6.2b)");
+
     auto *src = static_cast<uint64_t *>(A.alloc(BUF_SIZE));
     auto *fence = static_cast<uint64_t *>(A.allocSmall(4096));
     if (!src || !fence) { printf("FAIL: alloc\n"); return failures + 1; }

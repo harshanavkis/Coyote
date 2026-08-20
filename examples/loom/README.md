@@ -289,7 +289,7 @@ Everything in `sw/` is **local route on ONE host** — no QP is ever created
 | binary | hosts | what it proves |
 |---|---|---|
 | `sw/build_hw/test` | 1 | 19 checks, single cThread: stores, descriptors, fences, ordering, exact counter relations, T3 stage cycles |
-| `sw/build_hw/aperture_test` | 1 | the load/store path: G2 at all 8 lanes, aperture reads, lane select, poison, window bounds |
+| `sw/build_hw/aperture_test` | 1 | the load/store path: G2 at all 8 lanes, **local** aperture reads, lane select, poison, window bounds |
 | `sw/build_hw/bulk_sweep` | 1 | descriptors from 64 B to 16 MB incl. non-64B lengths, every byte verified; prints the T2 cycle curve |
 | `sw/build_hw/roles` | 1 | role split, a cThread per role, so imports translate under the *exporter's* ctid (G1) |
 | `sw/build_hw/loomd` + `roles_sock` | 1 | the same flow with the control plane in a separate process over a Unix socket |
@@ -357,6 +357,22 @@ Two properties trip up expected values, and both look like bugs:
   2. Windows are returned by `releaseWindow` and reused, so repeated runs
   against one daemon are fine - but a client that exits without releasing
   leaks one, and there are only 15.
+
+#### Reads are local-only
+
+`loom_engine`'s validity check contains `(l_is_read ? !l_route : 1'b1)`, so a
+load through an **rdma-route** window fails validation and is answered with
+poison - the same path an unprogrammed window takes. Reads always answer;
+they never hang the issuing CPU. `aperture_test` proves the read path on
+hardware, but every window it programs is local route, so what is measured is
+local loads: the held-open AXI read channel, the 64 B line pull under the
+destination's pid, and the lane select.
+
+Remote reads mean serving incoming `rq_rd` the way `09_perf_rdma` does
+(`rq_rd -> sq_rd`, `host_recv -> rrsp_send`), and the T6 round trip that
+follows. Both are 6.2b. `loom_host` asserts the poison contract so a
+half-finished 6.2b cannot turn loads into something that neither poisons nor
+returns.
 
 Do the 5.4 gate tests (G1/G2/G4) on stock examples before the first run.
 Deployment binaries (`app_export`/`app_import`) are 5.4a.
