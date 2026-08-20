@@ -247,61 +247,109 @@ always @(posedge aclk) begin
     end
 end
 
-// Deliver one message: ceil(len/PMTU) fragments, vaddr advancing, last only
-// on the final one, and exactly one tlast at the very end of the payload
-task deliver_next();
+// The link has two independent streams, and modelling them as one is what
+// used to hide this class of bug. rq_wr and the payload are separate AXI
+// channels: the shell does NOT wait for the far side to finish a
+// transaction before pushing the next request, and it does not stop
+// streaming payload at a receiver that is still owed beats. So a
+// transaction that ends short does not stall the link - the beats of the
+// NEXT transaction flow into the receiver that is still waiting, and land
+// wherever the unfinished request said they should. Driving both from one
+// task, gated on the far side being idle, turns that into a deadlock the
+// model reports as "engine never produced the payload", which is a
+// statement about the model and not about the hardware.
+//
+// How many PMTU packets the shell merges into one rq_wr. Hardware shows
+// BOTH shapes on the same workload: rx_fwd counted 17x64 requests for
+// 17x256 KB (one request per packet, req_pkts 1) on one run and ~26 per
+// transfer (~10 KB each, req_pkts ~3) on the next, for a 4.7x throughput
+// difference. loom_rx derives its beat budget from rq_wr.len, so the two
+// shapes exercise different arithmetic in it, and only the first has ever
+// been simulated. The test sequence sets this between cases.
+int req_pkts = 1;
+
+// Frame boundaries the payload driver needs from the request driver: how
+// many beats each fragment carries, and which one ends the message (the
+// single tlast).
+typedef struct { int beats; bit last_frag; } frame_t;
+frame_t net_frames[$];
+
+// Request driver: ceil(len/PMTU) fragments per message, vaddr advancing,
+// rq_wr.last only on the final one
+task deliver_reqs();
     wreq_t w;
-    int nfrag, frag_len, beats, bi, guard;
+    int nfrag, frag_len, guard, span;
     w = net_reqs.pop_front();
-    nfrag = (w.len + PMTU - 1) / PMTU;
+    span  = PMTU * req_pkts;
+    nfrag = (w.len + span - 1) / span;
     for (int f = 0; f < nfrag; f++) begin
-        frag_len = (f == nfrag - 1) ? (w.len - f*PMTU) : PMTU;
+        frag_len = (f == nfrag - 1) ? (w.len - f*span) : span;
         @(negedge aclk);
         rx_rq_req = '0;
         rx_rq_req.pid   = QP_OWNER;
-        rx_rq_req.vaddr = w.vaddr + f*PMTU;
+        rx_rq_req.vaddr = w.vaddr + f*span;
         rx_rq_req.len   = frag_len;
         rx_rq_req.last  = (f == nfrag - 1);
         rx_rq_valid = 1;
+        net_frames.push_back('{(frag_len + 63) / 64, (f == nfrag - 1)});
         guard = 0;
         do begin @(posedge aclk); guard++; end
-        while (!rx_rq_ready && guard < 2000);
+        while (!rx_rq_ready && guard < 20000);
         @(negedge aclk);
         rx_rq_valid = 0;
-        if (guard >= 2000) begin
-            check(1'b0, "far side never accepted the request (stuck)");
+        if (guard >= 20000) begin
+            check(1'b0, $sformatf(
+                "far side never accepted the request @%0h (stuck)", w.vaddr));
             return;
         end
+    end
+endtask
 
-        beats = (frag_len + 63) / 64;
-        for (bi = 0; bi < beats; bi++) begin
-            // Bounded: a far side that stops taking beats is a framing bug,
-            // and it should be reported as one rather than as a timeout
+initial forever begin
+    @(posedge aclk);
+    if (net_reqs.size() > 0) deliver_reqs();
+end
+
+// Payload driver: independent of the requests, as the stream is on
+// hardware. It never asks which transaction produced a beat - it puts
+// them on the wire in the order they were produced, and the far side
+// pairs them with whatever request it is currently serving.
+initial forever begin
+    frame_t fr;
+    int guard;
+    @(posedge aclk);
+    if (net_frames.size() > 0) begin
+        fr = net_frames.pop_front();
+        for (int bi = 0; bi < fr.beats; bi++) begin
+            // Long enough that a beat from a LATER transaction still
+            // arrives; only a client with nothing left to send reaches it
             guard = 0;
-            while (net_beats.size() == 0 && guard < 2000) begin
+            while (net_beats.size() == 0 && guard < 4000) begin
                 @(posedge aclk); guard++;
             end
             if (net_beats.size() == 0) begin
-                check(1'b0, "shell model: engine never produced the payload");
-                return;
+                check(1'b0, $sformatf(
+                    "shell model: payload starved (%0d of %0d beats)",
+                    bi, fr.beats));
+                break;
             end
             @(negedge aclk);
             rx_s_tdata  = net_beats.pop_front();
             rx_s_tkeep  = {64{1'b1}};
             rx_s_tvalid = 1;
-            rx_s_tlast  = (f == nfrag - 1) && (bi == beats - 1);
+            rx_s_tlast  = fr.last_frag && (bi == fr.beats - 1);
             guard = 0;
             do begin @(posedge aclk); guard++; end
-            while (!rx_s_tready && guard < 2000);
+            while (!rx_s_tready && guard < 20000);
             @(negedge aclk);
             rx_s_tvalid = 0; rx_s_tlast = 0;
-            if (guard >= 2000) begin
+            if (guard >= 20000) begin
                 check(1'b0, "far side stopped taking beats (stuck mid-transaction)");
-                return;
+                break;
             end
         end
     end
-endtask
+end
 
 // -------------------------------------------------------------------------
 // Far-side host memory: what loom_rx actually lands, and in what order
@@ -380,30 +428,55 @@ task copy(input [3:0] win, input [27:0] off, input [63:0] src_va,
     axil_write(16'd96,  64'd1);
 endtask
 
-// Run the client until it has nothing left, then hand every message over
+// Wait for the client and the link to go quiet. Delivery itself is the
+// free-running process above: on hardware the shell drains the net stream
+// while the client is still issuing, and pumping it from this thread
+// instead would hide every ordering effect between the two - including a
+// short transaction whose missing beats are supplied by the transaction
+// that follows it, which cannot happen if the client is blocked here
+// while the link waits.
 task settle();
     int n;
     n = 0;
-    while (n < 4000 && (!fifo_empty || eng_busy || net_reqs.size() > 0 ||
-                        rx_busy || net_beats.size() > 0)) begin
-        if (net_reqs.size() > 0 && !rx_busy) deliver_next();
-        else begin @(posedge aclk); n++; end
+    while (n < 20000 && (!fifo_empty || eng_busy || net_reqs.size() > 0 ||
+                         rx_busy || net_beats.size() > 0 ||
+                         net_frames.size() > 0)) begin
+        @(posedge aclk); n++;
     end
     repeat (10) @(posedge aclk);
-    if (net_reqs.size() > 0 || net_beats.size() > 0)
+    if (net_reqs.size() > 0 || net_beats.size() > 0 || net_frames.size() > 0)
         check(1'b0, "shell model: message left undelivered");
 endtask
 
 task check_payload(input [47:0] at, input int words, input string msg);
     bit ok;
+    int first;
     ok = 1;
+    first = -1;
     for (int i = 0; i < words; i++)
-        if (!mem.exists((at + i*8) >> 3) || mem[(at + i*8) >> 3] != src_word(i))
+        if (!mem.exists((at + i*8) >> 3) || mem[(at + i*8) >> 3] != src_word(i)) begin
             ok = 0;
+            if (first < 0) first = i;
+        end
     check(ok, msg);
+    // What sat in the first bad word is the evidence: on hardware the
+    // corruption was an intact inline wire message (op 2 in lane 0, target
+    // VA in lane 1) written verbatim into the bulk destination, so print
+    // the word and its neighbours rather than only the fact of a mismatch
+    if (!ok) begin
+        $display("       first bad word %0d @0x%0h: got %0h want %0h",
+                 first, at + first*8,
+                 mem.exists((at + first*8) >> 3) ? mem[(at + first*8) >> 3] : 64'hx,
+                 src_word(first));
+        for (int l = 0; l < 3; l++)
+            if (mem.exists((at + (first+l)*8) >> 3))
+                $display("       lane %0d: %0h", l, mem[(at + (first+l)*8) >> 3]);
+    end
 endtask
 
 int n_writes_before;
+int landed, ovf;
+logic [63:0] ovf_before;
 
 initial begin
     axi_ctrl.awvalid = 0; axi_ctrl.wvalid = 0; axi_ctrl.arvalid = 0;
@@ -494,6 +567,101 @@ initial begin
           mem[(BASE1 + 48'hC0) >> 3] == 64'hB0DA_0001,
           "store after an unevenly fragmented copy parses its own header");
 
+    // --- the bulk -> store transition. This is the hardware bench's shape:
+    //     a multi-fragment copy, then a run of inline stores, with nothing
+    //     settling in between, so the shell model is holding the bulk's
+    //     beats AND the stores' message beats in one queue when it pairs
+    //     them to requests. That is the situation in which a request short
+    //     of its payload takes the NEXT transaction's beat - on hardware
+    //     256 KB came back with an inline store message written verbatim
+    //     into the bulk destination, at word 0 of the region, meaning a
+    //     request holding the bulk's vaddr took that beat having received
+    //     none of its own. Every case above either settles between the two
+    //     phases or follows the copy with a single store.
+    n_writes_before = writes.size();
+    copy(4'd1, 28'h60000, {16'b0, SRC_VA}, 28'd16384, {16'b0, CPL_VA});
+    for (int st = 0; st < 8; st++)
+        store(4'd1, 12'h100 + 12'(st*8), 64'hC0DE_0000 + 64'(st));
+    settle();
+    check_payload(BASE1 + 48'h60000, 2048,
+                  "bulk survives the store phase that follows it");
+    for (int st = 0; st < 8; st++)
+        check(mem.exists((BASE1 + 48'h100 + 48'(st*8)) >> 3) &&
+              mem[(BASE1 + 48'h100 + 48'(st*8)) >> 3] == (64'hC0DE_0000 + 64'(st)),
+              $sformatf("store %0d after the bulk lands at its own target", st));
+
+    // --- the same transition with the shell MERGING packets into one
+    //     rq_wr, which is the shape the faster hardware run showed. The
+    //     receiver's beat budget now spans several packets per request,
+    //     so a boundary it gets wrong lands somewhere different
+    req_pkts = 3;
+    copy(4'd1, 28'h70000, {16'b0, SRC_VA}, 28'd16384, {16'b0, CPL_VA});
+    for (int st = 0; st < 8; st++)
+        store(4'd1, 12'h200 + 12'(st*8), 64'hBA7C_0000 + 64'(st));
+    settle();
+    check_payload(BASE1 + 48'h70000, 2048,
+                  "batched requests: bulk survives the store phase");
+    for (int st = 0; st < 8; st++)
+        check(mem.exists((BASE1 + 48'h200 + 48'(st*8)) >> 3) &&
+              mem[(BASE1 + 48'h200 + 48'(st*8)) >> 3] == (64'hBA7C_0000 + 64'(st)),
+              $sformatf("batched requests: store %0d lands at its own target", st));
+    req_pkts = 1;
+
+    // --- the failing hardware workload's actual scale: a 256 KB copy (64
+    //     PMTU packets) followed by 256 inline stores, no settle between.
+    //     The order FIFO is 64 deep and DROPS a push when full rather than
+    //     stalling the AXI-Lite bridge (posted-write semantics toward the
+    //     host, loom_ctrl "Order FIFO"), so a store phase this long, issued
+    //     while the engine is still streaming the bulk, is guaranteed to
+    //     overflow it. That is by design - what must hold is that nothing
+    //     vanishes silently: every store either lands or is counted in
+    //     dbg[6]. Software that wants all 256 has to size against the depth
+    //     or read the counter, which the bench does not do.
+    ovf_before = inst_ctrl.dbg[6];
+    copy(4'd1, 28'h100000, {16'b0, SRC_VA}, 28'd262144, {16'b0, CPL_VA});
+    for (int st = 0; st < 256; st++)
+        store(4'd1, 12'h400 + 12'(st*8), 64'h5709_0000 + 64'(st));
+    settle();
+    check_payload(BASE1 + 48'h100000, 32768,
+                  "256 KB bulk survives the 256-store phase that follows it");
+    landed = 0;
+    for (int st = 0; st < 256; st++)
+        if (mem.exists((BASE1 + 48'h400 + 48'(st*8)) >> 3) &&
+            mem[(BASE1 + 48'h400 + 48'(st*8)) >> 3] == (64'h5709_0000 + 64'(st)))
+            landed++;
+    ovf = int'(inst_ctrl.dbg[6] - ovf_before);
+    $display("       256-store phase: %0d landed, %0d dropped on a full FIFO",
+             landed, ovf);
+    check(landed + ovf == 256,
+          $sformatf("every store lands or is counted (%0d + %0d)", landed, ovf));
+    // A store that made it through must be intact and at its own address:
+    // the drops must not shift the ones that survive
+    for (int st = 0; st < landed; st++)
+        check(mem.exists((BASE1 + 48'h400 + 48'(st*8)) >> 3) &&
+              mem[(BASE1 + 48'h400 + 48'(st*8)) >> 3] == (64'h5709_0000 + 64'(st)),
+              $sformatf("surviving store %0d is intact and in place", st));
+
+    // Respecting the depth, the same phase loses nothing: the FIFO is the
+    // constraint, not the transition itself
+    ovf_before = inst_ctrl.dbg[6];
+    copy(4'd1, 28'h140000, {16'b0, SRC_VA}, 28'd262144, {16'b0, CPL_VA});
+    settle();
+    for (int batch = 0; batch < 4; batch++) begin
+        for (int st = 0; st < 60; st++)
+            store(4'd1, 12'h800 + 12'((batch*60 + st)*8), 64'h9E11_0000 + 64'(batch*60 + st));
+        settle();
+    end
+    check_payload(BASE1 + 48'h140000, 32768,
+                  "256 KB bulk intact when the store phase respects the depth");
+    landed = 0;
+    for (int st = 0; st < 240; st++)
+        if (mem.exists((BASE1 + 48'h800 + 48'(st*8)) >> 3) &&
+            mem[(BASE1 + 48'h800 + 48'(st*8)) >> 3] == (64'h9E11_0000 + 64'(st)))
+            landed++;
+    check(landed == 240,
+          $sformatf("all 240 stores land when issued within the depth (%0d)", landed));
+    check(inst_ctrl.dbg[6] == ovf_before, "no overflow when the depth is respected");
+
     check(rx_drop === 1'b0, "no header was ever rejected on the far side");
 
     // The engine must have delivered exactly what its requests claimed
@@ -508,7 +676,7 @@ initial begin
 end
 
 initial begin
-    #2ms;
+    #5ms;
     $display("TB FAIL (tb_loom_loopback): timeout");
     $finish;
 end
