@@ -95,6 +95,27 @@ constexpr uint64_t BENCH_SIZES[] = {
     64, 256, 1024, 4096, 16384, 65536, 262144, 1048576, 4194304
 };
 constexpr int BENCH_ITERS = 32;      // per size, issued back to back
+constexpr uint64_t BENCH_MAX_BURST = 4ULL * 1024 * 1024;   // bytes in flight
+
+// Bound the burst by bytes, not by count: 32 x 4 MB is 128 MB staged as
+// fast as the CSR path allows, far past anything the far side sustains.
+int bench_iters(uint64_t len) {
+    uint64_t n = BENCH_MAX_BURST / (len ? len : 1);
+    if (n > BENCH_ITERS) n = BENCH_ITERS;
+    return n ? int(n) : 1;
+}
+
+// Cap on descriptors in flight. loom_engine tracks nothing: vfpga_top ties
+// cq_wr.ready high and discards every completion, so the engine drains the
+// order FIFO as fast as sq_wr is accepted and the number of outstanding
+// RDMA writes is bounded by nothing at all. The shell's budget is
+// RDMA_N_WR_OUTSTANDING = 16. Pacing here in software says whether that is
+// what the large sizes hit: if they come back clean under a cap, the fix is
+// credit tracking in the engine, not bandwidth and not the receive path.
+int bench_credit() {
+    const char *e = getenv("LOOM_BENCH_CREDIT");
+    return e ? atoi(e) : 0;                  // 0 = unlimited, as today
+}
 constexpr int BENCH_STORES = 256;    // inline messages for the store rate
 
 // Where each size's last iteration lands, packed nose to tail
@@ -137,6 +158,18 @@ void check(bool ok, const char *msg) {
 // Spin, no sleeping: the benchmark's unit of time is microseconds, and
 // poll64's 10 ms usleep granularity swamped every size below a megabyte -
 // it reported the sleep, not the transfer.
+// Wait for the fence to reach AT LEAST `want`: pacing needs the window to
+// have drained enough, not to have drained exactly
+bool spin64_ge(volatile uint64_t *addr, uint64_t want, double timeout_us) {
+    auto t0 = std::chrono::steady_clock::now();
+    while (*addr < want) {
+        if (std::chrono::duration<double, std::micro>(
+                std::chrono::steady_clock::now() - t0).count() > timeout_us)
+            return false;
+    }
+    return true;
+}
+
 bool spin64(volatile uint64_t *addr, uint64_t want, double timeout_us) {
     auto t0 = std::chrono::steady_clock::now();
     while (*addr != want) {
@@ -195,9 +228,11 @@ bool poll_payload(volatile uint64_t *dst_words) {
 // than a series of round trips through software.
 void run_bench(coyote::cThread &t_ctrl, loom::Xpu &A, int win,
                uint64_t *src, volatile uint64_t *fence) {
-    printf("\n== remote transmit benchmark (%d iters/size)\n", BENCH_ITERS);
-    printf("%10s %10s %10s %12s %10s %8s %8s %10s\n",
-           "bytes", "cyc/op", "queue_cyc", "us/op", "GB/s",
+    printf("\n== remote transmit benchmark (<=%d iters/size, <=%lu MB burst, "
+           "credit %d)\n", BENCH_ITERS,
+           (unsigned long) (BENCH_MAX_BURST >> 20), bench_credit());
+    printf("%10s %6s %10s %10s %12s %10s %8s %8s %10s\n",
+           "bytes", "iters", "cyc/op", "queue_cyc", "us/op", "GB/s",
            "retrans", "psndrop", "landed");
 
     for (int i = 0; i < BENCH_N; i++) {
@@ -219,11 +254,16 @@ void run_bench(coyote::cThread &t_ctrl, loom::Xpu &A, int win,
         const long rt0 = net_stat("Retrans cnt"), pd0 = net_stat("PSN drop cnt");
         loom::StageStats a = loom::read_stage_stats(t_ctrl);
         auto t0 = std::chrono::steady_clock::now();
-        for (int k = 0; k < BENCH_ITERS; k++)
+        const int iters  = bench_iters(len);
+        const int credit = bench_credit();
+        for (int k = 0; k < iters; k++) {
             A.copy(win, uint32_t(off), src, len, fence);
+            if (credit && k + 1 > credit)          // at most `credit` unretired
+                spin64_ge(fence, base + uint64_t(k + 1 - credit), 5e6);
+        }
         // Generous but bounded: a size that cannot keep up should report,
         // not hold the run for the poll timeout
-        bool ok = spin64(fence, base + BENCH_ITERS, 5e6);
+        bool ok = spin64(fence, base + iters, 5e6);
         auto t1 = std::chrono::steady_clock::now();
         loom::StageStats b = loom::read_stage_stats(t_ctrl);
         const long rt1 = net_stat("Retrans cnt"), pd1 = net_stat("PSN drop cnt");
@@ -232,12 +272,12 @@ void run_bench(coyote::cThread &t_ctrl, loom::Xpu &A, int win,
         uint64_t cyc = b.acc[loom::STG_DMA_RDMA] - a.acc[loom::STG_DMA_RDMA];
         uint64_t ops = b.cnt[loom::STG_DMA_RDMA] - a.cnt[loom::STG_DMA_RDMA];
         uint64_t q   = b.queue_acc - a.queue_acc;
-        printf("%10lu %10lu %10lu %12.2f %10.3f %8ld %8ld %10s\n",
-               (unsigned long) len,
+        printf("%10lu %6d %10lu %10lu %12.2f %10.3f %8ld %8ld %10s\n",
+               (unsigned long) len, iters,
                (unsigned long) (ops ? cyc / ops : 0),
                (unsigned long) (ops ? q / ops : 0),
-               us / BENCH_ITERS,
-               (double(len) * BENCH_ITERS) / (us * 1e3),
+               us / iters,
+               (double(len) * iters) / (us * 1e3),
                rt1 - rt0, pd1 - pd0,
                ok ? "yes" : "NO FENCE");
 
