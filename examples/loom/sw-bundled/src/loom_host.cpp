@@ -242,9 +242,16 @@ void run_bench(coyote::cThread &t_ctrl, loom::Xpu &A, int win,
            "bytes", "iters", "cyc/op", "queue_cyc", "us/op", "GB/s",
            "retrans", "psndrop", "landed");
 
+    // LOOM_BENCH_ONLY=<bytes> runs one size and nothing else. The sweep
+    // runs sizes in order, so a failure at 256 KB may be that size or may
+    // be everything before it having degraded the QP - this separates them.
+    const char *only = getenv("LOOM_BENCH_ONLY");
+    const uint64_t only_len = only ? strtoull(only, nullptr, 0) : 0;
+
     for (int i = 0; i < BENCH_N; i++) {
         const uint64_t len = BENCH_SIZES[i];
         const uint64_t off = bench_offset(i);
+        if (only_len && len != only_len) continue;
 
         // Distinct pattern per size so the exporter can tell them apart
         for (uint64_t w = 0; w < len / 8; w++) src[w] = bench_word(i, w);
