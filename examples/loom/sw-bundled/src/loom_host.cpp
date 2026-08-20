@@ -240,6 +240,17 @@ void run_bench(coyote::cThread &t_ctrl, loom::Xpu &A, int win,
                (double(len) * BENCH_ITERS) / (us * 1e3),
                rt1 - rt0, pd1 - pd0,
                ok ? "yes" : "NO FENCE");
+
+        // Once the wire has lost a packet the QP is compromised: stop.
+        // Every later row would measure the recovery rather than the
+        // pipeline, and a replayed write has been seen landing at the
+        // wrong offset - the exporter reports that as a corrupt region
+        // for a size that was never the problem.
+        if (rt1 > rt0 || pd1 > pd0 || !ok) {
+            printf("  receive path gave out here; later sizes would "
+                   "measure RC recovery, not the pipeline\n");
+            break;
+        }
     }
 
     // Inline stores have no fence of their own; the engine's rdma-write
