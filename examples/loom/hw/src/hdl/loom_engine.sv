@@ -180,6 +180,27 @@ logic [PID_BITS-1:0]   l_pid;
 logic [VADDR_BITS-1:0] l_base;
 logic [LEN_BITS-1:0]   l_lim;
 
+// Beats of the descriptor's payload still to forward. The pull's tlast is
+// NOT the transaction boundary: the shell may return a large local read as
+// several tlast-terminated segments, and exiting on the first one leaves
+// the sq_wr we already posted short of the length it claimed. The shell
+// then takes the NEXT transaction's beat to make up the difference, which
+// is how an inline store message was seen landing verbatim inside a bulk
+// destination - header, target VA and payload intact - and why the damage
+// accumulates: every shortfall shifts the request/payload pairing for
+// everything after it. The length we asked for is the authority; tlast
+// only ends a transaction early if it arrives when nothing is owed.
+logic [22:0] l_sbeats;
+
+function automatic logic [22:0] beats_of(input logic [27:0] len);
+    logic [28:0] padded;
+    padded   = {1'b0, len} + 29'd63;
+    beats_of = padded[28:6];
+endfunction
+
+// Last payload beat this descriptor may forward
+wire stream_last = (l_sbeats <= 23'd1);
+
 logic [63:0] compl_cnt;
 logic [63:0] rd_data;      // lane-selected read result (or poison)
 logic [2:0]  rd_lane;      // which 8 B lane of the pulled line
@@ -213,7 +234,7 @@ always_ff @(posedge aclk) begin
         l_is_desc <= 0; l_is_read <= 0; l_off <= 0; l_len <= 0;
         l_src_pid <= 0; l_compl_va <= 0;
         rd_data <= 0; rd_lane <= 0;
-        l_payload <= 0;
+        l_payload <= 0; l_sbeats <= 0;
         l_valid <= 0; l_route <= 0; l_pid <= 0; l_base <= 0; l_lim <= 0;
     end else begin
         case (state)
@@ -227,6 +248,7 @@ always_ff @(posedge aclk) begin
                 l_src_pid <= fifo_src_pid;
                 l_compl_va <= fifo_compl_va;
                 l_payload <= fifo_payload;
+                l_sbeats  <= beats_of(fifo_len);
                 l_valid   <= lu_valid;
                 l_route   <= lu_route;
                 l_pid     <= lu_pid;
@@ -262,9 +284,12 @@ always_ff @(posedge aclk) begin
             ST_RD_REQ:    if (rd_ready) state <= ST_DMA_WR_REQ;
             ST_DMA_WR_REQ: if (wr_ready) state <= ST_STREAM;
             ST_STREAM:
-                if (s_tvalid && s_tlast &&
-                    (( l_route && m_net_tready) || (!l_route && m_host_tready)))
-                    state <= (l_compl_va != 0) ? ST_CP_REQ : ST_IDLE;
+                if (s_tvalid &&
+                    (( l_route && m_net_tready) || (!l_route && m_host_tready))) begin
+                    l_sbeats <= l_sbeats - 23'd1;
+                    if (stream_last)
+                        state <= (l_compl_va != 0) ? ST_CP_REQ : ST_IDLE;
+                end
 
             // Fence release: skipped entirely when the descriptor's
             // completion VA is 0
@@ -433,7 +458,7 @@ always_comb begin
     // Host output: store beat (local), DMA forward (local), completion beat
     m_host_tdata  = stream_local ? s_tdata : beat_data;
     m_host_tkeep  = stream_local ? s_tkeep : beat_keep;
-    m_host_tlast  = stream_local ? s_tlast : 1'b1;
+    m_host_tlast  = stream_local ? stream_last : 1'b1;
     m_host_tvalid = ((state == ST_WR_DATA) && !l_route) ||
                     (stream_local && s_tvalid) ||
                     (state == ST_CP_DATA);
@@ -443,7 +468,7 @@ always_comb begin
     // (keep all ones) - nothing sub-beat ever goes on the wire
     m_net_tdata  = (state == ST_WR_DATA) ? msg_inline_beat : s_tdata;
     m_net_tkeep  = stream_net ? s_tkeep : {(AXI_DATA_BITS/8){1'b1}};
-    m_net_tlast  = stream_net ? s_tlast : (state == ST_WR_DATA);
+    m_net_tlast  = stream_net ? stream_last : (state == ST_WR_DATA);
     m_net_tvalid = ((state == ST_WR_DATA) && l_route) ||
                    (stream_net && s_tvalid);
 end
@@ -463,9 +488,9 @@ assign rd_resp_valid = (state == ST_RD_RESP);
 
 assign cnt_drop     = (state == ST_CHECK) && !ok;
 assign cnt_local_wr = ((state == ST_WR_DATA) && !l_route && m_host_tready) ||
-                      (stream_local && s_tvalid && s_tlast && m_host_tready);
+                      (stream_local && s_tvalid && stream_last && m_host_tready);
 assign cnt_rdma_wr  = ((state == ST_WR_DATA) && l_route && m_net_tready) ||
-                      (stream_net && s_tvalid && s_tlast && m_net_tready);
+                      (stream_net && s_tvalid && stream_last && m_net_tready);
 assign cnt_compl    = (state == ST_CP_DATA) && m_host_tready;
 
 // -------------------------------------------------------------------------

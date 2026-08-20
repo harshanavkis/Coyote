@@ -29,6 +29,10 @@ module tb_loom_loopback;
 
 localparam int PMTU = 4096;
 
+// Beats per local-read segment, 0 = one unbroken response. The engine must
+// forward what its request claimed regardless of how the pull is chopped up.
+localparam int PULL_SEG = 4;
+
 logic aclk = 0;
 logic aresetn = 0;
 always #2 aclk = ~aclk;
@@ -195,7 +199,13 @@ initial forever begin
                     src_word(int'((pull_req.vaddr - SRC_VA) >> 3) + b*8 + l);
             pull_tkeep  = {64{1'b1}};
             pull_tvalid = 1;
-            pull_tlast  = (b == pull_beats - 1);
+            // Segment the response: the shell may return a large local read
+            // as several tlast-terminated chunks, and an engine that treats
+            // the first tlast as the end of the transfer leaves the sq_wr it
+            // already posted short of the length it claimed. The far side
+            // then completes that request with the NEXT transaction's beat.
+            pull_tlast  = (b == pull_beats - 1) ||
+                          (PULL_SEG != 0 && ((b + 1) % PULL_SEG == 0));
             do @(posedge aclk); while (!pull_tready);
         end
         @(negedge aclk);
