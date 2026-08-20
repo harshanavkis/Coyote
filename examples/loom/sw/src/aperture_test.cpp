@@ -211,11 +211,23 @@ int main() {
         double us = std::chrono::duration<double, std::micro>(t1 - t0).count();
         uint64_t cyc = b.acc[loom::STG_READ] - a.acc[loom::STG_READ];
         uint64_t ops = b.cnt[loom::STG_READ] - a.cnt[loom::STG_READ];
-        printf("\nT6 local load, %d reads: %lu cyc/read in the engine, "
-               "%.3f us/read end to end (sink %016lx)\n",
-               N, (unsigned long) (ops ? cyc / ops : 0), us / N,
-               (unsigned long) sink);
-        check(ops == N, "T6: every load reached the engine's read stage");
+
+        // One software load is NOT one aperture read. A host ctrl read
+        // bursts over the rest of its 64 B line the same way a write does,
+        // so a single 8 B load arrives as eight reads at +0..+56 - and
+        // because reads are single-outstanding, they serialize: the load a
+        // program sees costs `per_load` of them back to back. There is no
+        // read-side equivalent of the wstrb gate, since a read carries
+        // nothing that says which one the CPU actually wanted.
+        const double per_load = ops ? double(ops) / N : 0;
+        printf("\nT6 local load, %d loads -> %lu engine reads (%.1f per load)\n",
+               N, (unsigned long) ops, per_load);
+        printf("  engine line pull : %lu cyc per read\n",
+               (unsigned long) (ops ? cyc / ops : 0));
+        printf("  end to end       : %.3f us per LOAD, %.3f us per read\n",
+               us / N, ops ? us / double(ops) : 0.0);
+        printf("  (sink %016lx)\n", (unsigned long) sink);
+        check(ops >= N, "T6: every load reached the engine's read stage");
     }
 
     dump_counters(t, "end");

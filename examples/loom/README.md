@@ -315,9 +315,14 @@ Two hosts, server first:
 cd examples/loom/sw-bundled/build
 sudo ./loom_host --server                    # host 2 (exporter)
 sudo ./loom_host --client <server-ip>        # host 1 (importer)
-# LOOM_SKIP_BULK=1 on BOTH sides runs the store path with no copies
-# LOOM_BENCH=1     on BOTH sides adds the remote transmit benchmark
+
+# Options go AFTER sudo - `VAR=1 sudo ...` sets the variable for sudo,
+# which resets the environment, and the program never sees it
+sudo LOOM_SKIP_BULK=1 ./loom_host --server   # store path, no copies
+sudo LOOM_BENCH=1     ./loom_host --server   # + remote transmit benchmark
 ```
+
+Both switches must be set on **both** sides.
 
 `LOOM_BENCH=1` sweeps rdma descriptors from 64 B to 4 MB, 32 back to back
 per size so the pipeline is in steady state, and reports the engine's
@@ -357,6 +362,17 @@ Two properties trip up expected values, and both look like bugs:
   2. Windows are returned by `releaseWindow` and reused, so repeated runs
   against one daemon are fine - but a client that exits without releasing
   leaks one, and there are only 15.
+
+**One software load is not one aperture read.** A host ctrl read bursts over
+the rest of its 64 B line exactly as a write does, so an 8 B load arrives as
+eight reads at +0..+56, and since reads are single-outstanding they
+serialize - the load a program sees costs eight round trips back to back.
+There is no read-side equivalent of the `wstrb` gate that collapses the write
+burst, because a read carries nothing saying which one the CPU wanted.
+`aperture_test` reports per-load and per-read numbers separately for this
+reason. Serving the seven companions from a cached copy of the pulled line
+would turn a load back into one pull, and is the obvious optimisation if T6
+matters.
 
 A load blocks whatever the route. The read is pushed into the same order
 FIFO as stores and descriptors, the AXI-Lite read channel is held open until
