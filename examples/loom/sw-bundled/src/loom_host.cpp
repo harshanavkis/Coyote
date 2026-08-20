@@ -36,6 +36,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <chrono>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -53,7 +54,10 @@
 
 namespace {
 
-constexpr uint64_t BUF_SIZE      = 2ULL * 1024 * 1024;
+// 16 MB: the benchmark sweep packs transfers up to 4 MB nose to tail from
+// 0x40000, which ends at 5.6 MB, and the window bounds check drops anything
+// past the segment length
+constexpr uint64_t BUF_SIZE      = 16ULL * 1024 * 1024;
 constexpr uint64_t DMA_BYTES     = 4096;        // rdma bulk: len % 64 == 0
 constexpr uint32_t STAGING_BYTES = 4096;
 // Bring-up: a poll that is going to fail should fail fast enough that the
@@ -70,6 +74,41 @@ int failures = 0;
 // this splits "the store path is broken" from "a preceding direct write
 // wedges the receiver". Both sides must be started with it set.
 bool skip_bulk() { return getenv("LOOM_SKIP_BULK") != nullptr; }
+
+// -------------------------------------------------------------------------
+// Remote benchmark plan. Both sides compile the same table, so the exporter
+// knows where every transfer should have landed without being told.
+//
+// What this can and cannot measure. The fence an rdma descriptor releases is
+// a LOCAL posted completion: it fires when the engine has finished streaming
+// the payload to the network, not when the far side has it. There is no
+// return path in 6.2a - the peering is one-directional and remote reads are
+// 6.2b - so round-trip latency is not available. What is available is the
+// transmit pipeline: the engine's own per-stage cycles (t-encap for stores,
+// dma-rdma for bulk) and the achieved bytes per second through it. Those are
+// exactly the T2/T3 quantities the simulator carries placeholders for; a
+// remote-read RTT (T6) has to wait for 6.2b.
+//
+// Sizes are multiples of 64 B because the rdma bulk route requires it by
+// contract (loom_engine drops the rest at the source).
+constexpr uint64_t BENCH_SIZES[] = {
+    64, 256, 1024, 4096, 16384, 65536, 262144, 1048576, 4194304
+};
+constexpr int BENCH_ITERS = 32;      // per size, issued back to back
+constexpr int BENCH_STORES = 256;    // inline messages for the store rate
+
+// Where each size's last iteration lands, packed nose to tail
+uint64_t bench_offset(int idx) {
+    uint64_t off = 0x40000;          // clear of the correctness checks
+    for (int i = 0; i < idx; i++) off += BENCH_SIZES[i];
+    return (off + 63) & ~63ULL;
+}
+uint64_t bench_word(int idx, uint64_t i) {
+    return (uint64_t(0xBE0 + idx) << 48) | i;
+}
+constexpr int BENCH_N = int(sizeof(BENCH_SIZES) / sizeof(BENCH_SIZES[0]));
+
+bool bench_mode() { return getenv("LOOM_BENCH") != nullptr; }
 
 // The vFPGA's own account of what it did, which is the only first-hand
 // evidence when a write does not arrive: dbg[4] counts transactions loom_rx
@@ -118,6 +157,74 @@ bool poll_payload(volatile uint64_t *dst_words) {
     if (!poll64(&dst_words[DMA_BYTES / 8 - 1], src_word(DMA_BYTES / 8 - 1)))
         return false;
     return payload_matches(const_cast<const uint64_t *>(dst_words));
+}
+
+// Issue BENCH_ITERS descriptors of each size back to back and wait for the
+// last fence, so the measurement covers a pipeline in steady state rather
+// than a series of round trips through software.
+void run_bench(coyote::cThread &t_ctrl, loom::Xpu &A, int win,
+               uint64_t *src, volatile uint64_t *fence) {
+    printf("\n== remote transmit benchmark (%d iters/size)\n", BENCH_ITERS);
+    printf("%10s %10s %10s %12s %10s %10s\n",
+           "bytes", "cyc/op", "queue_cyc", "us/op", "GB/s", "landed");
+
+    for (int i = 0; i < BENCH_N; i++) {
+        const uint64_t len = BENCH_SIZES[i];
+        const uint64_t off = bench_offset(i);
+
+        // Distinct pattern per size so the exporter can tell them apart
+        for (uint64_t w = 0; w < len / 8; w++) src[w] = bench_word(i, w);
+
+        const uint64_t warm = loom::csr_read(t_ctrl, loom::DBG_BASE + 8 * 7);
+        A.copy(win, uint32_t(off), src, len, fence);      // warm the path
+        if (!poll64(fence, warm + 1)) {
+            printf("%10lu   warm-up never fenced - skipping\n",
+                   (unsigned long) len);
+            continue;
+        }
+
+        const uint64_t base = warm + 1;
+        loom::StageStats a = loom::read_stage_stats(t_ctrl);
+        auto t0 = std::chrono::steady_clock::now();
+        for (int k = 0; k < BENCH_ITERS; k++)
+            A.copy(win, uint32_t(off), src, len, fence);
+        bool ok = poll64(fence, base + BENCH_ITERS);
+        auto t1 = std::chrono::steady_clock::now();
+        loom::StageStats b = loom::read_stage_stats(t_ctrl);
+
+        double us = std::chrono::duration<double, std::micro>(t1 - t0).count();
+        uint64_t cyc = b.acc[loom::STG_DMA_RDMA] - a.acc[loom::STG_DMA_RDMA];
+        uint64_t ops = b.cnt[loom::STG_DMA_RDMA] - a.cnt[loom::STG_DMA_RDMA];
+        uint64_t q   = b.queue_acc - a.queue_acc;
+        printf("%10lu %10lu %10lu %12.2f %10.3f %10s\n",
+               (unsigned long) len,
+               (unsigned long) (ops ? cyc / ops : 0),
+               (unsigned long) (ops ? q / ops : 0),
+               us / BENCH_ITERS,
+               (double(len) * BENCH_ITERS) / (us * 1e3),
+               ok ? "yes" : "NO FENCE");
+    }
+
+    // Inline stores have no fence of their own; the engine's rdma-write
+    // counter advancing by the number issued is what says they are gone
+    {
+        const uint64_t w0 = loom::csr_read(t_ctrl, loom::DBG_BASE + 8 * 3);
+        loom::StageStats a = loom::read_stage_stats(t_ctrl);
+        auto t0 = std::chrono::steady_clock::now();
+        for (int k = 0; k < BENCH_STORES; k++)
+            A.store(win, 0x100, 0x5709'0000'0000'0000ULL | uint64_t(k));
+        while (loom::csr_read(t_ctrl, loom::DBG_BASE + 8 * 3) < w0 + BENCH_STORES)
+            ;
+        auto t1 = std::chrono::steady_clock::now();
+        loom::StageStats b = loom::read_stage_stats(t_ctrl);
+        double us = std::chrono::duration<double, std::micro>(t1 - t0).count();
+        uint64_t cyc = b.acc[loom::STG_STORE_RDMA] - a.acc[loom::STG_STORE_RDMA];
+        uint64_t ops = b.cnt[loom::STG_STORE_RDMA] - a.cnt[loom::STG_STORE_RDMA];
+        printf("8 B store x%d: t-encap %lu cyc/op, %.2f us/op, %lu ops\n",
+               BENCH_STORES, (unsigned long) (ops ? cyc / ops : 0),
+               us / BENCH_STORES, (unsigned long) ops);
+    }
+    fflush(stdout);
 }
 
 int run_server(uint16_t qp_port, uint16_t peer_port, const std::string &sock) {
@@ -233,6 +340,25 @@ int run_server(uint16_t qp_port, uint16_t peer_port, const std::string &sock) {
     for (int i = 0; i < poll_secs() * 100 && peer.doneCount() < 1; i++)
         usleep(10000);
     check(peer.doneCount() >= 1, "client DONE received");
+
+    if (bench_mode()) {
+        printf("\n== exporter check of the benchmark regions\n");
+        for (int i = 0; i < BENCH_N; i++) {
+            const uint64_t len = BENCH_SIZES[i], off = bench_offset(i);
+            bool ok = true;
+            for (uint64_t w = 0; ok && w < len / 8; w++)
+                if (dst1[off / 8 + w] != bench_word(i, w)) {
+                    printf("  %lu B at 0x%lx: word %lu is %016lx, want %016lx\n",
+                           (unsigned long) len, (unsigned long) off,
+                           (unsigned long) w,
+                           (unsigned long) dst1[off / 8 + w],
+                           (unsigned long) bench_word(i, w));
+                    ok = false;
+                }
+            check(ok, ok ? "bench region landed intact" : "bench region CORRUPT");
+        }
+    }
+
     dump_counters(t_ctrl, "server final");
 
     t_data.connSync(false);
@@ -330,6 +456,8 @@ int run_client(const std::string &ip, uint16_t qp_port, uint16_t peer_port,
     }
     check(dropped, "store to released window dropped at source");
     dump_counters(t_ctrl, "client final");
+
+    if (bench_mode()) run_bench(t_ctrl, A, w1, src, fence);
 
     check(peer.done(), "DONE barrier acknowledged");
     t_data.connSync(true);

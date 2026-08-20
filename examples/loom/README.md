@@ -316,7 +316,22 @@ cd examples/loom/sw-bundled/build
 sudo ./loom_host --server                    # host 2 (exporter)
 sudo ./loom_host --client <server-ip>        # host 1 (importer)
 # LOOM_SKIP_BULK=1 on BOTH sides runs the store path with no copies
+# LOOM_BENCH=1     on BOTH sides adds the remote transmit benchmark
 ```
+
+`LOOM_BENCH=1` sweeps rdma descriptors from 64 B to 4 MB, 32 back to back
+per size so the pipeline is in steady state, and reports the engine's
+dma-rdma cycles per op, order-FIFO residency, wall-clock per op and the
+achieved GB/s; then 256 inline stores for t-encap. The exporter verifies
+every region afterwards, so a number is only meaningful next to its
+`bench region landed intact`.
+
+It measures the **transmit pipeline, not a round trip**. The fence an rdma
+descriptor releases is a local posted completion - it fires when the engine
+has streamed the payload to the network, not when the far side has it - and
+6.2a has no return path, since the peering is one-directional and remote
+reads are 6.2b. So this gives T2 and the rdma half of T3; T6 (remote read
+RTT) needs 6.2b.
 
 `LOOM_POLL_SECS` overrides the poll timeout everywhere (default 20-30 s).
 
