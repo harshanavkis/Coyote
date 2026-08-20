@@ -311,6 +311,17 @@ void run_bench(coyote::cThread &t_ctrl, loom::Xpu &A, int win,
         }
     }
 
+    // The corrupting write seen at 256 KB carries store #255's payload and
+    // lands at word 0 of the bulk region - the START, so a request holding
+    // the bulk's vaddr took it having received none of its own beats. That
+    // is a bulk-to-store transition, not a short bulk transfer. Skip the
+    // stores and the region should stay clean if that reading is right.
+    if (getenv("LOOM_BENCH_NO_STORES")) {
+        printf("LOOM_BENCH_NO_STORES: skipping the inline store phase\n");
+        fflush(stdout);
+        return;
+    }
+
     // Inline stores have no fence of their own; the engine's rdma-write
     // counter advancing by the number issued is what says they are gone
     {
