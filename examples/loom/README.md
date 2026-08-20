@@ -289,7 +289,7 @@ Everything in `sw/` is **local route on ONE host** — no QP is ever created
 | binary | hosts | what it proves |
 |---|---|---|
 | `sw/build_hw/test` | 1 | 19 checks, single cThread: stores, descriptors, fences, ordering, exact counter relations, T3 stage cycles |
-| `sw/build_hw/aperture_test` | 1 | the load/store path: G2 at all 8 lanes, **local** aperture reads, lane select, poison, window bounds |
+| `sw/build_hw/aperture_test` | 1 | the load/store path: G2 at all 8 lanes, **local** aperture reads, lane select, poison, window bounds; reports **T6**, the local load round trip |
 | `sw/build_hw/bulk_sweep` | 1 | descriptors from 64 B to 16 MB incl. non-64B lengths, every byte verified; prints the T2 cycle curve |
 | `sw/build_hw/roles` | 1 | role split, a cThread per role, so imports translate under the *exporter's* ctid (G1) |
 | `sw/build_hw/loomd` + `roles_sock` | 1 | the same flow with the control plane in a separate process over a Unix socket |
@@ -357,6 +357,16 @@ Two properties trip up expected values, and both look like bugs:
   2. Windows are returned by `releaseWindow` and reused, so repeated runs
   against one daemon are fine - but a client that exits without releasing
   leaks one, and there are only 15.
+
+A load blocks whatever the route. The read is pushed into the same order
+FIFO as stores and descriptors, the AXI-Lite read channel is held open until
+the engine has pulled the containing 64 B line and lane-selected, and
+`rd_pending` withholds `arready` meanwhile - so a load stalls the issuing
+core and any other CSR **read**, but not writes, which use the separate
+AW/W/B channels. Descriptors are six CSR writes with no reads and their fence
+is polled in host memory, so the bulk path never queues behind a load.
+Locally that costs a PCIe line pull; once 6.2b lands it costs a network round
+trip, and the same mechanism measures both.
 
 #### Reads are local-only
 

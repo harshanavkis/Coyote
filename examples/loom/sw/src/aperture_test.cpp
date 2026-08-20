@@ -31,6 +31,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <chrono>
 #include <cstring>
 #include <unistd.h>
 
@@ -184,6 +185,37 @@ int main() {
               "bounds: nothing was written past the window");
         check(loom::aperture_read(t, 2, 0x800) == loom::READ_POISON,
               "bounds: a read past the window returns poison");
+    }
+
+    // --- T6: what a load actually costs ---
+    // The read holds the AXI-Lite read channel open until the engine has
+    // pulled the containing 64 B line and lane-selected, so a load is a
+    // blocking round trip whatever the route - local here, a network RTT
+    // once 6.2b lands. Two numbers: the engine's own read-stage
+    // accumulator, which is the device-side line pull, and wall clock,
+    // which is what an XPU issuing the load would actually see (MMIO out,
+    // pull, MMIO completion back).
+    //
+    // No counter reads inside the loop: CSR reads are single-outstanding,
+    // so one in here would serialize behind every load and inflate it.
+    {
+        constexpr int N = 1000;
+        loom::StageStats a = loom::read_stage_stats(t);
+        auto t0 = std::chrono::steady_clock::now();
+        uint64_t sink = 0;
+        for (int i = 0; i < N; i++)
+            sink ^= loom::aperture_read(t, 1, uint32_t((i % 64) * 8));
+        auto t1 = std::chrono::steady_clock::now();
+        loom::StageStats b = loom::read_stage_stats(t);
+
+        double us = std::chrono::duration<double, std::micro>(t1 - t0).count();
+        uint64_t cyc = b.acc[loom::STG_READ] - a.acc[loom::STG_READ];
+        uint64_t ops = b.cnt[loom::STG_READ] - a.cnt[loom::STG_READ];
+        printf("\nT6 local load, %d reads: %lu cyc/read in the engine, "
+               "%.3f us/read end to end (sink %016lx)\n",
+               N, (unsigned long) (ops ? cyc / ops : 0), us / N,
+               (unsigned long) sink);
+        check(ops == N, "T6: every load reached the engine's read stage");
     }
 
     dump_counters(t, "end");
