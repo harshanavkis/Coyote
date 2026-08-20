@@ -385,7 +385,10 @@ int run_server(uint16_t qp_port, uint16_t peer_port, const std::string &sock) {
     }
 
     // End-of-run barrier, then teardown
-    for (int i = 0; i < poll_secs() * 100 && peer.doneCount() < 1; i++)
+    // The importer's benchmark can spend seconds per size before it gives
+    // up on one, so DONE has to outlast it rather than expire underneath
+    const int done_secs = bench_mode() ? poll_secs() * 10 : poll_secs();
+    for (int i = 0; i < done_secs * 100 && peer.doneCount() < 1; i++)
         usleep(10000);
     check(peer.doneCount() >= 1, "client DONE received");
 
@@ -393,6 +396,21 @@ int run_server(uint16_t qp_port, uint16_t peer_port, const std::string &sock) {
         printf("\n== exporter check of the benchmark regions\n");
         for (int i = 0; i < BENCH_N; i++) {
             const uint64_t len = BENCH_SIZES[i], off = bench_offset(i);
+
+            // The importer stops at the first size that loses packets, so
+            // the sizes after it were never sent. An untouched region is
+            // not a failure, and reporting it as one buries the size that
+            // actually broke.
+            bool touched = false;
+            for (uint64_t w = 0; !touched && w < len / 8; w++)
+                if (dst1[off / 8 + w] != 0) touched = true;
+            if (!touched) {
+                printf("  %8lu B at 0x%-8lx never written (importer stopped "
+                       "before this size)\n",
+                       (unsigned long) len, (unsigned long) off);
+                continue;
+            }
+
             bool ok = true;
             for (uint64_t w = 0; ok && w < len / 8; w++)
                 if (dst1[off / 8 + w] != bench_word(i, w)) {
