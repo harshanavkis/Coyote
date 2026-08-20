@@ -203,8 +203,12 @@ int main() {
         loom::StageStats a = loom::read_stage_stats(t);
         auto t0 = std::chrono::steady_clock::now();
         uint64_t sink = 0;
+        // Lane 0 of each line only. The ctrl read burst covers from the
+        // target word to the END of its 64 B line, so a read at lane 0
+        // costs exactly 8 and one at lane 7 costs 1 - mixing lanes makes
+        // the reads-per-load a fraction and the check unfalsifiable.
         for (int i = 0; i < N; i++)
-            sink ^= loom::aperture_read(t, 1, uint32_t((i % 64) * 8));
+            sink ^= loom::aperture_read(t, 1, uint32_t((i % 8) * 64));
         auto t1 = std::chrono::steady_clock::now();
         loom::StageStats b = loom::read_stage_stats(t);
 
@@ -227,7 +231,10 @@ int main() {
         printf("  end to end       : %.3f us per LOAD, %.3f us per read\n",
                us / N, ops ? us / double(ops) : 0.0);
         printf("  (sink %016lx)\n", (unsigned long) sink);
-        check(ops >= N, "T6: every load reached the engine's read stage");
+        // Exact, not >=: every load is lane 0, so every load must cost
+        // exactly the 8 reads the burst implies
+        check(ops == 8 * N,
+              "T6: every load cost exactly 8 engine reads (the ctrl burst)");
     }
 
     dump_counters(t, "end");
