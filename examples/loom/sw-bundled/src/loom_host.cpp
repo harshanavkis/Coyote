@@ -134,6 +134,37 @@ void check(bool ok, const char *msg) {
     if (!ok) failures++;
 }
 
+// Spin, no sleeping: the benchmark's unit of time is microseconds, and
+// poll64's 10 ms usleep granularity swamped every size below a megabyte -
+// it reported the sleep, not the transfer.
+bool spin64(volatile uint64_t *addr, uint64_t want, double timeout_us) {
+    auto t0 = std::chrono::steady_clock::now();
+    while (*addr != want) {
+        if (std::chrono::duration<double, std::micro>(
+                std::chrono::steady_clock::now() - t0).count() > timeout_us)
+            return false;
+    }
+    return true;
+}
+
+// One field out of the shell's network counters. The receive path losing
+// packets shows up here and nowhere else in this program: a drop is a
+// packet loom_rx did not forward, and RC then retransmits it.
+long net_stat(const char *field) {
+    FILE *f = fopen("/sys/kernel/coyote_sysfs_0/cyt_attr_nstats", "r");
+    if (!f) return -1;
+    char line[256];
+    long v = -1;
+    while (fgets(line, sizeof(line), f))
+        if (strstr(line, field)) { 
+            const char *c = strchr(line, ':');
+            if (c) v = atol(c + 1);
+            break;
+        }
+    fclose(f);
+    return v;
+}
+
 bool poll64(volatile uint64_t *addr, uint64_t want) {
     for (int i = 0; i < poll_secs() * 100; i++) {
         if (*addr == want) return true;
@@ -165,8 +196,9 @@ bool poll_payload(volatile uint64_t *dst_words) {
 void run_bench(coyote::cThread &t_ctrl, loom::Xpu &A, int win,
                uint64_t *src, volatile uint64_t *fence) {
     printf("\n== remote transmit benchmark (%d iters/size)\n", BENCH_ITERS);
-    printf("%10s %10s %10s %12s %10s %10s\n",
-           "bytes", "cyc/op", "queue_cyc", "us/op", "GB/s", "landed");
+    printf("%10s %10s %10s %12s %10s %8s %8s %10s\n",
+           "bytes", "cyc/op", "queue_cyc", "us/op", "GB/s",
+           "retrans", "psndrop", "landed");
 
     for (int i = 0; i < BENCH_N; i++) {
         const uint64_t len = BENCH_SIZES[i];
@@ -177,31 +209,36 @@ void run_bench(coyote::cThread &t_ctrl, loom::Xpu &A, int win,
 
         const uint64_t warm = loom::csr_read(t_ctrl, loom::DBG_BASE + 8 * 7);
         A.copy(win, uint32_t(off), src, len, fence);      // warm the path
-        if (!poll64(fence, warm + 1)) {
+        if (!spin64(fence, warm + 1, 5e6)) {
             printf("%10lu   warm-up never fenced - skipping\n",
                    (unsigned long) len);
             continue;
         }
 
         const uint64_t base = warm + 1;
+        const long rt0 = net_stat("Retrans cnt"), pd0 = net_stat("PSN drop cnt");
         loom::StageStats a = loom::read_stage_stats(t_ctrl);
         auto t0 = std::chrono::steady_clock::now();
         for (int k = 0; k < BENCH_ITERS; k++)
             A.copy(win, uint32_t(off), src, len, fence);
-        bool ok = poll64(fence, base + BENCH_ITERS);
+        // Generous but bounded: a size that cannot keep up should report,
+        // not hold the run for the poll timeout
+        bool ok = spin64(fence, base + BENCH_ITERS, 5e6);
         auto t1 = std::chrono::steady_clock::now();
         loom::StageStats b = loom::read_stage_stats(t_ctrl);
+        const long rt1 = net_stat("Retrans cnt"), pd1 = net_stat("PSN drop cnt");
 
         double us = std::chrono::duration<double, std::micro>(t1 - t0).count();
         uint64_t cyc = b.acc[loom::STG_DMA_RDMA] - a.acc[loom::STG_DMA_RDMA];
         uint64_t ops = b.cnt[loom::STG_DMA_RDMA] - a.cnt[loom::STG_DMA_RDMA];
         uint64_t q   = b.queue_acc - a.queue_acc;
-        printf("%10lu %10lu %10lu %12.2f %10.3f %10s\n",
+        printf("%10lu %10lu %10lu %12.2f %10.3f %8ld %8ld %10s\n",
                (unsigned long) len,
                (unsigned long) (ops ? cyc / ops : 0),
                (unsigned long) (ops ? q / ops : 0),
                us / BENCH_ITERS,
                (double(len) * BENCH_ITERS) / (us * 1e3),
+               rt1 - rt0, pd1 - pd0,
                ok ? "yes" : "NO FENCE");
     }
 
