@@ -330,10 +330,18 @@ bounds check. Pair them with `cat /sys/kernel/coyote_sysfs_0/cyt_attr_nstats`
 on both hosts, which says whether the packets ever left or arrived. That
 combination localized every hardware bug found so far in a single run.
 
-One property that trips up expected values: **the fence word carries the
-engine's running completion count**, not a per-descriptor 1. `compl_cnt`
-clears only on `aresetn`, so a test that has to know the value must read
-`dbg[compl]` first and expect the next ones.
+Two properties trip up expected values, and both look like bugs:
+
+- **The fence word carries the engine's running completion count**, not a
+  per-descriptor 1. `compl_cnt` clears only on `aresetn`, so a test that has
+  to know the value must read `dbg[compl]` first and expect the next ones. A
+  test hardcoding 1 passes only against a freshly programmed card.
+- **A long-lived `loomd` carries state across client runs.** It holds its
+  ctid, so the ctids a client reports shift from run to run, and it owns the
+  window table, so imported windows are whichever are free rather than 1 and
+  2. Windows are returned by `releaseWindow` and reused, so repeated runs
+  against one daemon are fine - but a client that exits without releasing
+  leaks one, and there are only 15.
 
 Do the 5.4 gate tests (G1/G2/G4) on stock examples before the first run.
 Deployment binaries (`app_export`/`app_import`) are 5.4a.
