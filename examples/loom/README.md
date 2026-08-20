@@ -331,6 +331,20 @@ achieved GB/s; then 256 inline stores for t-encap. The exporter verifies
 every region afterwards, so a number is only meaningful next to its
 `bench region landed intact`.
 
+Isolation switches, for splitting a failure rather than measuring:
+`LOOM_BENCH_ONLY=<bytes>` runs one size and nothing else,
+`LOOM_BENCH_ITERS=N` issues N descriptors per size instead of 32, and
+`LOOM_BENCH_NO_STORES=1` skips the closing store phase. Pairing them
+localizes a fault to a phase: a big `LOOM_BENCH_ONLY` puts a long bulk
+immediately in front of the stores, a small one does not.
+
+The store phase reports `order FIFO: N of 256 dropped`. The FIFO is 64
+deep and drops rather than stalling the bridge (HW-DESIGN, deliberate
+simplifications), and the engine drains nothing while it streams a bulk,
+so a nonzero N means the stores outran it - not that anything is broken.
+Every store in that phase targets the same offset, so a drop shows up in
+this counter and nowhere else.
+
 It measures the **transmit pipeline, not a round trip**. The fence an rdma
 descriptor releases is a local posted completion - it fires when the engine
 has streamed the payload to the network, not when the far side has it - and

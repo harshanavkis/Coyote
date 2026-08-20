@@ -326,14 +326,27 @@ void run_bench(coyote::cThread &t_ctrl, loom::Xpu &A, int win,
     // counter advancing by the number issued is what says they are gone
     {
         const uint64_t w0 = loom::csr_read(t_ctrl, loom::DBG_BASE + 8 * 3);
+        // The order FIFO is 64 deep and DROPS a push when it is full rather
+        // than stalling the AXI-Lite bridge (loom_ctrl, deliberate: aperture
+        // stores stay posted toward the host). The engine drains nothing
+        // while it streams a bulk, so this phase - issued back to back right
+        // after the sweep's last transfer - is exactly where the depth can
+        // be the whole budget. A drop is INVISIBLE in the data here, because
+        // every store below targets the same offset; only dbg[6] shows it.
+        const uint64_t ovf0 = loom::csr_read(t_ctrl, loom::DBG_BASE + 8 * 6);
         loom::StageStats a = loom::read_stage_stats(t_ctrl);
         auto t0 = std::chrono::steady_clock::now();
         for (int k = 0; k < BENCH_STORES; k++)
             A.store(win, 0x100, 0x5709'0000'0000'0000ULL | uint64_t(k));
         // Bounded: after a size has wrecked the QP these may never retire,
-        // and an unbounded spin here hangs the whole run
+        // and an unbounded spin here hangs the whole run. A store that was
+        // dropped never retires either, so the wait counts the dropped ones
+        // as accounted for - otherwise the 5 s guard lands inside the
+        // measurement and every rate below it is meaningless.
         auto guard = std::chrono::steady_clock::now();
-        while (loom::csr_read(t_ctrl, loom::DBG_BASE + 8 * 3) < w0 + BENCH_STORES) {
+        while ((loom::csr_read(t_ctrl, loom::DBG_BASE + 8 * 3) - w0) +
+               (loom::csr_read(t_ctrl, loom::DBG_BASE + 8 * 6) - ovf0)
+                   < uint64_t(BENCH_STORES)) {
             if (std::chrono::duration<double>(
                     std::chrono::steady_clock::now() - guard).count() > 5.0) {
                 printf("  store rate: gave up waiting for the engine\n");
@@ -345,10 +358,15 @@ void run_bench(coyote::cThread &t_ctrl, loom::Xpu &A, int win,
         double us = std::chrono::duration<double, std::micro>(t1 - t0).count();
         uint64_t cyc = b.acc[loom::STG_STORE_RDMA] - a.acc[loom::STG_STORE_RDMA];
         uint64_t ops = b.cnt[loom::STG_STORE_RDMA] - a.cnt[loom::STG_STORE_RDMA];
+        const uint64_t ovf = loom::csr_read(t_ctrl, loom::DBG_BASE + 8 * 6) - ovf0;
         printf("8 B store x%d: t-encap %lu cyc/op, %.2f us/op, %lu ops\n",
                BENCH_STORES, (unsigned long) (ops ? cyc / ops : 0),
                us / BENCH_STORES, (unsigned long) ops);
+        printf("  order FIFO: %lu of %d dropped on a full FIFO (depth 64)%s\n",
+               (unsigned long) ovf, BENCH_STORES,
+               ovf ? "  <-- the store phase outran the engine" : "");
     }
+    dump_counters(t_ctrl, "client after bench");
     fflush(stdout);
 }
 
