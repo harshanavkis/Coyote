@@ -485,6 +485,22 @@ int run_server(uint16_t qp_port, uint16_t peer_port, const std::string &sock) {
                            (unsigned long) w,
                            (unsigned long) dst1[off / 8 + w],
                            (unsigned long) bench_word(i, w));
+                    // A whole 64 B line here says what overwrote it. An
+                    // inline wire message is {op|len, target VA, data} in
+                    // the first three lanes and zero after: seeing that
+                    // means loom_rx forwarded a MESSAGE down the direct
+                    // path instead of parsing it, so the far side compared
+                    // its RETH against the staging address and missed.
+                    const uint64_t base = (off / 8 + w) & ~7ULL;
+                    printf("    line at 0x%lx:",
+                           (unsigned long) (base * 8));
+                    for (int l = 0; l < 8; l++)
+                        printf(" %016lx", (unsigned long) dst1[base + l]);
+                    printf("\n");
+                    if ((dst1[base] & 0xFF) == 2 && (dst1[base] >> 8) == 8)
+                        printf("    ^ that is a Loom inline message header "
+                               "(op 2, len 8): a message was written as "
+                               "bulk payload\n");
                     ok = false;
                 }
             check(ok, ok ? "bench region landed intact" : "bench region CORRUPT");
