@@ -506,6 +506,52 @@ int run_server(uint16_t qp_port, uint16_t peer_port, const std::string &sock) {
                 continue;
             }
 
+            // Characterize the damage instead of stopping at the first bad
+            // word. bench_word is (0xBE0+idx)<<48 | word_index, so any word
+            // that landed says exactly WHICH source word it is - the
+            // displacement is read off, not guessed. That separates the
+            // three things the counters cannot: a region most of which never
+            // arrived (zeros), one that arrived whole but shifted (a
+            // consistent nonzero displacement), and one clobbered by
+            // something that is not this size's payload at all.
+            uint64_t bad = 0, zeros = 0, foreign = 0;
+            uint64_t first_bad = ~0ULL, last_bad = 0;
+            int64_t shift = 0;
+            bool shift_seen = false, shift_same = true;
+            for (uint64_t w = 0; w < len / 8; w++) {
+                const uint64_t got = dst1[off / 8 + w];
+                if (got == bench_word(i, w)) continue;
+                bad++;
+                if (first_bad == ~0ULL) first_bad = w;
+                last_bad = w;
+                if (got == 0) { zeros++; continue; }
+                if ((got >> 48) == uint64_t(0xBE0 + i)) {
+                    const int64_t d = int64_t(got & 0xFFFF'FFFF'FFFFULL) - int64_t(w);
+                    if (!shift_seen) { shift = d; shift_seen = true; }
+                    else if (d != shift) shift_same = false;
+                } else {
+                    foreign++;
+                }
+            }
+            if (bad) {
+                printf("  %lu B at 0x%lx: %lu of %lu words wrong "
+                       "(%lu never written, %lu not this payload), "
+                       "first %lu last %lu\n",
+                       (unsigned long) len, (unsigned long) off,
+                       (unsigned long) bad, (unsigned long) (len / 8),
+                       (unsigned long) zeros, (unsigned long) foreign,
+                       (unsigned long) first_bad, (unsigned long) last_bad);
+                if (shift_seen)
+                    printf("    displaced payload is offset by %+ld words "
+                           "(%+ld x 64 B beats)%s\n",
+                           (long) shift, (long) (shift / 8),
+                           shift_same ? ", the same everywhere"
+                                      : ", NOT consistent across the region");
+                if (zeros == bad)
+                    printf("    every wrong word is zero: this payload never "
+                           "arrived, it was not misplaced\n");
+            }
+
             bool ok = true;
             for (uint64_t w = 0; ok && w < len / 8; w++)
                 if (dst1[off / 8 + w] != bench_word(i, w)) {
