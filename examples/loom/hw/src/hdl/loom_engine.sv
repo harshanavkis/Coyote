@@ -190,6 +190,15 @@ logic [LEN_BITS-1:0]   l_lim;
 // accumulates: every shortfall shifts the request/payload pairing for
 // everything after it. The length we asked for is the authority; tlast
 // only ends a transaction early if it arrives when nothing is owed.
+//
+// SCOPE, honestly: this is correct on its own terms and reproduced in
+// simulation (tb_loom_loopback segments the pull, and the pre-fix engine
+// fails there). It has NOT been shown to be the cause of the hardware
+// corruption seen at 256 KB. Buffers are HPF, so 2 MB huge pages: a 4 MB
+// transfer spans two of them and plausibly does come back in segments -
+// and 4 MB is exactly the size that never fences - but 256 KB sits inside
+// one huge page and has no obvious reason to be split. If the 256 KB
+// message-into-bulk corruption survives a rebuild, this fix is not it.
 logic [22:0] l_sbeats;
 
 function automatic logic [22:0] beats_of(input logic [27:0] len);
