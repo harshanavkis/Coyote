@@ -165,6 +165,16 @@ Binaries: `loomd` exists; `app_export`/`app_import` are Phase 5.4a.
   the simulation calibrates against. Per-destination queues + scheduler
   and the error containment unit are **descoped** (2026-08 eval review:
   no isolation claim, victim experiment dead, failure containment dropped).
+- **The order FIFO is 64 deep and drops on overflow.** A store or
+  descriptor trigger that arrives at a full FIFO is discarded and counted
+  (`fifo_ovfl`, RO word 38) rather than stalling the AXI-Lite bridge, which
+  would turn posted aperture stores into blocking ones back through PCIe.
+  Software sizes its outstanding work against the depth or reads the
+  counter. Where this bites is a store phase issued while the engine is
+  still streaming a large bulk: the engine drains nothing for the duration,
+  so the depth is the whole budget. `tb_loom_loopback` covers both sides -
+  256 stores behind a 256 KB copy lose everything past the 64th (each one
+  counted), and the same phase within the depth loses nothing.
 - **Aperture reads are local-only** (5.2). A READ rides the same order
   FIFO; the engine pulls the full 64 B aligned line and lane-selects,
   which avoids sub-line DMA entirely (cf. G5). Reads are never dropped
