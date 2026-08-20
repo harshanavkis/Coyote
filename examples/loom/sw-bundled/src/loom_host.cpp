@@ -252,9 +252,13 @@ void run_bench(coyote::cThread &t_ctrl, loom::Xpu &A, int win,
         const uint64_t warm = loom::csr_read(t_ctrl, loom::DBG_BASE + 8 * 7);
         A.copy(win, uint32_t(off), src, len, fence);      // warm the path
         if (!spin64(fence, warm + 1, 5e6)) {
-            printf("%10lu   warm-up never fenced - skipping\n",
+            printf("%10lu   warm-up never fenced - stopping\n",
                    (unsigned long) len);
-            continue;
+            printf("  a single descriptor of this size does not complete; "
+                   "its recovery has been seen splattering into the region "
+                   "below, so later rows and the store rate would both "
+                   "measure a wrecked QP\n");
+            break;
         }
 
         const uint64_t base = warm + 1;
