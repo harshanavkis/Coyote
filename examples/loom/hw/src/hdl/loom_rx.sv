@@ -74,7 +74,19 @@ module loom_rx (
 
     // Debug counter pulses (to loom_ctrl)
     output logic                        cnt_rx_fwd,
-    output logic                        cnt_rx_drop
+    output logic                        cnt_rx_drop,
+
+    // Where the cycles go while forwarding. This module holds NO buffer: a
+    // beat moves only when the RoCE ingress and the host write path are
+    // ready in the SAME cycle, so every bubble on either side costs a cycle
+    // and a lost cycle on ingress is eventually a dropped packet. The FSM
+    // itself is cheap - one cycle to accept the request, one for the sq_wr
+    // handshake, ~2 to hand the arbiter back, against 64 beats of data - so
+    // when the measured cost per packet runs far above the 64-beat floor,
+    // the difference is stall, not overhead, and these say which side.
+    output logic                        cnt_rx_move,    // both ready
+    output logic                        cnt_rx_starve,  // ingress had nothing
+    output logic                        cnt_rx_stall    // host write not ready
 );
 
 // Wire-message header ops (keep in sync with loom_engine.sv)
@@ -247,5 +259,9 @@ end
 assign cnt_rx_fwd  = ((state == ST_INLINE_DATA) && m_tready) ||
                      ((state == ST_STREAM) && s_tvalid && m_tready && stream_end);
 assign cnt_rx_drop = (state == ST_HDR) && s_tvalid && !hdr_ok;
+
+assign cnt_rx_move   = (state == ST_STREAM) &&  s_tvalid &&  m_tready;
+assign cnt_rx_starve = (state == ST_STREAM) && !s_tvalid;
+assign cnt_rx_stall  = (state == ST_STREAM) &&  s_tvalid && !m_tready;
 
 endmodule

@@ -47,6 +47,18 @@ constexpr uint32_t DBG_BASE    = 0x100;  // 10 x RO counters (see loom_ctrl.sv)
 // Stage cycle counters (RO, words 48-63; see loom_ctrl.sv header). Feed
 // the T3 per-stage latency measurements: average cycles = acc / cnt,
 // scaled by the vFPGA clock period.
+// Receive-path cycle accounting (RO words 42-44, loom_rx). The three
+// partition every cycle loom_rx spends forwarding a payload: moving (both
+// sides ready), starved (RoCE ingress had no beat), stalled (host write path
+// not ready). loom_rx holds no buffer, so a cycle lost to either side is a
+// cycle the ingress is not drained, and above ~9 GB/s that becomes a dropped
+// packet and then a PSN storm. The FSM itself costs ~6 cycles per packet
+// against 64 beats of data, so a per-packet cost far above the 64-cycle
+// floor is stall, not overhead - these say which side to fix.
+constexpr uint32_t RX_MOVE       = 0x150;
+constexpr uint32_t RX_STARVE     = 0x158;
+constexpr uint32_t RX_STALL      = 0x160;
+
 constexpr uint32_t STG_CYC       = 0x180;  // free-running cycle counter
 constexpr uint32_t STG_QUEUE_ACC = 0x188;  // order-FIFO residency sum (t-queue)
 constexpr uint32_t STG_ACC_BASE  = 0x190;  // 7 words, cycles per stage

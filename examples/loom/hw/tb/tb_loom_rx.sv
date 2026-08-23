@@ -35,6 +35,8 @@ logic m_tvalid, m_tlast;
 logic m_tready = 1;
 
 logic req, grant = 0, busy, cnt_rx_fwd, cnt_rx_drop;
+logic cnt_rx_move, cnt_rx_starve, cnt_rx_stall;
+int move_pulses = 0, starve_pulses = 0, stall_pulses = 0;
 
 int errors = 0;
 int fwd_pulses = 0;
@@ -55,7 +57,9 @@ loom_rx dut (
     .m_tdata(m_tdata), .m_tkeep(m_tkeep), .m_tvalid(m_tvalid),
     .m_tready(m_tready), .m_tlast(m_tlast),
     .req(req), .grant(grant), .busy(busy),
-    .cnt_rx_fwd(cnt_rx_fwd), .cnt_rx_drop(cnt_rx_drop)
+    .cnt_rx_fwd(cnt_rx_fwd), .cnt_rx_drop(cnt_rx_drop),
+    .cnt_rx_move(cnt_rx_move), .cnt_rx_starve(cnt_rx_starve),
+    .cnt_rx_stall(cnt_rx_stall)
 );
 
 req_t wrq[$];
@@ -78,6 +82,9 @@ always @(posedge aclk) begin
         outq.push_back('{data: m_tdata[63:0], keep8: m_tkeep[7:0], last: m_tlast});
     if (cnt_rx_fwd) fwd_pulses++;
     if (cnt_rx_drop) drop_pulses++;
+    if (cnt_rx_move) move_pulses++;
+    if (cnt_rx_starve) starve_pulses++;
+    if (cnt_rx_stall) stall_pulses++;
 end
 
 // Print what the DUT actually issued: a framing bug shows up as the wrong
@@ -481,6 +488,36 @@ initial begin
         check(wrq[1].vaddr == TARGET + 48'hE00,
               "over-long stream: tlast is the boundary, next header clean");
     check(outq.size() == 4, "over-long stream: all three beats forwarded");
+
+    // --- 13. Receive-path cycle accounting. These three partition every
+    //     cycle spent in ST_STREAM and are what attributes the receiver's
+    //     ceiling: the FSM costs ~6 cycles per packet against 64 beats of
+    //     data, so a measured cost far above the floor is stall, and which
+    //     counter moves says which side of the stream to fix. They ride a
+    //     bitstream build, and a counter that miscounts is worse than none -
+    //     it sends the next round of work at the wrong half of the path.
+    move_pulses = 0; starve_pulses = 0; stall_pulses = 0;
+    outq.delete(); wrq.delete();
+    incoming(6'd1, 28'd256, TARGET, 1'b1);        // direct bulk, 4 beats
+    // starved: give it one beat, then leave the ingress dry for a while
+    send_msg_beat(64'hA0, 64'hA1, 64'hA2, 1'b0);
+    repeat (6) @(posedge aclk);
+    send_msg_beat(64'hB0, 64'hB1, 64'hB2, 1'b0);
+    // stalled: beats available, host write path refusing them
+    @(negedge aclk); m_tready = 0;
+    send_msg_beat(64'hC0, 64'hC1, 64'hC2, 1'b0);
+    send_msg_beat(64'hD0, 64'hD1, 64'hD2, 1'b1);
+    repeat (6) @(posedge aclk);
+    @(negedge aclk); m_tready = 1;
+    wait_idle_to(400, "13: receive-path cycle accounting");
+    check(move_pulses == 4,
+          $sformatf("accounting: one move per beat forwarded (%0d of 4)",
+                    move_pulses));
+    check(starve_pulses > 0,
+          "accounting: starve fires when the ingress is dry");
+    check(stall_pulses > 0,
+          "accounting: stall fires when the host write path is not ready");
+    check(outq.size() == 4, "accounting: all four beats still forwarded");
 
     if (errors == 0) $display("TB PASS (tb_loom_rx)");
     else             $display("TB FAIL (tb_loom_rx): %0d errors", errors);

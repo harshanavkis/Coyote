@@ -107,6 +107,9 @@ module loom_ctrl (
     input  logic                        cnt_rx_drop,
     input  logic                        cnt_drop,
     input  logic                        cnt_compl,
+    input  logic                        cnt_rx_move,
+    input  logic                        cnt_rx_starve,
+    input  logic                        cnt_rx_stall,
 
     // Stage cycle counters (accumulated in loom_engine, read out here)
     input  logic [63:0]                 stage_acc [7],
@@ -141,6 +144,14 @@ localparam integer R_DMA_COMPL_VA = 13;
 localparam integer R_RDMA_STAGING = 16;
 localparam integer R_DBG_BASE    = 32;
 localparam integer N_DBG         = 10;
+// Receive-path cycle accounting (RO 42-44). Words 42-47 were unused; these
+// three partition the cycles loom_rx spends forwarding, so the receiver's
+// ceiling can be attributed without a probe on the host side (a CSR poll is
+// a PCIe transaction into the card that is landing the payload, and spinning
+// on it slows the receiver enough to change the answer).
+localparam integer R_RX_MOVE     = 42;
+localparam integer R_RX_STARVE   = 43;
+localparam integer R_RX_STALL    = 44;
 localparam integer R_CYC         = 48;
 localparam integer R_QUEUE_ACC   = 49;
 localparam integer R_STG_ACC     = 50;   // 7 words: 50-56
@@ -221,6 +232,7 @@ logic [63:0] r_tbl_idx, r_tbl_cfg, r_tbl_pid, r_tbl_base, r_tbl_len;
 logic [63:0] r_dma_dst, r_dma_src_va, r_dma_len, r_dma_src_pid, r_dma_compl_va;
 logic [63:0] r_rdma_staging;
 logic [63:0] dbg [N_DBG];
+logic [63:0] rx_move, rx_starve, rx_stall;
 
 // COMMIT/TRIGGER are edge-style: they fire on the write pulse itself
 // (ctrl_reg_wren), not on a stored value, so writing 1 twice fires twice
@@ -408,6 +420,7 @@ end
 always_ff @(posedge aclk) begin
     if (!aresetn) begin
         for (int i = 0; i < N_DBG; i++) dbg[i] <= 0;
+        rx_move <= 0; rx_starve <= 0; rx_stall <= 0;
     end else begin
         if (push_store)   dbg[0] <= dbg[0] + 1;
         if (push_desc)    dbg[1] <= dbg[1] + 1;
@@ -419,6 +432,9 @@ always_ff @(posedge aclk) begin
         if (cnt_compl)    dbg[7] <= dbg[7] + 1;
         if (push_read)    dbg[8] <= dbg[8] + 1;
         if (cnt_rx_drop)  dbg[9] <= dbg[9] + 1;
+        if (cnt_rx_move)   rx_move   <= rx_move + 1;
+        if (cnt_rx_starve) rx_starve <= rx_starve + 1;
+        if (cnt_rx_stall)  rx_stall  <= rx_stall + 1;
     end
 end
 
@@ -448,6 +464,12 @@ always_ff @(posedge aclk) begin
             default:
                 if (rd_idx >= R_DBG_BASE && rd_idx < R_DBG_BASE + N_DBG)
                     axi_rdata <= dbg[rd_idx - R_DBG_BASE];
+                else if (rd_idx == R_RX_MOVE)
+                    axi_rdata <= rx_move;
+                else if (rd_idx == R_RX_STARVE)
+                    axi_rdata <= rx_starve;
+                else if (rd_idx == R_RX_STALL)
+                    axi_rdata <= rx_stall;
                 else if (rd_idx == R_CYC)
                     axi_rdata <= cycle_cnt;
                 else if (rd_idx == R_QUEUE_ACC)

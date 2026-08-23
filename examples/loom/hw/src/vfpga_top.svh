@@ -61,6 +61,7 @@ logic eng_host_tvalid, eng_host_tlast, eng_net_tvalid, eng_net_tlast;
 req_t rx_wr_req;
 logic rx_wr_valid;
 logic rx_req_arb, rx_busy;
+logic rx_cnt_move, rx_cnt_starve, rx_cnt_stall;
 logic [AXI_DATA_BITS-1:0]   rx_tdata;
 logic [AXI_DATA_BITS/8-1:0] rx_tkeep;
 logic rx_tvalid, rx_tlast;
@@ -140,6 +141,8 @@ loom_ctrl inst_loom_ctrl (
     .cnt_local_wr(cnt_local_wr), .cnt_rdma_wr(cnt_rdma_wr),
     .cnt_rx_fwd(cnt_rx_fwd), .cnt_rx_drop(cnt_rx_drop),
     .cnt_drop(cnt_drop), .cnt_compl(cnt_compl),
+    .cnt_rx_move(rx_cnt_move), .cnt_rx_starve(rx_cnt_starve),
+    .cnt_rx_stall(rx_cnt_stall),
     .stage_acc(stage_acc), .stage_cnt(stage_cnt)
 );
 
@@ -197,6 +200,8 @@ loom_rx inst_loom_rx (
     .m_tdata(rx_tdata), .m_tkeep(rx_tkeep), .m_tvalid(rx_tvalid),
     .m_tready(axis_host_send[0].tready && rx_grant), .m_tlast(rx_tlast),
     .req(rx_req_arb), .grant(rx_grant), .busy(rx_busy),
+    .cnt_rx_move(rx_cnt_move), .cnt_rx_starve(rx_cnt_starve),
+    .cnt_rx_stall(rx_cnt_stall),
     .cnt_rx_fwd(cnt_rx_fwd), .cnt_rx_drop(cnt_rx_drop)
 );
 

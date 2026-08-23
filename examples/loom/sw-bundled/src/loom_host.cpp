@@ -651,6 +651,27 @@ int run_server(uint16_t qp_port, uint16_t peer_port, const std::string &sock) {
         }
     }
 
+    if (bench_mode()) {
+        // Where the receive path's cycles went. loom_rx holds no buffer, so
+        // a beat moves only when the RoCE ingress and the host write path
+        // are ready in the same cycle; these three partition the forwarding
+        // cycles and say which side owns the ceiling. Unlike a host-side
+        // poll this costs nothing while it is being measured.
+        const uint64_t mv = loom::csr_read(t_ctrl, loom::RX_MOVE);
+        const uint64_t sv = loom::csr_read(t_ctrl, loom::RX_STARVE);
+        const uint64_t st = loom::csr_read(t_ctrl, loom::RX_STALL);
+        const uint64_t tot = mv + sv + st;
+        printf("receive path cycles: %lu moving, %lu starved (ingress had "
+               "nothing), %lu stalled (host write not ready)\n",
+               (unsigned long) mv, (unsigned long) sv, (unsigned long) st);
+        if (tot)
+            printf("  %.1f%% moving, %.1f%% starved, %.1f%% stalled;"
+                   " 64 beats of data per 4096 B packet is the floor\n",
+                   100.0 * double(mv) / double(tot),
+                   100.0 * double(sv) / double(tot),
+                   100.0 * double(st) / double(tot));
+    }
+
     dump_counters(t_ctrl, "server final");
 
     t_data.connSync(false);
