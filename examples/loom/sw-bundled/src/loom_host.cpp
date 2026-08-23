@@ -509,11 +509,25 @@ int run_server(uint16_t qp_port, uint16_t peer_port, const std::string &sock) {
     // Run with LOOM_BENCH_NO_STORES=1 to read this: the store phase forwards
     // 64 B packets that cost one beat each, and mixing them in makes the
     // cycles-per-packet figure meaningless.
+    // OPT-IN (LOOM_RX_PROBE=1), because it PERTURBS what it measures. Each
+    // sample is a CSR read, i.e. a PCIe transaction into the same card that
+    // is landing the payload, and spinning on it costs the receiver enough
+    // that the SENDER slows down with it: the identical 4-iteration run
+    // measured 8.797 GB/s unprobed and 2.311 GB/s probed. Numbers taken
+    // while this is on describe a loaded receiver, not the real ceiling.
+    //
+    // The unperturbed way to get the same answer is the cliff itself - the
+    // last intact rate divided into the packet size gives the per-packet
+    // budget with no instrument in the path at all. A direct measurement
+    // wants an RTL cycle accumulator gated on loom_rx being busy, read once
+    // at the end; that costs a build, and this exists to avoid guessing in
+    // the meantime.
     uint64_t c_first = 0, c_last = 0, f_first = 0, f_last = 0;
     bool started = false;
     int idle_polls = 0;
-    const uint64_t f0 = loom::csr_read(t_ctrl, loom::DBG_BASE + 8 * 4);
-    for (int i = 0; i < done_secs * 1000000 && peer.doneCount() < 1; i++) {
+    const bool probe = getenv("LOOM_RX_PROBE") != nullptr;
+    const uint64_t f0 = probe ? loom::csr_read(t_ctrl, loom::DBG_BASE + 8 * 4) : 0;
+    for (int i = 0; probe && i < done_secs * 1000000 && peer.doneCount() < 1; i++) {
         const uint64_t f = loom::csr_read(t_ctrl, loom::DBG_BASE + 8 * 4);
         if (!started) {
             if (f != f0) {          // first packet of the phase
@@ -530,6 +544,9 @@ int run_server(uint16_t qp_port, uint16_t peer_port, const std::string &sock) {
         }
         if (!started) f_last = f;
     }
+    if (!probe)
+        for (int i = 0; i < done_secs * 100 && peer.doneCount() < 1; i++)
+            usleep(10000);
     check(peer.doneCount() >= 1, "client DONE received");
     if (bench_mode() && f_last > f_first && c_last > c_first)
         printf("receive path: %lu cycles per packet over the active phase "
