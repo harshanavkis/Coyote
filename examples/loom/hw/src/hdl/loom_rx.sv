@@ -97,7 +97,15 @@ module loom_rx (
     // body-heavy means the host write path is bursty and wants a buffer;
     // neither means its sustained bandwidth is simply the ceiling.
     output logic                        cnt_rx_stall_head,
-    output logic                        cnt_rx_stall_body
+    output logic                        cnt_rx_stall_body,
+
+    // Requests ACCEPTED off rq_wr. cnt_rx_fwd counts the ones this module
+    // finished, and the difference between the two is the question that
+    // could not be answered on hardware for a whole round of debugging:
+    // when completions came up short of the packets the shell must have
+    // sent, nothing said whether the requests never arrived or arrived and
+    // were never finished. Those have opposite causes and opposite fixes.
+    output logic                        cnt_rx_req
 );
 
 // Wire-message header ops (keep in sync with loom_engine.sv)
@@ -280,5 +288,7 @@ assign cnt_rx_stall  = (state == ST_STREAM) &&  s_tvalid && !m_tready;
 
 assign cnt_rx_stall_head = cnt_rx_stall && !l_moved;
 assign cnt_rx_stall_body = cnt_rx_stall &&  l_moved;
+
+assign cnt_rx_req = rq_valid && rq_ready;
 
 endmodule

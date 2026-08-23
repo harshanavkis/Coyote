@@ -66,6 +66,10 @@ constexpr uint32_t RX_STALL      = 0x160;
 // Neither: its sustained bandwidth is the ceiling and neither fix helps.
 constexpr uint32_t RX_STALL_HEAD = 0x168;
 constexpr uint32_t RX_STALL_BODY = 0x170;
+// Requests accepted off rq_wr, against DBG rx_fwd (completed). A gap says
+// requests arrived and were not finished; equality with a shortfall against
+// the packets the sender must have sent says they never arrived at all.
+constexpr uint32_t RX_REQ        = 0x178;
 
 constexpr uint32_t STG_CYC       = 0x180;  // free-running cycle counter
 constexpr uint32_t STG_QUEUE_ACC = 0x188;  // order-FIFO residency sum (t-queue)

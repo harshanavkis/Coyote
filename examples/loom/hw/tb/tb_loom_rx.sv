@@ -36,7 +36,8 @@ logic m_tready = 1;
 
 logic req, grant = 0, busy, cnt_rx_fwd, cnt_rx_drop;
 logic cnt_rx_move, cnt_rx_starve, cnt_rx_stall;
-logic cnt_rx_stall_head, cnt_rx_stall_body;
+logic cnt_rx_stall_head, cnt_rx_stall_body, cnt_rx_req;
+int req_pulses = 0;
 int head_pulses = 0, body_pulses = 0;
 int move_pulses = 0, starve_pulses = 0, stall_pulses = 0;
 
@@ -63,7 +64,8 @@ loom_rx dut (
     .cnt_rx_move(cnt_rx_move), .cnt_rx_starve(cnt_rx_starve),
     .cnt_rx_stall(cnt_rx_stall),
     .cnt_rx_stall_head(cnt_rx_stall_head),
-    .cnt_rx_stall_body(cnt_rx_stall_body)
+    .cnt_rx_stall_body(cnt_rx_stall_body),
+    .cnt_rx_req(cnt_rx_req)
 );
 
 req_t wrq[$];
@@ -91,6 +93,7 @@ always @(posedge aclk) begin
     if (cnt_rx_stall) stall_pulses++;
     if (cnt_rx_stall_head) head_pulses++;
     if (cnt_rx_stall_body) body_pulses++;
+    if (cnt_rx_req) req_pulses++;
 end
 
 // Print what the DUT actually issued: a framing bug shows up as the wrong
@@ -502,7 +505,7 @@ initial begin
     //     counter moves says which side of the stream to fix. They ride a
     //     bitstream build, and a counter that miscounts is worse than none -
     //     it sends the next round of work at the wrong half of the path.
-    move_pulses = 0; starve_pulses = 0; stall_pulses = 0;
+    move_pulses = 0; starve_pulses = 0; stall_pulses = 0; req_pulses = 0;
     outq.delete(); wrq.delete();
     incoming(6'd1, 28'd256, TARGET, 1'b1);        // direct bulk, 4 beats
     // starved: give it one beat, then leave the ingress dry for a while
@@ -545,6 +548,13 @@ initial begin
     check(head_pulses > 0,
           $sformatf("accounting: a stall before the first beat counts as head (%0d)",
                     head_pulses));
+    // Requests accepted vs completed. On hardware these came apart and
+    // nothing could say whether the missing ones never arrived or arrived
+    // and never finished; both transactions above accepted exactly one
+    // request and finished it.
+    check(req_pulses == 2,
+          $sformatf("accounting: one pulse per request accepted (%0d of 2)",
+                    req_pulses));
 
     if (errors == 0) $display("TB PASS (tb_loom_rx)");
     else             $display("TB FAIL (tb_loom_rx): %0d errors", errors);

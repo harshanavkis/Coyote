@@ -241,6 +241,12 @@ void run_bench(coyote::cThread &t_ctrl, loom::Xpu &A, int win,
     printf("%10s %6s %10s %10s %12s %10s %8s %8s %10s\n",
            "bytes", "iters", "cyc/op", "queue_cyc", "us/op", "GB/s",
            "retrans", "psndrop", "landed");
+    // The per-size columns below bracket only the timed loop, and an RC
+    // retransmit timer fires well after the payload has been streamed - so
+    // they read zero on runs that go on to retransmit over a thousand
+    // packets. Bracket the whole benchmark as well, and sample after a
+    // settle so the timers have actually run.
+    const long rt_all0 = net_stat("Retrans cnt"), pd_all0 = net_stat("PSN drop cnt");
 
     // LOOM_BENCH_ONLY=<bytes> runs one size and nothing else. The sweep
     // runs sizes in order, so a failure at 256 KB may be that size or may
@@ -318,6 +324,14 @@ void run_bench(coyote::cThread &t_ctrl, loom::Xpu &A, int win,
     // stores and the region should stay clean if that reading is right.
     if (getenv("LOOM_BENCH_NO_STORES")) {
         printf("LOOM_BENCH_NO_STORES: skipping the inline store phase\n");
+    usleep(500000);      // let RC retransmit timers fire before sampling
+    {
+        const long rt = net_stat("Retrans cnt") - rt_all0;
+        const long pd = net_stat("PSN drop cnt") - pd_all0;
+        printf("whole run: %ld retransmissions, %ld PSN drops%s\n", rt, pd,
+               (rt || pd) ? "  <-- the per-size columns above sample too "
+                            "early to show these" : "");
+    }
         fflush(stdout);
         return;
     }
@@ -365,6 +379,14 @@ void run_bench(coyote::cThread &t_ctrl, loom::Xpu &A, int win,
         printf("  order FIFO: %lu of %d dropped on a full FIFO (depth 64)%s\n",
                (unsigned long) ovf, BENCH_STORES,
                ovf ? "  <-- the store phase outran the engine" : "");
+    }
+    usleep(500000);      // let RC retransmit timers fire before sampling
+    {
+        const long rt = net_stat("Retrans cnt") - rt_all0;
+        const long pd = net_stat("PSN drop cnt") - pd_all0;
+        printf("whole run: %ld retransmissions, %ld PSN drops%s\n", rt, pd,
+               (rt || pd) ? "  <-- the per-size columns above sample too "
+                            "early to show these" : "");
     }
     dump_counters(t_ctrl, "client after bench");
     fflush(stdout);
@@ -670,6 +692,11 @@ int run_server(uint16_t qp_port, uint16_t peer_port, const std::string &sock) {
                    100.0 * double(mv) / double(tot),
                    100.0 * double(sv) / double(tot),
                    100.0 * double(st) / double(tot));
+        const uint64_t acc = loom::csr_read(t_ctrl, loom::RX_REQ);
+        const uint64_t don = loom::csr_read(t_ctrl, loom::DBG_BASE + 8 * 4);
+        printf("rq_wr: %lu accepted, %lu completed%s\n",
+               (unsigned long) acc, (unsigned long) don,
+               acc == don ? "" : "  <-- requests accepted and never finished");
         const uint64_t hd = loom::csr_read(t_ctrl, loom::RX_STALL_HEAD);
         const uint64_t bd = loom::csr_read(t_ctrl, loom::RX_STALL_BODY);
         if (st)
