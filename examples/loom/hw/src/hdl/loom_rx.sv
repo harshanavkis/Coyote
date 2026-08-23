@@ -86,7 +86,18 @@ module loom_rx (
     // the difference is stall, not overhead, and these say which side.
     output logic                        cnt_rx_move,    // both ready
     output logic                        cnt_rx_starve,  // ingress had nothing
-    output logic                        cnt_rx_stall    // host write not ready
+    output logic                        cnt_rx_stall,   // host write not ready
+    // Stall split by WHERE in the packet it lands, which is what tells the
+    // two candidate fixes apart. This module is single-outstanding on the
+    // write side: it posts one sq_wr, streams that packet, and only then
+    // takes the next request - so if the shell withholds m_tready until it
+    // has accepted and translated the request, every packet pays that
+    // latency serially and the stalls bunch up BEFORE its first beat.
+    // Head-heavy means overlap the next request with the current stream;
+    // body-heavy means the host write path is bursty and wants a buffer;
+    // neither means its sustained bandwidth is simply the ceiling.
+    output logic                        cnt_rx_stall_head,
+    output logic                        cnt_rx_stall_body
 );
 
 // Wire-message header ops (keep in sync with loom_engine.sv)
@@ -104,6 +115,7 @@ logic [27:0]           l_len;
 logic [VADDR_BITS-1:0] l_va;
 logic [63:0]           l_inline;
 logic [22:0]           l_beats;      // beats of this request still on the stream
+logic                  l_moved;      // this transaction has had at least one beat
 logic                  l_req_last;   // shell will terminate this stream with tlast
 
 // Where a transaction ends is decided by the REQUEST's length, not by
@@ -161,10 +173,11 @@ always_ff @(posedge aclk) begin
     if (!aresetn) begin
         state <= ST_IDLE;
         l_pid <= 0; l_op <= 0; l_len <= 0; l_va <= 0; l_inline <= 0;
-        l_beats <= 0; l_req_last <= 1'b1;
+        l_beats <= 0; l_req_last <= 1'b1; l_moved <= 1'b0;
     end else begin
         case (state)
             ST_IDLE: if (rq_valid && grant) begin
+                l_moved    <= 1'b0;
                 l_pid      <= rq_req.pid;
                 l_beats     <= beats_of(rq_req.len[27:0]);
                 l_req_last  <= rq_req.last;
@@ -207,6 +220,7 @@ always_ff @(posedge aclk) begin
 
             // Forward the remaining payload beats
             ST_STREAM: if (s_tvalid && m_tready) begin
+                l_moved <= 1'b1;
                 l_beats <= l_beats - 23'd1;
                 if (stream_end) state <= ST_IDLE;
             end
@@ -263,5 +277,8 @@ assign cnt_rx_drop = (state == ST_HDR) && s_tvalid && !hdr_ok;
 assign cnt_rx_move   = (state == ST_STREAM) &&  s_tvalid &&  m_tready;
 assign cnt_rx_starve = (state == ST_STREAM) && !s_tvalid;
 assign cnt_rx_stall  = (state == ST_STREAM) &&  s_tvalid && !m_tready;
+
+assign cnt_rx_stall_head = cnt_rx_stall && !l_moved;
+assign cnt_rx_stall_body = cnt_rx_stall &&  l_moved;
 
 endmodule

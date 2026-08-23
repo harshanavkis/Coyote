@@ -58,6 +58,14 @@ constexpr uint32_t DBG_BASE    = 0x100;  // 10 x RO counters (see loom_ctrl.sv)
 constexpr uint32_t RX_MOVE       = 0x150;
 constexpr uint32_t RX_STARVE     = 0x158;
 constexpr uint32_t RX_STALL      = 0x160;
+// The stall split. loom_rx is single-outstanding on the write side, so if
+// the shell withholds m_tready until it has accepted and translated the
+// request, every packet pays that latency serially and the stalls land
+// BEFORE its first beat. Head-heavy: overlap the next request with the
+// current stream. Body-heavy: the host write path is bursty, buffer it.
+// Neither: its sustained bandwidth is the ceiling and neither fix helps.
+constexpr uint32_t RX_STALL_HEAD = 0x168;
+constexpr uint32_t RX_STALL_BODY = 0x170;
 
 constexpr uint32_t STG_CYC       = 0x180;  // free-running cycle counter
 constexpr uint32_t STG_QUEUE_ACC = 0x188;  // order-FIFO residency sum (t-queue)

@@ -670,6 +670,15 @@ int run_server(uint16_t qp_port, uint16_t peer_port, const std::string &sock) {
                    100.0 * double(mv) / double(tot),
                    100.0 * double(sv) / double(tot),
                    100.0 * double(st) / double(tot));
+        const uint64_t hd = loom::csr_read(t_ctrl, loom::RX_STALL_HEAD);
+        const uint64_t bd = loom::csr_read(t_ctrl, loom::RX_STALL_BODY);
+        if (st)
+            printf("  of the stalls: %lu before the packet's first beat, "
+                   "%lu after -> %s\n", (unsigned long) hd,
+                   (unsigned long) bd,
+                   hd > bd ? "single-outstanding request latency; overlap the "
+                             "next sq_wr with the current stream"
+                           : "a bursty host write path; buffer it");
     }
 
     dump_counters(t_ctrl, "server final");

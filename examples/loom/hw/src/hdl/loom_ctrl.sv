@@ -110,6 +110,8 @@ module loom_ctrl (
     input  logic                        cnt_rx_move,
     input  logic                        cnt_rx_starve,
     input  logic                        cnt_rx_stall,
+    input  logic                        cnt_rx_stall_head,
+    input  logic                        cnt_rx_stall_body,
 
     // Stage cycle counters (accumulated in loom_engine, read out here)
     input  logic [63:0]                 stage_acc [7],
@@ -152,6 +154,8 @@ localparam integer N_DBG         = 10;
 localparam integer R_RX_MOVE     = 42;
 localparam integer R_RX_STARVE   = 43;
 localparam integer R_RX_STALL    = 44;
+localparam integer R_RX_ST_HEAD  = 45;   // stalled before the packet's first beat
+localparam integer R_RX_ST_BODY  = 46;   // stalled after it
 localparam integer R_CYC         = 48;
 localparam integer R_QUEUE_ACC   = 49;
 localparam integer R_STG_ACC     = 50;   // 7 words: 50-56
@@ -232,7 +236,7 @@ logic [63:0] r_tbl_idx, r_tbl_cfg, r_tbl_pid, r_tbl_base, r_tbl_len;
 logic [63:0] r_dma_dst, r_dma_src_va, r_dma_len, r_dma_src_pid, r_dma_compl_va;
 logic [63:0] r_rdma_staging;
 logic [63:0] dbg [N_DBG];
-logic [63:0] rx_move, rx_starve, rx_stall;
+logic [63:0] rx_move, rx_starve, rx_stall, rx_st_head, rx_st_body;
 
 // COMMIT/TRIGGER are edge-style: they fire on the write pulse itself
 // (ctrl_reg_wren), not on a stored value, so writing 1 twice fires twice
@@ -421,6 +425,7 @@ always_ff @(posedge aclk) begin
     if (!aresetn) begin
         for (int i = 0; i < N_DBG; i++) dbg[i] <= 0;
         rx_move <= 0; rx_starve <= 0; rx_stall <= 0;
+        rx_st_head <= 0; rx_st_body <= 0;
     end else begin
         if (push_store)   dbg[0] <= dbg[0] + 1;
         if (push_desc)    dbg[1] <= dbg[1] + 1;
@@ -435,6 +440,8 @@ always_ff @(posedge aclk) begin
         if (cnt_rx_move)   rx_move   <= rx_move + 1;
         if (cnt_rx_starve) rx_starve <= rx_starve + 1;
         if (cnt_rx_stall)  rx_stall  <= rx_stall + 1;
+        if (cnt_rx_stall_head) rx_st_head <= rx_st_head + 1;
+        if (cnt_rx_stall_body) rx_st_body <= rx_st_body + 1;
     end
 end
 
@@ -470,6 +477,10 @@ always_ff @(posedge aclk) begin
                     axi_rdata <= rx_starve;
                 else if (rd_idx == R_RX_STALL)
                     axi_rdata <= rx_stall;
+                else if (rd_idx == R_RX_ST_HEAD)
+                    axi_rdata <= rx_st_head;
+                else if (rd_idx == R_RX_ST_BODY)
+                    axi_rdata <= rx_st_body;
                 else if (rd_idx == R_CYC)
                     axi_rdata <= cycle_cnt;
                 else if (rd_idx == R_QUEUE_ACC)

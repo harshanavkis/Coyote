@@ -36,6 +36,8 @@ logic m_tready = 1;
 
 logic req, grant = 0, busy, cnt_rx_fwd, cnt_rx_drop;
 logic cnt_rx_move, cnt_rx_starve, cnt_rx_stall;
+logic cnt_rx_stall_head, cnt_rx_stall_body;
+int head_pulses = 0, body_pulses = 0;
 int move_pulses = 0, starve_pulses = 0, stall_pulses = 0;
 
 int errors = 0;
@@ -59,7 +61,9 @@ loom_rx dut (
     .req(req), .grant(grant), .busy(busy),
     .cnt_rx_fwd(cnt_rx_fwd), .cnt_rx_drop(cnt_rx_drop),
     .cnt_rx_move(cnt_rx_move), .cnt_rx_starve(cnt_rx_starve),
-    .cnt_rx_stall(cnt_rx_stall)
+    .cnt_rx_stall(cnt_rx_stall),
+    .cnt_rx_stall_head(cnt_rx_stall_head),
+    .cnt_rx_stall_body(cnt_rx_stall_body)
 );
 
 req_t wrq[$];
@@ -85,6 +89,8 @@ always @(posedge aclk) begin
     if (cnt_rx_move) move_pulses++;
     if (cnt_rx_starve) starve_pulses++;
     if (cnt_rx_stall) stall_pulses++;
+    if (cnt_rx_stall_head) head_pulses++;
+    if (cnt_rx_stall_body) body_pulses++;
 end
 
 // Print what the DUT actually issued: a framing bug shows up as the wrong
@@ -518,6 +524,27 @@ initial begin
     check(stall_pulses > 0,
           "accounting: stall fires when the host write path is not ready");
     check(outq.size() == 4, "accounting: all four beats still forwarded");
+    check(head_pulses + body_pulses == stall_pulses,
+          "accounting: head and body partition the stalls exactly");
+    // The stall above was applied AFTER beats had already moved, so it is
+    // body. A head stall is the shell withholding m_tready before the
+    // packet's first beat, which is the single-outstanding cost this is
+    // meant to expose.
+    check(body_pulses > 0 && head_pulses == 0,
+          $sformatf("accounting: a mid-packet stall counts as body (%0d head, %0d body)",
+                    head_pulses, body_pulses));
+    head_pulses = 0; body_pulses = 0; stall_pulses = 0;
+    outq.delete(); wrq.delete();
+    @(negedge aclk); m_tready = 0;                 // refuse before ANY beat
+    incoming(6'd1, 28'd128, TARGET, 1'b1);
+    send_msg_beat(64'hE0, 64'hE1, 64'hE2, 1'b0);
+    send_msg_beat(64'hF0, 64'hF1, 64'hF2, 1'b1);
+    repeat (8) @(posedge aclk);
+    @(negedge aclk); m_tready = 1;
+    wait_idle_to(400, "13b: head stall");
+    check(head_pulses > 0,
+          $sformatf("accounting: a stall before the first beat counts as head (%0d)",
+                    head_pulses));
 
     if (errors == 0) $display("TB PASS (tb_loom_rx)");
     else             $display("TB FAIL (tb_loom_rx): %0d errors", errors);
