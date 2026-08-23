@@ -483,9 +483,42 @@ int run_server(uint16_t qp_port, uint16_t peer_port, const std::string &sock) {
     // The importer's benchmark can spend seconds per size before it gives
     // up on one, so DONE has to outlast it rather than expire underneath
     const int done_secs = bench_mode() ? poll_secs() * 10 : poll_secs();
-    for (int i = 0; i < done_secs * 100 && peer.doneCount() < 1; i++)
+
+    // Time the receive path against its own clock while the importer runs.
+    // Above roughly 9 GB/s the offered rate outruns this side, the shell
+    // drops what it cannot deliver, and one drop turns every packet after it
+    // into a PSN mismatch - so what matters is how many cycles loom_rx spends
+    // per packet, measured HERE rather than inferred from the sender.
+    //
+    // The floor is structural: a PMTU packet is 4096 B = 64 beats, so 64
+    // cycles is the best any receiver can do. Landing near it means loom_rx
+    // is already at its limit and the ceiling belongs to something else (the
+    // host write path); landing well above it means the per-transaction cost
+    // - ST_IDLE, ST_WR_REQ, the arbiter handover, all paid per packet - is
+    // the ceiling, and pipelining it is the fix.
+    //
+    // Run with LOOM_BENCH_NO_STORES=1 to read this: the store phase forwards
+    // 64 B packets that cost one beat each, and mixing them in makes the
+    // cycles-per-packet figure meaningless.
+    uint64_t best_per_pkt = ~0ULL, busiest = 0;
+    uint64_t p_cyc = loom::csr_read(t_ctrl, loom::STG_CYC);
+    uint64_t p_fwd = loom::csr_read(t_ctrl, loom::DBG_BASE + 8 * 4);
+    for (int i = 0; i < done_secs * 100 && peer.doneCount() < 1; i++) {
         usleep(10000);
+        const uint64_t c = loom::csr_read(t_ctrl, loom::STG_CYC);
+        const uint64_t f = loom::csr_read(t_ctrl, loom::DBG_BASE + 8 * 4);
+        if (f > p_fwd && c > p_cyc && (f - p_fwd) >= 16) {
+            const uint64_t per = (c - p_cyc) / (f - p_fwd);
+            if (per < best_per_pkt) best_per_pkt = per;
+            if (f - p_fwd > busiest) busiest = f - p_fwd;
+        }
+        p_cyc = c; p_fwd = f;
+    }
     check(peer.doneCount() >= 1, "client DONE received");
+    if (bench_mode() && best_per_pkt != ~0ULL)
+        printf("receive path: %lu cycles per packet at peak (64 = the beat "
+               "floor for a 4096 B packet), busiest window %lu packets\n",
+               (unsigned long) best_per_pkt, (unsigned long) busiest);
 
     if (bench_mode()) {
         printf("\n== exporter check of the benchmark regions\n");
