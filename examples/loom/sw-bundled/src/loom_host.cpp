@@ -490,35 +490,54 @@ int run_server(uint16_t qp_port, uint16_t peer_port, const std::string &sock) {
     // into a PSN mismatch - so what matters is how many cycles loom_rx spends
     // per packet, measured HERE rather than inferred from the sender.
     //
+    // Sampling on a wall-clock tick does NOT measure this. A 32x64 KB phase
+    // is ~200 us end to end while any sane poll interval is milliseconds, so
+    // every window is almost entirely idle and the answer comes back as
+    // "interval / packets" - 31464 cycles per packet for a 64-beat packet,
+    // which is just 10 ms divided by 80. Bracket the ACTIVE phase instead:
+    // spin on the counters, stamp the cycle counter at the first packet and
+    // at the last, and divide by the packets actually forwarded between them.
+    // A CSR read is a PCIe round trip (~1 us), which bounds the edges but not
+    // the interior - over a 200 us phase that is about 1%.
+    //
     // The floor is structural: a PMTU packet is 4096 B = 64 beats, so 64
-    // cycles is the best any receiver can do. Landing near it means loom_rx
-    // is already at its limit and the ceiling belongs to something else (the
-    // host write path); landing well above it means the per-transaction cost
-    // - ST_IDLE, ST_WR_REQ, the arbiter handover, all paid per packet - is
-    // the ceiling, and pipelining it is the fix.
+    // cycles is the best any receiver can do. Near it, loom_rx is at its
+    // limit and the ceiling belongs to the host write path; well above it,
+    // the per-transaction cost - ST_IDLE, ST_WR_REQ, the arbiter handover,
+    // paid per packet - is the ceiling and pipelining loom_rx is the fix.
     //
     // Run with LOOM_BENCH_NO_STORES=1 to read this: the store phase forwards
     // 64 B packets that cost one beat each, and mixing them in makes the
     // cycles-per-packet figure meaningless.
-    uint64_t best_per_pkt = ~0ULL, busiest = 0;
-    uint64_t p_cyc = loom::csr_read(t_ctrl, loom::STG_CYC);
-    uint64_t p_fwd = loom::csr_read(t_ctrl, loom::DBG_BASE + 8 * 4);
-    for (int i = 0; i < done_secs * 100 && peer.doneCount() < 1; i++) {
-        usleep(10000);
-        const uint64_t c = loom::csr_read(t_ctrl, loom::STG_CYC);
+    uint64_t c_first = 0, c_last = 0, f_first = 0, f_last = 0;
+    bool started = false;
+    int idle_polls = 0;
+    const uint64_t f0 = loom::csr_read(t_ctrl, loom::DBG_BASE + 8 * 4);
+    for (int i = 0; i < done_secs * 1000000 && peer.doneCount() < 1; i++) {
         const uint64_t f = loom::csr_read(t_ctrl, loom::DBG_BASE + 8 * 4);
-        if (f > p_fwd && c > p_cyc && (f - p_fwd) >= 16) {
-            const uint64_t per = (c - p_cyc) / (f - p_fwd);
-            if (per < best_per_pkt) best_per_pkt = per;
-            if (f - p_fwd > busiest) busiest = f - p_fwd;
+        if (!started) {
+            if (f != f0) {          // first packet of the phase
+                c_first = loom::csr_read(t_ctrl, loom::STG_CYC);
+                f_first = f;
+                started = true;
+            }
+        } else if (f != f_last) {   // still moving
+            c_last = loom::csr_read(t_ctrl, loom::STG_CYC);
+            f_last = f;
+            idle_polls = 0;
+        } else if (++idle_polls > 200000) {
+            break;                  // phase over, stop burning PCIe reads
         }
-        p_cyc = c; p_fwd = f;
+        if (!started) f_last = f;
     }
     check(peer.doneCount() >= 1, "client DONE received");
-    if (bench_mode() && best_per_pkt != ~0ULL)
-        printf("receive path: %lu cycles per packet at peak (64 = the beat "
-               "floor for a 4096 B packet), busiest window %lu packets\n",
-               (unsigned long) best_per_pkt, (unsigned long) busiest);
+    if (bench_mode() && f_last > f_first && c_last > c_first)
+        printf("receive path: %lu cycles per packet over the active phase "
+               "(%lu packets, %lu cycles; 64 = the beat floor for a 4096 B "
+               "packet)\n",
+               (unsigned long) ((c_last - c_first) / (f_last - f_first)),
+               (unsigned long) (f_last - f_first),
+               (unsigned long) (c_last - c_first));
 
     if (bench_mode()) {
         printf("\n== exporter check of the benchmark regions\n");
