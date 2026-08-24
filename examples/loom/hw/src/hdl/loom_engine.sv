@@ -125,6 +125,17 @@ module loom_engine (
     output logic [63:0]                 stage_acc [7],
     output logic [63:0]                 stage_cnt [7],
 
+    // Where the transmit stream's cycles go, mirroring loom_rx's. The engine
+    // is a pass-through in ST_STREAM: a beat moves only when the host pull
+    // has one AND the network takes it, so a cycle is spent one of three
+    // ways. cyc/op alone cannot tell them apart, and they have opposite
+    // meanings - starved is a gap WE put into the outgoing packet stream
+    // because the pull ran dry; stalled is the shell pushing back, which is
+    // the fabric working as intended.
+    output logic                        cnt_tx_move,
+    output logic                        cnt_tx_starve,
+    output logic                        cnt_tx_stall,
+
     output logic                        busy
 );
 
@@ -514,6 +525,20 @@ end
 // -------------------------------------------------------------------------
 assign rd_resp_data  = rd_data;
 assign rd_resp_valid = (state == ST_RD_RESP);
+
+// Only the rdma route: the local route's beats never reach a wire, and
+// mixing them in makes the figure unreadable the same way the store phase
+// did on the receive side.
+// The header beat counts too - it is a beat on the same wire, and waiting
+// to place it is the same stall as waiting to place payload. It can never
+// be starved: it is generated here, not pulled.
+wire tx_stream = (state == ST_STREAM)   && l_route;
+wire tx_hdr    = (state == ST_HDR_BEAT);
+assign cnt_tx_move   = (tx_hdr    &&  m_net_tready) ||
+                       (tx_stream &&  s_tvalid && m_net_tready);
+assign cnt_tx_starve =  tx_stream && !s_tvalid;
+assign cnt_tx_stall  = (tx_hdr    && !m_net_tready) ||
+                       (tx_stream &&  s_tvalid && !m_net_tready);
 
 assign cnt_drop     = (state == ST_CHECK) && !ok;
 assign cnt_local_wr = ((state == ST_WR_DATA) && !l_route && m_host_tready) ||

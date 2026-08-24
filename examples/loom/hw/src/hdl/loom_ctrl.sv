@@ -110,6 +110,9 @@ module loom_ctrl (
     input  logic                        cnt_rx_move,
     input  logic                        cnt_rx_starve,
     input  logic                        cnt_rx_stall,
+    input  logic                        cnt_tx_move,
+    input  logic                        cnt_tx_starve,
+    input  logic                        cnt_tx_stall,
     input  logic                        cnt_rx_stall_head,
     input  logic                        cnt_rx_stall_body,
     input  logic                        cnt_rx_req,
@@ -156,10 +159,19 @@ localparam integer N_DBG         = 10;
 localparam integer R_RX_MOVE     = 42;
 localparam integer R_RX_STARVE   = 43;
 localparam integer R_RX_STALL    = 44;
+// Transmit-side counterpart (RO 17-19; 45-47 are the RX stall split and the
+// request count). starved says the host pull left a gap in the outgoing
+// packet stream - a gap WE created; stalled says the shell pushed back,
+// which is the fabric behaving. cyc/op cannot tell those apart and they
+// have opposite fixes.
+localparam integer R_TX_MOVE     = 17;
+localparam integer R_TX_STARVE   = 18;
+localparam integer R_TX_STALL    = 19;
 localparam integer R_RX_ST_HEAD  = 45;   // stalled before the packet's first beat
 localparam integer R_RX_ST_BODY  = 46;   // stalled after it
 localparam integer R_RX_REQ      = 47;   // rq_wr requests accepted
-localparam integer R_RX_SPAN     = 17;   // continuation requests absorbed
+localparam integer R_RX_SPAN     = 20;   // continuation requests absorbed
+                                         // (17-19 are the TX cycle split)
 localparam integer R_CYC         = 48;
 localparam integer R_QUEUE_ACC   = 49;
 localparam integer R_STG_ACC     = 50;   // 7 words: 50-56
@@ -241,6 +253,7 @@ logic [63:0] r_dma_dst, r_dma_src_va, r_dma_len, r_dma_src_pid, r_dma_compl_va;
 logic [63:0] r_rdma_staging;
 logic [63:0] dbg [N_DBG];
 logic [63:0] rx_move, rx_starve, rx_stall, rx_st_head, rx_st_body, rx_req_cnt;
+logic [63:0] tx_move, tx_starve, tx_stall;
 logic [63:0] rx_span_cnt;
 
 // COMMIT/TRIGGER are edge-style: they fire on the write pulse itself
@@ -430,6 +443,7 @@ always_ff @(posedge aclk) begin
     if (!aresetn) begin
         for (int i = 0; i < N_DBG; i++) dbg[i] <= 0;
         rx_move <= 0; rx_starve <= 0; rx_stall <= 0;
+        tx_move <= 0; tx_starve <= 0; tx_stall <= 0;
         rx_st_head <= 0; rx_st_body <= 0; rx_req_cnt <= 0; rx_span_cnt <= 0;
     end else begin
         if (push_store)   dbg[0] <= dbg[0] + 1;
@@ -442,6 +456,9 @@ always_ff @(posedge aclk) begin
         if (cnt_compl)    dbg[7] <= dbg[7] + 1;
         if (push_read)    dbg[8] <= dbg[8] + 1;
         if (cnt_rx_drop)  dbg[9] <= dbg[9] + 1;
+        if (cnt_tx_move)   tx_move   <= tx_move + 1;
+        if (cnt_tx_starve) tx_starve <= tx_starve + 1;
+        if (cnt_tx_stall)  tx_stall  <= tx_stall + 1;
         if (cnt_rx_move)   rx_move   <= rx_move + 1;
         if (cnt_rx_starve) rx_starve <= rx_starve + 1;
         if (cnt_rx_stall)  rx_stall  <= rx_stall + 1;
@@ -492,6 +509,12 @@ always_ff @(posedge aclk) begin
                     axi_rdata <= rx_span_cnt;
                 else if (rd_idx == R_RX_REQ)
                     axi_rdata <= rx_req_cnt;
+                else if (rd_idx == R_TX_MOVE)
+                    axi_rdata <= tx_move;
+                else if (rd_idx == R_TX_STARVE)
+                    axi_rdata <= tx_starve;
+                else if (rd_idx == R_TX_STALL)
+                    axi_rdata <= tx_stall;
                 else if (rd_idx == R_CYC)
                     axi_rdata <= cycle_cnt;
                 else if (rd_idx == R_QUEUE_ACC)

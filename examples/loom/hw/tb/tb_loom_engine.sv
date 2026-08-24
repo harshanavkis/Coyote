@@ -63,6 +63,8 @@ logic [AXI_DATA_BITS-1:0]   m_host_tdata, m_net_tdata;
 logic [AXI_DATA_BITS/8-1:0] m_host_tkeep, m_net_tkeep;
 logic m_host_tvalid, m_net_tvalid, m_host_tlast, m_net_tlast;
 logic m_host_tready = 1, m_net_tready = 1;
+logic cnt_tx_move, cnt_tx_starve, cnt_tx_stall;
+int tx_move = 0, tx_starve = 0, tx_stall = 0;
 logic busy;
 
 int errors = 0;
@@ -118,6 +120,8 @@ loom_engine inst_engine (
     .cnt_local_wr(cnt_local_wr), .cnt_rdma_wr(cnt_rdma_wr),
     .cnt_drop(cnt_drop), .cnt_compl(cnt_compl),
     .stage_acc(stage_acc), .stage_cnt(stage_cnt),
+    .cnt_tx_move(cnt_tx_move), .cnt_tx_starve(cnt_tx_starve),
+    .cnt_tx_stall(cnt_tx_stall),
     .busy(busy)
 );
 
@@ -133,6 +137,9 @@ always @(posedge aclk) begin
     if (m_host_tvalid && m_host_tready)
         hostq.push_back('{data: m_host_tdata[63:0], q1: m_host_tdata[127:64],
                           q2: m_host_tdata[191:128], last: m_host_tlast});
+    if (cnt_tx_move) tx_move++;
+    if (cnt_tx_starve) tx_starve++;
+    if (cnt_tx_stall) tx_stall++;
     if (m_net_tvalid && m_net_tready)
         netq.push_back('{data: m_net_tdata[63:0], q1: m_net_tdata[127:64],
                           q2: m_net_tdata[191:128], last: m_net_tlast});
@@ -600,6 +607,40 @@ initial begin
         axil_read(16'(62 * 8), a0);
         check(v == a0, "stage: reads captured == reads answered");
     end
+
+    // --- Transmit-side cycle accounting. The engine is a pass-through in
+    //     ST_STREAM, so every rdma cycle is moving, starved (the host pull
+    //     had no beat - a gap WE put on the wire) or stalled (the shell
+    //     pushed back). cyc/op cannot separate those and they have opposite
+    //     fixes, which is why hardware could say the engine runs at line
+    //     rate without saying whether that was healthy.
+    tx_move = 0; tx_starve = 0; tx_stall = 0;
+    netq.delete();
+    m_net_tready = 0;                                  // refuse the network
+    descriptor(4'd2, 28'h800, {16'b0, SRC_VA}, 28'd256, 6'd0);
+    fork send_beats(4, 64'hE000); join_none
+    repeat (20) @(posedge aclk);
+    check(tx_stall > 0, "tx accounting: stall fires when the net refuses");
+    check(tx_move == 0, "tx accounting: nothing moved while refused");
+    @(negedge aclk); m_net_tready = 1;
+    wait_idle();
+    // header beat + 4 payload beats
+    check(tx_move == 5,
+          $sformatf("tx accounting: one move per beat sent (%0d of 5)", tx_move));
+    check(tx_starve > 0,
+          "tx accounting: starve fires while the pull has not delivered");
+    netq.delete();
+
+    // Local route must not appear in these at all - its beats never reach a
+    // wire, and counting them makes the figure unreadable
+    tx_move = 0; tx_starve = 0; tx_stall = 0;
+    descriptor(4'd1, 28'h900, {16'b0, SRC_VA}, 28'd256, 6'd2);
+    fork send_beats(4, 64'hE100); join_none
+    wait_idle();
+    check(tx_move == 0 && tx_starve == 0 && tx_stall == 0,
+          $sformatf("tx accounting: local route excluded (%0d/%0d/%0d)",
+                    tx_move, tx_starve, tx_stall));
+    hostq.delete(); netq.delete(); wrq.delete(); rdq.delete();
 
     if (errors == 0) $display("TB PASS (tb_loom_engine)");
     else             $display("TB FAIL (tb_loom_engine): %0d errors", errors);

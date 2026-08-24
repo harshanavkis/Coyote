@@ -55,6 +55,15 @@ constexpr uint32_t DBG_BASE    = 0x100;  // 10 x RO counters (see loom_ctrl.sv)
 // packet and then a PSN storm. The FSM itself costs ~6 cycles per packet
 // against 64 beats of data, so a per-packet cost far above the 64-cycle
 // floor is stall, not overhead - these say which side to fix.
+// Transmit-side cycle accounting (RO words 17-19, loom_engine). Same three
+// buckets as the receive side, for the rdma route only. starved means the
+// host pull left a gap in the outgoing packet stream - a gap Loom created;
+// stalled means the shell pushed back, which is the fabric behaving. The
+// engine's cyc/op cannot tell those apart, and they have opposite fixes.
+constexpr uint32_t TX_MOVE       = 0x88;
+constexpr uint32_t TX_STARVE     = 0x90;
+constexpr uint32_t TX_STALL      = 0x98;
+
 constexpr uint32_t RX_MOVE       = 0x150;
 constexpr uint32_t RX_STARVE     = 0x158;
 constexpr uint32_t RX_STALL      = 0x160;
@@ -75,7 +84,7 @@ constexpr uint32_t RX_REQ        = 0x178;
 // swallowed rather than becoming transactions. Expect, per bulk message,
 // ceil((len + 64) / PMTU) - 1. Anything else means the receive side is
 // pairing requests with payload differently than the sender framed it.
-constexpr uint32_t RX_SPAN       = 0x88;
+constexpr uint32_t RX_SPAN       = 0xA0;
 
 constexpr uint32_t STG_CYC       = 0x180;  // free-running cycle counter
 constexpr uint32_t STG_QUEUE_ACC = 0x188;  // order-FIFO residency sum (t-queue)
