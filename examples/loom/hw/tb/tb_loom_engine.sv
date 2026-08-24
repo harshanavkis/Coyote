@@ -321,15 +321,29 @@ initial begin
     check(wrq.size() == 2, "dma rdma: dma wr_req + completion wr_req");
     if (wrq.size() == 2) begin
         r = wrq.pop_front();
+        // Bulk is a WRITE message now, not a direct write: staging-addressed
+        // like a store, and 64 B longer for the header it carries. The true
+        // target moved out of the RETH and into that header, which is what
+        // lets the far side issue one host write for the whole message
+        // rather than one per PMTU packet.
         check(r.opcode == APP_WRITE && r.strm == STRM_RDMA && r.pid == 6'd3 &&
-              r.vaddr == BASE_C + 48'h200 && r.len == 128 && r.remote,
-              "dma rdma: DIRECT write, RETH = true target");
+              r.vaddr == STAGING && r.len == 128 + 64 && r.remote,
+              "dma rdma: WRITE message at staging, len includes the header");
         r = wrq.pop_front();
         check(r.vaddr == CPL_VA, "dma rdma: completion wr_req");
     end else wrq.delete();
-    check(netq.size() == 2 && netq[0].data == 64'hBB00 &&
-          netq[1].data == 64'hBB01 && netq[1].last,
-          "dma rdma: raw payload beats, no framing");
+    // header beat first: {op 1, len} in lane 0, target VA in lane 1
+    check(netq.size() == 3, $sformatf("dma rdma: header + 2 payload beats (%0d)",
+                                      netq.size()));
+    if (netq.size() == 3) begin
+        check(netq[0].data == {28'b0, 28'd128, 8'd1} && !netq[0].last,
+              "dma rdma: header beat carries op 1 and the payload length");
+        check(netq[0].q1 == {16'b0, BASE_C + 48'h200},
+              "dma rdma: header beat carries the true target VA");
+        check(netq[1].data == 64'hBB00 && !netq[1].last &&
+              netq[2].data == 64'hBB01 && netq[2].last,
+              "dma rdma: payload beats follow the header unchanged");
+    end
     netq.delete();
     check(hostq.size() == 1 && hostq[0].data == 64'd2, "dma rdma: completion value 2");
     hostq.delete();

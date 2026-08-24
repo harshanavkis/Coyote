@@ -151,7 +151,7 @@ module loom_engine (
 // coalescer and per-destination scheduling).
 typedef enum logic [3:0] {
     ST_IDLE, ST_CHECK, ST_WR_REQ, ST_WR_DATA,
-    ST_RD_REQ, ST_DMA_WR_REQ, ST_STREAM,
+    ST_RD_REQ, ST_DMA_WR_REQ, ST_HDR_BEAT, ST_STREAM,
     ST_CP_REQ, ST_CP_DATA,
     ST_RDP_REQ, ST_RDP_WAIT, ST_RD_RESP
 } state_t;
@@ -291,7 +291,16 @@ always_ff @(posedge aclk) begin
 
             // ---- DESC: pull request, write request, stream, fence ----
             ST_RD_REQ:    if (rd_ready) state <= ST_DMA_WR_REQ;
-            ST_DMA_WR_REQ: if (wr_ready) state <= ST_STREAM;
+            // Rdma bulk now travels as a WRITE message: a header beat
+            // carrying {op 1, len} + the target VA, then the payload. The
+            // far side takes the destination and the LENGTH from that
+            // header, so it can issue ONE host write for the whole message
+            // instead of one per PMTU packet - which is what the receive
+            // path was doing, 256 of them for a 1 MB transfer. Local route
+            // is untouched: it writes host memory directly, no wire, no
+            // header.
+            ST_DMA_WR_REQ: if (wr_ready) state <= l_route ? ST_HDR_BEAT : ST_STREAM;
+            ST_HDR_BEAT:   if (m_net_tready) state <= ST_STREAM;
             ST_STREAM:
                 if (s_tvalid &&
                     (( l_route && m_net_tready) || (!l_route && m_host_tready))) begin
@@ -406,8 +415,11 @@ always_comb begin
         wr_req.pid    = l_pid;       // QP owner
         // Bulk goes DIRECT (RETH = true target); only sub-64 B stores
         // use the staging-addressed inline message envelope
-        wr_req.vaddr  = l_is_desc ? dst_vaddr : rdma_staging_va;
-        wr_req.len    = l_is_desc ? l_len[LEN_BITS-1:0] : 'd64;
+        // Both forms are messages at the staging vaddr now; the header
+        // carries the true target. Bulk adds one 64 B header beat to the
+        // length it claims.
+        wr_req.vaddr  = rdma_staging_va;
+        wr_req.len    = l_is_desc ? (l_len[LEN_BITS-1:0] + 'd64) : 'd64;
     end else begin
         // Local route: a host-memory write through the shell TLB. pid
         // names the DESTINATION process's address space (the exporter's
@@ -432,6 +444,12 @@ wire [63:0] hdr_q1        = {{(64-VADDR_BITS){1'b0}}, dst_vaddr};
 
 wire [AXI_DATA_BITS-1:0] msg_inline_beat =
     {{(AXI_DATA_BITS-192){1'b0}}, l_payload, hdr_q1, hdr_q0_inline};
+
+// Bulk header: same layout, op 1, and the length is the payload's - lane 2
+// is unused because the data follows as its own beats
+wire [63:0] hdr_q0_write = {28'b0, l_len, MSG_OP_WRITE};
+wire [AXI_DATA_BITS-1:0] msg_write_beat =
+    {{(AXI_DATA_BITS-192){1'b0}}, 64'b0, hdr_q1, hdr_q0_write};
 
 // -------------------------------------------------------------------------
 // Data streams
@@ -475,10 +493,12 @@ always_comb begin
     // Net output: inline message beat (rdma store) or forwarded DMA
     // beats (rdma bulk, raw payload). The message beat is a full 64 B
     // (keep all ones) - nothing sub-beat ever goes on the wire
-    m_net_tdata  = (state == ST_WR_DATA) ? msg_inline_beat : s_tdata;
+    m_net_tdata  = (state == ST_WR_DATA)  ? msg_inline_beat :
+                   (state == ST_HDR_BEAT) ? msg_write_beat  : s_tdata;
     m_net_tkeep  = stream_net ? s_tkeep : {(AXI_DATA_BITS/8){1'b1}};
     m_net_tlast  = stream_net ? stream_last : (state == ST_WR_DATA);
     m_net_tvalid = ((state == ST_WR_DATA) && l_route) ||
+                   (state == ST_HDR_BEAT) ||
                    (stream_net && s_tvalid);
 end
 

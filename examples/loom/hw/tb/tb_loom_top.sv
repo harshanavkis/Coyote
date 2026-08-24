@@ -364,11 +364,13 @@ initial begin
         host_before = host_beats;
         descriptor_compl(4'd3, 28'h1000, 28'd256, {16'b0, BASE_B + 48'h3000});
         wait_quiesce();
-        check(net_beats == net_before + 4,
-              "T7: rdma bulk streamed its 4 beats to the net");
+        // 4 payload beats + the WRITE message's header beat
+        check(net_beats == net_before + 5,
+              "T7: rdma bulk streamed a header beat + its 4 payload beats");
         check(host_beats == host_before + 1, "T7: fence beat went to the host");
+        // staging-addressed like a store now, and 64 B longer for the header
         check(wrq.size() == 2 && wrq[0].strm == STRM_RDMA &&
-              wrq[0].vaddr == BASE_B + 48'h1000 && wrq[0].len == 256 &&
+              wrq[0].vaddr == STAGING_VA && wrq[0].len == 256 + 64 &&
               wrq[1].strm == STRM_HOST && wrq[1].len == 8,
               "T7: bulk request goes out rdma, fence stays local");
     end

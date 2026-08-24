@@ -755,6 +755,21 @@ initial begin
     tlast_per_pkt = 0;
     end
 
+    // --- one host write per MESSAGE, not per packet. This is the entire
+    //     point of carrying the target VA in a Loom header rather than the
+    //     RETH: 64 KB is 17 PMTU packets on the wire, and the receive path
+    //     used to issue a host write for every one of them. The far side
+    //     now takes the destination and the full length from the header and
+    //     issues ONE, spanning the packets underneath it.
+    fwd_before = rx_txns;
+    copy(4'd1, 28'h90000, {16'b0, SRC_VA}, 28'd65536, {16'b0, CPL_VA});
+    settle();
+    check_payload(BASE1 + 48'h90000, 8192,
+                  "64 KB message spanning 17 packets lands intact");
+    check(rx_txns - fwd_before == 1,
+          $sformatf("64 KB landed as ONE host write, not per packet (%0d)",
+                    rx_txns - fwd_before));
+
     check(rx_drop === 1'b0, "no header was ever rejected on the far side");
 
     // The engine must have delivered exactly what its requests claimed

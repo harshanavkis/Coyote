@@ -124,7 +124,14 @@ logic [VADDR_BITS-1:0] l_va;
 logic [63:0]           l_inline;
 logic [22:0]           l_beats;      // beats of this request still on the stream
 logic                  l_moved;      // this transaction has had at least one beat
+// A WRITE message (op 1) is ONE logical write that may span several PMTU
+// packets, so its beat budget comes from the HEADER's length, not from the
+// request's, and the intermediate rq_wr's and tlasts belong to packets
+// rather than to the transaction. This is what lets the receive path issue
+// one host write per message instead of one per packet.
 logic                  l_req_last;   // shell will terminate this stream with tlast
+logic                  l_span;       // op-1 message: budget from the header
+logic [22:0]           l_rbeats;     // beats left in the CURRENT request
 
 // Where a transaction ends is decided by the REQUEST's length, not by
 // tlast. rq_wr.last is low whenever the shell ends the stream WITHOUT a
@@ -153,7 +160,10 @@ endfunction
 // parks in ST_WR_REQ - which is exactly how the two-host run wedged, with
 // rx_fwd frozen at 17 of 26 and nothing rejected. The count is used ONLY
 // where there is no tlast to wait for, and to bound the drain.
-wire stream_end = l_req_last ? s_tlast : (l_beats <= 23'd1);
+// A spanning message ends where its header said it would and nowhere else:
+// the tlast at every intermediate packet boundary is not its boundary.
+wire stream_end = l_span ? (l_beats <= 23'd1)
+                         : (l_req_last ? s_tlast : (l_beats <= 23'd1));
 
 // Header contract. The exporter hands the parsed target straight to the
 // shell TLB under the QP owner's pid, so a header this side does not
@@ -173,7 +183,17 @@ wire hdr_ok = (s_tdata[63:36] == 28'b0) &&
 
 // Accept a request only when granted, so a transaction never starts while
 // the engine owns the shared write path
-assign rq_ready = (state == ST_IDLE) && grant;
+// While a message spans packets its later rq_wr's carry nothing this module
+// needs - the header already said where the data goes and how much there is -
+// but they must still be taken off the interface or the shell's request path
+// backs up behind a transaction that is deliberately ignoring it.
+// A spanning message consumes several requests, but ONLY its own: take the
+// next one exactly when the current request's beats are spent and the header
+// still owes payload. Accepting indiscriminately swallows whatever transaction
+// happens to be queued behind it - the store after a bulk, in practice.
+assign rq_ready = ((state == ST_IDLE) && grant) ||
+                  (l_span && (state == ST_STREAM) &&
+                   (l_rbeats == 23'd0) && (l_beats != 23'd0));
 assign req      = rq_valid || (state != ST_IDLE);
 assign busy     = (state != ST_IDLE);
 
@@ -181,13 +201,16 @@ always_ff @(posedge aclk) begin
     if (!aresetn) begin
         state <= ST_IDLE;
         l_pid <= 0; l_op <= 0; l_len <= 0; l_va <= 0; l_inline <= 0;
-        l_beats <= 0; l_req_last <= 1'b1; l_moved <= 1'b0;
+        l_beats <= 0; l_req_last <= 1'b1; l_moved <= 1'b0; l_span <= 1'b0;
+        l_rbeats <= 0;
     end else begin
         case (state)
             ST_IDLE: if (rq_valid && grant) begin
                 l_moved    <= 1'b0;
+                l_span     <= 1'b0;
                 l_pid      <= rq_req.pid;
                 l_beats     <= beats_of(rq_req.len[27:0]);
+                l_rbeats    <= beats_of(rq_req.len[27:0]);
                 l_req_last  <= rq_req.last;
                 if (rq_req.vaddr[VADDR_BITS-1:0] == rdma_staging_va) begin
                     state <= ST_HDR;             // Loom message: parse
@@ -207,7 +230,16 @@ always_ff @(posedge aclk) begin
                 l_len    <= s_tdata[35:8];
                 l_va     <= s_tdata[64 +: VADDR_BITS];
                 l_inline <= s_tdata[128 +: 64];
-                l_beats  <= l_beats - 23'd1;
+                // op 1 spans packets: take the budget from the header and
+                // stop counting the request's. op 2 is one beat and cannot
+                // span, so it keeps the request's accounting.
+                if (s_tdata[7:0] == MSG_OP_WRITE) begin
+                    l_beats <= beats_of(s_tdata[35:8]);
+                    l_span  <= 1'b1;
+                end else begin
+                    l_beats <= l_beats - 23'd1;
+                end
+                l_rbeats <= l_rbeats - 23'd1;      // the header beat
                 if (hdr_ok)
                     state <= ST_WR_REQ;
                 else
@@ -227,10 +259,17 @@ always_ff @(posedge aclk) begin
                 state <= (l_beats != 0) ? ST_DRAIN : ST_IDLE;
 
             // Forward the remaining payload beats
-            ST_STREAM: if (s_tvalid && m_tready) begin
-                l_moved <= 1'b1;
-                l_beats <= l_beats - 23'd1;
-                if (stream_end) state <= ST_IDLE;
+            // s_tready is withheld while a spanning message is between
+            // requests, so taking a beat and taking a request never collide
+            ST_STREAM: begin
+                if (rq_valid && rq_ready)
+                    l_rbeats <= beats_of(rq_req.len[27:0]);
+                if (s_tvalid && m_tready) begin
+                    l_moved  <= 1'b1;
+                    l_beats  <= l_beats  - 23'd1;
+                    l_rbeats <= l_rbeats - 23'd1;
+                    if (stream_end) state <= ST_IDLE;
+                end
             end
 
             ST_DRAIN: if (s_tvalid) begin
@@ -258,8 +297,11 @@ end
 
 always_comb begin
     // Consume the incoming stream while parsing, forwarding, or draining
+    // Hold the payload off while a spanning message waits for its next
+    // request: those beats belong to a request this module has not taken yet
     s_tready = (state == ST_HDR) || (state == ST_DRAIN) ||
-               ((state == ST_STREAM) && m_tready);
+               ((state == ST_STREAM) && m_tready &&
+                (!l_span || (l_rbeats != 23'd0)));
 
     if (state == ST_INLINE_DATA) begin
         // Constructed beat: exact-length write, data LSB-aligned
