@@ -95,6 +95,7 @@ module loom_ctrl (
 
     // RDMA staging VA (to loom_engine): RETH vaddr for outgoing messages
     output logic [VADDR_BITS-1:0]       rdma_staging_va,
+    output logic [PID_BITS-1:0]         rx_pid,
 
     // Read response (from loom_engine): completes the held-open AXI read
     input  logic [63:0]                 rd_resp_data,
@@ -149,6 +150,10 @@ localparam integer R_DMA_COMPL_VA = 13;
 // a line boundary, so from here only a write to this register can reach it,
 // and the rest of its line (17-23) is unused.
 localparam integer R_RDMA_STAGING = 16;
+// Whose address space incoming rdma writes land in. The QP owner's cThread
+// is fixed for the connection, so this is written once at QP setup and the
+// receive path never has to read it off a request.
+localparam integer R_RX_PID      = 21;
 localparam integer R_DBG_BASE    = 32;
 localparam integer N_DBG         = 10;
 // Receive-path cycle accounting (RO 42-44). Words 42-47 were unused; these
@@ -251,6 +256,7 @@ wire [CSR_BITS-1:0] rd_idx = axi_araddr[ADDR_LSB +: CSR_BITS];
 logic [63:0] r_tbl_idx, r_tbl_cfg, r_tbl_pid, r_tbl_base, r_tbl_len;
 logic [63:0] r_dma_dst, r_dma_src_va, r_dma_len, r_dma_src_pid, r_dma_compl_va;
 logic [63:0] r_rdma_staging;
+logic [63:0] r_rx_pid;
 logic [63:0] dbg [N_DBG];
 logic [63:0] rx_move, rx_starve, rx_stall, rx_st_head, rx_st_body, rx_req_cnt;
 logic [63:0] tx_move, tx_starve, tx_stall;
@@ -271,7 +277,7 @@ always_ff @(posedge aclk) begin
     if (!aresetn) begin
         r_tbl_idx <= 0; r_tbl_cfg <= 0; r_tbl_pid <= 0; r_tbl_base <= 0; r_tbl_len <= 0;
         r_dma_dst <= 0; r_dma_src_va <= 0; r_dma_len <= 0; r_dma_src_pid <= 0;
-        r_dma_compl_va <= 0; r_rdma_staging <= 0;
+        r_dma_compl_va <= 0; r_rdma_staging <= 0; r_rx_pid <= 0;
     end else if (csr_wr) begin
         case (wr_idx)
             R_TBL_IDX:     r_tbl_idx     <= axi_ctrl.wdata;
@@ -285,6 +291,7 @@ always_ff @(posedge aclk) begin
             R_DMA_SRC_PID: r_dma_src_pid <= axi_ctrl.wdata;
             R_DMA_COMPL_VA: r_dma_compl_va <= axi_ctrl.wdata;
             R_RDMA_STAGING: r_rdma_staging <= axi_ctrl.wdata;
+            R_RX_PID: r_rx_pid <= axi_ctrl.wdata;
             default: ;
         endcase
     end
@@ -298,6 +305,7 @@ assign tbl_pid    = r_tbl_pid[PID_BITS-1:0];
 assign tbl_base   = r_tbl_base[VADDR_BITS-1:0];
 assign tbl_len    = r_tbl_len[LEN_BITS-1:0];
 assign rdma_staging_va = r_rdma_staging[VADDR_BITS-1:0];
+assign rx_pid          = r_rx_pid[PID_BITS-1:0];
 
 // -------------------------------------------------------------------------
 // Order FIFO - the ordering heart of the design
@@ -492,6 +500,7 @@ always_ff @(posedge aclk) begin
             R_DMA_SRC_PID: axi_rdata <= r_dma_src_pid;
             R_DMA_COMPL_VA: axi_rdata <= r_dma_compl_va;
             R_RDMA_STAGING: axi_rdata <= r_rdma_staging;
+            R_RX_PID:      axi_rdata <= r_rx_pid;
             default:
                 if (rd_idx >= R_DBG_BASE && rd_idx < R_DBG_BASE + N_DBG)
                     axi_rdata <= dbg[rd_idx - R_DBG_BASE];

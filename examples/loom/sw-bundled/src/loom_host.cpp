@@ -427,6 +427,12 @@ int run_server(uint16_t qp_port, uint16_t peer_port, const std::string &sock) {
     // loom_rx recognizes wire messages by RETH == staging
     loom::set_rdma_staging(t_ctrl, staging);
 
+    // Whose address space incoming writes land in. loom_rx no longer reads a
+    // pid off each request - it drains rq_wr without inspecting it, the way
+    // jigsaw's controller does - so the QP owner's ctid is programmed once
+    // here. It is fixed for the life of the connection.
+    loom::set_rx_pid(t_ctrl, t_data.getCtid());
+
     // Exporter role: two destination segments under the QP owner's ctid
     auto *dst1 = static_cast<uint64_t *>(
         t_data.getMem({coyote::CoyoteAllocType::HPF, BUF_SIZE}));

@@ -48,12 +48,16 @@ int drop_pulses = 0;
 
 localparam [7:0] OP_WR = 8'd1, OP_INL = 8'd2;
 localparam [47:0] STAGING = 48'h7f00_0000_0000;
+// Incoming writes land under the QP owner's pid, which is a CSR now rather
+// than a field of each request - jigsaw's controller uses a configured pid
+// the same way, and it is fixed for the life of the connection.
+localparam [PID_BITS-1:0] RX_PID = 6'd2;
 localparam [47:0] TARGET  = 48'h7f9e_8860_0000;
 
 loom_rx dut (
     .aclk(aclk), .aresetn(aresetn),
     .rq_req(rq_req), .rq_valid(rq_valid), .rq_ready(rq_ready),
-    .rdma_staging_va(STAGING),
+    .rdma_staging_va(STAGING), .rx_pid(RX_PID),
     .wr_req(wr_req), .wr_valid(wr_valid), .wr_ready(wr_ready),
     .s_tdata(s_tdata), .s_tkeep(s_tkeep), .s_tvalid(s_tvalid),
     .s_tready(s_tready), .s_tlast(s_tlast),
@@ -169,8 +173,14 @@ task drain_beats(input int cycles, input string what);
 endtask
 
 task wait_idle();
-    do @(posedge aclk); while (busy);
-    repeat (2) @(posedge aclk);
+    int n;
+    n = 0;
+    // A transaction is started by a BEAT now, not by a request, so busy can
+    // still be low when this is called - waiting on it alone returns before
+    // the DUT has even looked at the stream. Wait for the beats to be taken
+    // and the transaction to finish.
+    while (n < 2000 && (sq.size() > 0 || busy)) begin @(posedge aclk); n++; end
+    repeat (4) @(posedge aclk);
 endtask
 
 // Bounded wait_idle: a framing bug parks the DUT in a stream state waiting
@@ -243,11 +253,19 @@ initial begin
     aresetn = 1;
     repeat (2) @(negedge aclk);
 
-    // --- 1. No grant, no acceptance ---
+    // --- 1. Requests are drained, not obeyed; a header beat is what starts
+    //     a transaction, and it still needs the grant first ---
     @(negedge aclk); rq_valid = 1; rq_req.pid = 6'd0;
     rq_req.vaddr = STAGING; rq_req.len = 64;
     repeat (10) @(posedge aclk);
-    check(req && !rq_ready && !busy, "must request but not accept without grant");
+    check(rq_ready && !busy && !req,
+          "a request alone is drained and starts nothing");
+    sq.push_back('{{28'b0, 28'd8, OP_INL}, {16'b0, TARGET}, 64'hAA, 1'b1});
+    repeat (4) @(posedge aclk);
+    check(req && !busy,
+          "a waiting header beat asks for the path but cannot start without grant");
+    sq.delete();                    // withdraw it; case 2 supplies its own
+    repeat (2) @(posedge aclk);
     @(negedge aclk); rq_valid = 0;
 
     // --- 2. Inline store message: exact 8 B write, no clobber ---
@@ -259,7 +277,7 @@ initial begin
     check(wrq.size() == 1, "inline: one wr_req");
     if (wrq.size() > 0) begin
         r = wrq.pop_front();
-        check(r.opcode == LOCAL_WRITE && r.strm == STRM_HOST && r.pid == 6'd2 &&
+        check(r.opcode == LOCAL_WRITE && r.strm == STRM_HOST && r.pid == RX_PID &&
               r.vaddr == TARGET + 48'h40 && r.len == 8 && r.last,
               "inline: exact 8 B write at header target");
     end
@@ -278,7 +296,7 @@ initial begin
     check(wrq.size() == 1, "bulk: one wr_req");
     if (wrq.size() > 0) begin
         r = wrq.pop_front();
-        check(r.pid == 6'd0 && r.vaddr == TARGET + 48'h100 && r.len == 128,
+        check(r.pid == RX_PID && r.vaddr == TARGET + 48'h100 && r.len == 128,
               "bulk: header-described write");
     end
     check(outq.size() == 2 && outq[0].data == 64'hB0B0_0000 && !outq[0].last &&
@@ -320,7 +338,7 @@ initial begin
     check(wrq.size() == 1, "bulk message: one wr_req");
     if (wrq.size() > 0) begin
         r = wrq.pop_front();
-        check(r.pid == 6'd3 && r.vaddr == TARGET + 48'h300 && r.len == 128,
+        check(r.pid == RX_PID && r.vaddr == TARGET + 48'h300 && r.len == 128,
               "bulk message: target and length come from the header");
     end
     check(outq.size() == 2 && outq[0].data == 64'hD1D1_0000 && !outq[0].last &&
@@ -349,7 +367,7 @@ initial begin
     incoming(6'd1, 28'd64);
     send_msg_beat({28'b0, 28'd8, OP_INL}, {16'b0, TARGET + 48'h1000}, 64'h2222, 1'b1);
     wait_idle();
-    check(wrq.size() == 2 && wrq[0].pid == 6'd0 && wrq[1].pid == 6'd1 &&
+    check(wrq.size() == 2 && wrq[0].pid == RX_PID && wrq[1].pid == RX_PID &&
           wrq[1].vaddr == TARGET + 48'h1000, "back-to-back wr_reqs");
     check(outq.size() == 2 && outq[0].data == 64'h1111 && outq[1].data == 64'h2222,
           "back-to-back beats");
@@ -433,7 +451,12 @@ initial begin
     incoming(6'd3, 28'd128, STAGING);
     send_msg_beat({28'b0, 28'd8, OP_INL}, {16'b0, TARGET + 48'h900},
                   64'h9999, 1'b0);
-    send_msg_beat({28'b0, 28'd8, OP_INL}, 64'h800, 64'hDEAD, 1'b1);
+    // A trailer is a malformed sender: an inline message is ONE beat by
+    // contract. There is no request framing to absorb it any more - the
+    // shape jigsaw uses reads every idle beat as a header - so it must at
+    // least be REJECTED rather than honoured. Give it the reserved field
+    // set, which is what a payload beat looks like.
+    send_msg_beat(64'h5A5A_0000_0000_0018, 64'h800, 64'hDEAD, 1'b1);
     wait_quiet(200, "10: multi-beat inline message");
     drain_beats(50, "10: trailing beat of a multi-beat inline message");
     incoming(6'd3, 28'd64, STAGING);
@@ -441,7 +464,7 @@ initial begin
                   64'hAAAA, 1'b1);
     wait_quiet(300, "10: message after a multi-beat one");
     dump_wrq("case 10");
-    check(wrq.size() == 2, "multi-beat inline: one write per message");
+    check(wrq.size() == 2, "multi-beat inline: one write per message, trailer rejected");
     if (wrq.size() == 2)
         check(wrq[0].vaddr == TARGET + 48'h900 &&
               wrq[1].vaddr == TARGET + 48'hA00,
@@ -483,8 +506,13 @@ initial begin
     drop_pulses = 0;
     incoming(6'd6, 28'd192, TARGET + 48'hB00);
     send_msg_beat({28'b0, 28'd100, OP_WR}, {16'b0, TARGET + 48'hB00}, 64'b0, 1'b0);
-    send_msg_beat(64'hDEAD_0000, 64'b0, 64'b0, 1'b0);
-    send_msg_beat(64'hDEAD_0001, 64'b0, 64'b0, 1'b1);
+    // These follow a header that was rejected, so they are read as headers
+    // themselves. 0xDEAD_0001 would parse as a VALID op-1 write of
+    // 0xDEAD00 bytes to address 0 - the hazard this architecture carries in
+    // exchange for having nothing to desynchronise. Use beats that cannot
+    // be mistaken for headers, and require every one to be counted.
+    send_msg_beat(64'h5A5A_0000_0000_0020, 64'b0, 64'b0, 1'b0);
+    send_msg_beat(64'h5A5A_0000_0000_0021, 64'b0, 64'b0, 1'b1);
     wait_quiet(200, "12: header claiming 100 B");
     incoming(6'd6, 28'd64, STAGING);
     send_msg_beat({28'b0, 28'd8, OP_INL}, {16'b0, TARGET + 48'hC00},
@@ -494,8 +522,10 @@ initial begin
     check(wrq.size() == 1, "odd length: the bad header wrote nothing");
     if (wrq.size() >= 1)
         check(wrq[0].vaddr == TARGET + 48'hC00,
-              "odd length: its beats drained, next header parsed clean");
-    check(drop_pulses == 1, "odd length: the rejection was counted");
+              "odd length: next header parsed clean after the rejection");
+    check(drop_pulses == 3,
+          $sformatf("odd length: the header and both stray beats counted (%0d)",
+                    drop_pulses));
 
     // --- 13. last=1 request that delivers MORE beats than its length ---
     // This is the hardware failure. When the shell says it will terminate
@@ -526,11 +556,15 @@ initial begin
         check(wrq[0].vaddr == TARGET + 48'hD00 && wrq[0].len == 64 &&
               wrq[1].vaddr == TARGET + 48'hE00,
               "over-long stream: header's write correct, next message clean");
-    // Drained, not rejected: the beat the message did not want still belonged
-    // to its request, so it is consumed silently rather than being read as
-    // the next header. Nothing is lost and nothing is counted.
-    check(drop_pulses == 0,
-          "over-long stream: the extra beat is drained, costing no message");
+    // Rejected, not drained. There is no request framing to say the beat
+    // belonged to the message that did not want it, so it is read as a
+    // header, fails the contract and is counted. One rejection, and the
+    // message after it still parses clean - which is the property that
+    // matters: a malformed sender costs one message, not the framing of
+    // everything after.
+    check(drop_pulses == 1,
+          $sformatf("over-long stream: the extra beat is rejected and counted (%0d)",
+                    drop_pulses));
 
     // --- 13. Receive-path cycle accounting. These three partition every
     //     cycle spent in ST_STREAM and are what attributes the receiver's

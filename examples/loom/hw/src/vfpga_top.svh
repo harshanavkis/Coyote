@@ -48,6 +48,7 @@ logic        rd_resp_valid;
 
 // RDMA staging VA: ctrl -> engine (RETH vaddr for all outgoing messages)
 logic [VADDR_BITS-1:0] rdma_staging_va;
+logic [PID_BITS-1:0]   rx_pid;
 
 // Engine shell-side signals
 req_t eng_rd_req, eng_wr_req;
@@ -138,7 +139,7 @@ loom_ctrl inst_loom_ctrl (
     .fifo_win(fifo_win), .fifo_off(fifo_off), .fifo_len(fifo_len),
     .fifo_src_pid(fifo_src_pid), .fifo_compl_va(fifo_compl_va),
     .fifo_payload(fifo_payload), .fifo_pop(fifo_pop),
-    .rdma_staging_va(rdma_staging_va),
+    .rdma_staging_va(rdma_staging_va), .rx_pid(rx_pid),
     .rd_resp_data(rd_resp_data), .rd_resp_valid(rd_resp_valid),
     .cnt_local_wr(cnt_local_wr), .cnt_rdma_wr(cnt_rdma_wr),
     .cnt_rx_fwd(cnt_rx_fwd), .cnt_rx_drop(cnt_rx_drop),
@@ -199,7 +200,7 @@ loom_engine inst_loom_engine (
 loom_rx inst_loom_rx (
     .aclk(aclk), .aresetn(aresetn),
     .rq_req(rq_wr.data), .rq_valid(rq_wr.valid), .rq_ready(rq_wr.ready),
-    .rdma_staging_va(rdma_staging_va),
+    .rdma_staging_va(rdma_staging_va), .rx_pid(rx_pid),
     .wr_req(rx_wr_req), .wr_valid(rx_wr_valid),
     .wr_ready(sq_wr.ready && rx_grant),
     .s_tdata(axis_rrsp_recv[0].tdata), .s_tkeep(axis_rrsp_recv[0].tkeep),

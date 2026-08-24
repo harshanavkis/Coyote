@@ -55,6 +55,10 @@ module loom_rx (
     // staging address is available here if a sanity check is ever wanted.
     /* verilator lint_off UNUSED */
     input  logic [VADDR_BITS-1:0]       rdma_staging_va,
+
+    // Whose address space incoming writes land in: the QP owner's cThread,
+    // fixed for the connection and written by loomd at QP setup
+    input  logic [PID_BITS-1:0]         rx_pid,
     /* verilator lint_on UNUSED */
 
     // Write requests out (to sq_wr via arbiter)
@@ -130,11 +134,10 @@ localparam [7:0] MSG_OP_WRITE        = 8'd1;
 localparam [7:0] MSG_OP_WRITE_INLINE = 8'd2;
 
 typedef enum logic [2:0] {
-    ST_IDLE, ST_HDR, ST_WR_REQ, ST_STREAM, ST_INLINE_DATA, ST_DRAIN
+    ST_IDLE, ST_WR_REQ, ST_STREAM, ST_INLINE_DATA
 } state_t;
 state_t state;
 
-logic [PID_BITS-1:0]   l_pid;
 logic [7:0]            l_op;
 logic [27:0]           l_len;
 logic [VADDR_BITS-1:0] l_va;
@@ -146,19 +149,19 @@ logic                  l_moved;      // this transaction has had at least one be
 // request's, and the intermediate rq_wr's and tlasts belong to packets
 // rather than to the transaction. This is what lets the receive path issue
 // one host write per message instead of one per packet.
-logic                  l_req_last;   // shell will terminate this stream with tlast
-logic                  l_span;       // op-1 message: budget from the header
-logic [22:0]           l_rbeats;     // beats left in the CURRENT request
 
-// Where a transaction ends is decided by the REQUEST's length, not by
-// tlast. rq_wr.last is low whenever the shell ends the stream WITHOUT a
-// tlast (see req_t in lynx_pkg), and ib_transport_protocol emits exactly
-// that for every RDMA_WRITE_FIRST/MIDDLE fragment; waiting for a tlast then
-// runs into the next message's beats, and from there every parse reads
-// payload as a header - which is how a store's target becomes whatever
-// happened to sit in lane 1. tlast still ends a transaction early when it
-// arrives first; whatever the request still owns after the write is drained
-// rather than left behind for the next parse to trip over.
+// Where a transaction ends is decided by the MESSAGE HEADER's length, and by
+// nothing else. Not by tlast, not by rq_wr - this is what jigsaw's
+// controller does, and it is the whole reason its receive side has nothing
+// to desynchronise: it latches a length out of its own header, counts the
+// payload beats down, and never looks at the request stream or tlast at all.
+//
+// Loom carries the same information in the same place, so it can be read the
+// same way. Everything that used to pair beats against requests is gone: the
+// per-request beat budget, the rule for absorbing a spanning message's
+// continuation requests, the interlock keeping those two from colliding.
+// That machinery is what produced a one-beat displacement at 1 MB - a count
+// that went wrong once and stayed wrong - and none of it was ever needed.
 function automatic logic [22:0] beats_of(input logic [27:0] len);
     logic [28:0] padded;
     padded   = {1'b0, len} + 29'd63;
@@ -179,8 +182,6 @@ endfunction
 // where there is no tlast to wait for, and to bound the drain.
 // A spanning message ends where its header said it would and nowhere else:
 // the tlast at every intermediate packet boundary is not its boundary.
-wire stream_end = l_span ? (l_beats <= 23'd1)
-                         : (l_req_last ? s_tlast : (l_beats <= 23'd1));
 
 // Header contract. The exporter hands the parsed target straight to the
 // shell TLB under the QP owner's pid, so a header this side does not
@@ -198,97 +199,53 @@ wire hdr_ok = (s_tdata[63:36] == 28'b0) &&
                (hdr_op == MSG_OP_WRITE &&
                 hdr_len != 28'd0 && hdr_len[5:0] == 6'b0));
 
-// Accept a request only when granted, so a transaction never starts while
-// the engine owns the shared write path
-// While a message spans packets its later rq_wr's carry nothing this module
-// needs - the header already said where the data goes and how much there is -
-// but they must still be taken off the interface or the shell's request path
-// backs up behind a transaction that is deliberately ignoring it.
-// A spanning message consumes several requests, but ONLY its own: take the
-// next one exactly when the current request's beats are spent and the header
-// still owes payload. Accepting indiscriminately swallows whatever transaction
-// happens to be queued behind it - the store after a bulk, in practice.
-assign rq_ready = ((state == ST_IDLE) && grant) ||
-                  (l_span && (state == ST_STREAM) &&
-                   (l_rbeats == 23'd0) && (l_beats != 23'd0));
-assign req      = rq_valid || (state != ST_IDLE);
+// Requests are DRAINED, never read. They must come off the interface or the
+// shell's request path backs up, but nothing here needs them: the header
+// says where the data goes and how much of it there is. The pid comes from
+// a CSR instead, written once at QP setup - the QP owner is fixed for the
+// life of the connection, so there is nothing per-request about it.
+assign rq_ready = 1'b1;
+
+// A header beat waiting on the payload stream is what wants the shared path
+assign req      = s_tvalid || (state != ST_IDLE);
 assign busy     = (state != ST_IDLE);
+
+// Last payload beat of the message
+wire stream_end = (l_beats <= 23'd1);
 
 always_ff @(posedge aclk) begin
     if (!aresetn) begin
         state <= ST_IDLE;
-        l_pid <= 0; l_op <= 0; l_len <= 0; l_va <= 0; l_inline <= 0;
-        l_beats <= 0; l_req_last <= 1'b1; l_moved <= 1'b0; l_span <= 1'b0;
-        l_rbeats <= 0;
+        l_op <= 0; l_len <= 0; l_va <= 0; l_inline <= 0;
+        l_beats <= 0; l_moved <= 1'b0;
     end else begin
         case (state)
-            ST_IDLE: if (rq_valid && grant) begin
-                l_moved    <= 1'b0;
-                l_span     <= 1'b0;
-                l_pid      <= rq_req.pid;
-                l_beats     <= beats_of(rq_req.len[27:0]);
-                l_rbeats    <= beats_of(rq_req.len[27:0]);
-                l_req_last  <= rq_req.last;
-                state       <= ST_HDR;
-            end
-
-            // Parse the header beat
-            ST_HDR: if (s_tvalid) begin
+            // The header beat arrives on the payload stream like any other,
+            // and is recognised by its contents rather than announced by a
+            // request. A beat that is not a header is skipped and counted;
+            // with a sender that agrees with us every beat here IS one.
+            ST_IDLE: if (s_tvalid && grant) begin
                 l_op     <= s_tdata[7:0];
                 l_len    <= s_tdata[35:8];
                 l_va     <= s_tdata[64 +: VADDR_BITS];
                 l_inline <= s_tdata[128 +: 64];
-                // op 1 spans packets: take the budget from the header and
-                // stop counting the request's. op 2 is one beat and cannot
-                // span, so it keeps the request's accounting.
-                if (s_tdata[7:0] == MSG_OP_WRITE) begin
-                    l_beats <= beats_of(s_tdata[35:8]);
-                    l_span  <= 1'b1;
-                end else begin
-                    l_beats <= l_beats - 23'd1;
-                end
-                l_rbeats <= l_rbeats - 23'd1;      // the header beat
-                if (hdr_ok)
-                    state <= ST_WR_REQ;
-                else
-                    // Not a header we recognize: drain what the request
-                    // still owns and write nothing (cnt_rx_drop pulses below)
-                    state <= (l_rbeats <= 23'd1) ? ST_IDLE : ST_DRAIN;
+                l_beats  <= beats_of(s_tdata[35:8]);
+                l_moved  <= 1'b0;
+                if (hdr_ok) state <= ST_WR_REQ;
             end
 
             ST_WR_REQ: if (wr_ready)
                 state <= (l_op == MSG_OP_WRITE_INLINE) ? ST_INLINE_DATA : ST_STREAM;
 
-            // One constructed beat: the inline data moved to lane 0. A
-            // message that was not a single beat still owns the rest of
-            // its request, so those beats are drained here instead of
-            // being left for the next parse to read as a header
-            ST_INLINE_DATA: if (m_tready)
-                state <= (l_rbeats != 23'd0) ? ST_DRAIN : ST_IDLE;
+            ST_INLINE_DATA: if (m_tready) state <= ST_IDLE;
 
-            // Forward the remaining payload beats
-            // s_tready is withheld while a spanning message is between
-            // requests, so taking a beat and taking a request never collide
-            ST_STREAM: begin
-                if (rq_valid && rq_ready)
-                    l_rbeats <= beats_of(rq_req.len[27:0]);
-                if (s_tvalid && m_tready) begin
-                    l_moved  <= 1'b1;
-                    l_beats  <= l_beats  - 23'd1;
-                    l_rbeats <= l_rbeats - 23'd1;
-                    // A message that ends before its request's beats are
-                    // spent leaves the remainder on the stream, where the
-                    // next parse would read it as a header - payload naming
-                    // its own destination, which is the failure this whole
-                    // module is shaped to avoid. Drain it instead.
-                    if (stream_end)
-                        state <= (l_rbeats > 23'd1) ? ST_DRAIN : ST_IDLE;
-                end
-            end
-
-            ST_DRAIN: if (s_tvalid) begin
-                l_rbeats <= l_rbeats - 23'd1;
-                if (s_tlast || l_rbeats <= 23'd1) state <= ST_IDLE;
+            // Forward exactly the payload the header promised, however many
+            // packets it spans. Intermediate tlasts belong to packets, not
+            // to this message, and are ignored.
+            ST_STREAM: if (s_tvalid && m_tready) begin
+                l_moved <= 1'b1;
+                l_beats <= l_beats - 23'd1;
+                if (stream_end) state <= ST_IDLE;
             end
 
             default: state <= ST_IDLE;
@@ -301,7 +258,7 @@ always_comb begin
     wr_req = '0;
     wr_req.opcode = LOCAL_WRITE;
     wr_req.strm   = STRM_HOST;
-    wr_req.pid    = l_pid;
+    wr_req.pid    = rx_pid;
     wr_req.vaddr  = l_va;
     wr_req.len    = l_len;
     wr_req.dest   = 0;
@@ -313,9 +270,10 @@ always_comb begin
     // Consume the incoming stream while parsing, forwarding, or draining
     // Hold the payload off while a spanning message waits for its next
     // request: those beats belong to a request this module has not taken yet
-    s_tready = (state == ST_HDR) || (state == ST_DRAIN) ||
-               ((state == ST_STREAM) && m_tready &&
-                (!l_span || (l_rbeats != 23'd0)));
+    // A header beat is taken in ST_IDLE (only while granted); payload beats
+    // move when the host write path will take them
+    s_tready = ((state == ST_IDLE) && grant) ||
+               ((state == ST_STREAM) && m_tready);
 
     if (state == ST_INLINE_DATA) begin
         // Constructed beat: exact-length write, data LSB-aligned
@@ -336,7 +294,7 @@ end
 
 assign cnt_rx_fwd  = ((state == ST_INLINE_DATA) && m_tready) ||
                      ((state == ST_STREAM) && s_tvalid && m_tready && stream_end);
-assign cnt_rx_drop = (state == ST_HDR) && s_tvalid && !hdr_ok;
+assign cnt_rx_drop = (state == ST_IDLE) && s_tvalid && grant && !hdr_ok;
 
 assign cnt_rx_move   = (state == ST_STREAM) &&  s_tvalid &&  m_tready;
 assign cnt_rx_starve = (state == ST_STREAM) && !s_tvalid;
@@ -345,8 +303,8 @@ assign cnt_rx_stall  = (state == ST_STREAM) &&  s_tvalid && !m_tready;
 assign cnt_rx_stall_head = cnt_rx_stall && !l_moved;
 assign cnt_rx_stall_body = cnt_rx_stall &&  l_moved;
 
-assign cnt_rx_req = rq_valid && rq_ready;
+assign cnt_rx_req = rq_valid && rq_ready;   // drained, not acted on
 
-assign cnt_rx_span = rq_valid && rq_ready && l_span && (state == ST_STREAM);
+assign cnt_rx_span = rq_valid && rq_ready && (state == ST_STREAM);
 
 endmodule

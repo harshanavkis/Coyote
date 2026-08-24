@@ -84,6 +84,11 @@ constexpr uint32_t RX_REQ        = 0x178;
 // swallowed rather than becoming transactions. Expect, per bulk message,
 // ceil((len + 64) / PMTU) - 1. Anything else means the receive side is
 // pairing requests with payload differently than the sender framed it.
+// Whose address space incoming rdma writes land in (RW word 21). The QP
+// owner's cThread is fixed for the connection, so the exporter writes it
+// once at QP setup and the receive path never reads a pid off a request -
+// jigsaw's controller uses a configured pid the same way.
+constexpr uint32_t RX_PID        = 0xA8;
 constexpr uint32_t RX_SPAN       = 0xA0;
 
 constexpr uint32_t STG_CYC       = 0x180;  // free-running cycle counter
@@ -165,6 +170,10 @@ inline uint64_t aperture_read(coyote::cThread &t, uint32_t win, uint32_t off) {
 // target rides the message header (op-len-vaddr).
 inline void set_rdma_staging(coyote::cThread &t, const void *va) {
     csr_write(t, RDMA_STAGING_VA, reinterpret_cast<uint64_t>(va));
+}
+
+inline void set_rx_pid(coyote::cThread &t, uint32_t ctid) {
+    csr_write(t, RX_PID, ctid);
 }
 
 // Bulk transfer: configure the DMA engine, then it moves the data.

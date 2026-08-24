@@ -74,6 +74,7 @@ logic cnt_local_wr, cnt_rdma_wr, cnt_drop, cnt_compl;
 logic [63:0] rd_resp_data;
 logic        rd_resp_valid;
 logic [VADDR_BITS-1:0] rdma_staging_va;
+logic [PID_BITS-1:0]   ctrl_rx_pid;
 logic [63:0] stage_acc [7];
 logic [63:0] stage_cnt [7];
 
@@ -103,7 +104,7 @@ loom_ctrl inst_ctrl (
     .fifo_win(fifo_win), .fifo_off(fifo_off), .fifo_len(fifo_len),
     .fifo_src_pid(fifo_src_pid), .fifo_compl_va(fifo_compl_va),
     .fifo_payload(fifo_payload), .fifo_pop(fifo_pop),
-    .rdma_staging_va(rdma_staging_va),
+    .rdma_staging_va(rdma_staging_va), .rx_pid(ctrl_rx_pid),
     .rd_resp_data(rd_resp_data), .rd_resp_valid(rd_resp_valid),
     .cnt_local_wr(cnt_local_wr), .cnt_rdma_wr(cnt_rdma_wr),
     .cnt_rx_fwd(1'b0), .cnt_rx_drop(1'b0), .cnt_drop(cnt_drop),
@@ -174,7 +175,7 @@ localparam [PID_BITS-1:0] QP_OWNER = 6'd1;         // exporter's data ctid
 loom_rx inst_rx (
     .aclk(aclk), .aresetn(aresetn),
     .rq_req(rx_rq_req), .rq_valid(rx_rq_valid), .rq_ready(rx_rq_ready),
-    .rdma_staging_va(STAGING),
+    .rdma_staging_va(STAGING), .rx_pid(QP_OWNER),
     .wr_req(rx_wr_req), .wr_valid(rx_wr_valid), .wr_ready(rx_wr_ready),
     .s_tdata(rx_s_tdata), .s_tkeep(rx_s_tkeep), .s_tvalid(rx_s_tvalid),
     .s_tready(rx_s_tready), .s_tlast(rx_s_tlast),

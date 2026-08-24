@@ -236,6 +236,11 @@ initial begin
     repeat (5) @(negedge aclk);
     aresetn = 1;
     repeat (2) @(negedge aclk);
+    // Incoming rdma writes land under the QP owner's pid, a CSR now rather
+    // than a field of each request
+    axil_write(16'd168, 64'd2);
+
+    repeat (2) @(negedge aclk);
 
     // Windows 1, 2 local; completion disabled (COMPL_VA = 0)
     program_win(4'd1, 1'b0, 6'd1, {16'b0, BASE_B}, 64'h40_0000);
