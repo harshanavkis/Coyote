@@ -293,7 +293,7 @@ Everything in `sw/` is **local route on ONE host** — no QP is ever created
 | `sw/build_hw/bulk_sweep` | 1 | descriptors from 64 B to 16 MB incl. non-64B lengths, every byte verified; prints the T2 cycle curve |
 | `sw/build_hw/roles` | 1 | role split, a cThread per role, so imports translate under the *exporter's* ctid (G1) |
 | `sw/build_hw/loomd` + `roles_sock` | 1 | the same flow with the control plane in a separate process over a Unix socket |
-| `sw-bundled/build/loom_host` | **2** | the RDMA data plane: wire messages, direct bulk, cross-host ordering |
+| `sw-bundled/build/loom_host` | **2** | the RDMA data plane: inline store messages, bulk write messages, cross-host ordering |
 
 ```bash
 cd examples/loom/sw/build_hw
@@ -431,9 +431,11 @@ happens in real hardware"). Three consequences the design lives with:
 - **A bystander register in the same line is destroyed.** `RDMA_STAGING_VA`
   was word 14, inside the burst of every `dma()` write at word 8. On hardware
   that zeroed it, the next store went out with `RETH = 0`, the far side saw a
-  vaddr that was not its staging address, forwarded it verbatim, and wrote
-  eight bytes at VA 0 - which the driver cannot pin, killing the host at
-  teardown in `tlb_put_user_pages_ctid`. It is now word 16, the first word of
+  vaddr that was not its staging address, forwarded it verbatim down the
+  direct path, and wrote eight bytes at VA 0 - which the driver cannot pin,
+  killing the host at teardown in `tlb_put_user_pages_ctid`. (That direct
+  path no longer exists: every write now takes its target from a Loom
+  header, so a request's address can no longer reach the TLB at all.) It is now word 16, the first word of
   an otherwise empty line; `tb_loom_ctrl` case 18 drives the burst and
   asserts it survives.
 - **Aperture pushes are gated on `wstrb`.** A padding beat writes nothing by

@@ -98,14 +98,24 @@ divergence only at the table lookup.
 
 ## Flow 4 — bulk, remote: `copy(P_C + 0x10000, src, 1MB)`
 
-Same pull as Flow 3; the write side is a DIRECT RDMA WRITE with RETH vaddr
-`buf_C+0x10000` (the true target), len 1 MB, raw payload, no Loom framing
-— op·len·vaddr on the wire is RDMA's own BTH/RETH here, and the shell
-fragments to PMTU. On host 2 loom_rx lands it verbatim as
-`sq_wr {LOCAL_WRITE, pid 0, buf_C+0x10000, 1MB}`, which is not optional:
-per gate G3 incoming writes land only if user logic issues them. Only
-sub-64 B stores (Flow 2) use the staging-addressed inline message, because
-a RETH cannot express "64 B envelope, 8 B true write".
+Same pull as Flow 3; the write side is a Loom WRITE message at the staging
+RETH vaddr, len 1 MB + 64. A header beat goes out first —
+`⟨op WRITE · len 1 MB⟩` in lane 0, `buf_C+0x10000` in lane 1 — and the
+payload follows it. The shell fragments the whole thing to PMTU, so it
+arrives at host 2 as 256 packets and 256 `rq_wr`s.
+
+loom_rx reads the target **and the length** out of that header and issues a
+single `sq_wr {LOCAL_WRITE, pid 0, buf_C+0x10000, 1MB}`, streaming the
+payload behind it and absorbing the other 255 requests as continuations of
+the message already in flight. Landing it is not optional: per gate G3
+incoming writes reach memory only if user logic issues them.
+
+The header is what makes that one write possible. Addressing bulk by RETH —
+which is RDMA's own form, and what this did until 2026-08-24 — leaves the
+receiver with nothing but a per-packet cursor to write from: 256 separate
+host writes for this transfer, and any packet arriving outside its message
+naming its own destination. The 64 B buys one write per message and leaves
+no path by which payload can address memory.
 
 ## Flow 5 — peer load, local: `v = *(P_B + 0x48)`
 

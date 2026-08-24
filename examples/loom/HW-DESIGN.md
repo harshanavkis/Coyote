@@ -24,7 +24,7 @@ Coyote cThread. Two producer paths converge in one pipeline:
                        loom_engine ------ sq_rd pull (DMA + read paths)
                        /          \
               local write        rdma write
-         sq_wr {pid, VA+off}   sq_wr {RETH vaddr = exporter VA + off}
+         sq_wr {pid, VA+off}   sq_wr {RETH vaddr = STAGING, msg header}
          + axis_host_send      + axis_rreq_send
                        \          /
                      shared-path arbiter also serving
@@ -55,18 +55,39 @@ Consulted once per transaction; nothing on the data path computes a route.
   `{lane0 = ⟨op WRITE_INLINE · len⟩, lane1 = exporter VA + off,
   lane2 = data}`; the far loom_rx issues the exact 8 B write. Nothing
   sub-64 B goes on the wire (G5 below).
-- DESC: pull `sq_rd {LOCAL_READ, src_pid, src_va, len}`, forward the
-  stream to the local or rdma write side, then release the fence — an
-  incrementing count to `(src_pid, compl_va)` if the descriptor named one.
+- DESC, rdma: also a wire message, op WRITE — a header beat
+  `{lane0 = ⟨op WRITE · len⟩, lane1 = exporter VA + off}` followed by the
+  payload beats, posted at the staging RETH vaddr and 64 B longer than the
+  transfer. The far side takes the destination **and the length** from that
+  header, so it issues ONE host write for the whole message however many
+  PMTU packets the shell splits it into. Addressing bulk by RETH instead
+  means one host write per packet — 256 for a 1 MB transfer — and lets a
+  stray packet name its own destination; neither is worth the 64 B.
+- DESC, local: pull `sq_rd {LOCAL_READ, src_pid, src_va, len}` and forward
+  the stream straight to host memory. No header: nothing crosses a wire.
+- Either route then releases the fence — an incrementing count to
+  `(src_pid, compl_va)` if the descriptor named one.
 - READ: pull the full 64 B aligned line under the destination pid, lane-
   select 8 B, answer the held-open AXI read.
 - Invalid window or bounds violation: entry dropped and counted.
 
-**loom_rx** — hybrid dispatch on one compare. An incoming write whose RETH
-vaddr equals STAGING is a Loom inline message: parse `⟨op · len · target
-VA⟩` and issue exactly the write it describes. Any other vaddr is direct
-bulk: forward request and every beat verbatim. Writes run under the QP
+**loom_rx** — every incoming transaction is a Loom message and its
+destination comes from the message header, never from `rq_wr.vaddr`. Parse
+`⟨op · len · target VA⟩`: op WRITE_INLINE is one beat and issues the exact
+8 B write it describes; op WRITE issues one write of the header's full
+length and streams the payload behind it, absorbing the continuation
+requests of however many packets that spans. Writes run under the QP
 owner's pid.
+
+The request's address is deliberately ignored — this is what jigsaw's
+controller does, and the reason is containment as much as throughput. An
+address that Loom did not write can then never reach the shell TLB: a beat
+that is not a recognizable header fails the contract and is counted, not
+written. A misparsed header with a zero target is what NULL-derefed
+`coyote_driver` in `tlb_put_user_pages_ctid` and cost the exporter a reboot
+(`96759b07`), and there is now no branch by which payload can name its own
+destination. Beats a message does not want but its request still owns are
+drained rather than left for the next parse to read as a header.
 
 Two rules keep a parsed target from ever being garbage, because this side
 hands it straight to the shell TLB. **Transactions are bounded by the
@@ -98,7 +119,7 @@ numbers only.
 | **G2** sub-line writes | CLOSED | `hw/hdl/static/xdma_wrapper.sv:49` — host writes drive XDMA descriptor-bypass with `{c2h_addr, c2h_len}`, i.e. byte-granular descriptors, payload consumed from stream lane 0. An 8 B `LOCAL_WRITE` = a `{PA, 8}` descriptor + our LSB-aligned beat |
 | **G3** RX interposition | CLOSED | `09_perf_rdma/hw/src/vfpga_top.svh` — an incoming RDMA WRITE surfaces as `rq_wr` (request) + `axis_rrsp_recv` (payload) and **user logic must land it**; there is no silent-to-memory path, which is why `loom_rx` is required rather than optional. `ib_transport_protocol.cpp:628` — the RX parser puts the RETH vaddr in verbatim (no MR table, no filter), MIDDLE/LAST continue from an MSN-table cursor seeded from it. Incoming READs likewise surface on `rq_rd` for user logic to serve (`rq_rd -> sq_rd`, `host_recv -> rrsp_send`) — the 6.x remote-read template |
 | **G4** QP selection | CLOSED | `sw/src/cThread.cpp:178` — `local.qpn = (vfid << PID_BITS) \| ctid`. The QPN encodes the cThread id, so one QP per cThread by construction and the request's pid field selects the QP because they are the same number. Our `wr_req.pid = entry.pid (QP owner)` is that mechanism |
-| **G5** minimum RDMA payload | RESOLVED BY DESIGN | No explicit `len >= 64` check exists (`rdma_req_parser.sv` handles any length; `udpLen = 12+16+payloadLen+4` is length-agnostic), but sub-64 B sits outside the exercised envelope: perf floors at `MIN_TRANSFER_SIZE_DEFAULT = 64`, `ib_transport_protocol.cpp:append_payload` carries a "TODO align this stuff!!", `lenToKeep` is `ap_uint<6>`, and jigsaw pads to 64 unconditionally. Hence the hybrid wire scheme: 64 B inline message for sub-64 B stores, direct RDMA WRITE for bulk, `len % 64 == 0` enforced for rdma bulk. Padding was never an option — it would clobber 56 neighbour bytes |
+| **G5** minimum RDMA payload | RESOLVED BY DESIGN | No explicit `len >= 64` check exists (`rdma_req_parser.sv` handles any length; `udpLen = 12+16+payloadLen+4` is length-agnostic), but sub-64 B sits outside the exercised envelope: perf floors at `MIN_TRANSFER_SIZE_DEFAULT = 64`, `ib_transport_protocol.cpp:append_payload` carries a "TODO align this stuff!!", `lenToKeep` is `ap_uint<6>`, and jigsaw pads to 64 unconditionally. Hence the wire scheme: 64 B inline message for sub-64 B stores, header-plus-payload message for bulk, `len % 64 == 0` enforced for rdma bulk. Padding was never an option — it would clobber 56 neighbour bytes |
 
 Reachability everywhere is a TLB entry under the QP owner's pid at
 write-issue time. No verbs MR registration exists in this path.
@@ -118,7 +139,7 @@ Shell config: `EN_STRM 1, N_STRM_AXI 1, EN_RDMA 1, N_REGIONS 1`
 | per-descriptor completion write (incrementing count to a memory word) | CE **semaphore release**: the engine writes a monotonic fence value to the address the command names; `cudaStreamSynchronize`/events spin on that word | our descriptor carries its fence VA like a CE command carries its release address |
 | polling the destination / fence in ordinary memory | polling mapped fence memory (spin) — the GPU fast path | never a register read on the data path |
 | order FIFO + serialized engine | ordering of one issuer's stores and CE ops through one fabric port / stream | our single global FIFO is *stricter* than required (orders across issuers too); per-binding relaxation is future work |
-| bulk: direct RDMA WRITE (RETH = exporter VA + off); sub-64 B stores: 64 B inline message at a staging RETH vaddr | direct: an RNIC's ordinary virtually-addressed write; inline: RNIC inline-send / NCCL LL fixed-size lines | op·len·vaddr on the wire is RDMA's own BTH/RETH for bulk; the inline header exists only because a RETH cannot say "envelope 64, true write 8" |
+| every rdma write is a message at a staging RETH vaddr, carrying `⟨op · len · target VA⟩`: op WRITE for bulk (header + payload), op WRITE_INLINE for sub-64 B stores | RNIC inline-send / NCCL LL fixed-size lines; the bulk header is the descriptor an RNIC would carry out of band | bulk was addressed by RETH until 2026-08-24, which is RDMA's own form but costs one host write per PMTU packet at the receiver and lets a stray packet address memory itself. The length in the header is what buys one write per message |
 | reachability = a TLB entry under the owner's pid (no MR registration, no keys) | GPU scale-up model: a peer write is valid iff the owning GPU's MMU translates it; nothing registered with the fabric, no key on any bus | deliberately NOT the verbs model — matches the design's "no addresses, keys, or QPs visible" claim; bounds at the source switch, translation at the destination |
 | staging buffer: small ordinary getMem of the QP owner, address exchanged at QP setup | NCCL per-connection transport buffer (plain cudaMalloc, address exchanged at connect/accept) | per G3 the shell never writes staging memory itself; the staging vaddr is addressing, and the allocation exists so the vaddr is honest and mappable |
 | debug counters (stores, descs, writes, drops, fences) | engine performance counters | read via CSRs off the data path |
