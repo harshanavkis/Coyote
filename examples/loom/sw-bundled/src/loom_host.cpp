@@ -324,6 +324,26 @@ void run_bench(coyote::cThread &t_ctrl, loom::Xpu &A, int win,
     // stores and the region should stay clean if that reading is right.
     if (getenv("LOOM_BENCH_NO_STORES")) {
         printf("LOOM_BENCH_NO_STORES: skipping the inline store phase\n");
+    {
+        // Where the transmit stream's cycles went. Only the rdma route is
+        // counted. A gap here is one Loom put into the outgoing packet
+        // stream; a stall is the shell declining to take a beat.
+        const uint64_t mv = loom::csr_read(t_ctrl, loom::TX_MOVE);
+        const uint64_t sv = loom::csr_read(t_ctrl, loom::TX_STARVE);
+        const uint64_t st = loom::csr_read(t_ctrl, loom::TX_STALL);
+        const uint64_t tot = mv + sv + st;
+        printf("transmit path cycles: %lu moving, %lu starved (host pull dry), "
+               "%lu stalled (network pushing back)\n",
+               (unsigned long) mv, (unsigned long) sv, (unsigned long) st);
+        if (tot)
+            printf("  %.1f%% moving, %.1f%% starved, %.1f%% stalled -> %s\n",
+                   100.0 * double(mv) / double(tot),
+                   100.0 * double(sv) / double(tot),
+                   100.0 * double(st) / double(tot),
+                   sv > st ? "the pull is gapping the outgoing stream"
+                           : "the fabric is pushing back, which is expected");
+    }
+
     usleep(500000);      // let RC retransmit timers fire before sampling
     {
         const long rt = net_stat("Retrans cnt") - rt_all0;
@@ -721,11 +741,12 @@ int run_server(uint16_t qp_port, uint16_t peer_port, const std::string &sock) {
         const uint64_t acc = loom::csr_read(t_ctrl, loom::RX_REQ);
         const uint64_t don = loom::csr_read(t_ctrl, loom::DBG_BASE + 8 * 4);
         const uint64_t spn = loom::csr_read(t_ctrl, loom::RX_SPAN);
-        printf("rq_wr: %lu accepted (%lu absorbed as message continuations), "
-               "%lu completed%s\n", (unsigned long) acc, (unsigned long) spn,
-               (unsigned long) don,
-               acc == don + spn ? ""
-                                : "  <-- accepted, neither completed nor absorbed");
+        // accepted counts PACKETS (every request is drained), completed
+        // counts MESSAGES. The ratio is packets per message; there is no
+        // identity between them to check.
+        printf("rq_wr: %lu accepted (packets), %lu completed (messages), "
+               "%lu arrived mid-stream\n",
+               (unsigned long) acc, (unsigned long) don, (unsigned long) spn);
         const uint64_t hd = loom::csr_read(t_ctrl, loom::RX_STALL_HEAD);
         const uint64_t bd = loom::csr_read(t_ctrl, loom::RX_STALL_BODY);
         if (st)
