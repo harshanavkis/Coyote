@@ -25,6 +25,8 @@ TBS="tb_loom_table tb_loom_ctrl tb_loom_engine tb_loom_rx tb_loom_top tb_loom_lo
 SRCS="$LYNX_PKG $AXI_INTF $COYOTE_ROOT/hw/hdl/pkg/lynx_intf.sv \
       ../src/hdl/loom_table.sv ../src/hdl/loom_ctrl.sv \
       ../src/hdl/loom_engine.sv ../src/hdl/loom_rx.sv \
+      ./sim_axisr_register_slice_512.sv \
+      $COYOTE_ROOT/hw/hdl/common/regs/axisr_reg.sv \
       ../build_sim/sim/user_logic_c0_0.sv"
 
 mkdir -p work && cd work

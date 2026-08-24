@@ -70,6 +70,21 @@ logic [AXI_DATA_BITS/8-1:0] rx_tkeep;
 logic rx_tvalid, rx_tlast;
 
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Pipeline registers on the host streams, as jigsaw's controller has. Without
+// them a stream is combinational end to end: the pull's tready is derived
+// from the network's, so every bubble on one side lands instantly on the
+// other and there is no elasticity anywhere. The transmit path measures 84%
+// starved waiting on the pull, which is what this is aimed at.
+// ---------------------------------------------------------------------------
+AXI4SR axis_pull (.*);
+axisr_reg inst_reg_pull (.aclk(aclk), .aresetn(aresetn),
+                         .s_axis(axis_host_recv[0]), .m_axis(axis_pull));
+
+AXI4SR axis_wr (.*);
+axisr_reg inst_reg_wr   (.aclk(aclk), .aresetn(aresetn),
+                         .s_axis(axis_wr), .m_axis(axis_host_send[0]));
+
 // Arbiter: exclusive, whole-transaction ownership of {sq_wr, axis_host_send}
 //
 // Why it exists: the engine (stores, DMA writes, fences) and rx
@@ -177,12 +192,12 @@ loom_engine inst_loom_engine (
     .rd_req(eng_rd_req), .rd_valid(eng_rd_valid), .rd_ready(sq_rd.ready),
     .wr_req(eng_wr_req), .wr_valid(eng_wr_valid),
     .wr_ready(sq_wr.ready && eng_grant),
-    .s_tdata(axis_host_recv[0].tdata), .s_tkeep(axis_host_recv[0].tkeep),
-    .s_tvalid(axis_host_recv[0].tvalid), .s_tready(axis_host_recv[0].tready),
-    .s_tlast(axis_host_recv[0].tlast),
+    .s_tdata(axis_pull.tdata), .s_tkeep(axis_pull.tkeep),
+    .s_tvalid(axis_pull.tvalid), .s_tready(axis_pull.tready),
+    .s_tlast(axis_pull.tlast),
     .m_host_tdata(eng_host_tdata), .m_host_tkeep(eng_host_tkeep),
     .m_host_tvalid(eng_host_tvalid),
-    .m_host_tready(axis_host_send[0].tready && eng_grant),
+    .m_host_tready(axis_wr.tready && eng_grant),
     .m_host_tlast(eng_host_tlast),
     .m_net_tdata(eng_net_tdata), .m_net_tkeep(eng_net_tkeep),
     .m_net_tvalid(eng_net_tvalid),
@@ -207,7 +222,7 @@ loom_rx inst_loom_rx (
     .s_tvalid(axis_rrsp_recv[0].tvalid), .s_tready(axis_rrsp_recv[0].tready),
     .s_tlast(axis_rrsp_recv[0].tlast),
     .m_tdata(rx_tdata), .m_tkeep(rx_tkeep), .m_tvalid(rx_tvalid),
-    .m_tready(axis_host_send[0].tready && rx_grant), .m_tlast(rx_tlast),
+    .m_tready(axis_wr.tready && rx_grant), .m_tlast(rx_tlast),
     .req(rx_req_arb), .grant(rx_grant), .busy(rx_busy),
     .cnt_rx_move(rx_cnt_move), .cnt_rx_starve(rx_cnt_starve),
     .cnt_rx_stall(rx_cnt_stall), .cnt_rx_stall_head(rx_cnt_st_head),
@@ -238,11 +253,11 @@ always_comb begin
 end
 
 always_comb begin
-    axis_host_send[0].tdata  = rx_grant ? rx_tdata  : eng_host_tdata;
-    axis_host_send[0].tkeep  = rx_grant ? rx_tkeep  : eng_host_tkeep;
-    axis_host_send[0].tlast  = rx_grant ? rx_tlast  : eng_host_tlast;
-    axis_host_send[0].tvalid = rx_grant ? rx_tvalid : (eng_host_tvalid && eng_grant);
-    axis_host_send[0].tid    = '0;
+    axis_wr.tdata  = rx_grant ? rx_tdata  : eng_host_tdata;
+    axis_wr.tkeep  = rx_grant ? rx_tkeep  : eng_host_tkeep;
+    axis_wr.tlast  = rx_grant ? rx_tlast  : eng_host_tlast;
+    axis_wr.tvalid = rx_grant ? rx_tvalid : (eng_host_tvalid && eng_grant);
+    axis_wr.tid    = '0;
 end
 
 always_comb begin
