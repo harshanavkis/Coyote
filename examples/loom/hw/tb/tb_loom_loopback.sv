@@ -463,7 +463,7 @@ endtask
 task settle();
     int n;
     n = 0;
-    while (n < 20000 && (!fifo_empty || eng_busy || net_reqs.size() > 0 ||
+    while (n < 4000000 && (!fifo_empty || eng_busy || net_reqs.size() > 0 ||
                          rx_busy || net_beats.size() > 0 ||
                          net_frames.size() > 0)) begin
         @(posedge aclk); n++;
@@ -516,8 +516,8 @@ initial begin
 
     // attachPeer: staging CSR from the exporter's hello, then two imports
     axil_write(16'd128, {16'b0, STAGING});
-    import_win(4'd1, {16'b0, BASE1}, 64'h20_0000);
-    import_win(4'd2, {16'b0, BASE2}, 64'h20_0000);
+    import_win(4'd1, {16'b0, BASE1}, 64'h100_0000);   // 16 MB: MB-scale cases below
+    import_win(4'd2, {16'b0, BASE2}, 64'h100_0000);
 
     // --- loom_host: small stores through both windows ---
     store(4'd1, 12'h40, 64'hB00B_0000_0000_0001);
@@ -770,6 +770,47 @@ initial begin
           $sformatf("64 KB landed as ONE host write, not per packet (%0d)",
                     rx_txns - fwd_before));
 
+    // --- The size that fails on hardware. A 1 MB message is 257 PMTU
+    //     packets and 16384 payload beats, and the failure there was a -1
+    //     beat displacement, consistent across the whole region, starting
+    //     at packet 99 of 256 - a beat budget going wrong once and staying
+    //     wrong. Everything above is 17 packets or fewer, so if the desync
+    //     needs scale nothing here would have caught it.
+    //     512 KB first: 129 packets, straddling where the shift appeared.
+    fwd_before = rx_txns;
+    copy(4'd1, 28'h400000, {16'b0, SRC_VA}, 28'd524288, {16'b0, CPL_VA});
+    settle();
+    check_payload(BASE1 + 48'h400000, 65536,
+                  "512 KB message (129 packets) lands intact");
+    check(rx_txns - fwd_before == 1,
+          $sformatf("512 KB landed as ONE host write (%0d)",
+                    rx_txns - fwd_before));
+
+    fwd_before = rx_txns;
+    copy(4'd1, 28'h800000, {16'b0, SRC_VA}, 28'd1048576, {16'b0, CPL_VA});
+    settle();
+    check_payload(BASE1 + 48'h800000, 131072,
+                  "1 MB message (257 packets) lands intact");
+    check(rx_txns - fwd_before == 1,
+          $sformatf("1 MB landed as ONE host write (%0d)", rx_txns - fwd_before));
+
+    // Same size, framed the way the RX path actually builds it: a tlast at
+    // every packet boundary rather than one at the end of the message. The
+    // model has defaulted to per-message since it was written, so no
+    // MB-scale case has ever run against per-packet framing - and a
+    // spanning message is exactly the thing that has to ignore 256
+    // intermediate tlasts and stop only where its header said.
+    tlast_per_pkt = 1;
+    fwd_before = rx_txns;
+    copy(4'd1, 28'hC00000, {16'b0, SRC_VA}, 28'd1048576, {16'b0, CPL_VA});
+    settle();
+    check_payload(BASE1 + 48'hC00000, 131072,
+                  "1 MB, per-packet tlast: lands intact");
+    check(rx_txns - fwd_before == 1,
+          $sformatf("1 MB, per-packet tlast: ONE host write (%0d)",
+                    rx_txns - fwd_before));
+    tlast_per_pkt = 0;
+
     check(rx_drop === 1'b0, "no header was ever rejected on the far side");
 
     // The engine must have delivered exactly what its requests claimed
@@ -784,7 +825,7 @@ initial begin
 end
 
 initial begin
-    #5ms;
+    #400ms;
     $display("TB FAIL (tb_loom_loopback): timeout");
     $finish;
 end
