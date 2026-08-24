@@ -306,20 +306,39 @@ initial begin
     wait_idle();
     check(wrq.size() == 0 && outq.size() == 0, "unknown op: no write, drained");
 
-    // --- 5b. DIRECT write (vaddr != staging): verbatim forward ---
-    incoming(6'd3, 28'd128, TARGET + 48'h300);
+    // --- 5b. BULK as a WRITE message: header names the target, payload
+    //     follows. There is no direct path any more - rq_wr.vaddr never
+    //     decides where a DMA lands, so a stray packet cannot name its own
+    //     destination. The request is 64 B longer than its payload for the
+    //     header it carries.
+    incoming(6'd3, 28'd192, TARGET + 48'h300);   // vaddr deliberately ignored
+    send_msg_beat({28'b0, 28'd128, OP_WR}, {16'b0, TARGET + 48'h300}, 64'b0, 1'b0);
     send_msg_beat(64'hD1D1_0000, 64'hAAAA, 64'hBBBB, 1'b0);
     send_msg_beat(64'hD1D1_0001, 64'b0, 64'b0, 1'b1);
     wait_idle();
-    check(wrq.size() == 1, "direct: one wr_req");
+    check(wrq.size() == 1, "bulk message: one wr_req");
     if (wrq.size() > 0) begin
         r = wrq.pop_front();
         check(r.pid == 6'd3 && r.vaddr == TARGET + 48'h300 && r.len == 128,
-              "direct: request forwarded verbatim");
+              "bulk message: target and length come from the header");
     end
     check(outq.size() == 2 && outq[0].data == 64'hD1D1_0000 && !outq[0].last &&
           outq[1].data == 64'hD1D1_0001 && outq[1].last,
-          "direct: ALL beats forwarded incl. the first");
+          "bulk message: payload beats forwarded, header stripped");
+    outq.delete();
+
+    // The target really is the header's, not the request's: send them
+    // deliberately different and the header must win.
+    incoming(6'd3, 28'd128, TARGET + 48'h9999);
+    send_msg_beat({28'b0, 28'd64, OP_WR}, {16'b0, TARGET + 48'h700}, 64'b0, 1'b0);
+    send_msg_beat(64'hC0C0_0001, 64'b0, 64'b0, 1'b1);
+    wait_idle();
+    check(wrq.size() == 1, "header wins: one wr_req");
+    if (wrq.size() > 0) begin
+        r = wrq.pop_front();
+        check(r.vaddr == TARGET + 48'h700,
+              $sformatf("header wins over rq_wr.vaddr (got %0h)", r.vaddr));
+    end
     outq.delete();
 
     // --- 6. Back-to-back inline messages ---
@@ -350,7 +369,8 @@ initial begin
 
     // --- 7. Next request pending while the previous payload streams ---
     dut_reset();
-    incoming(6'd4, 28'd192, TARGET + 48'h400);
+    incoming(6'd4, 28'd256, TARGET + 48'h400);
+    send_msg_beat({28'b0, 28'd192, OP_WR}, {16'b0, TARGET + 48'h400}, 64'b0, 1'b0);
     send_msg_beat(64'hC0C0_0000, 64'b0, 64'b0, 1'b0);
     present_pending(6'd5, 28'd64, STAGING);
     send_msg_beat(64'hC0C0_0001, 64'b0, 64'b0, 1'b0);
@@ -363,19 +383,19 @@ initial begin
     if (wrq.size() == 2)
         check(wrq[0].vaddr == TARGET + 48'h400 && wrq[0].len == 192 &&
               wrq[1].vaddr == TARGET + 48'h500 && wrq[1].len == 8,
-              "pipelined: message target survives a preceding direct write");
+              "pipelined: message target survives a preceding bulk");
 
     // --- 8. The 6.2a ordering sequence: bulk, bulk, then the flag store ---
     // Same shape as loom_host's ordering test, which is where hardware
     // stopped landing writes
     dut_reset();
     incoming(6'd1, 28'd128, TARGET + 48'h10000);
-    send_msg_beat(64'hBEEF_0000, 64'b0, 64'b0, 1'b0);
+    send_msg_beat({28'b0, 28'd64, OP_WR}, {16'b0, TARGET + 48'h10000}, 64'b0, 1'b0);
+    send_msg_beat(64'hBEEF_0000, 64'b0, 64'b0, 1'b1);
     present_pending(6'd1, 28'd128, TARGET + 48'h20000);
-    send_msg_beat(64'hBEEF_0001, 64'b0, 64'b0, 1'b1);
-    send_msg_beat(64'hBEEF_0002, 64'b0, 64'b0, 1'b0);
+    send_msg_beat({28'b0, 28'd64, OP_WR}, {16'b0, TARGET + 48'h20000}, 64'b0, 1'b0);
+    send_msg_beat(64'hBEEF_0002, 64'b0, 64'b0, 1'b1);
     present_pending(6'd1, 28'd64, STAGING);
-    send_msg_beat(64'hBEEF_0003, 64'b0, 64'b0, 1'b1);
     send_msg_beat({28'b0, 28'd8, OP_INL}, {16'b0, TARGET + 48'h800},
                   64'hF1A6, 1'b1);
     wait_quiet(400, "8: bulk, bulk, flag store");
@@ -390,7 +410,7 @@ initial begin
     // instead waits for a tlast that belongs to the NEXT message
     dut_reset();
     incoming(6'd2, 28'd128, TARGET + 48'h600, 1'b0);
-    send_msg_beat(64'hA5A5_0000, 64'b0, 64'b0, 1'b0);
+    send_msg_beat({28'b0, 28'd64, OP_WR}, {16'b0, TARGET + 48'h600}, 64'b0, 1'b0);
     send_msg_beat(64'hA5A5_0001, 64'b0, 64'b0, 1'b0);   // len reached, no tlast
     present_pending(6'd2, 28'd64, STAGING);
     send_msg_beat({28'b0, 28'd8, OP_INL}, {16'b0, TARGET + 48'h700},
@@ -452,27 +472,29 @@ initial begin
     check(wrq.size() == 0, "malformed headers: nothing written");
     check(drop_pulses == 5, "malformed headers: every one counted");
 
-    // --- 12. Direct write whose length is not a whole number of beats ---
-    // Every length used above is a multiple of 64, so the rounding in
-    // beats_of has never mattered - a plain `len >> 6` would pass all of
-    // them. loom_engine cannot emit such a write (it drops rdma bulk with
-    // len[5:0] != 0 at the source) but the RX takes its length from the
-    // wire, where nothing enforces that, so a sender that disagrees with us
-    // must cost one dropped write and not the framing of everything after
+    // --- 12. A header whose length is not a whole number of beats ---
+    // loom_engine cannot emit one (rdma bulk with len[5:0] != 0 is dropped
+    // at the source) but the RX takes its length from the wire, where
+    // nothing enforces it. A sender that disagrees with us must cost one
+    // rejected message and NOT the framing of everything after: the beats
+    // it already owns get drained, and the next header parses clean.
     dut_reset();
-    incoming(6'd6, 28'd100, TARGET + 48'hB00);
+    drop_pulses = 0;
+    incoming(6'd6, 28'd192, TARGET + 48'hB00);
+    send_msg_beat({28'b0, 28'd100, OP_WR}, {16'b0, TARGET + 48'hB00}, 64'b0, 1'b0);
     send_msg_beat(64'hDEAD_0000, 64'b0, 64'b0, 1'b0);
     send_msg_beat(64'hDEAD_0001, 64'b0, 64'b0, 1'b1);
-    wait_quiet(200, "12: direct write of 100 B");
+    wait_quiet(200, "12: header claiming 100 B");
     incoming(6'd6, 28'd64, STAGING);
     send_msg_beat({28'b0, 28'd8, OP_INL}, {16'b0, TARGET + 48'hC00},
                   64'hCC, 1'b1);
-    wait_quiet(200, "12: message after a 100 B direct write");
+    wait_quiet(200, "12: message after a rejected length");
     dump_wrq("case 12");
-    check(wrq.size() == 2, "odd length: one write each");
-    if (wrq.size() == 2)
-        check(wrq[0].len == 100 && wrq[1].vaddr == TARGET + 48'hC00,
-              "odd length: both beats consumed, next header parsed clean");
+    check(wrq.size() == 1, "odd length: the bad header wrote nothing");
+    if (wrq.size() >= 1)
+        check(wrq[0].vaddr == TARGET + 48'hC00,
+              "odd length: its beats drained, next header parsed clean");
+    check(drop_pulses == 1, "odd length: the rejection was counted");
 
     // --- 13. last=1 request that delivers MORE beats than its length ---
     // This is the hardware failure. When the shell says it will terminate
@@ -482,21 +504,32 @@ initial begin
     // the write we had asked for was never satisfied, sq_wr backed up and
     // this module parked in ST_WR_REQ with rx_fwd frozen
     dut_reset();
-    incoming(6'd7, 28'd128, TARGET + 48'hD00);      // len says 2 beats
-    send_msg_beat(64'hFEED_0000, 64'b0, 64'b0, 1'b0);
+    // The header's length is authoritative, so a stream carrying MORE than
+    // it claims leaves a stale beat behind. That beat must not become a
+    // write: the next parse sees it, fails the contract and counts it, and
+    // the message after that lands normally. One message is lost, nothing
+    // is written to an address that came from payload.
+    drop_pulses = 0;
+    incoming(6'd7, 28'd192, TARGET + 48'hD00);
+    send_msg_beat({28'b0, 28'd64, OP_WR}, {16'b0, TARGET + 48'hD00}, 64'b0, 1'b0);
     send_msg_beat(64'hFEED_0001, 64'b0, 64'b0, 1'b0);
-    send_msg_beat(64'hFEED_0002, 64'b0, 64'b0, 1'b1);   // tlast on the third
+    send_msg_beat(64'hFEED_0002, 64'b0, 64'b0, 1'b1);   // one beat too many
     wait_quiet(300, "13: last=1 stream longer than its length");
     incoming(6'd7, 28'd64, STAGING);
     send_msg_beat({28'b0, 28'd8, OP_INL}, {16'b0, TARGET + 48'hE00},
                   64'hEE, 1'b1);
     wait_quiet(300, "13: message after an over-long stream");
     dump_wrq("case 13");
-    check(wrq.size() == 2, "over-long stream: both transactions completed");
+    check(wrq.size() == 2, "over-long stream: both writes issued");
     if (wrq.size() == 2)
-        check(wrq[1].vaddr == TARGET + 48'hE00,
-              "over-long stream: tlast is the boundary, next header clean");
-    check(outq.size() == 4, "over-long stream: all three beats forwarded");
+        check(wrq[0].vaddr == TARGET + 48'hD00 && wrq[0].len == 64 &&
+              wrq[1].vaddr == TARGET + 48'hE00,
+              "over-long stream: header's write correct, next message clean");
+    // Drained, not rejected: the beat the message did not want still belonged
+    // to its request, so it is consumed silently rather than being read as
+    // the next header. Nothing is lost and nothing is counted.
+    check(drop_pulses == 0,
+          "over-long stream: the extra beat is drained, costing no message");
 
     // --- 13. Receive-path cycle accounting. These three partition every
     //     cycle spent in ST_STREAM and are what attributes the receiver's
@@ -507,7 +540,8 @@ initial begin
     //     it sends the next round of work at the wrong half of the path.
     move_pulses = 0; starve_pulses = 0; stall_pulses = 0; req_pulses = 0;
     outq.delete(); wrq.delete();
-    incoming(6'd1, 28'd256, TARGET, 1'b1);        // direct bulk, 4 beats
+    incoming(6'd1, 28'd320, TARGET, 1'b1);        // header + 4 payload beats
+    send_msg_beat({28'b0, 28'd256, OP_WR}, {16'b0, TARGET}, 64'b0, 1'b0);
     // starved: give it one beat, then leave the ingress dry for a while
     send_msg_beat(64'hA0, 64'hA1, 64'hA2, 1'b0);
     repeat (6) @(posedge aclk);
@@ -539,7 +573,8 @@ initial begin
     head_pulses = 0; body_pulses = 0; stall_pulses = 0;
     outq.delete(); wrq.delete();
     @(negedge aclk); m_tready = 0;                 // refuse before ANY beat
-    incoming(6'd1, 28'd128, TARGET, 1'b1);
+    incoming(6'd1, 28'd192, TARGET, 1'b1);
+    send_msg_beat({28'b0, 28'd128, OP_WR}, {16'b0, TARGET}, 64'b0, 1'b0);
     send_msg_beat(64'hE0, 64'hE1, 64'hE2, 1'b0);
     send_msg_beat(64'hF0, 64'hF1, 64'hF2, 1'b1);
     repeat (8) @(posedge aclk);

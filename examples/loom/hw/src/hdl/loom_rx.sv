@@ -3,14 +3,19 @@ import lynxTypes::*;
 /**
  * loom_rx
  *
- * Receive side, hybrid dispatch on the incoming RETH vaddr:
+ * Receive side. EVERY incoming transaction is a Loom message and its
+ * destination comes from the message header - never from rq_wr.vaddr. The
+ * request is used for its pid (whose address space to land in) and to keep
+ * the interface flowing; its address is ignored.
  *
- *   vaddr == STAGING: a Loom inline MESSAGE (sub-64 B store envelope).
- *     Parse the header beat and issue the EXACT write it describes.
- *   vaddr != STAGING: a DIRECT RDMA WRITE (bulk) - forward verbatim as
- *     sq_wr {LOCAL_WRITE, pid, vaddr, len} + all beats untouched. (If
- *     the stock shell already lands these without user logic - gate G3
- *     - this path simply never fires; both are correct.)
+ * That is deliberate, and it is how jigsaw's controller works. A write
+ * addressed by the incoming RETH means the shell's per-packet cursor decides
+ * where a DMA lands: one host write per PMTU packet, 256 of them for a 1 MB
+ * transfer, and a stray packet - a retransmission arriving out of a message,
+ * say - becomes a write to whatever address it carried. Taking the target
+ * from our own header instead gives one write per MESSAGE however many
+ * packets it spans, and leaves no path by which an unrecognized beat can
+ * name its own destination: it fails hdr_ok and is counted, not written.
  *
  * Message header (first beat, staging only):
  *
@@ -45,8 +50,12 @@ module loom_rx (
     input  logic                        rq_valid,
     output logic                        rq_ready,
 
-    // Staging vaddr (from loom_ctrl): selects message-parse vs direct
+    // Staging vaddr (from loom_ctrl). No longer selects anything - every
+    // transaction is parsed as a message - but kept wired so the exporter's
+    // staging address is available here if a sanity check is ever wanted.
+    /* verilator lint_off UNUSED */
     input  logic [VADDR_BITS-1:0]       rdma_staging_va,
+    /* verilator lint_on UNUSED */
 
     // Write requests out (to sq_wr via arbiter)
     output req_t                        wr_req,
@@ -212,16 +221,7 @@ always_ff @(posedge aclk) begin
                 l_beats     <= beats_of(rq_req.len[27:0]);
                 l_rbeats    <= beats_of(rq_req.len[27:0]);
                 l_req_last  <= rq_req.last;
-                if (rq_req.vaddr[VADDR_BITS-1:0] == rdma_staging_va) begin
-                    state <= ST_HDR;             // Loom message: parse
-                end else begin
-                    // Direct bulk write: take target and length from the
-                    // request itself, forward every beat untouched
-                    l_va  <= rq_req.vaddr[VADDR_BITS-1:0];
-                    l_len <= rq_req.len[27:0];
-                    l_op  <= MSG_OP_WRITE;
-                    state <= ST_WR_REQ;
-                end
+                state       <= ST_HDR;
             end
 
             // Parse the header beat
@@ -245,7 +245,7 @@ always_ff @(posedge aclk) begin
                 else
                     // Not a header we recognize: drain what the request
                     // still owns and write nothing (cnt_rx_drop pulses below)
-                    state <= stream_end ? ST_IDLE : ST_DRAIN;
+                    state <= (l_rbeats <= 23'd1) ? ST_IDLE : ST_DRAIN;
             end
 
             ST_WR_REQ: if (wr_ready)
@@ -256,7 +256,7 @@ always_ff @(posedge aclk) begin
             // its request, so those beats are drained here instead of
             // being left for the next parse to read as a header
             ST_INLINE_DATA: if (m_tready)
-                state <= (l_beats != 0) ? ST_DRAIN : ST_IDLE;
+                state <= (l_rbeats != 23'd0) ? ST_DRAIN : ST_IDLE;
 
             // Forward the remaining payload beats
             // s_tready is withheld while a spanning message is between
@@ -268,13 +268,19 @@ always_ff @(posedge aclk) begin
                     l_moved  <= 1'b1;
                     l_beats  <= l_beats  - 23'd1;
                     l_rbeats <= l_rbeats - 23'd1;
-                    if (stream_end) state <= ST_IDLE;
+                    // A message that ends before its request's beats are
+                    // spent leaves the remainder on the stream, where the
+                    // next parse would read it as a header - payload naming
+                    // its own destination, which is the failure this whole
+                    // module is shaped to avoid. Drain it instead.
+                    if (stream_end)
+                        state <= (l_rbeats > 23'd1) ? ST_DRAIN : ST_IDLE;
                 end
             end
 
             ST_DRAIN: if (s_tvalid) begin
-                l_beats <= l_beats - 23'd1;
-                if (s_tlast || l_beats <= 23'd1) state <= ST_IDLE;
+                l_rbeats <= l_rbeats - 23'd1;
+                if (s_tlast || l_rbeats <= 23'd1) state <= ST_IDLE;
             end
 
             default: state <= ST_IDLE;
