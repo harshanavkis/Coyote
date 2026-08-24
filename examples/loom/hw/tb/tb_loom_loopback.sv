@@ -89,7 +89,18 @@ logic pull_tvalid = 0, pull_tready, pull_tlast = 0;
 logic [AXI_DATA_BITS-1:0]   m_host_tdata, m_net_tdata;
 logic [AXI_DATA_BITS/8-1:0] m_host_tkeep, m_net_tkeep;
 logic m_host_tvalid, m_net_tvalid, m_host_tlast, m_net_tlast;
-logic m_host_tready = 1, m_net_tready = 1;
+logic [AXI_DATA_BITS-1:0] net_beats[$];
+logic m_host_tready = 1;
+
+// The network side does NOT take beats unconditionally. The shell buffers
+// what it has not yet put on the wire, and when that fills it stops
+// accepting - RDMA_N_WR_OUTSTANDING packets' worth, which at PMTU 4096 is
+// 1024 beats. The model used to hold m_net_tready high forever, so no TB
+// has ever driven the engine against a full window, and on hardware a 4 MB
+// message (65537 beats, 1025 packets) parked it in ST_STREAM for 1.25
+// billion cycles with the network refusing every beat.
+localparam int NET_WINDOW_BEATS = 16 * (PMTU / 64);
+wire m_net_tready = (net_beats.size() < NET_WINDOW_BEATS);
 logic eng_busy;
 
 int errors = 0;
@@ -231,7 +242,6 @@ end
 // -------------------------------------------------------------------------
 typedef struct { logic [47:0] vaddr; logic [27:0] len; } wreq_t;
 wreq_t net_reqs[$];
-logic [AXI_DATA_BITS-1:0] net_beats[$];
 int fences = 0;
 
 // Beat accounting. A request claims `len` bytes; the engine must put
