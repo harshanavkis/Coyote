@@ -694,9 +694,12 @@ int run_server(uint16_t qp_port, uint16_t peer_port, const std::string &sock) {
                    100.0 * double(st) / double(tot));
         const uint64_t acc = loom::csr_read(t_ctrl, loom::RX_REQ);
         const uint64_t don = loom::csr_read(t_ctrl, loom::DBG_BASE + 8 * 4);
-        printf("rq_wr: %lu accepted, %lu completed%s\n",
-               (unsigned long) acc, (unsigned long) don,
-               acc == don ? "" : "  <-- requests accepted and never finished");
+        const uint64_t spn = loom::csr_read(t_ctrl, loom::RX_SPAN);
+        printf("rq_wr: %lu accepted (%lu absorbed as message continuations), "
+               "%lu completed%s\n", (unsigned long) acc, (unsigned long) spn,
+               (unsigned long) don,
+               acc == don + spn ? ""
+                                : "  <-- accepted, neither completed nor absorbed");
         const uint64_t hd = loom::csr_read(t_ctrl, loom::RX_STALL_HEAD);
         const uint64_t bd = loom::csr_read(t_ctrl, loom::RX_STALL_BODY);
         if (st)

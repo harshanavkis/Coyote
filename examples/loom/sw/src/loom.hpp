@@ -70,6 +70,12 @@ constexpr uint32_t RX_STALL_BODY = 0x170;
 // requests arrived and were not finished; equality with a shortfall against
 // the packets the sender must have sent says they never arrived at all.
 constexpr uint32_t RX_REQ        = 0x178;
+// Continuation requests absorbed by a spanning message (RO word 17). A bulk
+// transfer is ONE write across many packets, so most of its rq_wr's are
+// swallowed rather than becoming transactions. Expect, per bulk message,
+// ceil((len + 64) / PMTU) - 1. Anything else means the receive side is
+// pairing requests with payload differently than the sender framed it.
+constexpr uint32_t RX_SPAN       = 0x88;
 
 constexpr uint32_t STG_CYC       = 0x180;  // free-running cycle counter
 constexpr uint32_t STG_QUEUE_ACC = 0x188;  // order-FIFO residency sum (t-queue)

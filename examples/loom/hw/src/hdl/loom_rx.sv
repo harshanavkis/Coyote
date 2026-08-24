@@ -114,7 +114,15 @@ module loom_rx (
     // when completions came up short of the packets the shell must have
     // sent, nothing said whether the requests never arrived or arrived and
     // were never finished. Those have opposite causes and opposite fixes.
-    output logic                        cnt_rx_req
+    output logic                        cnt_rx_req,
+
+    // Continuation requests absorbed by a spanning message. A bulk transfer
+    // is one logical write across many packets, so most of its rq_wr's are
+    // swallowed here rather than becoming transactions - and nothing else
+    // observes that. If the absorption ever mis-counts, the payload lands
+    // wrong with no counter moving, which is the situation this whole
+    // investigation started in. Expect (packets per message - 1) per bulk.
+    output logic                        cnt_rx_span
 );
 
 // Wire-message header ops (keep in sync with loom_engine.sv)
@@ -338,5 +346,7 @@ assign cnt_rx_stall_head = cnt_rx_stall && !l_moved;
 assign cnt_rx_stall_body = cnt_rx_stall &&  l_moved;
 
 assign cnt_rx_req = rq_valid && rq_ready;
+
+assign cnt_rx_span = rq_valid && rq_ready && l_span && (state == ST_STREAM);
 
 endmodule

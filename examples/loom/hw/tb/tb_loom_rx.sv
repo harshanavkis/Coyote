@@ -36,8 +36,8 @@ logic m_tready = 1;
 
 logic req, grant = 0, busy, cnt_rx_fwd, cnt_rx_drop;
 logic cnt_rx_move, cnt_rx_starve, cnt_rx_stall;
-logic cnt_rx_stall_head, cnt_rx_stall_body, cnt_rx_req;
-int req_pulses = 0;
+logic cnt_rx_stall_head, cnt_rx_stall_body, cnt_rx_req, cnt_rx_span;
+int req_pulses = 0, span_pulses = 0;
 int head_pulses = 0, body_pulses = 0;
 int move_pulses = 0, starve_pulses = 0, stall_pulses = 0;
 
@@ -65,7 +65,7 @@ loom_rx dut (
     .cnt_rx_stall(cnt_rx_stall),
     .cnt_rx_stall_head(cnt_rx_stall_head),
     .cnt_rx_stall_body(cnt_rx_stall_body),
-    .cnt_rx_req(cnt_rx_req)
+    .cnt_rx_req(cnt_rx_req), .cnt_rx_span(cnt_rx_span)
 );
 
 req_t wrq[$];
@@ -94,6 +94,7 @@ always @(posedge aclk) begin
     if (cnt_rx_stall_head) head_pulses++;
     if (cnt_rx_stall_body) body_pulses++;
     if (cnt_rx_req) req_pulses++;
+    if (cnt_rx_span) span_pulses++;
 end
 
 // Print what the DUT actually issued: a framing bug shows up as the wrong
@@ -590,6 +591,32 @@ initial begin
     check(req_pulses == 2,
           $sformatf("accounting: one pulse per request accepted (%0d of 2)",
                     req_pulses));
+
+    // --- 14. A message spanning three requests absorbs exactly two of
+    //     them. Nothing else observes that absorption, so if it ever
+    //     mis-counts the payload lands wrong with no counter moving.
+    dut_reset();
+    req_pulses = 0; span_pulses = 0;
+    outq.delete(); wrq.delete();
+    incoming(6'd2, 28'd128, STAGING);                 // 2 beats: hdr + 1
+    send_msg_beat({28'b0, 28'd192, OP_WR}, {16'b0, TARGET + 48'h2000}, 64'b0, 1'b0);
+    send_msg_beat(64'h5100, 64'b0, 64'b0, 1'b0);
+    present_pending(6'd2, 28'd64, STAGING + 48'h1000);  // continuation
+    send_msg_beat(64'h5101, 64'b0, 64'b0, 1'b0);
+    present_pending(6'd2, 28'd64, STAGING + 48'h2000);  // continuation
+    send_msg_beat(64'h5102, 64'b0, 64'b0, 1'b1);
+    wait_quiet(400, "14: message spanning three requests");
+    dump_wrq("case 14");
+    check(wrq.size() == 1, "spanning: ONE write for the whole message");
+    if (wrq.size() >= 1)
+        check(wrq[0].vaddr == TARGET + 48'h2000 && wrq[0].len == 192,
+              "spanning: target and length are the header's");
+    check(outq.size() == 3, "spanning: all three payload beats forwarded");
+    check(req_pulses == 3,
+          $sformatf("spanning: three requests accepted (%0d)", req_pulses));
+    check(span_pulses == 2,
+          $sformatf("spanning: two of them absorbed as continuations (%0d)",
+                    span_pulses));
 
     if (errors == 0) $display("TB PASS (tb_loom_rx)");
     else             $display("TB FAIL (tb_loom_rx): %0d errors", errors);
