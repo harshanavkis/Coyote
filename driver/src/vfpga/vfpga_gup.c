@@ -764,7 +764,11 @@ int sync_user_pages(struct vfpga_dev *device, uint64_t vaddr, uint32_t len, int3
 
 const struct dma_buf_attach_ops gpu_importer_ops = {
     .allow_peer2peer = true,
-    .move_notify = p2p_move_notify 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 1, 0)
+    .invalidate_mappings = p2p_move_notify
+#else
+    .move_notify = p2p_move_notify
+#endif
 };
 
 void p2p_move_notify(struct dma_buf_attachment *attach) {
