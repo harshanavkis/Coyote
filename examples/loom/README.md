@@ -263,10 +263,20 @@ tmux new-session -d -s loom_bit \
 **Program + driver**, on every host that will run anything:
 
 ```bash
-cd <coyote-root>
-xilinx-shell -c "vivado -mode batch -source program_fpga.tcl ..."
-sudo bash setup_coyote.sh
+cd examples/loom/hw
+xilinx-shell -c "vivado -mode batch -notrace -source program_loom.tcl \
+  -tclargs $PWD/build_aug24/bitstreams/cyt_top.bit"
+cd <coyote-root> && sudo bash setup_coyote.sh
 ```
+
+`program_loom.tcl` picks the device whose PART matches `xcu280*` (override
+with a second `-tclargs` word; add `-dry` to print the selection and stop).
+Coyote's own `program_fpga.tcl` opens a bare `open_hw_target` and takes
+`[lindex [get_hw_devices] 0]`, which only works on a host with one JTAG
+target holding one device. clara has two targets - a Versal V80
+(`arm_dap_0` + `xcv80_1`, PCIe `81:00.0`) and the Alveo U280 Coyote runs on
+(`xcu280_u55c_0`, PCIe `e1:00.0`, the BDF `setup_coyote.sh` reloads) - so
+device 0 there is an ARM debug port, not an FPGA.
 
 **Build the software** in hardware mode (no `EN_SIM`, no `COYOTE_SIM_DIR`).
 Two trees, built separately, and both are needed on both hosts for the
