@@ -828,10 +828,19 @@ int run_client(const std::string &ip, uint16_t qp_port, uint16_t peer_port,
     A.store(w1, 0x40, 0xB00B'0000'0000'0001ULL);
     A.store(w2, 0x40, 0xB00B'0000'0000'0002ULL);
 
+    // The fence word carries the engine's RUNNING completion count, and
+    // compl_cnt clears only on aresetn - so a second run against the same
+    // card starts wherever the previous one left off. Read the baseline
+    // instead of hardcoding 1, exactly as roles_test.hpp does; poll64 is an
+    // equality wait, so a hardcoded value burns the whole timeout and then
+    // reports a failure that is really just a warm card.
+    const uint64_t f0 = loom::csr_read(t_ctrl, loom::DBG_BASE + 8 * 7);
+
     // Bulk with fence (direct RDMA WRITE; fence = local posted completion)
     if (!skip_bulk()) {
         A.copy(w1, 0x10000, src, DMA_BYTES, fence);
-        check(poll64(&fence[0], 1), "fence 1 after copy (posted completion)");
+        check(poll64(&fence[0], f0 + 1),
+              "fence 1 after copy (posted completion)");
         // Probe: the same window and the same kind of store as the ordering
         // flag, but right after a descriptor rather than after two. If this
         // one lands and the flag does not, position in the sequence is not
@@ -847,7 +856,7 @@ int run_client(const std::string &ip, uint16_t qp_port, uint16_t peer_port,
     if (!skip_bulk()) {
         A.copy(w1, 0x20000, src, DMA_BYTES, fence);
         A.store(w2, 0x800, 0xF1A6ULL);
-        check(poll64(&fence[0], 2), "fence 2 after ordering copy");
+        check(poll64(&fence[0], f0 + 2), "fence 2 after ordering copy");
     } else {
         A.store(w2, 0x800, 0xF1A6ULL);
     }
