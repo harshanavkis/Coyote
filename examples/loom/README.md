@@ -94,7 +94,7 @@ equivalent, since XSIM only dlopens it at runtime.
 ### Block-level testbenches
 
 ```bash
-examples/loom/hw/tb/run_tbs.sh      # expect PASS x5, logs in hw/tb/work/
+examples/loom/hw/tb/run_tbs.sh      # expect PASS x6, logs in hw/tb/work/
 ```
 
 Re-execs itself inside `xilinx-shell`, compiles `lynx_pkg.sv` +

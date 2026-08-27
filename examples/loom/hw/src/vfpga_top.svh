@@ -85,6 +85,36 @@ AXI4SR axis_wr (.*);
 axisr_reg inst_reg_wr   (.aclk(aclk), .aresetn(aresetn),
                          .s_axis(axis_wr), .m_axis(axis_host_send[0]));
 
+// ---------------------------------------------------------------------------
+// Ingress FIFO in front of loom_rx, as jigsaw's device controller has on its
+// DMA input. loom_rx holds no buffer, so a stall on the host write path
+// reached axis_rrsp_recv.tready in the SAME cycle. Backpressuring an RC
+// receiver for longer than the sender's retransmit timer delays its ACKs, the
+// timer fires (retransmitter.hpp TIMER_RETRANS), and the retransmission
+// perturbs the payload beat stream that loom_rx counts position from - which
+// is how a run with nothing lost on the wire still lands displaced.
+//
+// 512 beats deep (common_infrastructure.tcl: n_outs * pmtu/64 = 8 * 64), so
+// eight packets' worth, generated already in the user project.
+// ---------------------------------------------------------------------------
+logic [511:0] rxf_tdata;
+logic [63:0]  rxf_tkeep;
+logic         rxf_tvalid, rxf_tready, rxf_tlast;
+
+axis_data_fifo_512 inst_rx_ingress_fifo (
+    .s_axis_aclk(aclk), .s_axis_aresetn(aresetn),
+    .s_axis_tdata(axis_rrsp_recv[0].tdata),
+    .s_axis_tkeep(axis_rrsp_recv[0].tkeep),
+    .s_axis_tvalid(axis_rrsp_recv[0].tvalid),
+    .s_axis_tready(axis_rrsp_recv[0].tready),
+    .s_axis_tlast(axis_rrsp_recv[0].tlast),
+    .m_axis_tdata(rxf_tdata),
+    .m_axis_tkeep(rxf_tkeep),
+    .m_axis_tvalid(rxf_tvalid),
+    .m_axis_tready(rxf_tready),
+    .m_axis_tlast(rxf_tlast)
+);
+
 // Arbiter: exclusive, whole-transaction ownership of {sq_wr, axis_host_send}
 //
 // Why it exists: the engine (stores, DMA writes, fences) and rx
@@ -218,9 +248,9 @@ loom_rx inst_loom_rx (
     .rdma_staging_va(rdma_staging_va), .rx_pid(rx_pid),
     .wr_req(rx_wr_req), .wr_valid(rx_wr_valid),
     .wr_ready(sq_wr.ready && rx_grant),
-    .s_tdata(axis_rrsp_recv[0].tdata), .s_tkeep(axis_rrsp_recv[0].tkeep),
-    .s_tvalid(axis_rrsp_recv[0].tvalid), .s_tready(axis_rrsp_recv[0].tready),
-    .s_tlast(axis_rrsp_recv[0].tlast),
+    .s_tdata(rxf_tdata), .s_tkeep(rxf_tkeep),
+    .s_tvalid(rxf_tvalid), .s_tready(rxf_tready),
+    .s_tlast(rxf_tlast),
     .m_tdata(rx_tdata), .m_tkeep(rx_tkeep), .m_tvalid(rx_tvalid),
     .m_tready(axis_wr.tready && rx_grant), .m_tlast(rx_tlast),
     .req(rx_req_arb), .grant(rx_grant), .busy(rx_busy),
