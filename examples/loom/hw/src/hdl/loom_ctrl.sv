@@ -177,6 +177,14 @@ localparam integer R_RX_ST_BODY  = 46;   // stalled after it
 localparam integer R_RX_REQ      = 47;   // rq_wr requests accepted
 localparam integer R_RX_SPAN     = 20;   // continuation requests absorbed
                                          // (17-19 are the TX cycle split)
+// Longest UNBROKEN run of stalled cycles, where R_RX_STALL is their sum.
+// The two answer different questions and only this one sizes a buffer: a
+// FIFO absorbs a burst up to its depth, so what matters is the worst single
+// run, not the total. If this comes back well under the ingress FIFO's 512
+// beats the stalls are bursty and buffering is the right lever; if it is a
+// large fraction of the run the host write path simply cannot keep up and no
+// depth fixes that - it only converts the burst into latency.
+localparam integer R_RX_STALL_MAX = 24;
 localparam integer R_CYC         = 48;
 localparam integer R_QUEUE_ACC   = 49;
 localparam integer R_STG_ACC     = 50;   // 7 words: 50-56
@@ -259,6 +267,7 @@ logic [63:0] r_rdma_staging;
 logic [63:0] r_rx_pid;
 logic [63:0] dbg [N_DBG];
 logic [63:0] rx_move, rx_starve, rx_stall, rx_st_head, rx_st_body, rx_req_cnt;
+logic [63:0] rx_stall_run, rx_stall_max;
 logic [63:0] tx_move, tx_starve, tx_stall;
 logic [63:0] rx_span_cnt;
 
@@ -453,6 +462,7 @@ always_ff @(posedge aclk) begin
         rx_move <= 0; rx_starve <= 0; rx_stall <= 0;
         tx_move <= 0; tx_starve <= 0; tx_stall <= 0;
         rx_st_head <= 0; rx_st_body <= 0; rx_req_cnt <= 0; rx_span_cnt <= 0;
+        rx_stall_run <= 0; rx_stall_max <= 0;
     end else begin
         if (push_store)   dbg[0] <= dbg[0] + 1;
         if (push_desc)    dbg[1] <= dbg[1] + 1;
@@ -470,6 +480,13 @@ always_ff @(posedge aclk) begin
         if (cnt_rx_move)   rx_move   <= rx_move + 1;
         if (cnt_rx_starve) rx_starve <= rx_starve + 1;
         if (cnt_rx_stall)  rx_stall  <= rx_stall + 1;
+        // Run length of consecutive stalled cycles, and the longest seen
+        if (cnt_rx_stall) begin
+            rx_stall_run <= rx_stall_run + 1;
+            if (rx_stall_run + 1 > rx_stall_max) rx_stall_max <= rx_stall_run + 1;
+        end else begin
+            rx_stall_run <= 0;
+        end
         if (cnt_rx_stall_head) rx_st_head <= rx_st_head + 1;
         if (cnt_rx_stall_body) rx_st_body <= rx_st_body + 1;
         if (cnt_rx_req)        rx_req_cnt <= rx_req_cnt + 1;
@@ -510,6 +527,8 @@ always_ff @(posedge aclk) begin
                     axi_rdata <= rx_starve;
                 else if (rd_idx == R_RX_STALL)
                     axi_rdata <= rx_stall;
+                else if (rd_idx == R_RX_STALL_MAX)
+                    axi_rdata <= rx_stall_max;
                 else if (rd_idx == R_RX_ST_HEAD)
                     axi_rdata <= rx_st_head;
                 else if (rd_idx == R_RX_ST_BODY)

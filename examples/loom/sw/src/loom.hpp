@@ -67,6 +67,10 @@ constexpr uint32_t TX_STALL      = 0x98;
 constexpr uint32_t RX_MOVE       = 0x150;
 constexpr uint32_t RX_STARVE     = 0x158;
 constexpr uint32_t RX_STALL      = 0x160;
+// Longest unbroken run of stalled cycles (RX_STALL is their sum). Only this
+// one sizes a buffer: a FIFO absorbs a burst up to its depth, so the worst
+// single run is the number that matters, not the total.
+constexpr uint32_t RX_STALL_MAX  = 0x0C0;   // word 24
 // The stall split. loom_rx is single-outstanding on the write side, so if
 // the shell withholds m_tready until it has accepted and translated the
 // request, every packet pays that latency serially and the stalls land

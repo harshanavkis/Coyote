@@ -756,6 +756,18 @@ int run_server(uint16_t qp_port, uint16_t peer_port, const std::string &sock) {
                    hd > bd ? "single-outstanding request latency; overlap the "
                              "next sq_wr with the current stream"
                            : "a bursty host write path; buffer it");
+        // Sum vs worst run: the ingress FIFO is 512 beats in the shell plus
+        // 512 in user logic, so a worst run well under that is a burst the
+        // buffer can swallow. A worst run comparable to the total means the
+        // write path is simply slower than the link and no depth fixes it.
+        const uint64_t mx = loom::csr_read(t_ctrl, loom::RX_STALL_MAX);
+        if (st)
+            printf("  longest unbroken stall: %lu cycles of %lu total -> %s\n",
+                   (unsigned long) mx, (unsigned long) st,
+                   mx < 512 ? "burst, inside one FIFO's depth"
+                            : (mx < 1024 ? "burst, needs the 1024 both FIFOs give"
+                                         : "sustained: deeper buffering will not "
+                                           "fix this"));
     }
 
     dump_counters(t_ctrl, "server final");

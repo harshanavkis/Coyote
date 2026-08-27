@@ -36,6 +36,7 @@ logic                  rd_resp_valid;
 logic [VADDR_BITS-1:0] rdma_staging_va;
 
 logic cnt_local_wr, cnt_rdma_wr, cnt_rx_fwd, cnt_rx_drop, cnt_drop, cnt_compl;
+logic cnt_rx_stall = 0;
 
 // Stage counter inputs: driven with distinct constants so the CSR read
 // mux (words 50-63) can be checked without an engine
@@ -60,6 +61,7 @@ loom_ctrl dut (
     .cnt_local_wr(cnt_local_wr), .cnt_rdma_wr(cnt_rdma_wr),
     .cnt_rx_fwd(cnt_rx_fwd), .cnt_rx_drop(cnt_rx_drop),
     .cnt_drop(cnt_drop), .cnt_compl(cnt_compl),
+    .cnt_rx_stall(cnt_rx_stall),
     .stage_acc(stage_acc), .stage_cnt(stage_cnt)
 );
 
@@ -69,6 +71,7 @@ always @(posedge aclk) if (tbl_commit) commit_pulses++;
 localparam int R_TBL_IDX = 0, R_TBL_CFG = 1, R_TBL_PID = 2, R_TBL_BASE = 3,
                R_TBL_LEN = 4, R_TBL_COMMIT = 5, R_DMA_DST = 8,
                R_RDMA_STAGING_TB = 16,
+               R_RX_STALL_TB = 44, R_RX_STALL_MAX_TB = 24,
                R_DMA_SRC_VA = 9, R_DMA_LEN = 10, R_DMA_SRC_PID = 11,
                R_DMA_TRIGGER = 12, R_DMA_COMPL_VA = 13, R_DBG = 32;
 
@@ -345,6 +348,33 @@ initial begin
             axil_write(16'(w * 8), 64'h0);
         check(rdma_staging_va == staged,
               "18: staging vaddr survives a descriptor-line burst");
+    end
+
+    // 19: the stall accounting keeps a SUM and a longest unbroken RUN, and
+    // they are different numbers. Only the run sizes a buffer - a FIFO
+    // swallows a burst up to its depth, so three short stalls are not the
+    // same problem as one long one even when they total the same.
+    begin
+        logic [63:0] sum, mx;
+        // runs of 5, 12 and 3, separated by idle cycles: sum 20, longest 12
+        for (int r = 0; r < 3; r++) begin
+            int len;
+            len = (r == 0) ? 5 : (r == 1) ? 12 : 3;
+            repeat (len) begin
+                @(negedge aclk); cnt_rx_stall = 1;
+                @(posedge aclk);
+            end
+            @(negedge aclk); cnt_rx_stall = 0;
+            repeat (4) @(posedge aclk);
+        end
+        @(negedge aclk);
+        axil_read(16'(R_RX_STALL_TB * 8), sum);
+        axil_read(16'(R_RX_STALL_MAX_TB * 8), mx);
+        check(sum == 64'd20,
+              $sformatf("19: stalled cycles sum to 20 (%0d)", sum));
+        check(mx == 64'd12,
+              $sformatf("19: longest unbroken stall is 12, not the sum (%0d)",
+                        mx));
     end
 
     if (errors == 0) $display("TB PASS (tb_loom_ctrl)");
