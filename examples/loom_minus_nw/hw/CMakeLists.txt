@@ -16,6 +16,15 @@ set(EN_RDMA 0)
 set(N_REGIONS 1)
 set(BUILD_OPT 1)
 
+# The four loom_*.sv are examples/loom's, not copies kept in step by hand.
+# They cannot be symlinks: cr_user.tcl does `file copy -force` of src/hdl into
+# the build tree, which copies a symlink VERBATIM, and a relative target does
+# not resolve from there - synthesis then fails with "module 'loom_ctrl' not
+# found". Materialising them at configure time gives cr_user.tcl real files
+# while keeping examples/loom the only place they are edited.
+file(COPY ${CMAKE_CURRENT_SOURCE_DIR}/../../loom/hw/src/hdl/
+     DESTINATION ${CMAKE_CURRENT_SOURCE_DIR}/src/hdl)
+
 validation_checks_hw()
 load_apps (
     VFPGA_C0_0 "src"

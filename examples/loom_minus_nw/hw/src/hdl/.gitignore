@@ -1,0 +1,5 @@
+# Copied from examples/loom at configure time; edit them there.
+loom_ctrl.sv
+loom_engine.sv
+loom_rx.sv
+loom_table.sv
