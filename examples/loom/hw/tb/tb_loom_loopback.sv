@@ -209,6 +209,16 @@ endfunction
 // -------------------------------------------------------------------------
 req_t pull_req;
 int   pull_beats;
+
+// One EXTRA beat on the pull response, once. The engine ends its outgoing
+// stream on a free-running count (loom_engine stream_last = l_sbeats <= 1)
+// and never checks that a beat belongs to the request it asked for, so a
+// single surplus beat on the shared axis_host_recv should shift the payload
+// permanently - with no packet loss, no reordering and no retransmission
+// anywhere in this model.
+bit pull_extra_beat = 0;
+bit pull_extra_done = 0;
+int pull_extra_count = 0;
 initial forever begin
     @(posedge aclk);
     if (eng_rd_valid && eng_rd_ready) begin
@@ -229,6 +239,19 @@ initial forever begin
             pull_tlast  = (b == pull_beats - 1) ||
                           (PULL_SEG != 0 && ((b + 1) % PULL_SEG == 0));
             do @(posedge aclk); while (!pull_tready);
+        end
+        // The surplus beat: valid data, correct framing, simply one more
+        // than was asked for.
+        if (pull_extra_beat && !pull_extra_done) begin
+            pull_extra_done = 1;
+            @(negedge aclk);
+            for (int l = 0; l < 8; l++)
+                pull_tdata[64*l +: 64] = 64'hDEAD_0000 + 64'(l);
+            pull_tkeep  = {64{1'b1}};
+            pull_tvalid = 1;
+            pull_tlast  = 1;
+            do @(posedge aclk); while (!pull_tready);
+            pull_extra_count++;
         end
         @(negedge aclk);
         pull_tvalid = 0; pull_tlast = 0;
@@ -914,13 +937,61 @@ initial begin
                           src_word(first_bad)));
     end
 
+    // ---------------------------------------------------------------------
+    // The sender-side counterpart, and the one that matters: a PERFECT
+    // link. No beats lost, no duplicates, no retransmission - just one
+    // surplus beat on the pull. loom_engine forwards the next l_sbeats
+    // beats off axis_host_recv without checking they belong to its own
+    // request, so the payload should shift and stay shifted.
+    // ---------------------------------------------------------------------
+    pull_extra_beat = 1;
+    pull_extra_done = 0;
+    fwd_before      = rx_txns;
+    copy(4'd1, 28'h700000, {16'b0, SRC_VA}, 28'd262144, {16'b0, CPL_VA});
+    copy(4'd1, 28'h740000, {16'b0, SRC_VA}, 28'd262144, {16'b0, CPL_VA});
+    // A third message so the shifted one's tail is filled from the stream
+    // behind it, exactly as it is on hardware where 32 run back to back.
+    // Without it the model simply runs dry and the tail reads "never
+    // written", which is an artefact of the harness, not of the bug.
+    copy(4'd1, 28'h780000, {16'b0, SRC_VA}, 28'd262144, {16'b0, CPL_VA});
+    settle();
+    pull_extra_beat = 0;
+
+    check(pull_extra_count == 1,
+          $sformatf("exactly one surplus pull beat injected (%0d)",
+                    pull_extra_count));
+    begin
+        int wrong = 0, never = 0, first_bad = -1;
+        for (int i = 0; i < 32768; i++) begin
+            logic [47:0] va = BASE1 + 48'h740000 + 48'(i*8);
+            if (!mem.exists(va >> 3)) never++;
+            else if (mem[va >> 3] != src_word(i)) begin
+                if (first_bad < 0) first_bad = i;
+                wrong++;
+            end
+        end
+        $display("       surplus-beat run: %0d of 32768 words wrong, %0d never written, first bad %0d",
+                 wrong, never, first_bad);
+        if (first_bad >= 0 && mem.exists((BASE1 + 48'h740000 + 48'(first_bad*8)) >> 3))
+            $display("       at word %0d: got %016x, want %016x",
+                     first_bad,
+                     mem[(BASE1 + 48'h740000 + 48'(first_bad*8)) >> 3],
+                     src_word(first_bad));
+        check(wrong > 0,
+              "a single surplus pull beat corrupts, with a PERFECT link");
+        check(rx_drop === 1'b0,
+              "and no header is rejected, so it looks like clean traffic");
+    end
+
     check(rx_drop === 1'b0, "no header was ever rejected on the far side");
 
     // The engine must have delivered exactly what its requests claimed
     check(net_extra == 0,
           $sformatf("no beat outside a request (%0d extra)", net_extra));
-    check(net_owed == 0,
-          $sformatf("no request left short of payload (%0d owed)", net_owed));
+    if (pull_extra_count == 0)
+        check(net_owed == 0,
+              $sformatf("no request left short of payload (%0d owed)",
+                        net_owed));
 
     if (errors == 0) $display("TB PASS (tb_loom_loopback)");
     else             $display("TB FAIL (tb_loom_loopback): %0d errors", errors);
