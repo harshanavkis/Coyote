@@ -166,67 +166,14 @@ req_t rx_wr_req;
 logic rx_wr_valid;
 logic rx_wr_ready = 1;
 
-logic [AXI_DATA_BITS-1:0]   rxf_s_tdata = 0;
-logic [AXI_DATA_BITS/8-1:0] rxf_s_tkeep = 0;
-logic rxf_s_tvalid = 0, rxf_s_tready, rxf_s_tlast = 0;
-
-// Ingress FIFO, exactly as vfpga_top now instantiates it in front of loom_rx.
-logic [AXI_DATA_BITS-1:0]   rx_s_tdata;
-logic [AXI_DATA_BITS/8-1:0] rx_s_tkeep;
-logic rx_s_tvalid, rx_s_tready, rx_s_tlast;
-
-axis_data_fifo_512 inst_rx_ingress_fifo (
-    .s_axis_aclk(aclk), .s_axis_aresetn(aresetn),
-    .s_axis_tdata(rxf_s_tdata), .s_axis_tkeep(rxf_s_tkeep),
-    .s_axis_tvalid(rxf_s_tvalid), .s_axis_tready(rxf_s_tready),
-    .s_axis_tlast(rxf_s_tlast),
-    .m_axis_tdata(rx_s_tdata), .m_axis_tkeep(rx_s_tkeep),
-    .m_axis_tvalid(rx_s_tvalid), .m_axis_tready(rx_s_tready),
-    .m_axis_tlast(rx_s_tlast)
-);
+logic [AXI_DATA_BITS-1:0]   rx_s_tdata = 0;
+logic [AXI_DATA_BITS/8-1:0] rx_s_tkeep = 0;
+logic rx_s_tvalid = 0, rx_s_tready, rx_s_tlast = 0;
 
 logic [AXI_DATA_BITS-1:0]   rx_m_tdata;
 logic [AXI_DATA_BITS/8-1:0] rx_m_tkeep;
 logic rx_m_tvalid, rx_m_tlast;
-// Host write path backpressure. Hardware reports every stall as body-heavy
-// ("0 before the packet's first beat"), i.e. the write path is bursty, and
-// with no buffer that burst reached the RoCE ingress in the same cycle.
-// Held ready until a test sets host_stall_len, then stalls that many cycles
-// once per host_stall_every accepted beats.
 logic rx_m_tready = 1;
-int   host_stall_len   = 0;       // cycles per stall burst
-int   host_stall_count = 0;       // bursts left to issue
-int   ingress_stall_cycles = 0;   // cycles the LINK was backpressured
-int   host_stall_cycles    = 0;   // cycles the host write path stalled us
-
-// One isolated burst per host_stall_count, each starting once the write path
-// is actually carrying data. Isolated on purpose: if the write path is held
-// off for a fixed FRACTION of every window it is a sustained-bandwidth
-// deficit and no FIFO depth fixes it - the buffer only ever converts a burst
-// into latency. What is being tested here is the burst case.
-// Driven on negedge, as every other stimulus in this TB is: rx_m_tready is
-// sampled at posedge by both loom_rx and the host-memory model, so assigning
-// it at posedge races them and shows up as a one-beat displacement.
-initial forever begin
-    @(negedge aclk);
-    if (host_stall_count > 0 && host_stall_len > 0) begin
-        while (!(rx_m_tvalid && rx_m_tready)) @(negedge aclk);
-        rx_m_tready = 0;
-        repeat (host_stall_len) begin
-            @(negedge aclk);
-            host_stall_cycles++;
-        end
-        rx_m_tready = 1;
-        host_stall_count--;
-    end
-end
-
-// The whole point of the ingress FIFO: while it has room, a host-write stall
-// must NOT reach the link. Count the cycles the link was held off.
-initial forever begin
-    @(posedge aclk);
-    if (aresetn && rxf_s_tvalid && !rxf_s_tready) ingress_stall_cycles++;
-end
 logic rx_req_arb, rx_busy, rx_fwd, rx_drop;
 
 localparam [47:0] STAGING  = 48'h7d24_8ca0_0000;   // exporter's staging VA
@@ -418,18 +365,18 @@ initial forever begin
                 break;
             end
             @(negedge aclk);
-            rxf_s_tdata  = net_beats.pop_front();
-            rxf_s_tkeep  = {64{1'b1}};
-            rxf_s_tvalid = 1;
-            rxf_s_tlast  = tlast_per_pkt
+            rx_s_tdata  = net_beats.pop_front();
+            rx_s_tkeep  = {64{1'b1}};
+            rx_s_tvalid = 1;
+            rx_s_tlast  = tlast_per_pkt
                           ? (((bi % (PMTU/64)) == (PMTU/64 - 1)) ||
                              (bi == fr.beats - 1))
                           : ((bi == fr.beats - 1) && fr.last_frag);
             guard = 0;
             do begin @(posedge aclk); guard++; end
-            while (!rxf_s_tready && guard < 20000);
+            while (!rx_s_tready && guard < 20000);
             @(negedge aclk);
-            rxf_s_tvalid = 0; rxf_s_tlast = 0;
+            rx_s_tvalid = 0; rx_s_tlast = 0;
             if (guard >= 20000) begin
                 check(1'b0, "far side stopped taking beats (stuck mid-transaction)");
                 break;
@@ -529,7 +476,7 @@ task settle();
     n = 0;
     while (n < 4000000 && (!fifo_empty || eng_busy || net_reqs.size() > 0 ||
                          rx_busy || net_beats.size() > 0 ||
-                         net_frames.size() > 0 || rx_s_tvalid)) begin
+                         net_frames.size() > 0)) begin
         @(posedge aclk); n++;
     end
     repeat (10) @(posedge aclk);
@@ -874,53 +821,6 @@ initial begin
           $sformatf("1 MB, per-packet tlast: ONE host write (%0d)",
                     rx_txns - fwd_before));
     tlast_per_pkt = 0;
-
-    // ---------------------------------------------------------------------
-    // The ingress FIFO's reason for existing. Hardware reports every host
-    // write stall as body-heavy, and with no buffer that stall reached
-    // axis_rrsp_recv.tready in the same cycle - which backpressures an RC
-    // receiver, delays its ACKs past the sender's retransmit timer, and the
-    // retransmission then displaces the beat stream loom_rx counts position
-    // from. With 512 beats of buffer a stall shorter than that must not
-    // reach the link at all.
-    // ---------------------------------------------------------------------
-    ingress_stall_cycles = 0;
-    host_stall_cycles    = 0;
-    host_stall_count     = 1;
-    host_stall_len       = 128;     // well inside the 512-beat FIFO
-    fwd_before = rx_txns;
-    copy(4'd1, 28'hA00000, {16'b0, SRC_VA}, 28'd262144, {16'b0, CPL_VA});
-    settle();
-    host_stall_len   = 0;
-    host_stall_count = 0;
-    check_payload(BASE1 + 48'hA00000, 32768,
-                  "256 KB with a bursty host write path: lands intact");
-    check(host_stall_cycles > 0,
-          $sformatf("the host write path really did stall (%0d cycles)",
-                    host_stall_cycles));
-    $display("       burst inside the FIFO: host stalled %0d cyc, link held off %0d cyc",
-             host_stall_cycles, ingress_stall_cycles);
-    check(ingress_stall_cycles == 0,
-          $sformatf("FIFO absorbed it: link never backpressured (%0d cycles)",
-                    ingress_stall_cycles));
-
-    // And the converse, so the check above cannot pass by the model simply
-    // never stalling: a burst DEEPER than the FIFO must reach the link.
-    ingress_stall_cycles = 0;
-    host_stall_cycles    = 0;
-    host_stall_count     = 1;
-    host_stall_len       = 1024;    // twice the FIFO
-    copy(4'd1, 28'hB00000, {16'b0, SRC_VA}, 28'd262144, {16'b0, CPL_VA});
-    settle();
-    host_stall_len   = 0;
-    host_stall_count = 0;
-    check_payload(BASE1 + 48'hB00000, 32768,
-                  "256 KB, stall deeper than the FIFO: still lands intact");
-    $display("       burst deeper than the FIFO: host stalled %0d cyc, link held off %0d cyc",
-             host_stall_cycles, ingress_stall_cycles);
-    check(ingress_stall_cycles > 0,
-          $sformatf("a stall deeper than the FIFO does reach the link (%0d)",
-                    ingress_stall_cycles));
 
     check(rx_drop === 1'b0, "no header was ever rejected on the far side");
 
