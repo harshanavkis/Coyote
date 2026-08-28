@@ -22,6 +22,7 @@ module tb_loom_mnw;
 localparam [47:0] DST_VA  = 48'h7f6a_1000_0000;
 localparam [47:0] SRC_VA  = 48'h7f6a_2000_0000;
 localparam int    COPY_B  = 4096;             // one PMTU packet of payload
+localparam [47:0] CPL_VA  = 48'h7f6a_3000_0000;
 localparam [3:0]  WIN     = 4'd1;
 localparam [5:0]  MY_PID  = 6'd0;
 
@@ -136,12 +137,13 @@ task program_window(input [3:0] idx, input bit route, input [5:0] pid,
     axil_write(16'd40, 64'd1);
 endtask
 
-task issue_copy(input [3:0] win, input [27:0] off, input [27:0] len);
+task issue_copy(input [3:0] win, input [27:0] off, input [27:0] len,
+                input [63:0] fence_va = 64'd0);
     axil_write(16'd64,  {win, 32'b0, off});
     axil_write(16'd72,  {16'b0, SRC_VA});
     axil_write(16'd80,  {36'b0, len});
     axil_write(16'd88,  {58'b0, MY_PID});
-    axil_write(16'd104, 64'd0);          // no fence: the landing is the check
+    axil_write(16'd104, fence_va);
     axil_write(16'd96,  64'd1);
 endtask
 
@@ -214,6 +216,23 @@ initial begin
         repeat (100000) @(posedge aclk);
         check(host_writes - w0 == 2,
               $sformatf("two back-to-back descriptors both landed (%0d)",
+                        host_writes - w0));
+    end
+
+    // The fence, which is what mnw_bench actually spins on. It is a LOCAL
+    // write the engine issues AFTER the payload has streamed, so it is the
+    // one shared-path request that has to re-acquire the arbiter once the
+    // engine has been released mid-message. If that re-grant does not
+    // happen the bench reports "warm-up never fenced" - the same symptom
+    // the deadlock produced - so it is checked here rather than on hardware.
+    begin
+        int w0 = host_writes;
+        issue_copy(WIN, 28'h30000, 28'd4096, {16'b0, CPL_VA});
+        repeat (100000) @(posedge aclk);
+        check(mem.exists(CPL_VA >> 3),
+              "fence word was written after the payload");
+        check(host_writes - w0 == 2,
+              $sformatf("payload write plus fence write (%0d)",
                         host_writes - w0));
     end
 
