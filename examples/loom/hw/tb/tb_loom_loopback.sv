@@ -219,6 +219,8 @@ int   pull_beats;
 bit pull_extra_beat = 0;
 bit pull_extra_done = 0;
 int pull_extra_count = 0;
+int desync_seen = 0;
+always @(posedge aclk) if (inst_engine.cnt_pull_desync) desync_seen++;
 initial forever begin
     @(posedge aclk);
     if (eng_rd_valid && eng_rd_ready) begin
@@ -979,6 +981,14 @@ initial begin
                      src_word(first_bad));
         check(wrong > 0,
               "a single surplus pull beat corrupts, with a PERFECT link");
+        // And the engine must NOTICE: on the last beat of its budget the
+        // response was not ending, which is the whole tell.
+        check(inst_engine.cnt_pull_desync !== 1'bx,
+              "pull desync detector is driven");
+        $display("       engine flagged %0d pull desync event(s)", desync_seen);
+        check(desync_seen > 0,
+              $sformatf("the engine detected the pull desync (%0d)",
+                        desync_seen));
         check(rx_drop === 1'b0,
               "and no header is rejected, so it looks like clean traffic");
     end

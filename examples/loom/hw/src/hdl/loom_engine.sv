@@ -132,6 +132,19 @@ module loom_engine (
     // meanings - starved is a gap WE put into the outgoing packet stream
     // because the pull ran dry; stalled is the shell pushing back, which is
     // the fabric working as intended.
+    // Pull framing disagreement. ST_STREAM forwards exactly beats_of(len)
+    // beats off the shared pull stream and never checks that the response
+    // it is draining is the one it asked for - a surplus beat from any
+    // source is forwarded as payload and shifts the message permanently,
+    // which is the corruption signature hardware shows (region covered, no
+    // header rejected, payload displaced by whole beats).
+    //
+    // The response's own framing is the cross-check: on the LAST beat of
+    // the budget, s_tlast should also be high. Low means the response has
+    // more beats than were taken and the surplus will be consumed by
+    // whatever streams next. Intermediate tlasts are ignored on purpose -
+    // the shell may return a large read as several chunks.
+    output logic                        cnt_pull_desync,
     output logic                        cnt_tx_move,
     output logic                        cnt_tx_starve,
     output logic                        cnt_tx_stall,
@@ -541,6 +554,16 @@ assign cnt_tx_stall  = (tx_hdr    && !m_net_tready) ||
                        (tx_stream &&  s_tvalid && !m_net_tready);
 
 assign cnt_drop     = (state == ST_CHECK) && !ok;
+// Residue on the pull stream at the moment a new read is issued. Nothing
+// should be waiting there: the previous transfer consumed exactly its own
+// budget, so a beat present now belongs to no one and will be forwarded as
+// the payload of the transfer about to start.
+//
+// Deliberately NOT keyed on s_tlast. The shell may return a large read as
+// several tlast-terminated chunks, so "the last beat carries tlast" is
+// satisfied by any chunk boundary and detects nothing.
+assign cnt_pull_desync = (state == ST_RD_REQ) && rd_ready && s_tvalid;
+
 assign cnt_local_wr = ((state == ST_WR_DATA) && !l_route && m_host_tready) ||
                       (stream_local && s_tvalid && stream_last && m_host_tready);
 assign cnt_rdma_wr  = ((state == ST_WR_DATA) && l_route && m_net_tready) ||

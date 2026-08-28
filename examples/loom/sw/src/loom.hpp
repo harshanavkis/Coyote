@@ -71,6 +71,11 @@ constexpr uint32_t RX_STALL      = 0x160;
 // one sizes a buffer: a FIFO absorbs a burst up to its depth, so the worst
 // single run is the number that matters, not the total.
 constexpr uint32_t RX_STALL_MAX  = 0x0C0;   // word 24
+// Beats left on the pull stream when a new read was issued. Nothing should
+// be waiting there, and a surplus beat is forwarded as the payload of the
+// transfer about to start - displacing it for the rest of its length. This
+// must read 0; anything else is the corruption signature's root.
+constexpr uint32_t PULL_DESYNC   = 0x0C8;   // word 25
 // The stall split. loom_rx is single-outstanding on the write side, so if
 // the shell withholds m_tready until it has accepted and translated the
 // request, every packet pays that latency serially and the stalls land

@@ -760,6 +760,11 @@ int run_server(uint16_t qp_port, uint16_t peer_port, const std::string &sock) {
         // 512 in user logic, so a worst run well under that is a burst the
         // buffer can swallow. A worst run comparable to the total means the
         // write path is simply slower than the link and no depth fixes it.
+        const uint64_t pd = loom::csr_read(t_ctrl, loom::PULL_DESYNC);
+        if (pd)
+            printf("  *** pull desync: %lu beat(s) left on the pull stream "
+                   "when a read was issued - payload displaced ***\n",
+                   (unsigned long) pd);
         const uint64_t mx = loom::csr_read(t_ctrl, loom::RX_STALL_MAX);
         if (st)
             printf("  longest unbroken stall: %lu cycles of %lu total -> %s\n",
