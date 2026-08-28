@@ -69,4 +69,41 @@ tmux new-session -d -s mnw_bit \
 
 Sanity check in the generated `base.tcl`: `en_rdma 0`, `en_dcard 0`.
 
-Software is not written yet.
+## Software
+
+One process, one cThread, one card. `loom.hpp` is shared with
+`examples/loom` (include path, not a copy).
+
+```bash
+cd examples/loom_minus_nw/sw && mkdir -p build && cd build
+nix-shell -p cmake gcc boost --run 'cmake .. && make -j8'
+sudo ./mnw_bench
+```
+
+Options, matching loom_host so numbers sit next to the two-host ones:
+`LOOM_BENCH_ONLY=<bytes>` for a single size, `LOOM_BENCH_ITERS=N` for the
+descriptors per size (default 32), `LOOM_POLL_SECS` for the fence timeout.
+
+It programs window 1 rdma-route with `base = dst`, sets `RDMA_STAGING_VA`
+and `RX_PID` to this cThread's ctid, then sweeps 64 B to 4 MB verifying
+every word and checking nothing lands past the end.
+
+### Reading a run
+
+The table gives cyc/op from the engine's dma-rdma stage accumulator, wall
+clock per op and the achieved rate. Below it:
+
+- `transmit path cycles` - starved means the engine's pull left gaps in
+  the outgoing stream. On the two-host runs this swung between 22% and 84%
+  and took throughput with it; if that reproduces here it is a host-side
+  effect and has nothing to do with the network.
+- `receive path cycles` - stalled means the host write path would not take
+  a beat. This is the number the whole example exists to isolate.
+- `longest unbroken stall` (RO word 24) against the stall total. A sum
+  cannot tell a burst from a sustained deficit and cannot size a buffer;
+  the longest run can. Under ~512 cycles the stalls are clustered and
+  buffering is the right lever; comparable to the total and the write path
+  is simply slower than the feed, in which case no depth fixes it.
+- `rx_hdr_reject` must stay 0. It has been 0 on every two-host run except
+  the one that wedged, and a nonzero value here means the framing
+  desynchronised with no network in the picture at all.
