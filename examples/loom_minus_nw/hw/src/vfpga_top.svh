@@ -179,13 +179,37 @@ always_ff @(posedge aclk) begin
         case (arb)
             ARB_IDLE: begin
                 rx_started <= 1'b0;
-                if (!fifo_empty)      arb <= ARB_ENG;   // engine priority
+                if (!fifo_empty || eng_wr_valid || eng_host_tvalid)
+                    arb <= ARB_ENG;                      // engine priority
                 else if (rx_req_arb)  arb <= ARB_RX;
             end
-            // Engine keeps the path while it has queued work; releasing
-            // requires both an empty FIFO and a finished transaction
+            // MINUS-NW DIFFERENCE, and the reason this file cannot just
+            // reuse examples/loom's arbiter.
+            //
+            // There, releasing on `fifo_empty && !eng_busy` is right: the
+            // engine's outgoing stream goes to the RoCE stack, which always
+            // accepts, and loom_rx is fed by ANOTHER CARD. The two are never
+            // active for the same transfer, so holding the path for the whole
+            // of eng_busy costs nothing.
+            //
+            // Here they are the same transfer. The engine stays eng_busy for
+            // the entire message while streaming into the loopback, loom_rx
+            // needs a grant to accept even the header
+            // (s_tready = (ST_IDLE && grant) || ...), and so the engine waits
+            // on rx, rx waits on the arbiter and the arbiter waits on the
+            // engine. The first hardware run hung exactly there: transmit
+            // 100% stalled, every rx counter zero.
+            //
+            // The shared resources are sq_wr and axis_host_send, and the
+            // engine touches neither while streaming to the net. So release
+            // on shared-path idleness rather than on eng_busy, and re-grant
+            // when the engine has a shared-path request pending - which is
+            // what its fence needs after the payload has gone. Safe because
+            // the engine's wr_ready and m_host_tready are already masked by
+            // eng_grant, so it cannot drive either while ungranted.
             ARB_ENG:
-                if (fifo_empty && !eng_busy) arb <= ARB_IDLE;
+                if (fifo_empty && !eng_wr_valid && !eng_host_tvalid)
+                    arb <= ARB_IDLE;
             // rx_started distinguishes "granted but not yet begun" from
             // "finished": leave only after busy has risen and fallen
             ARB_RX: begin
