@@ -299,6 +299,31 @@ int req_pkts = 1;
 // has ever been simulated. 1 = a tlast per packet, as the RX path builds it.
 int tlast_per_pkt = 0;
 
+// ---------------------------------------------------------------------------
+// Beat loss: what a retransmission does to the OUTGOING payload stream.
+//
+// The shell does not replay a buffered packet on retransmit. It re-reads
+// localAddr/length and feeds that into the same transmit path the engine is
+// streaming into (ib_transport_protocol.cpp writes memCmdInternal with
+// rev.localAddr). The two share the outgoing payload path, so the engine's
+// in-flight message loses beats to the replay - which is why hardware showed
+// data arriving EARLY (word 103218 held the value belonging 16 words later),
+// i.e. beats missing ahead of it, rather than duplicated.
+//
+// The duplicate packets themselves never reach loom_rx: the receiver drops
+// them by PSN (93 of them on the run above) BEFORE the payload path. So the
+// damage is entirely on the sender, and modelling it means removing beats
+// from the middle of a message, not injecting any.
+//
+// drop_at_beat counts within the message's payload; 0 disables.
+int drop_at_beat  = 0;
+int drop_n_beats  = 0;
+int beats_dropped = 0;
+// Position within the MESSAGE, not within a fragment: bi in the payload
+// driver restarts at every PMTU frame, so it never reaches a megabyte.
+int msg_beat      = 0;
+bit drop_done     = 0;      // steal from ONE message, as one retransmit would
+
 // Frame boundaries the payload driver needs from the request driver: how
 // many beats each fragment carries, and which one ends the message (the
 // single tlast).
@@ -351,7 +376,7 @@ initial forever begin
     @(posedge aclk);
     if (net_frames.size() > 0) begin
         fr = net_frames.pop_front();
-        for (int bi = 0; bi < fr.beats; bi++) begin
+        for (int bi = 0; bi < fr.beats; bi++) begin  // msg_beat spans frames
             // Long enough that a beat from a LATER transaction still
             // arrives; only a client with nothing left to send reaches it
             guard = 0;
@@ -359,11 +384,24 @@ initial forever begin
                 @(posedge aclk); guard++;
             end
             if (net_beats.size() == 0) begin
-                check(1'b0, $sformatf(
-                    "shell model: payload starved (%0d of %0d beats)",
-                    bi, fr.beats));
+                // Expected when beats have been stolen: the message really
+                // IS short, which is the whole point of the case.
+                if (beats_dropped == 0)
+                    check(1'b0, $sformatf(
+                        "shell model: payload starved (%0d of %0d beats)",
+                        bi, fr.beats));
                 break;
             end
+            // Steal beats the way the shell's retransmit re-read does
+            if (drop_at_beat != 0 && !drop_done && msg_beat == drop_at_beat) begin
+                drop_done = 1;
+                for (int d = 0; d < drop_n_beats; d++)
+                    if (net_beats.size() > 0) begin
+                        void'(net_beats.pop_front());
+                        beats_dropped++;
+                    end
+            end
+            if (net_beats.size() == 0) break;
             @(negedge aclk);
             rx_s_tdata  = net_beats.pop_front();
             rx_s_tkeep  = {64{1'b1}};
@@ -377,11 +415,15 @@ initial forever begin
             while (!rx_s_tready && guard < 20000);
             @(negedge aclk);
             rx_s_tvalid = 0; rx_s_tlast = 0;
+            msg_beat++;
             if (guard >= 20000) begin
                 check(1'b0, "far side stopped taking beats (stuck mid-transaction)");
                 break;
             end
         end
+        // A message ends at its last fragment; position restarts there, the
+        // same way loom_rx restarts its own count at the next header.
+        if (fr.last_frag) msg_beat = 0;
     end
 end
 
@@ -821,6 +863,56 @@ initial begin
           $sformatf("1 MB, per-packet tlast: ONE host write (%0d)",
                     rx_txns - fwd_before));
     tlast_per_pkt = 0;
+
+    // ---------------------------------------------------------------------
+    // The two-host failure, reproduced: 1 MB x1 is clean, 1 MB x2 back to
+    // back is not. Model the sender-side damage a retransmission does -
+    // beats stolen from the message in flight - and see whether loom_rx
+    // lands the hardware signature: region fully covered, nothing "never
+    // written", no header rejected, and payload displaced by whole beats
+    // because position is a running count that cannot recover.
+    // ---------------------------------------------------------------------
+    beats_dropped = 0;
+    fwd_before    = rx_txns;
+    drop_done     = 0;
+    drop_at_beat  = 4096;       // partway into the message
+    drop_n_beats  = 2;          // hardware's smallest observed displacement
+    copy(4'd1, 28'hD00000, {16'b0, SRC_VA}, 28'd1048576, {16'b0, CPL_VA});
+    copy(4'd1, 28'hE00000, {16'b0, SRC_VA}, 28'd1048576, {16'b0, CPL_VA});
+    settle();
+    drop_at_beat = 0;
+    drop_n_beats = 0;
+
+    check(beats_dropped == 2,
+          $sformatf("the model stole %0d beats mid-message", beats_dropped));
+    check(rx_drop === 1'b0,
+          "no header rejected even though the stream lost beats");
+
+    begin
+        int wrong = 0, never = 0, first_bad = -1;
+        for (int i = 0; i < 131072; i++) begin
+            logic [47:0] va = BASE1 + 48'hD00000 + 48'(i*8);
+            if (!mem.exists(va >> 3)) never++;
+            else if (mem[va >> 3] != src_word(i)) begin
+                if (first_bad < 0) first_bad = i;
+                wrong++;
+            end
+        end
+        $display("       stolen-beat message: %0d of 131072 words wrong, %0d never written, first bad %0d",
+                 wrong, never, first_bad);
+        // The hardware signature, precisely: everything arrived and the
+        // whole region was covered, but it landed in the wrong place.
+        check(never == 0,
+              "whole region still covered - nothing was lost, only displaced");
+        check(wrong > 0, "losing beats DOES displace the payload");
+        if (first_bad >= 0 && mem.exists((BASE1 + 48'hD00000 + 48'(first_bad*8)) >> 3))
+            $display("       at word %0d: got %016x, want %016x (delta %0d words)",
+                     first_bad,
+                     mem[(BASE1 + 48'hD00000 + 48'(first_bad*8)) >> 3],
+                     src_word(first_bad),
+                     int'(mem[(BASE1 + 48'hD00000 + 48'(first_bad*8)) >> 3] -
+                          src_word(first_bad)));
+    end
 
     check(rx_drop === 1'b0, "no header was ever rejected on the far side");
 
