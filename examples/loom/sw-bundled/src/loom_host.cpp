@@ -119,6 +119,10 @@ int bench_iters(uint64_t len) {
 // RDMA_N_WR_OUTSTANDING = 16. Pacing here in software says whether that is
 // what the large sizes hit: if they come back clean under a cap, the fix is
 // credit tracking in the engine, not bandwidth and not the receive path.
+int bench_gap_us() {
+    const char *e = getenv("LOOM_BENCH_GAP_US");
+    return e ? atoi(e) : 0;
+}
 int bench_credit() {
     const char *e = getenv("LOOM_BENCH_CREDIT");
     return e ? atoi(e) : 0;                  // 0 = unlimited, as today
@@ -280,10 +284,25 @@ void run_bench(coyote::cThread &t_ctrl, loom::Xpu &A, int win,
         auto t0 = std::chrono::steady_clock::now();
         const int iters  = bench_iters(len);
         const int credit = bench_credit();
+        const int gap_us = bench_gap_us();
         for (int k = 0; k < iters; k++) {
             A.copy(win, uint32_t(off), src, len, fence);
             if (credit && k + 1 > credit)          // at most `credit` unretired
                 spin64_ge(fence, base + uint64_t(k + 1 - credit), 5e6);
+            // Pace against the RECEIVER, which nothing else here does. The
+            // fence is a local posted completion, so with credit 0 the
+            // descriptors go out back to back at whatever rate the engine
+            // sustains - 12.3 GB/s on hardware, above the ~11.8 GB/s
+            // perf_rdma settles at because ITS benchmark is throttled by
+            // waiting for the server to echo. Idling between messages tests
+            // whether the loss is back-to-back pressure: ITERS=1 is clean at
+            // the same instantaneous rate, so a gap should make ITERS=N look
+            // like N separate clean runs. It does NOT reduce the rate within
+            // a message, so loss occurring inside one will survive it.
+            if (gap_us) {
+                spin64_ge(fence, base + uint64_t(k + 1), 5e6);
+                usleep(useconds_t(gap_us));
+            }
         }
         // Generous but bounded: a size that cannot keep up should report,
         // not hold the run for the poll timeout
