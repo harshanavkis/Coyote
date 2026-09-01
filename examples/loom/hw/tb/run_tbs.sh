@@ -26,6 +26,7 @@ SRCS="$LYNX_PKG $AXI_INTF $COYOTE_ROOT/hw/hdl/pkg/lynx_intf.sv \
       ../src/hdl/loom_table.sv ../src/hdl/loom_ctrl.sv \
       ../src/hdl/loom_engine.sv ../src/hdl/loom_rx.sv \
       ./sim_axisr_register_slice_512.sv \
+      ./sim_axis_data_fifo_512.sv \
       $COYOTE_ROOT/hw/hdl/common/regs/axisr_reg.sv \
       ../build_sim/sim/user_logic_c0_0.sv"
 

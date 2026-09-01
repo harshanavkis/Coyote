@@ -214,15 +214,55 @@ loom_engine inst_loom_engine (
     .busy(eng_busy)
 );
 
+// ---------------------------------------------------------------------------
+// Ingress FIFO in front of loom_rx.
+//
+// This is about PACKET LOSS, not throughput. loom_rx holds no buffer, so its
+// s_tready IS the host write path's readiness, and that backpressure travels
+// upstream into the shell's own 512-beat ingress FIFO (remote_credits_rd.sv
+// inst_recv_cq). Backpressure inside the card cannot reach the wire: RoCE
+// over plain Ethernet has no link-level flow control here, so once the
+// receiving stack has nowhere to put an arriving packet it drops it. A
+// dropped packet is a PSN gap, which the receiver NAKs, which makes the
+// sender retransmit - and every corrupt run has retransmissions while every
+// clean one has none.
+//
+// Hardware at 12.3 GB/s: client sent 895 RoCE packets, server received 875.
+// Twenty lost in flight on a direct point-to-point link, with loom_rx
+// stalled 8.5% of the run. At 2.4 GB/s nothing is lost and nothing is
+// retransmitted.
+//
+// 512 beats is ~2 us at line rate, doubling what the shell already gives.
+// The measure of whether this is the right fix is client ROCE TX against
+// server ROCE RX: if that gap closes, ingress overflow was the cause.
+// ---------------------------------------------------------------------------
+logic [511:0] rxf_tdata;
+logic [63:0]  rxf_tkeep;
+logic         rxf_tvalid, rxf_tready, rxf_tlast;
+
+axis_data_fifo_512 inst_rx_ingress_fifo (
+    .s_axis_aclk(aclk), .s_axis_aresetn(aresetn),
+    .s_axis_tdata(axis_rrsp_recv[0].tdata),
+    .s_axis_tkeep(axis_rrsp_recv[0].tkeep),
+    .s_axis_tvalid(axis_rrsp_recv[0].tvalid),
+    .s_axis_tready(axis_rrsp_recv[0].tready),
+    .s_axis_tlast(axis_rrsp_recv[0].tlast),
+    .m_axis_tdata(rxf_tdata),
+    .m_axis_tkeep(rxf_tkeep),
+    .m_axis_tvalid(rxf_tvalid),
+    .m_axis_tready(rxf_tready),
+    .m_axis_tlast(rxf_tlast)
+);
+
 loom_rx inst_loom_rx (
     .aclk(aclk), .aresetn(aresetn),
     .rq_req(rq_wr.data), .rq_valid(rq_wr.valid), .rq_ready(rq_wr.ready),
     .rdma_staging_va(rdma_staging_va), .rx_pid(rx_pid),
     .wr_req(rx_wr_req), .wr_valid(rx_wr_valid),
     .wr_ready(sq_wr.ready && rx_grant),
-    .s_tdata(axis_rrsp_recv[0].tdata), .s_tkeep(axis_rrsp_recv[0].tkeep),
-    .s_tvalid(axis_rrsp_recv[0].tvalid), .s_tready(axis_rrsp_recv[0].tready),
-    .s_tlast(axis_rrsp_recv[0].tlast),
+    .s_tdata(rxf_tdata), .s_tkeep(rxf_tkeep),
+    .s_tvalid(rxf_tvalid), .s_tready(rxf_tready),
+    .s_tlast(rxf_tlast),
     .m_tdata(rx_tdata), .m_tkeep(rx_tkeep), .m_tvalid(rx_tvalid),
     .m_tready(axis_wr.tready && rx_grant), .m_tlast(rx_tlast),
     .req(rx_req_arb), .grant(rx_grant), .busy(rx_busy),
