@@ -216,6 +216,16 @@ int   pull_beats;
 // single surplus beat on the shared axis_host_recv should shift the payload
 // permanently - with no packet loss, no reordering and no retransmission
 // anywhere in this model.
+// Adversarial pull shaping. Hardware's pull runs at ~78% duty with gaps
+// (transmit path: 49285 moving, 13881 starved), and the responder here has
+// always fed the engine as fast as it would take beats. That is the gentlest
+// possible stimulus, and it is why every TB passes while hardware displaces.
+// These introduce idle cycles between beats and vary where the response's
+// tlast falls, so the engine is driven the way the shell actually drives it.
+int pull_gap_pct  = 0;      // chance of an idle cycle before each beat
+int pull_gap_max  = 0;      // up to this many idle cycles
+int pull_seg_rand = 0;      // randomise the response's chunk boundaries
+
 bit pull_extra_beat = 0;
 bit pull_extra_done = 0;
 int pull_extra_count = 0;
@@ -227,6 +237,11 @@ initial forever begin
         pull_req   = eng_rd_req;
         pull_beats = (pull_req.len + 63) / 64;
         for (int b = 0; b < pull_beats; b++) begin
+            // Idle cycles before this beat. tvalid is already low here -
+            // the beat below deasserts it after its handshake completes -
+            // so a gap is genuinely idle time and cannot drop a beat.
+            if (pull_gap_pct != 0 && ($urandom_range(99) < pull_gap_pct))
+                repeat ($urandom_range(pull_gap_max - 1) + 1) @(posedge aclk);
             @(negedge aclk);
             for (int l = 0; l < 8; l++)
                 pull_tdata[64*l +: 64] =
@@ -239,8 +254,12 @@ initial forever begin
             // already posted short of the length it claimed. The far side
             // then completes that request with the NEXT transaction's beat.
             pull_tlast  = (b == pull_beats - 1) ||
-                          (PULL_SEG != 0 && ((b + 1) % PULL_SEG == 0));
+                          (pull_seg_rand != 0
+                             ? ($urandom_range(63) == 0)
+                             : (PULL_SEG != 0 && ((b + 1) % PULL_SEG == 0)));
             do @(posedge aclk); while (!pull_tready);
+            @(negedge aclk);
+            pull_tvalid = 0; pull_tlast = 0;
         end
         // The surplus beat: valid data, correct framing, simply one more
         // than was asked for.
@@ -420,11 +439,16 @@ initial forever begin
             // Steal beats the way the shell's retransmit re-read does
             if (drop_at_beat != 0 && !drop_done && msg_beat == drop_at_beat) begin
                 drop_done = 1;
-                for (int d = 0; d < drop_n_beats; d++)
+                for (int d = 0; d < drop_n_beats; d++) begin
+                    automatic int w = 0;
+                    while (net_beats.size() == 0 && w < 4000) begin
+                        @(posedge aclk); w++;
+                    end
                     if (net_beats.size() > 0) begin
                         void'(net_beats.pop_front());
                         beats_dropped++;
                     end
+                end
             end
             if (net_beats.size() == 0) break;
             @(negedge aclk);
@@ -547,7 +571,8 @@ task settle();
         @(posedge aclk); n++;
     end
     repeat (10) @(posedge aclk);
-    if (net_reqs.size() > 0 || net_beats.size() > 0 || net_frames.size() > 0)
+    if ((net_reqs.size() > 0 || net_beats.size() > 0 || net_frames.size() > 0)
+        && beats_dropped == 0 && pull_extra_count == 0)
         check(1'b0, "shell model: message left undelivered");
 endtask
 
@@ -890,6 +915,49 @@ initial begin
     tlast_per_pkt = 0;
 
     // ---------------------------------------------------------------------
+    // Soak the engine the way hardware drives it: a gappy pull at roughly
+    // the duty cycle the corrupt runs showed (78% moving / 22% starved),
+    // with the response's chunk boundaries falling wherever they like.
+    // Every TB before this fed the engine beats as fast as it would take
+    // them, which is why they all pass while hardware displaces by whole
+    // beats. If the engine has a rate-dependent accounting bug this is what
+    // should find it - and if it stays clean, the engine emits correctly
+    // under gaps and the fault is not here.
+    // ---------------------------------------------------------------------
+    pull_gap_pct  = 25;
+    pull_gap_max  = 3;
+    pull_seg_rand = 1;
+    begin
+        int bad_msgs = 0;
+        for (int rep = 0; rep < 6; rep++) begin
+            // automatic: a declaration inside a procedural loop is STATIC in
+            // SystemVerilog and its initialiser runs once at time 0, so off
+            // held a value computed before rep existed and ok never reset
+            // after the first miss.
+            automatic logic [27:0] off = 28'h200000 + 28'(rep * 28'h40000);
+            automatic bit ok = 1;
+            copy(4'd1, off, {16'b0, SRC_VA}, 28'd262144, {16'b0, CPL_VA});
+            settle();
+            for (int i = 0; i < 32768; i++) begin
+                logic [47:0] va = BASE1 + 48'(off) + 48'(i*8);
+                if (!mem.exists(va >> 3) || mem[va >> 3] != src_word(i)) begin
+                    if (ok)
+                        $display("       soak rep %0d: first bad word %0d", rep, i);
+                    ok = 0;
+                end
+            end
+            if (!ok) bad_msgs++;
+        end
+        $display("       gappy-pull soak: %0d of 6 messages displaced", bad_msgs);
+        check(bad_msgs == 0,
+              $sformatf("engine emits correctly under a gappy pull (%0d bad)",
+                        bad_msgs));
+    end
+    pull_gap_pct  = 0;
+    pull_gap_max  = 0;
+    pull_seg_rand = 0;
+
+    // ---------------------------------------------------------------------
     // The two-host failure, reproduced: 1 MB x1 is clean, 1 MB x2 back to
     // back is not. Model the sender-side damage a retransmission does -
     // beats stolen from the message in flight - and see whether loom_rx
@@ -992,6 +1060,7 @@ initial begin
         check(rx_drop === 1'b0,
               "and no header is rejected, so it looks like clean traffic");
     end
+
 
     check(rx_drop === 1'b0, "no header was ever rejected on the far side");
 
