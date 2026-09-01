@@ -1,0 +1,5 @@
+# Live hardware run log, overwritten per run - never committed
+experiments-log.txt
+build_*-experiments.txt
+# Meeting material
+loom-slides.txt
