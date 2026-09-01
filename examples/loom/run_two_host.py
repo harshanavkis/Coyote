@@ -42,6 +42,7 @@ BUILD       = f"{COYOTE}/examples/loom/sw-bundled/build"
 SYSFS_GLOB  = "/sys/kernel/coyote_sysfs_*"
 SSH         = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10"]
 
+SETTLE = 5   # seconds to let a PCI rescan finish
 BOLD, DIM, RED, RESET = "\033[1m", "\033[2m", "\033[31m", "\033[0m"
 
 
@@ -115,27 +116,25 @@ def flash(args):
             f'-nolog -nojournal -notrace -source program_loom.tcl -tclargs {BIT}"')
 
     for host, run in (("amy", remote), ("clara", local)):
-        # teardown_coyote.sh and setup_coyote.sh both hardcode 0000:e1:00.0.
-        # That BDF is not reliably the U280: on clara it has come back as a
-        # Pericom PCIe switch after a re-enumeration, and removing THAT takes
-        # down its whole subtree - the NICs and the SATA controller - while
-        # leaving the U280 untouched. Programming then drops the card's
-        # endpoint with nothing to bring it back. Refuse rather than repeat
-        # that.
+        # e1:00.0 is the U280 on both hosts. If it is anything else the
+        # card has ALREADY fallen off the bus and the BDF has been taken by
+        # whatever the renumbering put there - tearing down that device
+        # would remove the wrong subtree, so stop instead.
         is_remote = host == "amy"
         vendor = (remote if is_remote else local)(
             "cat /sys/bus/pci/devices/0000:e1:00.0/vendor 2>/dev/null",
             check=False).stdout.strip()
         if vendor != "0x10ee":
-            die(f"{host}: 0000:e1:00.0 is not a Xilinx device (vendor "
-                f"{vendor or 'absent'}), but teardown_coyote.sh and "
-                f"setup_coyote.sh both hardcode that BDF. Running them now "
-                f"would remove the wrong device and leave the U280 off the "
-                f"bus. Fix the BDF in those scripts, or recover the card "
-                f"first.")
+            die(f"{host}: the U280 is not at 0000:e1:00.0 (found "
+                f"{vendor or 'nothing'}), so it is already off the bus. "
+                f"Recover it with a cold power cycle before flashing.")
 
         say(f"{host}: teardown -> program -> setup")
         run(f"cd {COYOTE} && sudo bash teardown_coyote.sh", check=False)
+        # The rescan inside teardown is asynchronous. Programming a card the
+        # kernel is still re-enumerating is how clara ended up off the bus
+        # while amy - whose steps are spaced by ssh round trips - survived.
+        time.sleep(SETTLE)
         r = run(prog, check=False)
         sel = [l for l in r.stdout.splitlines()
                if "SELECTED" in l or "PROGRAMMED" in l or l.startswith("ERROR")]
@@ -143,9 +142,21 @@ def flash(args):
             print("   " + l.strip(), flush=True)
         if not any("PROGRAMMED" in l for l in sel):
             die(f"{host}: programming did not complete")
+        # The endpoint is down straight after programming; give it time
+        # before setup's remove/rescan tries to bring it back.
+        time.sleep(SETTLE)
         run(f"cd {COYOTE} && sudo bash setup_coyote.sh", check=False)
-        if not driver_loaded(host == "amy"):
-            die(f"{host}: driver not loaded after setup")
+
+        for _ in range(10):
+            time.sleep(2)
+            if card_programmed(is_remote) and driver_loaded(is_remote):
+                break
+        if not card_programmed(is_remote):
+            die(f"{host}: card did not come back after programming "
+                f"(expected 10ee:903f). It needs a cold power cycle.")
+        if not driver_loaded(is_remote):
+            die(f"{host}: card is up but the driver did not attach")
+        print(f"   {host}: card programmed and driver up", flush=True)
 
 
 def preflight():
