@@ -301,7 +301,16 @@ void run_bench(coyote::cThread &t_ctrl, loom::Xpu &A, int win,
             // a message, so loss occurring inside one will survive it.
             if (gap_us) {
                 spin64_ge(fence, base + uint64_t(k + 1), 5e6);
-                usleep(useconds_t(gap_us));
+                // Spin, do not usleep. The kernel timer bounds usleep's
+                // resolution, so usleep(5) and usleep(20) both idle for
+                // hundreds of microseconds - a 5, 10 and 20 us sweep came
+                // back 515.67, 509.64 and 506.77 us/op, which is one
+                // experiment run three times. A message is ~85 us, so the
+                // interesting range needs single-microsecond resolution.
+                auto g0 = std::chrono::steady_clock::now();
+                while (std::chrono::duration<double, std::micro>(
+                           std::chrono::steady_clock::now() - g0).count()
+                       < double(gap_us)) { }
             }
         }
         // Generous but bounded: a size that cannot keep up should report,
