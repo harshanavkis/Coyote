@@ -62,6 +62,23 @@ constexpr uint64_t DMA_BYTES     = 4096;        // rdma bulk: len % 64 == 0
 constexpr uint32_t STAGING_BYTES = 4096;
 // Bring-up: a poll that is going to fail should fail fast enough that the
 // counter dump after it is worth reading. LOOM_POLL_SECS overrides.
+// Which /dev/coyote_fpga_<device>_v0 to open. The driver's device index
+// increments on every load within a boot, so a host whose driver has been
+// reloaded a few times is not device 0 any more - amy came up as
+// coyote_fpga_6_v0 while clara, freshly rebooted, was 0. Passing 0
+// regardless fails with "cThread instance could not be obtained, vfid: 0"
+// even though the card and driver are perfectly healthy.
+uint32_t coyote_device() {
+    if (const char *e = getenv("LOOM_DEVICE")) return uint32_t(atoi(e));
+    // Discover it: whichever node exists is the one to use.
+    for (uint32_t d = 0; d < 64; d++) {
+        char path[64];
+        snprintf(path, sizeof(path), "/dev/coyote_fpga_%u_v0", d);
+        if (access(path, F_OK) == 0) return d;
+    }
+    return 0;
+}
+
 int poll_secs() {
     const char *e = getenv("LOOM_POLL_SECS");
     return e ? atoi(e) : 20;
@@ -461,8 +478,9 @@ void run_bench(coyote::cThread &t_ctrl, loom::Xpu &A, int win,
 }
 
 int run_server(uint16_t qp_port, uint16_t peer_port, const std::string &sock) {
-    coyote::cThread t_ctrl(0, getpid(), 0);
-    coyote::cThread t_data(0, getpid(), 0);
+    const uint32_t dev = coyote_device();
+    coyote::cThread t_ctrl(0, getpid(), dev);
+    coyote::cThread t_data(0, getpid(), dev);
     printf("ctids: ctrl %d, data %d\n", t_ctrl.getCtid(), t_data.getCtid());
 
     // QP exchange (blocks until the client's initRDMA connects); the
@@ -816,8 +834,9 @@ int run_server(uint16_t qp_port, uint16_t peer_port, const std::string &sock) {
 
 int run_client(const std::string &ip, uint16_t qp_port, uint16_t peer_port,
                const std::string &sock) {
-    coyote::cThread t_ctrl(0, getpid(), 0);
-    coyote::cThread t_data(0, getpid(), 0);
+    const uint32_t dev = coyote_device();
+    coyote::cThread t_ctrl(0, getpid(), dev);
+    coyote::cThread t_data(0, getpid(), dev);
     printf("ctids: ctrl %d, data %d\n", t_ctrl.getCtid(), t_data.getCtid());
 
     // QP exchange (the server is already blocking in its initRDMA)

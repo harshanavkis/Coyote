@@ -291,6 +291,16 @@ def main():
     if d_tx is not None and d_rx is not None:
         lost = d_tx - d_rx
         print(f"  packets lost   : {lost}" + ("  <-- receiver overrun" if lost > 0 else ""))
+    # NO FENCE means the descriptor never retired, so nothing was
+    # transferred - "intact" and "0 lost" below would be true and useless.
+    if "NO FENCE" in cli_txt:
+        print(f"  {RED}bench WEDGED: no fence, nothing transferred{RESET}")
+        for l in cli_txt.splitlines():
+            if "stalled (network pushing back)" in l or "% moving" in l:
+                print("                   " + l.strip())
+        print(f"\nfull log: {args.out}")
+        return 2
+
     if "CORRUPT" in srv_txt:
         print(f"  payload        : {RED}CORRUPT{RESET}")
         for l in srv_txt.splitlines():
