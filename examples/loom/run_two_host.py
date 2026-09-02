@@ -450,7 +450,12 @@ def log_run(path, args, gap, env, result):
             f.write(f"\n{name} stats:\n{txt}")
 
 
-def summarize(args, gap, result):
+# Worst-first. A CORRUPT attempt is a REAL MEASUREMENT and must never be
+# retried away; only a WEDGE is an infrastructure failure worth re-running.
+VERDICT_RANK = {"CORRUPT": 0, "FAIL": 1, "WEDGED": 2, "intact": 3}
+
+
+def summarize(args, gap, result, verdicts=None):
     """One row of the sweep."""
     srv_out, cli_out, srv_n0, srv_n1, cli_n0, cli_n1 = result
     cli_txt, srv_txt = "".join(cli_out), "".join(srv_out)
@@ -462,44 +467,65 @@ def summarize(args, gap, result):
     d_tx = tx[0] - tx[1] if None not in tx else None
     d_rx = rx[0] - rx[1] if None not in rx else None
     lost = d_tx - d_rx if None not in (d_tx, d_rx) else None
+    # Report the WORST verdict across attempts, not the last one. Retrying
+    # until a run comes back clean and printing only that run turns "corrupt
+    # on 2 of 3 attempts" into "intact" - the same false clean this script
+    # already had once, arrived at by a different route.
+    vs = list(verdicts) if verdicts else [verdict(result)]
+    # A WEDGE is the infrastructure failure the retry exists to get past, so
+    # it is discarded once any attempt produced a real verdict. CORRUPT and
+    # FAIL are real results and always survive.
+    real = [v for v in vs if v != "WEDGED"] or vs
+    worst = min(real, key=lambda v: VERDICT_RANK.get(v, 3))
     return {"gap": gap,
             "rate": m.group(1) if m else "?",
             "retrans": rt.group(1) if rt else "?",
             "tx": d_tx, "rx": d_rx, "lost": lost,
-            "payload": verdict(result)}
+            "payload": worst,
+            "attempts": vs}
 
 
-def recover():
-    """A wedged transmit path leaves the QP unusable: the shell's send window
-    filled and never drained, so nothing further is accepted. Reloading the
-    driver on both sides tears the QP down and rebuilds it. The device index
-    moves when the driver reloads, which is why loom_host discovers its node
-    rather than assuming 0."""
-    remote(f"cd {COYOTE} && sudo bash setup_coyote.sh", check=False)
-    local(f"cd {COYOTE} && sudo bash setup_coyote.sh", check=False)
-    for is_remote, name in ((True, "amy"), (False, "clara")):
-        wait_for("the driver to come back after the reload", is_remote,
-                 lambda s: (s.get("driver") == "coyote_driver"
-                            and bool(s.get("sysfs"))),
-                 WAIT_SETUP, name)
+def recover(settle=15):
+    """Clear a wedge by REFLASHING. A driver reload is not enough.
+
+    Owner, from experience, confirmed by this bench's own counters: after a
+    wedge only the first run following a FLASH puts real traffic on the wire
+    (2017 ROCE packets); every run after a mere driver reload sends 2. So a
+    reload leaves the shell's send window filled and never drained, and every
+    later sweep point inherits the wrecked QP and wedges in turn - which is
+    how a sweep silently turns into one failure repeated N times.
+
+    Reflashing costs minutes per point, which is the price of a real
+    measurement; the alternative is a fast sweep of meaningless rows.
+    """
+    flash(settle)
 
 
 def run_gap(args, gap):
-    """One sweep point, retried through a wedge. A point that stays wedged is
-    recorded and the sweep goes on - the other points are still wanted."""
+    """One sweep point, retried through a wedge.
+
+    Returns (last result, every attempt's verdict). The caller reports the
+    worst of those verdicts - a run that corrupted still counts even if a
+    later attempt came back clean.
+    """
     env = bench_env(args, gap)
+    verdicts = []
+    result = None
     for attempt in range(1, args.retries + 2):
         result = one_run(args, env)
         log_run(args.out, args, gap, env, result)
-        if not wedged(result):
-            return result
+        v = verdict(result)
+        verdicts.append(v)
+        if v != "WEDGED":
+            return result, verdicts
         if attempt > args.retries:
             say(f"gap={gap}us stayed wedged after {args.retries} retries - "
                 f"recording it and moving on")
-            return result
-        say(f"bench wedged - reloading drivers and retrying "
+            return result, verdicts
+        say(f"bench wedged - reflashing both cards and retrying "
             f"({attempt}/{args.retries})")
-        recover()
+        recover(args.settle)
+    return result, verdicts
 
 
 def main():
@@ -538,18 +564,20 @@ def main():
     rows = []
     for i, gap in enumerate(gaps, 1):
         say(f"sweep point {i}/{len(gaps)}: gap={gap}us")
-        result = run_gap(args, gap)
-        row = summarize(args, gap, result)
+        result, verdicts = run_gap(args, gap)
+        row = summarize(args, gap, result, verdicts)
         rows.append(row)
+        extra = ("  [attempts: " + ", ".join(row["attempts"]) + "]"
+                 if len(row["attempts"]) > 1 else "")
         print(f"   gap={gap}us -> {row['rate']} GB/s, {row['retrans']} retrans, "
-              f"{row['payload']}", flush=True)
+              f"{row['payload']}{extra}", flush=True)
         # "a single descriptor of this size does not complete; its recovery
         # has been seen splattering into the region below" - the bench's own
-        # words. A point that ended badly leaves the QP wrecked, so reload
-        # before the next one instead of measuring a wrecked QP.
+        # words. A point that ended badly leaves the QP wrecked, and only a
+        # reflash clears it, so pay for one before measuring the next point.
         if row["payload"] != "intact" and i < len(gaps):
-            say("clearing the QP before the next point")
-            recover()
+            say("reflashing to clear the wedge before the next point")
+            recover(args.settle)
 
     # ------------------------------------------------------------- summary
     say("sweep summary")
@@ -566,13 +594,16 @@ def main():
             mark = f"  {RED}<-- server checks failed{RESET}"
         elif r["lost"]:
             mark = "  <-- receiver overrun"
+        att = ("  (" + "/".join(r["attempts"]) + ")"
+               if len(r["attempts"]) > 1 else "")
         print(f"  {r['gap']:>7} {r['rate']:>8} {r['retrans']:>8} "
               f"{n(r['tx']):>7} {n(r['rx']):>7} {n(r['lost']):>6}  "
-              f"{r['payload']}{mark}")
+              f"{r['payload']}{att}{mark}")
 
     # The headline number: the fastest point that was verified byte-correct.
+    # "verified correct" means EVERY attempt at that gap was intact.
     clean = [r for r in rows
-             if r["payload"] == "intact" and r["retrans"] == "0"]
+             if r["retrans"] == "0" and all(v == "intact" for v in r["attempts"])]
     if clean:
         best = max(clean, key=lambda r: float(r["rate"]) if r["rate"] != "?" else -1)
         print(f"\n  {BOLD}fastest verified-correct point: {best['rate']} GB/s "
