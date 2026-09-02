@@ -198,30 +198,14 @@ def stream(proc, sink, echo_prefix=None):
             print(echo_prefix + line.rstrip(), flush=True)
 
 
-def main():
-    ap = argparse.ArgumentParser(
-        description="Two-host Loom run, all logs captured on clara",
-        formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
-    ap.add_argument("--size", type=int, default=1048576)
-    ap.add_argument("--iters", type=int, default=2)
-    ap.add_argument("--gap", type=int, default=0, help="microseconds between messages")
-    ap.add_argument("--flash", action="store_true", help="teardown, program, setup, then run")
-    ap.add_argument("--skip-bulk", action="store_true")
-    ap.add_argument("--out", default=f"{COYOTE}/examples/loom/experiments-log.txt")
-    args = ap.parse_args()
 
-    if args.flash:
-        flash(args)
-    preflight()
-
-    env = (f"LOOM_BENCH=1 LOOM_BENCH_NO_STORES=1 "
-           f"LOOM_BENCH_ONLY={args.size} LOOM_BENCH_ITERS={args.iters}")
-    if args.gap:
-        env += f" LOOM_BENCH_GAP_US={args.gap}"
-    if args.skip_bulk:
-        env += " LOOM_SKIP_BULK=1"
-
+def one_run(args, env):
+    """One server+client pass. Returns None if the bench wedged."""
     srv_n0, cli_n0 = read_nstats(True), read_nstats(False)
+
+    remote("sudo pkill -x loom_host; true", check=False)
+    local("sudo pkill -x loom_host || true", check=False)
+    time.sleep(1)
 
     # stdbuf: over ssh stdout is not a tty, so libc block-buffers it and the
     # readiness line never arrives for the poll below.
@@ -246,7 +230,8 @@ def main():
         die("server never became ready")
 
     say("running client")
-    cli_cmd = f"cd {BUILD} && sudo stdbuf -oL -eL env {env} ./loom_host --client {SERVER_IP}"
+    cli_cmd = (f"cd {BUILD} && sudo stdbuf -oL -eL env {env} "
+               f"./loom_host --client {SERVER_IP}")
     cli = subprocess.Popen(cli_cmd, shell=True, stdout=subprocess.PIPE,
                            stderr=subprocess.STDOUT, text=True, bufsize=1)
     cli_out = []
@@ -259,19 +244,59 @@ def main():
         srv.kill()
     remote("sudo pkill -x loom_host; true", check=False)
 
-    srv_n1, cli_n1 = read_nstats(True), read_nstats(False)
+    if "NO FENCE" in "".join(cli_out):
+        return None
 
-    with open(args.out, "w") as f:
-        f.write(f"# {datetime.now():%F %T}  size={args.size} iters={args.iters} "
-                f"gap={args.gap}us\n# server {SERVER_HOST}, client {os.uname().nodename}\n\n")
-        f.write(f"sudo env {env} ./loom_host --server\n\n")
-        f.writelines(srv_out)
-        f.write(f"\nserver side stats (before):\n{srv_n0}")
-        f.write(f"\nserver side stats (after):\n{srv_n1}")
-        f.write(f"\nsudo env {env} ./loom_host --client {SERVER_IP}\n\n")
-        f.writelines(cli_out)
-        f.write(f"\nclient side stats (before):\n{cli_n0}")
-        f.write(f"\nclient side stats (after):\n{cli_n1}")
+    return (srv_out, cli_out, srv_n0, read_nstats(True), cli_n0,
+            read_nstats(False))
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description="Two-host Loom run, all logs captured on clara",
+        formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
+    ap.add_argument("--size", type=int, default=1048576)
+    ap.add_argument("--iters", type=int, default=2)
+    ap.add_argument("--gap", type=int, default=0, help="microseconds between messages")
+    ap.add_argument("--flash", action="store_true", help="teardown, program, setup, then run")
+    ap.add_argument("--skip-bulk", action="store_true")
+    ap.add_argument("--retries", type=int, default=2,
+                    help="reload drivers and retry after a wedge")
+    ap.add_argument("--out", default=f"{COYOTE}/examples/loom/experiments-log.txt")
+    args = ap.parse_args()
+
+    if args.flash:
+        flash(args)
+    preflight()
+
+    env = (f"LOOM_BENCH=1 LOOM_BENCH_NO_STORES=1 "
+           f"LOOM_BENCH_ONLY={args.size} LOOM_BENCH_ITERS={args.iters}")
+    if args.gap:
+        env += f" LOOM_BENCH_GAP_US={args.gap}"
+    if args.skip_bulk:
+        env += " LOOM_SKIP_BULK=1"
+
+    for attempt in range(1, args.retries + 2):
+        result = one_run(args, env)
+        if result is not None:
+            break
+        if attempt > args.retries:
+            die("bench wedged and retries are exhausted")
+        # A wedged transmit path leaves the QP unusable: the shell's send
+        # window filled and never drained, so nothing further is accepted.
+        # Reloading the driver on both sides tears the QP down and rebuilds
+        # it. The device index moves when the driver reloads, which is why
+        # loom_host discovers its node rather than assuming 0.
+        say(f"bench wedged - reloading drivers and retrying "
+            f"({attempt}/{args.retries})")
+        remote(f"cd {COYOTE} && sudo bash setup_coyote.sh", check=False)
+        local(f"cd {COYOTE} && sudo bash setup_coyote.sh", check=False)
+        time.sleep(SETTLE)
+        for is_remote, name in ((True, "amy"), (False, "clara")):
+            if not driver_loaded(is_remote):
+                die(f"{name}: driver did not come back after reload")
+
+    srv_out, cli_out, srv_n0, srv_n1, cli_n0, cli_n1 = result
 
     # ------------------------------------------------------------- summary
     cli_txt, srv_txt = "".join(cli_out), "".join(srv_out)
