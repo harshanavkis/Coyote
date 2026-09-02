@@ -60,6 +60,7 @@ SSH         = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10"]
 WAIT_TEARDOWN = 60    # the rescan done re-enumerating, link trained
 WAIT_SETUP    = 60    # insmod returned and the sysfs node published
 WAIT_VIVADO   = 900   # JTAG programming, start to finish
+SETUP_TRIES   = 3     # setup_coyote.sh runs that did not take are re-run
 BOLD, DIM, RED, RESET = "\033[1m", "\033[2m", "\033[31m", "\033[0m"
 
 
@@ -123,6 +124,18 @@ def show(st):
             f"driver={st.get('driver') or '-'} "
             f"module={st.get('module') or '-'} "
             f"sysfs={st.get('sysfs') or '-'}")
+
+
+def poll_for(done, is_remote, timeout):
+    """Poll until done(state); return the state, or None on timeout."""
+    deadline = time.time() + timeout
+    st = {}
+    while time.time() < deadline:
+        st = card_state(is_remote)
+        if done(st):
+            return st
+        time.sleep(1)
+    return None
 
 
 def wait_for(what, is_remote, done, timeout, host):
@@ -192,7 +205,7 @@ def roce(nstats, direction):
     return int(m.group(1)) if m else None
 
 
-def flash(settle):
+def flash(settle, hosts=("amy", "clara")):
     if not os.path.isfile(BIT):
         die(f"no bitstream at {BIT}")
     # vivado exists only inside xilinx-shell, and a non-interactive ssh does
@@ -202,6 +215,8 @@ def flash(settle):
             f'-nolog -nojournal -notrace -source program_loom.tcl -tclargs {BIT}"')
 
     for host, run in (("amy", remote), ("clara", local)):
+        if host not in hosts:
+            continue
         is_remote = host == "amy"
         say(f"{host}: teardown -> program -> setup")
 
@@ -255,16 +270,28 @@ def flash(settle):
         settle_after_program(host, settle)
 
         # ---- 3/3 setup: PCI remove/rescan, insmod with ip/mac -----------
-        print(f"   {host}: setup", flush=True)
-        run(f"cd {COYOTE} && sudo bash setup_coyote.sh",
-            check=False, quiet=False)
-        st = wait_for("the reprogrammed card to come back and the driver "
-                      "to attach",
-                      is_remote,
-                      lambda s: (s.get("device") == "0x903f"
-                                 and s.get("driver") == "coyote_driver"
-                                 and bool(s.get("sysfs"))),
-                      WAIT_SETUP, host)
+        # RE-RUN, not merely waited on. If setup ran while the card was still
+        # settling its insmod does not take, and no amount of waiting fixes
+        # that - the remedy is to run setup again, which is what is done by
+        # hand. amy hit exactly this: one setup left driver=- module=0, and
+        # the identical command by hand a minute later worked first try.
+        up = lambda s: (s.get("device") == "0x903f"
+                        and s.get("driver") == "coyote_driver"
+                        and bool(s.get("sysfs")))
+        st = None
+        for attempt in range(1, SETUP_TRIES + 1):
+            print(f"   {host}: setup ({attempt}/{SETUP_TRIES})", flush=True)
+            run(f"cd {COYOTE} && sudo bash setup_coyote.sh",
+                check=False, quiet=False)
+            st = poll_for(up, is_remote, WAIT_SETUP // SETUP_TRIES)
+            if st:
+                break
+            print(f"   {host}: setup did not take, running it again",
+                  flush=True)
+        if not st:
+            die(f"{host}: the driver did not attach after {SETUP_TRIES} "
+                f"setup_coyote.sh runs.\n"
+                f"  card reports: {show(card_state(is_remote))}")
         print(f"   {host}: card programmed and driver up ({show(st)})",
               flush=True)
 
