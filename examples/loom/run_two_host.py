@@ -5,8 +5,12 @@ Both sides' output is captured HERE: the server's stdout is streamed back
 over the ssh connection rather than written on amy and fetched afterwards,
 so a run that dies mid-way still leaves whatever the server managed to say.
 
---flash programs both cards first, in the order the card needs, WAITING FOR
-EACH STAGE TO FINISH before starting the next:
+BEFORE EVERY SWEEP POINT both cards go through teardown -> flash -> setup,
+in the order the card needs, WAITING FOR EACH STAGE TO FINISH before starting
+the next. The bench does not return to a comparable state on its own, so a
+point run on what the previous point left behind measures that damage rather
+than the pacing under test. --no-flash skips it, for debugging this script
+only.
 
     teardown_coyote.sh   rmmod, PCI remove, rescan - endpoint goes down
                          wait: endpoint re-enumerated, PCIe link trained
@@ -24,10 +28,10 @@ That is what dropped clara's U280 off the bus: a stage that had not finished
 was followed by one that assumed it had. amy only looked reliable because its
 steps go over ssh and the round trips spaced them by accident.
 
-    ./run_two_host.py                        # 1 MB x2, back to back
-    ./run_two_host.py --iters 8 --gap 15     # 15 us between messages
-    ./run_two_host.py --size 4194304 --iters 1
-    ./run_two_host.py --flash --iters 8      # reprogram both, then run
+    ./run_two_host.py                          # 1 MB x2, back to back
+    ./run_two_host.py --iters 8 --gap 15       # 15 us between messages
+    ./run_two_host.py --gap 180,160,140        # a sweep, flashed per point
+    ./run_two_host.py --gap 180,180,180        # the same point three times
 """
 
 import argparse
@@ -537,13 +541,16 @@ def main():
     ap.add_argument("--gap", default="0",
                     help="microseconds between messages; comma-separated for "
                          "a sweep, e.g. --gap 0,10,20,40,80")
-    ap.add_argument("--flash", action="store_true", help="teardown, program, setup, then run")
+    ap.add_argument("--no-flash", action="store_true",
+                    help="skip the per-point teardown/flash/setup. FOR "
+                         "DEBUGGING THE SCRIPT ONLY - the measurements it "
+                         "produces are not comparable (see main)")
     ap.add_argument("--settle", type=int, default=15,
                     help="seconds to leave the card alone after programming, "
                          "while the PCIe link retrains (default 15)")
     ap.add_argument("--skip-bulk", action="store_true")
     ap.add_argument("--retries", type=int, default=2,
-                    help="reload drivers and retry after a wedge")
+                    help="reflash both cards and retry after a wedge")
     ap.add_argument("--out", default=f"{COYOTE}/examples/loom/experiments-log.txt")
     args = ap.parse_args()
 
@@ -554,16 +561,26 @@ def main():
     if not gaps:
         die("--gap: no sweep points given")
 
-    # Flash ONCE, before the sweep. Reprogramming between points would put the
-    # card through the one sequence that has ever dropped it off the bus, for
-    # no gain: the bitstream does not change across a pacing sweep.
-    if args.flash:
-        flash(args.settle)
     preflight()
 
     rows = []
     for i, gap in enumerate(gaps, 1):
         say(f"sweep point {i}/{len(gaps)}: gap={gap}us")
+        # TEARDOWN -> FLASH -> SETUP ON BOTH HOSTS BEFORE EVERY POINT.
+        # Owner mandate, and the reason for it is measured: the bench does
+        # not return to a comparable state by itself. Only the first run
+        # after a flash puts real traffic on the wire (2017 ROCE packets vs 2
+        # after a driver reload), so a point measured on the bench the
+        # previous point left behind is not a measurement of that point - it
+        # is a measurement of the previous point's damage. This is what made
+        # gap=160us read "wedged" once and "intact" once.
+        #
+        # It costs minutes per point. That is the price of every point being
+        # independent, and it is cheaper than a table of numbers that cannot
+        # be compared to each other.
+        if not args.no_flash:
+            say("teardown -> flash -> setup, both hosts")
+            flash(args.settle)
         result, verdicts = run_gap(args, gap)
         row = summarize(args, gap, result, verdicts)
         rows.append(row)
