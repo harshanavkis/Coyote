@@ -55,6 +55,11 @@ BUILD       = f"{COYOTE}/examples/loom/sw-bundled/build"
 # hardcoded path silently reads nothing and the counters look empty.
 SYSFS_GLOB  = "/sys/kernel/coyote_sysfs_*"
 BDF         = os.environ.get("BDF", "e1:00.0")   # the U280 on clara and amy
+# Absolute, because numactl lives in the nix store and is NOT on the PATH that
+# `sudo env ...` gets - neither locally nor over ssh. Same store path on both
+# hosts. This is the same trap as vivado and cmake.
+NUMACTL     = os.environ.get("NUMACTL",
+    "/nix/store/gdni20c8009xdz8gms6yn1r2hfhmk1jk-numactl-2.0.18/bin/numactl")
 SSH         = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10"]
 
 # Each stage is waited for by POLLING THE CARD until it reports the state that
@@ -113,6 +118,7 @@ def card_state(is_remote):
         f"echo driver=$(readlink {d}/driver 2>/dev/null | sed 's:.*/::')",
         "echo module=$(grep -c '^coyote_driver ' /proc/modules)",
         f"echo sysfs=$(ls -d {SYSFS_GLOB} 2>/dev/null | head -1)",
+        f"echo numa=$(cat {d}/numa_node 2>/dev/null)",
     ])
     out = (remote(cmd, check=False) if is_remote else local(cmd, check=False)).stdout
     st = {}
@@ -120,6 +126,34 @@ def card_state(is_remote):
         k, _, v = line.partition("=")
         st[k.strip()] = v.strip()
     return st
+
+
+def numactl_prefix(args, is_remote, host):
+    """Pin this host's process to the NUMA node ITS card is on.
+
+    Measured 2026-09-02, and it is the whole ballgame. The U280 sits on node
+    1 on both hosts; unpinned, the scheduler puts the process wherever it
+    likes and its source buffer follows. Land on node 0 and every DMA pull
+    crosses the inter-socket link, the engine starves (84% starved, 16%
+    moving), it emits a gappy stream, packets are lost, the RC layer
+    retransmits, and a retransmit lands displaced - the corruption this
+    project spent weeks attributing to Loom's logic.
+
+    Same sweep, same bitstream, same minute, only the node differing:
+      node 1: every size PASS, 0 retransmissions, 12.5 GB/s at 1 MB
+      node 0: 2.4 GB/s at 256 KB, then 1 MB wedges with 479 retransmissions
+              and the exporter reports CORRUPT
+    """
+    if args.numa == "off":
+        return ""
+    node = (args.numa if args.numa != "auto"
+            else card_state(is_remote).get("numa"))
+    if node in (None, "", "-1"):
+        die(f"{host}: cannot read the card's NUMA node; pass --numa <n> "
+            f"or --numa off")
+    if not os.access(NUMACTL, os.X_OK):
+        die(f"no numactl at {NUMACTL}; set NUMACTL=<path> or --numa off")
+    return f"{NUMACTL} --cpunodebind={node} --membind={node} "
 
 
 def show(st):
@@ -353,7 +387,8 @@ def one_run(args, env):
     # stdbuf: over ssh stdout is not a tty, so libc block-buffers it and the
     # readiness line never arrives for the poll below.
     say(f"starting server on {SERVER_HOST}")
-    srv_cmd = f"cd {BUILD} && sudo stdbuf -oL -eL env {env} ./loom_host --server"
+    srv_cmd = (f"cd {BUILD} && sudo stdbuf -oL -eL env {env} "
+               f"{numactl_prefix(args, True, 'amy')}./loom_host --server")
     srv = subprocess.Popen(SSH + [SERVER_HOST, srv_cmd], stdout=subprocess.PIPE,
                            stderr=subprocess.STDOUT, text=True, bufsize=1)
     srv_out = []
@@ -374,7 +409,8 @@ def one_run(args, env):
 
     say("running client")
     cli_cmd = (f"cd {BUILD} && sudo stdbuf -oL -eL env {env} "
-               f"./loom_host --client {SERVER_IP}")
+               f"{numactl_prefix(args, False, 'clara')}./loom_host "
+               f"--client {SERVER_IP}")
     cli = subprocess.Popen(cli_cmd, shell=True, stdout=subprocess.PIPE,
                            stderr=subprocess.STDOUT, text=True, bufsize=1)
     cli_out = []
@@ -425,8 +461,13 @@ def wedged(result):
 
 
 def bench_env(args, gap):
-    env = (f"LOOM_BENCH=1 LOOM_BENCH_NO_STORES=1 "
-           f"LOOM_BENCH_ONLY={args.size} LOOM_BENCH_ITERS={args.iters}")
+    # size 0 means "every size in BENCH_SIZES": the bench sweeps its whole
+    # list when LOOM_BENCH_ONLY is unset. It stops at the first size that
+    # retransmits, since later rows would measure RC recovery instead.
+    env = "LOOM_BENCH=1 LOOM_BENCH_NO_STORES=1 "
+    if args.size:
+        env += f"LOOM_BENCH_ONLY={args.size} "
+    env += f"LOOM_BENCH_ITERS={args.iters}"
     if gap:
         env += f" LOOM_BENCH_GAP_US={gap}"
     if args.skip_bulk:
@@ -536,7 +577,8 @@ def main():
     ap = argparse.ArgumentParser(
         description="Two-host Loom run, all logs captured on clara",
         formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
-    ap.add_argument("--size", type=int, default=1048576)
+    ap.add_argument("--size", type=int, default=1048576,
+                    help="one transfer size in bytes, or 0 to sweep them all")
     ap.add_argument("--iters", type=int, default=2)
     ap.add_argument("--gap", default="0",
                     help="microseconds between messages; comma-separated for "
@@ -545,6 +587,12 @@ def main():
                     help="skip the per-point teardown/flash/setup. FOR "
                          "DEBUGGING THE SCRIPT ONLY - the measurements it "
                          "produces are not comparable (see main)")
+    ap.add_argument("--numa", default="auto",
+                    help="NUMA node to pin each side to: 'auto' (default) "
+                         "pins each host to the node ITS card reports, a "
+                         "number forces one, 'off' disables pinning. Leaving "
+                         "it unpinned is what made runs randomly slow AND "
+                         "corrupt - see numactl_prefix()")
     ap.add_argument("--settle", type=int, default=15,
                     help="seconds to leave the card alone after programming, "
                          "while the PCIe link retrains (default 15)")

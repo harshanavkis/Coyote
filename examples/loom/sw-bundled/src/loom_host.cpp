@@ -259,8 +259,18 @@ void run_bench(coyote::cThread &t_ctrl, loom::Xpu &A, int win,
     printf("\n== remote transmit benchmark (<=%d iters/size, <=%lu MB burst, "
            "credit %d)\n", BENCH_ITERS,
            (unsigned long) (BENCH_MAX_BURST >> 20), bench_credit());
-    printf("%10s %6s %10s %10s %12s %10s %8s %8s %10s\n",
+    // us/op and GB/s are the TRANSFER alone - the deliberate idle of
+    // LOOM_BENCH_GAP_US is excluded, so they answer "how fast does Loom move
+    // a message" and are directly comparable to perf_rdma's throughput
+    // column. offered_* include that idle: the sustained rate a paced sender
+    // actually offers. Reporting only the latter is what made a pacing sweep
+    // look like a throughput collapse - at 1 MB the wall clock is
+    // size/(transfer + gap), so it tracked the gap almost exactly (gap 1000
+    // us predicted 0.967 and measured 0.965 GB/s; 160 us predicted 4.30 and
+    // measured 4.257) while the transfer underneath never moved.
+    printf("%10s %6s %10s %10s %12s %10s %12s %12s %8s %8s %10s\n",
            "bytes", "iters", "cyc/op", "queue_cyc", "us/op", "GB/s",
+           "offered_us", "offered_GB/s",
            "retrans", "psndrop", "landed");
     // The per-size columns below bracket only the timed loop, and an RC
     // retransmit timer fires well after the payload has been streamed - so
@@ -302,6 +312,7 @@ void run_bench(coyote::cThread &t_ctrl, loom::Xpu &A, int win,
         const int iters  = bench_iters(len);
         const int credit = bench_credit();
         const int gap_us = bench_gap_us();
+        double idle_us = 0.0;   // deliberate pacing idle, excluded below
         for (int k = 0; k < iters; k++) {
             A.copy(win, uint32_t(off), src, len, fence);
             if (credit && k + 1 > credit)          // at most `credit` unretired
@@ -328,6 +339,10 @@ void run_bench(coyote::cThread &t_ctrl, loom::Xpu &A, int win,
                 while (std::chrono::duration<double, std::micro>(
                            std::chrono::steady_clock::now() - g0).count()
                        < double(gap_us)) { }
+                // The fence wait above is transfer time and stays counted;
+                // only this idle comes back out.
+                idle_us += std::chrono::duration<double, std::micro>(
+                    std::chrono::steady_clock::now() - g0).count();
             }
         }
         // Generous but bounded: a size that cannot keep up should report,
@@ -337,16 +352,22 @@ void run_bench(coyote::cThread &t_ctrl, loom::Xpu &A, int win,
         loom::StageStats b = loom::read_stage_stats(t_ctrl);
         const long rt1 = net_stat("Retrans cnt"), pd1 = net_stat("PSN drop cnt");
 
-        double us = std::chrono::duration<double, std::micro>(t1 - t0).count();
+        const double wall_us = std::chrono::duration<double, std::micro>(
+            t1 - t0).count();
+        double us = wall_us - idle_us;      // transfer alone
+        if (us < 1.0) us = wall_us;         // never divide by ~0
         uint64_t cyc = b.acc[loom::STG_DMA_RDMA] - a.acc[loom::STG_DMA_RDMA];
         uint64_t ops = b.cnt[loom::STG_DMA_RDMA] - a.cnt[loom::STG_DMA_RDMA];
         uint64_t q   = b.queue_acc - a.queue_acc;
-        printf("%10lu %6d %10lu %10lu %12.2f %10.3f %8ld %8ld %10s\n",
+        printf("%10lu %6d %10lu %10lu %12.2f %10.3f %12.2f %12.3f "
+               "%8ld %8ld %10s\n",
                (unsigned long) len, iters,
                (unsigned long) (ops ? cyc / ops : 0),
                (unsigned long) (ops ? q / ops : 0),
                us / iters,
                (double(len) * iters) / (us * 1e3),
+               wall_us / iters,
+               (double(len) * iters) / (wall_us * 1e3),
                rt1 - rt0, pd1 - pd0,
                ok ? "yes" : "NO FENCE");
 
