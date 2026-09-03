@@ -619,7 +619,8 @@ initial begin
 
     // attachPeer: staging CSR from the exporter's hello, then two imports
     axil_write(16'd128, {16'b0, STAGING});
-    import_win(4'd1, {16'b0, BASE1}, 64'h100_0000);   // 16 MB: MB-scale cases below
+    import_win(4'd1, {16'b0, BASE1}, 64'h200_0000);   // 32 MB: MB-scale cases below,
+                                                     // incl. the 8 MB one at 0x1000000
     import_win(4'd2, {16'b0, BASE2}, 64'h100_0000);
 
     // --- loom_host: small stores through both windows ---
@@ -896,6 +897,22 @@ initial begin
                   "1 MB message (257 packets) lands intact");
     check(rx_txns - fwd_before == 1,
           $sformatf("1 MB landed as ONE host write (%0d)", rx_txns - fwd_before));
+
+    // 8 MB: the size that DEADLOCKS ON HARDWARE. loom_engine parks in
+    // ST_STREAM with m_net_tready low for 1.25 billion cycles and the
+    // descriptor never fences, while perf_rdma does single 8/32/128 MB
+    // WRITEs on the same shell at a flat ~10.7 GB/s - so it is not a shell
+    // limit. 1 MB works here and on hardware; this case exists to find where
+    // between them Loom stops. 2049 packets, 131073 beats.
+    fwd_before = rx_txns;
+    $display("       8 MB case: issuing (2049 packets, 131073 beats)");
+    copy(4'd1, 28'h1000000, {16'b0, SRC_VA}, 28'd8388608, {16'b0, CPL_VA});
+    settle();
+    $display("       8 MB case: settled, rx_txns delta = %0d", rx_txns - fwd_before);
+    check_payload(BASE1 + 48'h1000000, 1048576,
+                  "8 MB message (2049 packets) lands intact");
+    check(rx_txns - fwd_before == 1,
+          $sformatf("8 MB landed as ONE host write (%0d)", rx_txns - fwd_before));
 
     // Same size, framed the way the RX path actually builds it: a tlast at
     // every packet boundary rather than one at the end of the message. The

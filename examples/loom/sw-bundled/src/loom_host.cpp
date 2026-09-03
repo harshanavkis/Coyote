@@ -57,7 +57,7 @@ namespace {
 // 16 MB: the benchmark sweep packs transfers up to 4 MB nose to tail from
 // 0x40000, which ends at 5.6 MB, and the window bounds check drops anything
 // past the segment length
-constexpr uint64_t BUF_SIZE      = 16ULL * 1024 * 1024;
+constexpr uint64_t BUF_SIZE      = 32ULL * 1024 * 1024;
 constexpr uint64_t DMA_BYTES     = 4096;        // rdma bulk: len % 64 == 0
 constexpr uint32_t STAGING_BYTES = 4096;
 // Bring-up: a poll that is going to fail should fail fast enough that the
@@ -109,7 +109,8 @@ bool skip_bulk() { return getenv("LOOM_SKIP_BULK") != nullptr; }
 // Sizes are multiples of 64 B because the rdma bulk route requires it by
 // contract (loom_engine drops the rest at the source).
 constexpr uint64_t BENCH_SIZES[] = {
-    64, 256, 1024, 4096, 16384, 65536, 262144, 1048576, 4194304, 8388608
+    64, 256, 1024, 4096, 16384, 65536, 262144, 1048576,
+    2097152, 4194304, 6291456, 8388608
 };
 // 8 MB exists so a run can send the whole thing as ONE descriptor rather
 // than N iterations of a smaller one. Iterating was only ever a way to reach
