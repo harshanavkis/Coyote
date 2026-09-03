@@ -109,8 +109,19 @@ bool skip_bulk() { return getenv("LOOM_SKIP_BULK") != nullptr; }
 // Sizes are multiples of 64 B because the rdma bulk route requires it by
 // contract (loom_engine drops the rest at the source).
 constexpr uint64_t BENCH_SIZES[] = {
-    64, 256, 1024, 4096, 16384, 65536, 262144, 1048576, 4194304
+    64, 256, 1024, 4096, 16384, 65536, 262144, 1048576, 4194304, 8388608
 };
+// 8 MB exists so a run can send the whole thing as ONE descriptor rather
+// than N iterations of a smaller one. Iterating was only ever a way to reach
+// steady state for a RATE, and it is actively misleading for CORRECTNESS:
+// every iteration writes the SAME bytes to the SAME destination offset (the
+// offset comes from the size index, not the loop counter), so a later clean
+// write silently repairs an earlier corrupted one and the exporter - which
+// checks the region once, at the end - cannot tell. More iterations mask
+// faults rather than expose them. One large transfer writes every
+// destination byte exactly once, so the exporter's check covers the entire
+// transfer, and there are no inter-message gaps in the measurement at all.
+// Offsets: 0x40000 + sum(previous) = 5853184, + 8 MB = 14241792 < BUF_SIZE.
 constexpr int BENCH_ITERS = 32;      // per size, issued back to back
 constexpr uint64_t BENCH_MAX_BURST = 4ULL * 1024 * 1024;   // bytes in flight
 
