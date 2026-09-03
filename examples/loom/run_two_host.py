@@ -599,14 +599,16 @@ def main():
                     help="seconds to leave the card alone after programming, "
                          "while the PCIe link retrains (default 15)")
     ap.add_argument("--credit", type=int, default=0,
-                    help="cap unretired descriptors. The engine tracks NO "
-                         "credits (vfpga_top ties cq_wr.ready high and "
-                         "discards every completion) while the shell's budget "
-                         "is RDMA_N_WR_OUTSTANDING=16, so more than 16 "
-                         "in flight fills the send queue and never drains: "
-                         "100%% stalled, 0 retransmissions, NO FENCE - a "
-                         "DIFFERENT failure from the retransmission-driven "
-                         "corruption. 0 = uncapped")
+                    help="cap unretired descriptors (LOOM_BENCH_CREDIT). "
+                         "0 = uncapped. NOTE: this was added believing "
+                         "outstanding-write count caused the iters=32 wedge. "
+                         "It does not - iters 16 and 20 pass, and iters=32 "
+                         "passes too once paced. That wedge is receiver "
+                         "overrun escalating, the same bug as the corruption. "
+                         "The shell already enforces its own window in "
+                         "rdma_flow.sv and the engine already waits on "
+                         "sq_wr.ready. Kept as a knob; do not read a "
+                         "mechanism into it")
     ap.add_argument("--skip-bulk", action="store_true")
     ap.add_argument("--retries", type=int, default=2,
                     help="reflash both cards and retry after a wedge")
