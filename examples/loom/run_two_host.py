@@ -470,6 +470,8 @@ def bench_env(args, gap):
     env += f"LOOM_BENCH_ITERS={args.iters}"
     if gap:
         env += f" LOOM_BENCH_GAP_US={gap}"
+    if args.credit:
+        env += f" LOOM_BENCH_CREDIT={args.credit}"
     if args.skip_bulk:
         env += " LOOM_SKIP_BULK=1"
     return env
@@ -596,6 +598,15 @@ def main():
     ap.add_argument("--settle", type=int, default=15,
                     help="seconds to leave the card alone after programming, "
                          "while the PCIe link retrains (default 15)")
+    ap.add_argument("--credit", type=int, default=0,
+                    help="cap unretired descriptors. The engine tracks NO "
+                         "credits (vfpga_top ties cq_wr.ready high and "
+                         "discards every completion) while the shell's budget "
+                         "is RDMA_N_WR_OUTSTANDING=16, so more than 16 "
+                         "in flight fills the send queue and never drains: "
+                         "100%% stalled, 0 retransmissions, NO FENCE - a "
+                         "DIFFERENT failure from the retransmission-driven "
+                         "corruption. 0 = uncapped")
     ap.add_argument("--skip-bulk", action="store_true")
     ap.add_argument("--retries", type=int, default=2,
                     help="reflash both cards and retry after a wedge")
