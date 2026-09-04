@@ -255,7 +255,20 @@ cd examples/loom
 ./run_two_host.py --size 0 --iters 1 --gap 20 --retries 0    # x6 -> a rate
 ```
 
-- `--size 0` sweeps all sizes (64 B … 8 MB); or give one size in bytes.
+- `--size 0` sweeps all sizes (64 B … 64 MB); or give one size in bytes.
+  **A single size is not the sweep with the other rows removed.** A lone
+  descriptor of 4 MB or more is the first bulk transfer the run makes, and
+  it fails — 4, 8, 32 and 64 MB all die about 2.9 MB in, while the same
+  sizes pass inside the sweep, which ramps 64 B upward first. 1 MB alone is
+  fine. So `--size <big>` measures that bug, not the size; use `--size 0`
+  for anything you intend to quote, and reach for a lone big size only when
+  you are working on the cold-start failure itself.
+- `--offset BYTES` puts the transfer at one address instead of the packed
+  nose-to-tail layout (hex accepted). The packed layout puts every size
+  below 69.58 MB except 64 MB, which alone reaches past it, so size and
+  address are confounded in a sweep; this separates them. Use it with
+  `--size`. Both hosts get the same value — they compile the same table and
+  the exporter derives the destination from it.
 - `--iters 1` for a transfer-rate number. Iterating rewrites the *same*
   destination offset (it comes from the size index, not the loop counter),
   so a later clean write repairs an earlier corrupt one and the exporter —

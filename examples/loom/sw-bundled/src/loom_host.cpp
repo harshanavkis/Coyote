@@ -111,7 +111,14 @@ bool skip_bulk() { return getenv("LOOM_SKIP_BULK") != nullptr; }
 constexpr uint64_t BENCH_SIZES[] = {
     64, 256, 1024, 4096, 16384, 65536, 262144, 1048576,
     2097152, 4194304, 6291456, 8388608,
-    16777216, 33554432, 67108864
+    16777216, 33554432, 67108864,
+    // Bisecting the ceiling: 32 MB passes, 64 MB does not, and 64 MB fails
+    // the same way at the start of the buffer as at 69.58 MB into it, so it
+    // is the LENGTH not the address. These three are APPENDED, never
+    // inserted, so indices 0..14 and every packed offset above stay exactly
+    // what the banked measurements were taken with. A --size 0 sweep stops
+    // at 64 MB and never reaches them; they are for --size with --offset.
+    41943040, 50331648, 58720256          // 40, 48, 56 MB
 };
 // 8 MB exists so a run can send the whole thing as ONE descriptor rather
 // than N iterations of a smaller one. Iterating was only ever a way to reach
@@ -161,6 +168,16 @@ constexpr int BENCH_STORES = 256;    // inline messages for the store rate
 
 // Where each size's last iteration lands, packed nose to tail
 uint64_t bench_offset(int idx) {
+    // LOOM_BENCH_OFF=<bytes> puts the transfer at one fixed offset instead
+    // of the packed layout. The packed layout confounds size with address:
+    // every size that passes lives in the first 69.58 MB of the buffer and
+    // 64 MB is the only one that reaches past it, so "64 MB fails" and "the
+    // region past 69.58 MB fails" cannot be told apart from a sweep. Use it
+    // with LOOM_BENCH_ONLY so exactly one size goes to exactly one address.
+    // Both hosts must be given the same value - they compile the same table
+    // and the exporter derives the destination from it.
+    if (const char *e = getenv("LOOM_BENCH_OFF"))
+        return strtoull(e, nullptr, 0) & ~63ULL;
     uint64_t off = 0x40000;          // clear of the correctness checks
     for (int i = 0; i < idx; i++) off += BENCH_SIZES[i];
     return (off + 63) & ~63ULL;
@@ -302,6 +319,7 @@ void run_bench(coyote::cThread &t_ctrl, loom::Xpu &A, int win,
         const uint64_t len = BENCH_SIZES[i];
         const uint64_t off = bench_offset(i);
         if (only_len && len != only_len) continue;
+        if (off + len > BUF_SIZE) continue;   // bisect sizes, packed layout
 
         // Distinct pattern per size so the exporter can tell them apart
         for (uint64_t w = 0; w < len / 8; w++) src[w] = bench_word(i, w);
@@ -706,8 +724,18 @@ int run_server(uint16_t qp_port, uint16_t peer_port, const std::string &sock) {
 
     if (bench_mode()) {
         printf("\n== exporter check of the benchmark regions\n");
+        const char *only_e = getenv("LOOM_BENCH_ONLY");
+        const uint64_t only_l = only_e ? strtoull(only_e, nullptr, 0) : 0;
         for (int i = 0; i < BENCH_N; i++) {
             const uint64_t len = BENCH_SIZES[i], off = bench_offset(i);
+
+            // A focused run sent ONE size; the others are not "untouched
+            // regions", they were never asked for. Skipping them by name
+            // beats inferring it from a region reading zero - and with
+            // LOOM_BENCH_OFF every size shares an address, so the zero test
+            // would report the sent bytes under fourteen wrong labels.
+            if (only_l && len != only_l) continue;
+            if (off + len > BUF_SIZE) continue;
 
             // The importer stops at the first size that loses packets, so
             // the sizes after it were never sent. An untouched region is

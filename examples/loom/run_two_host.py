@@ -472,6 +472,8 @@ def bench_env(args, gap):
         env += f" LOOM_BENCH_GAP_US={gap}"
     if args.credit:
         env += f" LOOM_BENCH_CREDIT={args.credit}"
+    if args.offset:
+        env += f" LOOM_BENCH_OFF={args.offset}"
     if args.skip_bulk:
         env += " LOOM_SKIP_BULK=1"
     return env
@@ -609,6 +611,13 @@ def main():
                          "rdma_flow.sv and the engine already waits on "
                          "sq_wr.ready. Kept as a knob; do not read a "
                          "mechanism into it")
+    ap.add_argument("--offset", default=None,
+                    help="place the transfer at this byte offset in the "
+                         "destination buffer (LOOM_BENCH_OFF; hex ok) "
+                         "instead of the packed nose-to-tail layout. Use "
+                         "with --size: the packed layout puts every passing "
+                         "size below 69.58 MB and only 64 MB past it, so "
+                         "size and address are otherwise confounded")
     ap.add_argument("--skip-bulk", action="store_true")
     ap.add_argument("--retries", type=int, default=2,
                     help="reflash both cards and retry after a wedge")
