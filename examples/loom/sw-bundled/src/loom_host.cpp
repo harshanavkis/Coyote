@@ -38,9 +38,11 @@
 #include <cstdlib>
 #include <chrono>
 #include <cstring>
+#include <immintrin.h>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <vector>
 #include <thread>
 #include <unistd.h>
 
@@ -322,8 +324,25 @@ void run_bench(coyote::cThread &t_ctrl, loom::Xpu &A, int win,
     // LOOM_BENCH_ONLY=<bytes> runs one size and nothing else. The sweep
     // runs sizes in order, so a failure at 256 KB may be that size or may
     // be everything before it having degraded the QP - this separates them.
-    const char *only = getenv("LOOM_BENCH_ONLY");
-    const uint64_t only_len = only ? strtoull(only, nullptr, 0) : 0;
+    // LOOM_BENCH_ONLY takes a comma-separated LIST now, so a run can be
+    // exactly "one 2 MB descriptor, then one 64 MB descriptor, nothing
+    // else". A single preceding 2 MB message is the only thing found that
+    // moves the cold failure rate (1590 retransmissions -> 17), and the
+    // question this answers is whether it is a fix or only an improvement.
+    std::vector<uint64_t> only_set;
+    if (const char *o = getenv("LOOM_BENCH_ONLY"))
+        for (const char *q = o; *q; ) {
+            only_set.push_back(strtoull(q, nullptr, 0));
+            while (*q && *q != ',') q++;
+            if (*q == ',') q++;
+        }
+    auto wanted = [&](uint64_t l) {
+        if (only_set.empty()) return true;
+        for (uint64_t v : only_set) if (v == l) return true;
+        return false;
+    };
+    const uint64_t only_len = only_set.size() == 1 ? only_set[0] : 0;
+    (void) only_len;
 
     // LOOM_BENCH_FROM=<bytes> starts the sweep at that size instead of at
     // 64 B, and runs everything above it. This is how much ramp a size
@@ -338,7 +357,7 @@ void run_bench(coyote::cThread &t_ctrl, loom::Xpu &A, int win,
     for (int i = 0; i < BENCH_N; i++) {
         const uint64_t len = BENCH_SIZES[i];
         const uint64_t off = bench_offset(i);
-        if (only_len && len != only_len) continue;
+        if (!wanted(len)) continue;
         if (from_len && len < from_len) continue;
         if (off + len > BUF_SIZE) continue;   // bisect sizes, packed layout
 
@@ -360,6 +379,23 @@ void run_bench(coyote::cThread &t_ctrl, loom::Xpu &A, int win,
         // Written AT the skew, so payload word w is still bench_word(i, w)
         // and the exporter's expectation does not change.
         for (uint64_t w = 0; w < len / 8; w++) psrc[w] = bench_word(i, w);
+        // LOOM_BENCH_FLUSH_SRC=1 evicts the payload from the CPU caches
+        // before the transfer. The fill above writes it with ordinary
+        // stores, so cold it is DIRTY in the LLC and the card's DMA read
+        // has to snoop it out; warm, a previous descriptor has already
+        // pulled those lines through. That is the one difference between a
+        // cold and a warm pull that is not itself a consequence of the
+        // pull being slow - and the pull being slow at the start is what
+        // starves the packetiser. If flushing makes a cold run clean, the
+        // trigger is dirty-line snooping and it is fixable in software.
+        if (getenv("LOOM_BENCH_FLUSH_SRC")) {
+            auto *p8 = reinterpret_cast<char *>(psrc);
+            for (uint64_t b = 0; b < len; b += 64)
+                _mm_clflush(p8 + b);
+            _mm_mfence();
+            printf("  source flushed from the CPU caches (%lu B)\n",
+                   (unsigned long) len);
+        }
         if (skew)
             printf("  source skewed by %lu B: src page offset %lu, "
                    "message offset %lu\n", (unsigned long) skew,
@@ -802,8 +838,19 @@ int run_server(uint16_t qp_port, uint16_t peer_port, const std::string &sock) {
 
     if (bench_mode()) {
         printf("\n== exporter check of the benchmark regions\n");
-        const char *only_e = getenv("LOOM_BENCH_ONLY");
-        const uint64_t only_l = only_e ? strtoull(only_e, nullptr, 0) : 0;
+        std::vector<uint64_t> only_e_set;
+        if (const char *o = getenv("LOOM_BENCH_ONLY"))
+            for (const char *q = o; *q; ) {
+                only_e_set.push_back(strtoull(q, nullptr, 0));
+                while (*q && *q != ',') q++;
+                if (*q == ',') q++;
+            }
+        const uint64_t only_l = only_e_set.empty() ? 0 : 1;   // "a list was given"
+        auto e_wanted = [&](uint64_t l) {
+            if (only_e_set.empty()) return true;
+            for (uint64_t v : only_e_set) if (v == l) return true;
+            return false;
+        };
         const char *from_e = getenv("LOOM_BENCH_FROM");
         const uint64_t from_l = from_e ? strtoull(from_e, nullptr, 0) : 0;
         for (int i = 0; i < BENCH_N; i++) {
@@ -814,7 +861,7 @@ int run_server(uint16_t qp_port, uint16_t peer_port, const std::string &sock) {
             // beats inferring it from a region reading zero - and with
             // LOOM_BENCH_OFF every size shares an address, so the zero test
             // would report the sent bytes under fourteen wrong labels.
-            if (only_l && len != only_l) continue;
+            if (!e_wanted(len)) continue;
             if (from_l && len < from_l) continue;
             if (off + len > BUF_SIZE) continue;
 

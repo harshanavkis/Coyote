@@ -465,7 +465,7 @@ def bench_env(args, gap):
     # list when LOOM_BENCH_ONLY is unset. It stops at the first size that
     # retransmits, since later rows would measure RC recovery instead.
     env = "LOOM_BENCH=1 LOOM_BENCH_NO_STORES=1 "
-    if args.size:
+    if str(args.size) != "0":
         env += f"LOOM_BENCH_ONLY={args.size} "
     env += f"LOOM_BENCH_ITERS={args.iters}"
     if gap:
@@ -476,6 +476,8 @@ def bench_env(args, gap):
         env += f" LOOM_BENCH_OFF={args.offset}"
     if args.frm:
         env += f" LOOM_BENCH_FROM={args.frm}"
+    if args.flush_src:
+        env += " LOOM_BENCH_FLUSH_SRC=1"
     if args.src_skew:
         env += f" LOOM_BENCH_SRC_SKEW={args.src_skew}"
     if args.warm:
@@ -587,8 +589,12 @@ def main():
     ap = argparse.ArgumentParser(
         description="Two-host Loom run, all logs captured on clara",
         formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
-    ap.add_argument("--size", type=int, default=1048576,
-                    help="one transfer size in bytes, or 0 to sweep them all")
+    ap.add_argument("--size", default="1048576",
+                    help="one transfer size in bytes, 0 to sweep them all, or "
+                         "a comma-separated list to run exactly those sizes "
+                         "in ascending order - e.g. 2097152,67108864 is one "
+                         "2 MB descriptor followed by one 64 MB descriptor "
+                         "and nothing else")
     ap.add_argument("--iters", type=int, default=2)
     ap.add_argument("--gap", default="0",
                     help="microseconds between messages; comma-separated for "
@@ -628,6 +634,11 @@ def main():
                     help="start the sweep at this size instead of 64 B and "
                          "run everything above it (LOOM_BENCH_FROM). Bisects "
                          "how much of the ramp a large size actually needs")
+    ap.add_argument("--flush-src", action="store_true",
+                    help="evict the payload from the CPU caches before the "
+                         "transfer (LOOM_BENCH_FLUSH_SRC). Tests whether the "
+                         "cold pull is slow because the card's DMA read has "
+                         "to snoop dirty LLC lines the fill just wrote")
     ap.add_argument("--src-skew", default=None,
                     help="read the payload from src+SKEW without moving the "
                          "destination (LOOM_BENCH_SRC_SKEW). Separates a "
