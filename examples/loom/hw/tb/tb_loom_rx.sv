@@ -652,6 +652,80 @@ initial begin
           $sformatf("spanning: two of them absorbed as continuations (%0d)",
                     span_pulses));
 
+    // --- 15. A REPLAYED BEAT DISPLACES THE PAYLOAD BY EXACTLY ONE BEAT.
+    //     On hardware, a run with as few as 17 retransmissions came back
+    //     wholly corrupt, and the exporter's verdict was that the payload
+    //     was displaced by an integer number of 64 B beats (+1 in one run,
+    //     +3 in another). loom_rx takes the beat count from the message's
+    //     own header and streams exactly that many, so one beat that the
+    //     header did not account for shifts everything after it. Here the
+    //     replay re-delivers the beat that carried the header, mid-stream.
+    //     Nothing rejects it: in ST_STREAM every beat is payload.
+    dut_reset();
+    drop_pulses = 0; outq.delete(); wrq.delete();
+    incoming(6'd2, 28'd320, STAGING);
+    send_msg_beat({28'b0, 28'd256, OP_WR}, {16'b0, TARGET + 48'h5000}, 64'b0, 1'b0);
+    send_msg_beat(64'hAA00, 64'b0, 64'b0, 1'b0);
+    send_msg_beat(64'hAA01, 64'b0, 64'b0, 1'b0);
+    // the replay: the header beat again, in the middle of the stream
+    send_msg_beat({28'b0, 28'd256, OP_WR}, {16'b0, TARGET + 48'h5000}, 64'b0, 1'b0);
+    send_msg_beat(64'hAA02, 64'b0, 64'b0, 1'b0);
+    send_msg_beat(64'hAA03, 64'b0, 64'b0, 1'b1);
+    wait_quiet(400, "15: replayed header beat");
+    dump_wrq("case 15");
+    check(outq.size() == 4,
+          $sformatf("replay: four beats forwarded for a 256 B message (%0d)",
+                    outq.size()));
+    if (outq.size() == 4) begin
+        // What SHOULD have landed is P0 P1 P2 P3. The header the replay
+        // re-delivered is written as data in P2's place, and every beat
+        // after it is one slot late - which is the +1 x 64 B displacement
+        // the exporter measured on hardware.
+        check(outq[0].data == 64'hAA00 && outq[1].data == 64'hAA01,
+              "replay: the beats before the replay are still correct");
+        check(outq[2].data != 64'hAA02,
+              "replay: the third beat is the replayed header, not payload");
+        check(outq[2].data == {28'b0, 28'd256, OP_WR},
+              "replay: the replayed header beat lands in the payload");
+        check(outq[3].data == 64'hAA02,
+              "replay: P2 is displaced one beat late");
+    end
+    // P3 was never accounted for by the header, so it arrives in ST_IDLE
+    // and is read as a header. It is not one, so it is counted and
+    // discarded - this is the rx_hdr_reject storm seen on hardware (65537).
+    check(drop_pulses == 1,
+          $sformatf("replay: leftover beat rejected as a header (%0d)",
+                    drop_pulses));
+    check(wrq.size() == 1,
+          "replay: still exactly one write - nothing signals the damage");
+
+    // --- 16. A LOST BEAT EATS THE NEXT MESSAGE'S HEADER. The other half of
+    //     the same fragility: if the stream is short of what the header
+    //     claimed, loom_rx stays in ST_STREAM and consumes the following
+    //     message's header beat as payload, so the next message is written
+    //     to the WRONG TARGET - the previous one's.
+    dut_reset();
+    drop_pulses = 0; outq.delete(); wrq.delete();
+    incoming(6'd2, 28'd256, STAGING);
+    send_msg_beat({28'b0, 28'd192, OP_WR}, {16'b0, TARGET + 48'h6000}, 64'b0, 1'b0);
+    send_msg_beat(64'hBB00, 64'b0, 64'b0, 1'b0);
+    send_msg_beat(64'hBB01, 64'b0, 64'b0, 1'b0);
+    // Q2 is the lost one - it never arrives. The next message follows.
+    incoming(6'd2, 28'd128, STAGING);
+    send_msg_beat({28'b0, 28'd64, OP_WR}, {16'b0, TARGET + 48'h7000}, 64'b0, 1'b0);
+    send_msg_beat(64'hCC00, 64'b0, 64'b0, 1'b1);
+    wait_quiet(400, "16: lost beat");
+    dump_wrq("case 16");
+    check(wrq.size() == 1,
+          $sformatf("lost beat: second message gets no write of its own (%0d)",
+                    wrq.size()));
+    if (wrq.size() >= 1)
+        check(wrq[0].vaddr == TARGET + 48'h6000,
+              "lost beat: the only write is the FIRST message's target");
+    if (outq.size() >= 3)
+        check(outq[2].data == {28'b0, 28'd64, OP_WR},
+              "lost beat: next header written as payload into previous buffer");
+
     if (errors == 0) $display("TB PASS (tb_loom_rx)");
     else             $display("TB FAIL (tb_loom_rx): %0d errors", errors);
     $finish;
