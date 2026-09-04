@@ -38,6 +38,7 @@ logic [LEN_BITS-1:0]    lu_len;
 
 logic cnt_local_wr, cnt_rdma_wr, cnt_rx_fwd, cnt_rx_drop, cnt_drop, cnt_compl;
 logic cnt_pull_desync;
+logic cnt_rx_orphan;
 
 // Stage cycle counters: engine -> ctrl (RO CSR words 50-63)
 logic [63:0] stage_acc [7];
@@ -165,6 +166,7 @@ loom_ctrl inst_loom_ctrl (
     .rd_resp_data(rd_resp_data), .rd_resp_valid(rd_resp_valid),
     .cnt_local_wr(cnt_local_wr), .cnt_rdma_wr(cnt_rdma_wr),
     .cnt_rx_fwd(cnt_rx_fwd), .cnt_rx_drop(cnt_rx_drop),
+    .cnt_rx_orphan(cnt_rx_orphan),
     .cnt_drop(cnt_drop), .cnt_compl(cnt_compl),
     .cnt_rx_move(rx_cnt_move), .cnt_rx_starve(rx_cnt_starve),
     .cnt_rx_stall(rx_cnt_stall), .cnt_rx_stall_head(rx_cnt_st_head),
@@ -276,7 +278,8 @@ loom_rx inst_loom_rx (
     .cnt_rx_stall(rx_cnt_stall), .cnt_rx_stall_head(rx_cnt_st_head),
     .cnt_rx_stall_body(rx_cnt_st_body), .cnt_rx_req(rx_cnt_req),
     .cnt_rx_span(rx_cnt_span),
-    .cnt_rx_fwd(cnt_rx_fwd), .cnt_rx_drop(cnt_rx_drop)
+    .cnt_rx_fwd(cnt_rx_fwd), .cnt_rx_drop(cnt_rx_drop),
+    .cnt_rx_orphan(cnt_rx_orphan)
 );
 
 // ---------------------------------------------------------------------------

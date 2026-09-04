@@ -88,6 +88,10 @@ module loom_rx (
     // Debug counter pulses (to loom_ctrl)
     output logic                        cnt_rx_fwd,
     output logic                        cnt_rx_drop,
+    // A beat the shell never announced. rq_wr says, packet by packet, how
+    // many bytes are about to be delivered; anything beyond that is a beat
+    // no request accounts for, and it is swallowed rather than forwarded.
+    output logic                        cnt_rx_orphan,
 
     // Where the cycles go while forwarding. This module holds NO buffer: a
     // beat moves only when the RoCE ingress and the host write path are
@@ -199,12 +203,29 @@ wire hdr_ok = (s_tdata[63:36] == 28'b0) &&
                (hdr_op == MSG_OP_WRITE &&
                 hdr_len != 28'd0 && hdr_len[5:0] == 6'b0));
 
-// Requests are DRAINED, never read. They must come off the interface or the
-// shell's request path backs up, but nothing here needs them: the header
-// says where the data goes and how much of it there is. The pid comes from
-// a CSR instead, written once at QP setup - the QP owner is fixed for the
-// life of the connection, so there is nothing per-request about it.
+// Requests are still DRAINED - rq_ready never falls, because holding it low
+// backs up the shell's request path and that is exactly how a two-host run
+// wedged once, with rx_fwd frozen at 17 of 26. What changed is that they are
+// no longer IGNORED: each one announces how many bytes the shell is about to
+// deliver, and that count becomes credit.
+//
+// A payload beat is forwarded only against credit. Loom used to believe the
+// payload stream alone, so a beat the shell never announced - the head of a
+// packet streamed to the user before the stack decided to drop it - was
+// absorbed as payload and displaced every byte after it, permanently and
+// silently. The header still says WHERE the bytes go, so a stray packet
+// still cannot name its own destination; the shell now says HOW MANY there
+// are. The two agree exactly over a message: the shell announces len + 64,
+// and the header's beats_of(len) plus the header beat is the same count.
+//
+// The pid comes from a CSR, written once at QP setup - the QP owner is fixed
+// for the life of the connection, so there is nothing per-request about it.
 assign rq_ready = 1'b1;
+
+logic [31:0] p_credit;
+wire         covered   = (p_credit != 32'd0);
+wire         take_beat = s_tvalid && s_tready;
+wire [22:0]  cred_add  = (rq_valid && rq_ready) ? beats_of(rq_req.len) : 23'd0;
 
 // A header beat waiting on the payload stream is what wants the shared path
 assign req      = s_tvalid || (state != ST_IDLE);
@@ -218,13 +239,15 @@ always_ff @(posedge aclk) begin
         state <= ST_IDLE;
         l_op <= 0; l_len <= 0; l_va <= 0; l_inline <= 0;
         l_beats <= 0; l_moved <= 1'b0;
+        p_credit <= 0;
     end else begin
+        p_credit <= p_credit + {9'b0, cred_add} - (take_beat ? 32'd1 : 32'd0);
         case (state)
             // The header beat arrives on the payload stream like any other,
             // and is recognised by its contents rather than announced by a
             // request. A beat that is not a header is skipped and counted;
             // with a sender that agrees with us every beat here IS one.
-            ST_IDLE: if (s_tvalid && grant) begin
+            ST_IDLE: if (s_tvalid && grant && covered) begin
                 l_op     <= s_tdata[7:0];
                 l_len    <= s_tdata[35:8];
                 l_va     <= s_tdata[64 +: VADDR_BITS];
@@ -242,7 +265,9 @@ always_ff @(posedge aclk) begin
             // Forward exactly the payload the header promised, however many
             // packets it spans. Intermediate tlasts belong to packets, not
             // to this message, and are ignored.
-            ST_STREAM: if (s_tvalid && m_tready) begin
+            // An uncovered beat is swallowed here without advancing the
+            // message: it is not payload, whatever it looks like.
+            ST_STREAM: if (s_tvalid && m_tready && covered) begin
                 l_moved <= 1'b1;
                 l_beats <= l_beats - 23'd1;
                 if (stream_end) state <= ST_IDLE;
@@ -273,7 +298,7 @@ always_comb begin
     // A header beat is taken in ST_IDLE (only while granted); payload beats
     // move when the host write path will take them
     s_tready = ((state == ST_IDLE) && grant) ||
-               ((state == ST_STREAM) && m_tready);
+               ((state == ST_STREAM) && (covered ? m_tready : 1'b1));
 
     if (state == ST_INLINE_DATA) begin
         // Constructed beat: exact-length write, data LSB-aligned
@@ -288,15 +313,16 @@ always_comb begin
         // stream carries no tlast of its own (rq_wr.last low): the beat
         // budget ends the transaction, so it ends the stream too
         m_tlast  = stream_end;
-        m_tvalid = (state == ST_STREAM) && s_tvalid;
+        m_tvalid = (state == ST_STREAM) && s_tvalid && covered;
     end
 end
 
 assign cnt_rx_fwd  = ((state == ST_INLINE_DATA) && m_tready) ||
-                     ((state == ST_STREAM) && s_tvalid && m_tready && stream_end);
-assign cnt_rx_drop = (state == ST_IDLE) && s_tvalid && grant && !hdr_ok;
+                     ((state == ST_STREAM) && s_tvalid && m_tready && covered && stream_end);
+assign cnt_rx_drop = (state == ST_IDLE) && s_tvalid && grant && covered && !hdr_ok;
+assign cnt_rx_orphan = take_beat && !covered;
 
-assign cnt_rx_move   = (state == ST_STREAM) &&  s_tvalid &&  m_tready;
+assign cnt_rx_move   = (state == ST_STREAM) &&  s_tvalid &&  m_tready && covered;
 assign cnt_rx_starve = (state == ST_STREAM) && !s_tvalid;
 assign cnt_rx_stall  = (state == ST_STREAM) &&  s_tvalid && !m_tready;
 
