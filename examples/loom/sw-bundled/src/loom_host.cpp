@@ -487,6 +487,15 @@ void run_bench(coyote::cThread &t_ctrl, loom::Xpu &A, int win,
                    100.0 * double(st) / double(tot),
                    sv > st ? "the pull is gapping the outgoing stream"
                            : "the fabric is pushing back, which is expected");
+        // The engine's own residue detector. It was read only in the
+        // receive-path report, which runs on the SERVER - where the engine
+        // never streams a bulk descriptor, so it could only ever read zero.
+        // The pull is the SENDER's, and this is the sender.
+        const uint64_t pdes = loom::csr_read(t_ctrl, loom::PULL_DESYNC);
+        printf("  pull desync: %lu   (beats left on the pull stream when a "
+               "read was issued; nonzero means the engine forwarded a beat "
+               "that was not its payload, and the message is displaced)\n",
+               (unsigned long) pdes);
     }
 
     usleep(500000);      // let RC retransmit timers fire before sampling
