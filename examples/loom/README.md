@@ -241,6 +241,51 @@ segments owned by the server's data cThread, and the global staging CSR
 serves the asymmetric topology only (client TX / server RX; symmetric
 traffic needs per-window staging, 6.1).
 
+#### `run_two_host.py` — the benchmark driver
+
+Everything measured goes through this; the two commands above are for
+debugging a single run. It flashes both cards, loads drivers, starts the
+server on amy, runs the client here, and appends both sides' output to
+`experiments-log.txt`.
+
+```bash
+cd examples/loom
+./run_two_host.py --size 0 --iters 1 --gap 20                # every size
+./run_two_host.py --size 1048576 --iters 8 --gap 0,10,20,40  # pacing sweep
+./run_two_host.py --size 0 --iters 1 --gap 20 --retries 0    # x6 -> a rate
+```
+
+- `--size 0` sweeps all sizes (64 B … 8 MB); or give one size in bytes.
+- `--iters 1` for a transfer-rate number. Iterating rewrites the *same*
+  destination offset (it comes from the size index, not the loop counter),
+  so a later clean write repairs an earlier corrupt one and the exporter —
+  which checks the region once, at the end — cannot tell.
+- `--gap US` idle between messages, comma-separated for a sweep. Excluded
+  from the transfer timing.
+- `--numa auto` (default) pins each host to the node its own card reports.
+  Unpinned, the source buffer lands on the far node about half the time and
+  the pull starves: ~2.3 GB/s instead of ~12.5.
+- `--retries` reflashes and retries after a wedge — never use it when
+  measuring a failure rate. `--settle`, `--credit`, `--skip-bulk`,
+  `--no-flash`, `--out`: see `--help`.
+
+Every point does teardown → flash → setup on **both** cards first (from
+`~/coyote-bitstreams/loom/hw/bitstreams/cyt_top.bit`; override with `BIT`).
+It is unconditional — the bench does not return to a comparable state on
+its own.
+
+Reading the table: `us/op`/`GB/s` are the **transfer alone**, idle excluded,
+comparable to `09_perf_rdma`'s throughput; `offered_*` include the idle.
+`cyc/op` is the engine's stage counter (250 MHz) and agrees with the wall
+clock to ~0.5%. **The per-size `retrans`/`psndrop` columns sample too early**
+and read 0 on runs that retransmit thousands — trust only the
+`whole run: N retransmissions` line and the exporter verdict; a point is
+`intact` only if the server printed `LOOM HOST SERVER PASS`.
+
+Health check for any suspicious result: amy's `ROCE RX pkgs` delta must
+equal `rq_wr: N accepted`. A shortfall means packets were dropped upstream
+of `loom_rx`.
+
 ### Hardware
 
 **Bitstream** (hours; tmux). U280 needs the HBM shell — with `EN_RDMA` on
