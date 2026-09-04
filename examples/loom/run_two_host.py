@@ -474,6 +474,10 @@ def bench_env(args, gap):
         env += f" LOOM_BENCH_CREDIT={args.credit}"
     if args.offset:
         env += f" LOOM_BENCH_OFF={args.offset}"
+    if args.frm:
+        env += f" LOOM_BENCH_FROM={args.frm}"
+    if args.warm:
+        env += f" LOOM_BENCH_WARM={args.warm} LOOM_BENCH_WARM_N={args.warm_n}"
     if args.skip_bulk:
         env += " LOOM_SKIP_BULK=1"
     return env
@@ -618,6 +622,18 @@ def main():
                          "with --size: the packed layout puts every passing "
                          "size below 69.58 MB and only 64 MB past it, so "
                          "size and address are otherwise confounded")
+    ap.add_argument("--from", dest="frm", default=None,
+                    help="start the sweep at this size instead of 64 B and "
+                         "run everything above it (LOOM_BENCH_FROM). Bisects "
+                         "how much of the ramp a large size actually needs")
+    ap.add_argument("--warm", default=None,
+                    help="send this many bytes as their own descriptor(s) to "
+                         "a scratch offset before the size under test "
+                         "(LOOM_BENCH_WARM, max 64 KB). A lone descriptor of "
+                         "4 MB or more fails while the same size passes "
+                         "inside the sweep; this asks what the ramp provides")
+    ap.add_argument("--warm-n", type=int, default=1,
+                    help="how many warm-up descriptors (LOOM_BENCH_WARM_N)")
     ap.add_argument("--skip-bulk", action="store_true")
     ap.add_argument("--retries", type=int, default=2,
                     help="reflash both cards and retry after a wedge")

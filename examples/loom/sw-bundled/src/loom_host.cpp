@@ -118,7 +118,12 @@ constexpr uint64_t BENCH_SIZES[] = {
     // inserted, so indices 0..14 and every packed offset above stay exactly
     // what the banked measurements were taken with. A --size 0 sweep stops
     // at 64 MB and never reaches them; they are for --size with --offset.
-    41943040, 50331648, 58720256          // 40, 48, 56 MB
+    41943040, 50331648, 58720256,         // 40, 48, 56 MB
+    // Cold, 2 MB passes and 4 MB does not. src is MAP_HUGETLB and 2 MB
+    // aligned, so 2 MB reads exactly one huge page and 4 MB reads two.
+    // 3 MB reads two as well: if it fails, the boundary is the huge page,
+    // not a byte count somewhere between 2 and 4 MB. Run it with --offset.
+    3145728                               // 3 MB
 };
 // 8 MB exists so a run can send the whole thing as ONE descriptor rather
 // than N iterations of a smaller one. Iterating was only ever a way to reach
@@ -165,6 +170,11 @@ int bench_credit() {
     return e ? atoi(e) : 0;                  // 0 = unlimited, as today
 }
 constexpr int BENCH_STORES = 256;    // inline messages for the store rate
+
+// Scratch for LOOM_BENCH_WARM: the tail of the buffer, clear of every
+// packed bench offset (40 MB, the last, ends at 173.58 MB).
+constexpr uint64_t WARM_SCRATCH_OFF = 176ULL * 1024 * 1024;
+constexpr uint64_t WARM_SCRATCH_LEN = 16ULL * 1024 * 1024;
 
 // Where each size's last iteration lands, packed nose to tail
 uint64_t bench_offset(int idx) {
@@ -315,14 +325,52 @@ void run_bench(coyote::cThread &t_ctrl, loom::Xpu &A, int win,
     const char *only = getenv("LOOM_BENCH_ONLY");
     const uint64_t only_len = only ? strtoull(only, nullptr, 0) : 0;
 
+    // LOOM_BENCH_FROM=<bytes> starts the sweep at that size instead of at
+    // 64 B, and runs everything above it. This is how much ramp a size
+    // gets: the sweep passes at every size and a lone size of 4 MB or more
+    // does not, so the question is how much of the ramp is load-bearing.
+    // Unlike a synthetic warm-up it uses real bench regions, so every byte
+    // the ramp writes is checked by the exporter too - a ramp that quietly
+    // corrupts cannot be mistaken for one that worked.
+    const char *from = getenv("LOOM_BENCH_FROM");
+    const uint64_t from_len = from ? strtoull(from, nullptr, 0) : 0;
+
     for (int i = 0; i < BENCH_N; i++) {
         const uint64_t len = BENCH_SIZES[i];
         const uint64_t off = bench_offset(i);
         if (only_len && len != only_len) continue;
+        if (from_len && len < from_len) continue;
         if (off + len > BUF_SIZE) continue;   // bisect sizes, packed layout
 
         // Distinct pattern per size so the exporter can tell them apart
         for (uint64_t w = 0; w < len / 8; w++) src[w] = bench_word(i, w);
+
+        // LOOM_BENCH_WARM=<bytes> sends that many bytes as its own
+        // descriptor(s) to a scratch offset BEFORE the size under test,
+        // LOOM_BENCH_WARM_N=<n> says how many. A lone descriptor of 4 MB or
+        // more fails while the same size passes inside the sweep, so the
+        // question is what the sweep's ramp provides: this asks whether one
+        // small write in front of it is enough, and if not, how many.
+        // Scratch sits ABOVE every bench region (the largest, 40 MB, ends at
+        // 173.58 MB) so a warm-up of any size lands where nothing is
+        // checked.
+        if (const char *we = getenv("LOOM_BENCH_WARM")) {
+            uint64_t wlen = strtoull(we, nullptr, 0) & ~63ULL;
+            if (wlen > WARM_SCRATCH_LEN) wlen = WARM_SCRATCH_LEN;
+            const char *wn = getenv("LOOM_BENCH_WARM_N");
+            const int wcount = wn ? atoi(wn) : 1;
+            int done = 0;
+            for (int k = 0; k < wcount && wlen; k++) {
+                const uint64_t c =
+                    loom::csr_read(t_ctrl, loom::DBG_BASE + 8 * 7);
+                A.copy(win, uint32_t(WARM_SCRATCH_OFF), src, wlen, fence);
+                if (!spin64(fence, c + 1, 5e6)) break;
+                done++;
+            }
+            printf("  primed with %d of %d x %lu B before %lu B\n",
+                   done, wcount, (unsigned long) wlen, (unsigned long) len);
+            fflush(stdout);
+        }
 
         const uint64_t warm = loom::csr_read(t_ctrl, loom::DBG_BASE + 8 * 7);
         A.copy(win, uint32_t(off), src, len, fence);      // warm the path
@@ -726,6 +774,8 @@ int run_server(uint16_t qp_port, uint16_t peer_port, const std::string &sock) {
         printf("\n== exporter check of the benchmark regions\n");
         const char *only_e = getenv("LOOM_BENCH_ONLY");
         const uint64_t only_l = only_e ? strtoull(only_e, nullptr, 0) : 0;
+        const char *from_e = getenv("LOOM_BENCH_FROM");
+        const uint64_t from_l = from_e ? strtoull(from_e, nullptr, 0) : 0;
         for (int i = 0; i < BENCH_N; i++) {
             const uint64_t len = BENCH_SIZES[i], off = bench_offset(i);
 
@@ -735,6 +785,7 @@ int run_server(uint16_t qp_port, uint16_t peer_port, const std::string &sock) {
             // LOOM_BENCH_OFF every size shares an address, so the zero test
             // would report the sent bytes under fourteen wrong labels.
             if (only_l && len != only_l) continue;
+            if (from_l && len < from_l) continue;
             if (off + len > BUF_SIZE) continue;
 
             // The importer stops at the first size that loses packets, so
@@ -745,6 +796,16 @@ int run_server(uint16_t qp_port, uint16_t peer_port, const std::string &sock) {
             for (uint64_t w = 0; !touched && w < len / 8; w++)
                 if (dst1[off / 8 + w] != 0) touched = true;
             if (!touched) {
+                // With LOOM_BENCH_ONLY there is no "before this size" - the
+                // one size asked for arrived as nothing at all, and calling
+                // that untouched is how a run that transferred NOTHING used
+                // to print SERVER PASS.
+                if (only_l) {
+                    printf("  %8lu B at 0x%-8lx: nothing arrived\n",
+                           (unsigned long) len, (unsigned long) off);
+                    check(false, "bench region CORRUPT");
+                    continue;
+                }
                 printf("  %8lu B at 0x%-8lx never written (importer stopped "
                        "before this size)\n",
                        (unsigned long) len, (unsigned long) off);
