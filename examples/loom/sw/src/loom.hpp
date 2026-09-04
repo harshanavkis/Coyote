@@ -76,6 +76,10 @@ constexpr uint32_t RX_STALL_MAX  = 0x0C0;   // word 24
 // transfer about to start - displacing it for the rest of its length. This
 // must read 0; anything else is the corruption signature's root.
 constexpr uint32_t PULL_DESYNC   = 0x0C8;   // word 25
+// Beats the receive path handed loom_rx that no rq_wr request announced.
+// Nonzero says the shell streamed a packet to the user and then did not
+// deliver it; zero says that never happened and the leak theory is wrong.
+constexpr uint32_t RX_ORPHAN     = 0x0D0;   // word 26
 // The stall split. loom_rx is single-outstanding on the write side, so if
 // the shell withholds m_tready until it has accepted and translated the
 // request, every packet pays that latency serially and the stalls land

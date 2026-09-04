@@ -1011,6 +1011,12 @@ int run_server(uint16_t qp_port, uint16_t peer_port, const std::string &sock) {
             printf("  *** pull desync: %lu beat(s) left on the pull stream "
                    "when a read was issued - payload displaced ***\n",
                    (unsigned long) pd);
+        // The receive path's own account of beats nobody announced. Printed
+        // unconditionally: a zero here is a result, not an absence.
+        const uint64_t orph = loom::csr_read(t_ctrl, loom::RX_ORPHAN);
+        printf("  rx orphan beats: %lu   (beats no rq_wr request accounted "
+               "for; nonzero means the receive path handed up a packet it "
+               "did not deliver)\n", (unsigned long) orph);
         const uint64_t mx = loom::csr_read(t_ctrl, loom::RX_STALL_MAX);
         if (st)
             printf("  longest unbroken stall: %lu cycles of %lu total -> %s\n",
