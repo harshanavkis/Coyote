@@ -49,7 +49,14 @@ bool poll64(volatile uint64_t *addr, uint64_t want) {
 const uint64_t SIZES[] = {
     64, 128, 256, 512, 1024, 4096, 16384, 65536,
     256ULL * 1024, 1024ULL * 1024, 4ULL * 1024 * 1024, 16ULL * 1024 * 1024,
-    8, 100, 4095, 4097, 65535
+    8, 100, 4095, 4097, 65535,
+    // The sizes the REMOTE bench fails at, so the same descriptor can be
+    // run down the local route. The local route shares the host READ with
+    // the remote one and differs only in where the payload goes: host
+    // memory instead of the network. If a lone local descriptor corrupts
+    // at the same place, the read is at fault and the RoCE stack is not.
+    2ULL * 1024 * 1024, 3ULL * 1024 * 1024, 8ULL * 1024 * 1024,
+    32ULL * 1024 * 1024
 };
 
 } // namespace
@@ -79,8 +86,16 @@ int main() {
     // The fence carries the engine's running completion count, which only
     // clears on aresetn - so start from whatever earlier runs left behind
     uint64_t expected_compl = loom::csr_read(t, loom::DBG_BASE + 8 * 7);
+    // LOOM_SWEEP_ONLY=<bytes> runs ONE size and nothing before it, so the
+    // descriptor under test is the process's FIRST bulk transfer - the
+    // condition the remote bench fails in. The default ramp warms the path
+    // and hides it, exactly as the remote sweep does.
+    const char *only = getenv("LOOM_SWEEP_ONLY");
+    const uint64_t only_len = only ? strtoull(only, nullptr, 0) : 0;
+
     for (uint64_t len : SIZES) {
-        if (len > BUF_SIZE) continue;
+        if (len + 64 > BUF_SIZE) continue;
+        if (only_len && len != only_len) continue;
         memset(dst, 0, len + 64);
 
         loom::StageStats a = loom::read_stage_stats(t);
@@ -90,6 +105,38 @@ int main() {
         loom::StageStats b = loom::read_stage_stats(t);
 
         bool ok = fenced && memcmp(dst, src, len) == 0;
+        if (fenced && !ok) {
+            // WHERE it breaks is the whole point. The remote bench's
+            // failures all begin at payload byte 2704 mod 4096, and that
+            // number is ambiguous there: it is equally the RoCE packet grid
+            // and the host read grid. Down here there are no packets.
+            uint64_t first = 0;
+            while (first < len && dst[first] == src[first]) first++;
+            if (first < len) {
+                uint64_t nwrong = 0;
+                for (uint64_t i = first; i < len; i++)
+                    if (dst[i] != src[i]) nwrong++;
+                printf("  first differing byte %lu (0x%lx): mod 4096 = %lu, "
+                       "mod 64 = %lu; %lu of %lu bytes wrong after it\n",
+                       (unsigned long) first, (unsigned long) first,
+                       (unsigned long) (first % 4096),
+                       (unsigned long) (first % 64),
+                       (unsigned long) nwrong, (unsigned long) (len - first));
+                // A whole-beat displacement shows up as dst[first] matching
+                // src[first + k*64] for some small k
+                for (int k = 1; k <= 16; k++) {
+                    uint64_t off = uint64_t(k) * 64;
+                    if (first + off + 64 <= len &&
+                        memcmp(dst + first, src + first + off, 64) == 0) {
+                        printf("  payload displaced: dst[%lu] carries "
+                               "src[%lu] (+%d x 64 B beats)\n",
+                               (unsigned long) first,
+                               (unsigned long) (first + off), k);
+                        break;
+                    }
+                }
+            }
+        }
         // Nothing beyond the transfer may be touched: a length rounded up to
         // a beat boundary would show here
         for (uint64_t i = len; ok && i < len + 64; i++)
