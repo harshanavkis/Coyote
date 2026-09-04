@@ -56,6 +56,12 @@ req_t eng_rd_req, eng_wr_req;
 logic eng_rd_valid, eng_wr_valid;
 logic eng_busy;
 logic [AXI_DATA_BITS-1:0]   eng_host_tdata, eng_net_tdata;
+// Egress FIFO between loom_engine's network stream and axis_rreq_send;
+// declared here because the engine's m_net_tready port is wired to it above
+// its instantiation below.
+logic [511:0] txf_tdata;
+logic [63:0]  txf_tkeep;
+logic         txf_tvalid, txf_tready, txf_tlast;
 logic [AXI_DATA_BITS/8-1:0] eng_host_tkeep, eng_net_tkeep;
 logic eng_host_tvalid, eng_host_tlast, eng_net_tvalid, eng_net_tlast;
 
@@ -202,7 +208,7 @@ loom_engine inst_loom_engine (
     .m_host_tlast(eng_host_tlast),
     .m_net_tdata(eng_net_tdata), .m_net_tkeep(eng_net_tkeep),
     .m_net_tvalid(eng_net_tvalid),
-    .m_net_tready(axis_rreq_send[0].tready),
+    .m_net_tready(txf_tready),
     .m_net_tlast(eng_net_tlast),
     .rd_resp_data(rd_resp_data), .rd_resp_valid(rd_resp_valid),
     .cnt_local_wr(cnt_local_wr), .cnt_rdma_wr(cnt_rdma_wr),
@@ -302,11 +308,52 @@ always_comb begin
     axis_wr.tid    = '0;
 end
 
+// ---------------------------------------------------------------------------
+// Egress FIFO behind loom_engine. The mirror of inst_rx_ingress_fifo, and
+// the same argument in the other direction.
+//
+// The engine is a pass-through: a beat reaches the network only when the
+// host pull has one. Its m_net stream went straight into axis_rreq_send
+// with no buffer, so every gap in the pull became a gap in the packetiser's
+// input, MID-PACKET. Backpressure cannot reach the wire, so a packet whose
+// data arrives late is damaged rather than delayed.
+//
+// The measurement that says this is the fix: cold, the transmit path runs
+// 20.6-22.5% STARVED / 0% stalled and nearly every run loses a beat; warm,
+// after any descriptor >= 2 MB has primed the pull, it runs 4.1% starved /
+// 18.5% stalled and three sweeps moved 88786 packets each with ZERO losses.
+// Starvation is the only quantity that tracks it. The damage lands at a
+// fixed position - message offset 2768, beat 43 of a packet - which is what
+// an underrun looks like once the packetiser's prefill has drained: gaps
+// before that point are absorbed, gaps after it always surface at the same
+// beat. 512 beats is 8 PMTU packets, so the pull can go dry for ~2 us at
+// line rate without the packetiser ever seeing it.
+//
+// How to tell whether it worked: `./run_two_host.py --size 4194304 --iters 1
+// --gap 20 --retries 0`, cold, no ramp. Transmit starved must fall from
+// ~21% toward the warm 4%, retransmissions must go to 0, and the exporter
+// must pass. If starvation drops but the run still corrupts, the underrun
+// was not the mechanism and the packet path is the owner's to chase.
+// ---------------------------------------------------------------------------
+axis_data_fifo_512 inst_tx_egress_fifo (
+    .s_axis_aclk(aclk), .s_axis_aresetn(aresetn),
+    .s_axis_tdata(eng_net_tdata),
+    .s_axis_tkeep(eng_net_tkeep),
+    .s_axis_tvalid(eng_net_tvalid),
+    .s_axis_tready(txf_tready),
+    .s_axis_tlast(eng_net_tlast),
+    .m_axis_tdata(txf_tdata),
+    .m_axis_tkeep(txf_tkeep),
+    .m_axis_tvalid(txf_tvalid),
+    .m_axis_tready(axis_rreq_send[0].tready),
+    .m_axis_tlast(txf_tlast)
+);
+
 always_comb begin
-    axis_rreq_send[0].tdata  = eng_net_tdata;
-    axis_rreq_send[0].tkeep  = eng_net_tkeep;
-    axis_rreq_send[0].tlast  = eng_net_tlast;
-    axis_rreq_send[0].tvalid = eng_net_tvalid;
+    axis_rreq_send[0].tdata  = txf_tdata;
+    axis_rreq_send[0].tkeep  = txf_tkeep;
+    axis_rreq_send[0].tlast  = txf_tlast;
+    axis_rreq_send[0].tvalid = txf_tvalid;
     axis_rreq_send[0].tid    = '0;
 end
 
