@@ -476,6 +476,8 @@ def bench_env(args, gap):
         env += f" LOOM_BENCH_OFF={args.offset}"
     if args.frm:
         env += f" LOOM_BENCH_FROM={args.frm}"
+    if args.src_skew:
+        env += f" LOOM_BENCH_SRC_SKEW={args.src_skew}"
     if args.warm:
         env += f" LOOM_BENCH_WARM={args.warm} LOOM_BENCH_WARM_N={args.warm_n}"
     if args.skip_bulk:
@@ -626,6 +628,12 @@ def main():
                     help="start the sweep at this size instead of 64 B and "
                          "run everything above it (LOOM_BENCH_FROM). Bisects "
                          "how much of the ramp a large size actually needs")
+    ap.add_argument("--src-skew", default=None,
+                    help="read the payload from src+SKEW without moving the "
+                         "destination (LOOM_BENCH_SRC_SKEW). Separates a "
+                         "break that follows the RoCE packet from one that "
+                         "follows the source 4 KB page - they coincide at "
+                         "skew 0 and no other run can tell them apart")
     ap.add_argument("--warm", default=None,
                     help="send this many bytes as their own descriptor(s) to "
                          "a scratch offset before the size under test "

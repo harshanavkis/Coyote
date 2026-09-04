@@ -342,8 +342,29 @@ void run_bench(coyote::cThread &t_ctrl, loom::Xpu &A, int win,
         if (from_len && len < from_len) continue;
         if (off + len > BUF_SIZE) continue;   // bisect sizes, packed layout
 
-        // Distinct pattern per size so the exporter can tell them apart
-        for (uint64_t w = 0; w < len / 8; w++) src[w] = bench_word(i, w);
+        // LOOM_BENCH_SRC_SKEW=<bytes> reads the payload from src + skew
+        // instead of src + 0, WITHOUT moving the destination. src is 4 KB
+        // aligned and the message prepends one 64 B header beat, so
+        // "constant at message byte 2768" and "constant at source-page byte
+        // 2704" are the same number and no run so far can tell them apart.
+        // Skewing the source by a non-multiple of 4096 separates them: the
+        // break either follows the packet (the RoCE packetiser) or follows
+        // the source page (the host read path).
+        const uint64_t skew = []{
+            const char *e = getenv("LOOM_BENCH_SRC_SKEW");
+            return e ? (strtoull(e, nullptr, 0) & ~63ULL) : 0ULL;
+        }();
+        uint64_t *const psrc = src + skew / 8;
+
+        // Distinct pattern per size so the exporter can tell them apart.
+        // Written AT the skew, so payload word w is still bench_word(i, w)
+        // and the exporter's expectation does not change.
+        for (uint64_t w = 0; w < len / 8; w++) psrc[w] = bench_word(i, w);
+        if (skew)
+            printf("  source skewed by %lu B: src page offset %lu, "
+                   "message offset %lu\n", (unsigned long) skew,
+                   (unsigned long) (skew % 4096),
+                   (unsigned long) ((skew + 64) % 4096));
 
         // LOOM_BENCH_WARM=<bytes> sends that many bytes as its own
         // descriptor(s) to a scratch offset BEFORE the size under test,
@@ -373,7 +394,7 @@ void run_bench(coyote::cThread &t_ctrl, loom::Xpu &A, int win,
         }
 
         const uint64_t warm = loom::csr_read(t_ctrl, loom::DBG_BASE + 8 * 7);
-        A.copy(win, uint32_t(off), src, len, fence);      // warm the path
+        A.copy(win, uint32_t(off), psrc, len, fence);      // warm the path
         if (!spin64(fence, warm + 1, 5e6)) {
             printf("%10lu   warm-up never fenced - stopping\n",
                    (unsigned long) len);
@@ -393,7 +414,7 @@ void run_bench(coyote::cThread &t_ctrl, loom::Xpu &A, int win,
         const int gap_us = bench_gap_us();
         double idle_us = 0.0;   // deliberate pacing idle, excluded below
         for (int k = 0; k < iters; k++) {
-            A.copy(win, uint32_t(off), src, len, fence);
+            A.copy(win, uint32_t(off), psrc, len, fence);
             if (credit && k + 1 > credit)          // at most `credit` unretired
                 spin64_ge(fence, base + uint64_t(k + 1 - credit), 5e6);
             // Pace against the RECEIVER, which nothing else here does. The
