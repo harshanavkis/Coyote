@@ -478,6 +478,8 @@ def bench_env(args, gap):
         env += f" LOOM_BENCH_FROM={args.frm}"
     if args.hw_chunk is not None:
         env += f" LOOM_CHUNK={args.hw_chunk}"
+    if args.inflight is not None:
+        env += f" LOOM_INFLIGHT={args.inflight}"
     if args.chunk:
         env += f" LOOM_BENCH_CHUNK={args.chunk}"
     if args.chunk_credit is not None:
@@ -640,6 +642,13 @@ def main():
                     help="start the sweep at this size instead of 64 B and "
                          "run everything above it (LOOM_BENCH_FROM). Bisects "
                          "how much of the ramp a large size actually needs")
+    ap.add_argument("--inflight", default=None,
+                    help="max outstanding RDMA writes in the engine, 0 = "
+                         "unlimited (CSR 29, LOOM_INFLIGHT). Independent of "
+                         "--hw-chunk: the invariant is (writes in flight) x "
+                         "(packets per write) <= the shell's retransmit "
+                         "slots, and these are its two halves. --hw-chunk 0 "
+                         "--inflight 1 is jigsaw's configuration exactly")
     ap.add_argument("--hw-chunk", default=None,
                     help="set the ENGINE's chunk size in bytes (CSR 28, "
                          "LOOM_CHUNK). 0 turns hardware chunking off, which "

@@ -734,8 +734,22 @@ int run_server(uint16_t qp_port, uint16_t peer_port, const std::string &sock) {
     memset(dst2, 0, BUF_SIZE);
 
     loom::BundledOrchestrator orch(t_ctrl);
+    // The two halves of the invariant, independently settable. Read back and
+    // printed, because a knob that silently did not take is how a whole
+    // experiment gets misread - and both defaults live in the bitstream, so
+    // an unset variable is not the same as a zero.
     if (const char *e = getenv("LOOM_CHUNK"))
         loom::csr_write(t_ctrl, loom::CHUNK, strtoull(e, nullptr, 0));
+    if (const char *e = getenv("LOOM_INFLIGHT"))
+        loom::csr_write(t_ctrl, loom::INFLIGHT, strtoull(e, nullptr, 0));
+    {
+        const uint64_t cb = loom::csr_read(t_ctrl, loom::CHUNK);
+        const uint64_t mi = loom::csr_read(t_ctrl, loom::INFLIGHT);
+        printf("engine config: chunk_bytes=%lu (%s), max_inflight=%lu (%s)\n",
+               (unsigned long) cb, cb ? "chunked" : "NOT chunked",
+               (unsigned long) mi, mi ? "paced" : "UNLIMITED");
+        fflush(stdout);
+    }
     loom::Handle h1 = orch.exportBuf(t_data.getCtid(), dst1, BUF_SIZE);
     loom::Handle h2 = orch.exportBuf(t_data.getCtid(), dst2, BUF_SIZE);
     printf("server: exported handles %u, %u\n", h1, h2);
@@ -1181,8 +1195,22 @@ int run_client(const std::string &ip, uint16_t qp_port, uint16_t peer_port,
 
     // The chunk register lives on the SENDER's engine, so the client needs
     // it too - the server write above only covers the receive side.
+    // The two halves of the invariant, independently settable. Read back and
+    // printed, because a knob that silently did not take is how a whole
+    // experiment gets misread - and both defaults live in the bitstream, so
+    // an unset variable is not the same as a zero.
     if (const char *e = getenv("LOOM_CHUNK"))
         loom::csr_write(t_ctrl, loom::CHUNK, strtoull(e, nullptr, 0));
+    if (const char *e = getenv("LOOM_INFLIGHT"))
+        loom::csr_write(t_ctrl, loom::INFLIGHT, strtoull(e, nullptr, 0));
+    {
+        const uint64_t cb = loom::csr_read(t_ctrl, loom::CHUNK);
+        const uint64_t mi = loom::csr_read(t_ctrl, loom::INFLIGHT);
+        printf("engine config: chunk_bytes=%lu (%s), max_inflight=%lu (%s)\n",
+               (unsigned long) cb, cb ? "chunked" : "NOT chunked",
+               (unsigned long) mi, mi ? "paced" : "UNLIMITED");
+        fflush(stdout);
+    }
 
     auto *src = static_cast<uint64_t *>(A.alloc(BUF_SIZE));
     auto *fence = static_cast<uint64_t *>(A.allocSmall(4096));

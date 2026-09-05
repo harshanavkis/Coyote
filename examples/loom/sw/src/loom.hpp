@@ -89,7 +89,11 @@ constexpr uint32_t TX_PARTIAL    = 0x0D8;   // word 27
 // write. 0 turns chunking off entirely - the pre-chunking behaviour - so both
 // can be compared on ONE bitstream. Resets to RDMA_N_WR_OUTSTANDING *
 // PMTU_BYTES - 64 = 65472, which needs no software at all.
-constexpr uint32_t CHUNK         = 0x0E0;   // word 28
+// The two halves of the retransmit-buffer invariant, both runtime settable
+// so they can be varied without a bitstream:
+//   (writes in flight) x (packets per write) <= the shell's retrans slots
+constexpr uint32_t CHUNK         = 0x0E0;   // word 28: 0 = do not chunk
+constexpr uint32_t INFLIGHT      = 0x0E8;   // word 29: 0 = unlimited
 // The stall split. loom_rx is single-outstanding on the write side, so if
 // the shell withholds m_tready until it has accepted and translated the
 // request, every packet pays that latency serially and the stalls land

@@ -44,7 +44,12 @@ logic [27:0] chunk_bytes;
 logic [7:0]  max_inflight;
 // The peer's ack for an RDMA write. Declared here because loom_engine's
 // port is wired to it above the cq_wr tie-off below.
-wire rdma_ack = cq_wr.valid && cq_wr.ready;
+// cq_wr is ARBITRATED between host-bypass write completions and RDMA acks
+// (cq_arb.sv:139-145), so its valid alone does not mean "the peer acked".
+// Only RC_ACK frees a retransmit slot; counting a bypass completion as one
+// would let a second write out while the first still owns the slots, which
+// is the exact overrun this pacing exists to prevent.
+wire rdma_ack = cq_wr.valid && cq_wr.ready && is_opcode_ack(cq_wr.data.opcode);
 // The peer's ack for an RDMA write; the engine paces on it.
 
 // Stage cycle counters: engine -> ctrl (RO CSR words 50-63)
