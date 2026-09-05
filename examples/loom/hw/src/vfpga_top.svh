@@ -41,6 +41,7 @@ logic cnt_pull_desync;
 logic cnt_rx_orphan;
 logic cnt_tx_partial;
 logic [27:0] chunk_bytes;
+logic [7:0]  max_inflight;
 // The peer's ack for an RDMA write. Declared here because loom_engine's
 // port is wired to it above the cq_wr tie-off below.
 wire rdma_ack = cq_wr.valid && cq_wr.ready;
@@ -163,7 +164,7 @@ loom_ctrl inst_loom_ctrl (
     .fifo_src_pid(fifo_src_pid), .fifo_compl_va(fifo_compl_va),
     .fifo_payload(fifo_payload), .fifo_pop(fifo_pop),
     .rdma_staging_va(rdma_staging_va), .rx_pid(rx_pid),
-    .chunk_bytes(chunk_bytes),
+    .chunk_bytes(chunk_bytes), .max_inflight(max_inflight),
     .rd_resp_data(rd_resp_data), .rd_resp_valid(rd_resp_valid),
     .cnt_local_wr(cnt_local_wr), .cnt_rdma_wr(cnt_rdma_wr),
     .cnt_rx_fwd(cnt_rx_fwd), .cnt_rx_drop(cnt_rx_drop),
@@ -220,7 +221,7 @@ loom_engine inst_loom_engine (
     .stage_acc(stage_acc), .stage_cnt(stage_cnt),
     .cnt_pull_desync(cnt_pull_desync), .cnt_tx_partial(cnt_tx_partial),
     .rdma_ack(rdma_ack),
-    .chunk_bytes(chunk_bytes),
+    .chunk_bytes(chunk_bytes), .max_inflight(max_inflight),
     .cnt_tx_move(tx_cnt_move), .cnt_tx_starve(tx_cnt_starve),
     .cnt_tx_stall(tx_cnt_stall),
     .busy(eng_busy)

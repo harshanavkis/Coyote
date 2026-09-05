@@ -154,8 +154,9 @@ wire rdma_ack = m_net_tvalid && m_net_tready && m_net_tlast;
 // loom_ctrl resets to. Zero here would switch chunking off.
 wire [27:0] chunk_bytes = RDMA_N_WR_OUTSTANDING * PMTU_BYTES - 64;
 
+logic [7:0] max_inflight = 8'd1;   // one outstanding write, as the CSR defaults
 loom_engine inst_engine (
-    .rdma_ack(rdma_ack), .chunk_bytes(chunk_bytes),
+    .rdma_ack(rdma_ack), .chunk_bytes(chunk_bytes), .max_inflight(max_inflight),
     .aclk(aclk), .aresetn(aresetn),
     .fifo_empty(fifo_empty), .fifo_is_desc(fifo_is_desc),
     .fifo_is_read(fifo_is_read),

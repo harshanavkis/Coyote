@@ -98,6 +98,7 @@ module loom_ctrl (
     output logic [PID_BITS-1:0]         rx_pid,
     // RDMA chunk size in bytes; 0 disables chunking
     output logic [27:0]                 chunk_bytes,
+    output logic [7:0]                  max_inflight,
 
     // Read response (from loom_engine): completes the held-open AXI read
     input  logic [63:0]                 rd_resp_data,
@@ -208,6 +209,13 @@ localparam integer R_TX_PARTIAL   = 27;
 // the two can be compared on ONE bitstream instead of two. Reset value is the
 // derived safe size, so it works without software touching it.
 localparam integer R_CHUNK        = 28;
+// Max outstanding RDMA writes, 0 = unlimited. INDEPENDENT of R_CHUNK so the
+// two halves of the invariant can be varied separately on one bitstream:
+//   chunk 0,     inflight 0  -> the original failure, one huge message
+//   chunk 0,     inflight 1  -> jigsaw's configuration exactly
+//   chunk 65472, inflight 0  -> chunked but unpaced (build_sep5's failure)
+//   chunk 65472, inflight 1  -> both bounded
+localparam integer R_INFLIGHT     = 29;
 localparam integer R_CYC         = 48;
 localparam integer R_QUEUE_ACC   = 49;
 localparam integer R_STG_ACC     = 50;   // 7 words: 50-56
@@ -289,6 +297,7 @@ logic [63:0] r_dma_dst, r_dma_src_va, r_dma_len, r_dma_src_pid, r_dma_compl_va;
 logic [63:0] r_rdma_staging;
 logic [63:0] r_rx_pid;
 logic [63:0] r_chunk;
+logic [63:0] r_inflight;
 logic [63:0] dbg [N_DBG];
 logic [63:0] rx_move, rx_starve, rx_stall, rx_st_head, rx_st_body, rx_req_cnt;
 logic [63:0] rx_stall_run, rx_stall_max;
@@ -315,6 +324,7 @@ always_ff @(posedge aclk) begin
         r_dma_dst <= 0; r_dma_src_va <= 0; r_dma_len <= 0; r_dma_src_pid <= 0;
         r_dma_compl_va <= 0; r_rdma_staging <= 0; r_rx_pid <= 0;
         r_chunk <= RDMA_N_WR_OUTSTANDING * PMTU_BYTES - 64;
+        r_inflight <= 64'd1;
     end else if (csr_wr) begin
         case (wr_idx)
             R_TBL_IDX:     r_tbl_idx     <= axi_ctrl.wdata;
@@ -330,6 +340,7 @@ always_ff @(posedge aclk) begin
             R_RDMA_STAGING: r_rdma_staging <= axi_ctrl.wdata;
             R_RX_PID: r_rx_pid <= axi_ctrl.wdata;
             R_CHUNK:  r_chunk  <= axi_ctrl.wdata;
+            R_INFLIGHT: r_inflight <= axi_ctrl.wdata;
             default: ;
         endcase
     end
@@ -345,6 +356,7 @@ assign tbl_len    = r_tbl_len[LEN_BITS-1:0];
 assign rdma_staging_va = r_rdma_staging[VADDR_BITS-1:0];
 assign rx_pid          = r_rx_pid[PID_BITS-1:0];
 assign chunk_bytes     = r_chunk[27:0];
+assign max_inflight    = r_inflight[7:0];
 
 // -------------------------------------------------------------------------
 // Order FIFO - the ordering heart of the design
@@ -555,6 +567,7 @@ always_ff @(posedge aclk) begin
             R_RDMA_STAGING: axi_rdata <= r_rdma_staging;
             R_RX_PID:      axi_rdata <= r_rx_pid;
             R_CHUNK:       axi_rdata <= r_chunk;
+            R_INFLIGHT:    axi_rdata <= r_inflight;
             default:
                 if (rd_idx >= R_DBG_BASE && rd_idx < R_DBG_BASE + N_DBG)
                     axi_rdata <= dbg[rd_idx - R_DBG_BASE];

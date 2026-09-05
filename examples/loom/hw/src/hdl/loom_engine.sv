@@ -156,6 +156,9 @@ module loom_engine (
     // is the pre-chunking behaviour and lets both be compared on one
     // bitstream. Reset value is the derived safe size.
     input  logic [27:0]                 chunk_bytes,
+    // Max outstanding RDMA writes, 0 = unlimited. Independent of
+    // chunk_bytes: the two halves of the invariant are separate knobs.
+    input  logic [7:0]                  max_inflight,
     output logic                        cnt_tx_move,
     output logic                        cnt_tx_starve,
     output logic                        cnt_tx_stall,
@@ -298,7 +301,11 @@ wire [VADDR_BITS-1:0] dst_vaddr = l_base + {{(VADDR_BITS-28){1'b0}}, l_off};
 // One outstanding RDMA write. Set when a chunk's request is accepted on the
 // net route, cleared by the peer's ack. The chunk fits the retransmit
 // buffer only while nothing else is using it.
-logic                  net_inflight;
+// Outstanding RDMA writes, incremented on issue and decremented by the
+// peer's ack. A counter rather than jigsaw's single bit, so the depth is a
+// runtime knob and not welded to whether chunking is on.
+logic [7:0]            net_ost;
+wire  ost_full = (max_inflight != 8'd0) && (net_ost >= max_inflight);
 
 logic [27:0]           c_left;    // payload bytes of this descriptor still to send
 logic [27:0]           c_len;     // bytes in the chunk being sent
@@ -355,16 +362,19 @@ always_ff @(posedge aclk) begin
         rd_data <= 0; rd_lane <= 0;
         l_payload <= 0; l_sbeats <= 0;
         c_left <= 0; c_len <= 0; c_va <= 0;
-        net_inflight <= 1'b0;
+        net_ost <= 8'd0;
         l_valid <= 0; l_route <= 0; l_pid <= 0; l_base <= 0; l_lim <= 0;
     end else begin
         // Set on issue, cleared by the ack. The ack can arrive in the same
         // cycle a request is accepted; issue wins, so a credit is never
         // lost and at most one write is ever outstanding.
-        if ((state == ST_DMA_WR_REQ) && wr_ready && l_route && chunk_en && !net_inflight)
-            net_inflight <= 1'b1;
-        else if (rdma_ack)
-            net_inflight <= 1'b0;
+        // Issue and ack can land in the same cycle; handle both so a credit
+        // is neither lost nor double-counted.
+        if ((state == ST_DMA_WR_REQ) && wr_ready && l_route && !ost_full && !rdma_ack)
+            net_ost <= net_ost + 8'd1;
+        else if (rdma_ack && !((state == ST_DMA_WR_REQ) && wr_ready && l_route && !ost_full)
+                 && (net_ost != 8'd0))
+            net_ost <= net_ost - 8'd1;
 
         case (state)
             // Latch the FIFO head and its table hit in one shot; fifo_pop
@@ -423,7 +433,7 @@ always_ff @(posedge aclk) begin
             // path was doing, 256 of them for a 1 MB transfer. Local route
             // is untouched: it writes host memory directly, no wire, no
             // header.
-            ST_DMA_WR_REQ: if (wr_ready && !(l_route && chunk_en && net_inflight)) begin
+            ST_DMA_WR_REQ: if (wr_ready && !(l_route && ost_full)) begin
                 c_len    <= l_route ? c_next : l_len;
                 l_sbeats <= beats_of(l_route ? c_next : l_len);
                 state    <= l_route ? ST_HDR_BEAT : ST_STREAM;
