@@ -107,7 +107,10 @@ logic eng_busy;
 // RDMA_N_WR_OUTSTANDING slots of PMTU, header included. One descriptor is
 // therefore N messages and N host writes on the far side - but still ONE
 // completion, because only the last chunk carries compl_va.
-localparam int CHUNK_BYTES = RDMA_N_WR_OUTSTANDING * PMTU_BYTES - 64;
+// Must track loom_engine's. The slots are shared by every outstanding
+// message, so with up to RDMA_N_WR_OUTSTANDING chunks in flight the only
+// unconditionally safe chunk is one packet.
+localparam int CHUNK_BYTES = PMTU_BYTES - 64;
 function automatic int chunks_of(input int len);
     chunks_of = (len + CHUNK_BYTES - 1) / CHUNK_BYTES;
 endfunction
@@ -998,7 +1001,7 @@ initial begin
     // splits a descriptor at CHUNK_BYTES, so nothing exceeds 1023 beats and
     // a drop at 4096 would never fire. The case's point is unchanged -
     // steal beats mid-message and show the payload displaces.
-    drop_at_beat  = 500;
+    drop_at_beat  = 30;         // a chunk is one packet: 64 beats
     drop_n_beats  = 2;          // hardware's smallest observed displacement
     copy(4'd1, 28'hD00000, {16'b0, SRC_VA}, 28'd1048576, {16'b0, CPL_VA});
     copy(4'd1, 28'hE00000, {16'b0, SRC_VA}, 28'd1048576, {16'b0, CPL_VA});

@@ -253,7 +253,30 @@ logic [22:0] l_sbeats;
 //  131072 (32 packets)  CORRUPT, 78 retrans
 //  262144 (64 packets)  CORRUPT, 375 retrans
 // 4194304 (1025 pkts)   CORRUPT, ~1500 retrans
-localparam integer CHUNK_BYTES = RDMA_N_WR_OUTSTANDING * PMTU_BYTES - 64;
+// The slots are per PID, SHARED BY EVERY OUTSTANDING MESSAGE - not per
+// message. rdma_flow.sv admits RDMA_N_WR_OUTSTANDING requests, and the
+// engine issues chunks back to back with nothing limiting concurrency, so
+// the real invariant is
+//
+//     (chunks in flight) x (packets per chunk)  <=  RDMA_N_WR_OUTSTANDING
+//
+// Sizing the chunk to the whole buffer satisfies that only if exactly one
+// chunk is ever in flight, and the engine cannot know that: vfpga_top ties
+// cq_wr.ready high and discards completions, so it has no retire signal to
+// pace against. Measured on build_sep5, same 65472 B chunk, cold 4 MB:
+//   engine chunks, back to back   476 retrans, CORRUPT at chunk 34 of 65
+//   same size, software paced       0 retrans, PASS, 9.803 GB/s
+//
+// With up to RDMA_N_WR_OUTSTANDING chunks in flight, the only chunk size
+// that satisfies the invariant unconditionally is ONE PACKET. Then
+// 16 x 1 <= 16 holds however deeply the engine pipelines, and no
+// completion feedback is needed. The cost is one 64 B header per packet,
+// 1.6% of the wire.
+//
+// Wiring cq_wr back into the engine would allow bigger chunks by bounding
+// the other factor, and is the way to get the header overhead back if this
+// ever matters. It is a larger change and is not what this is.
+localparam integer CHUNK_BYTES = PMTU_BYTES - 64;
 
 // Declared here because ST_RD_REQ latches the first chunk's target from it.
 wire [VADDR_BITS-1:0] dst_vaddr = l_base + {{(VADDR_BITS-28){1'b0}}, l_off};
