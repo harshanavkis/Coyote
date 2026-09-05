@@ -149,8 +149,14 @@ int bench_iters(uint64_t len) {
     // the shell still emits 64 back-to-back PMTU packets, and 64 KB - which
     // works - is 16. If one descriptor on its own fails, the limit is the
     // burst within a message and no software pacing can reach it.
+    // LOOM_BENCH_ITERS=0 runs the warm-up descriptor and NOTHING after it,
+    // so the destination region is written by exactly ONE message. Every
+    // run to date wrote it twice - warm-up plus the timed copy - so a
+    // corrupt region was a mix of two messages and the forensics were
+    // ambiguous. There is no rate from such a run, only a clean picture of
+    // what one message did.
     const char *e = getenv("LOOM_BENCH_ITERS");
-    if (e) { int v = atoi(e); return v > 0 ? v : 1; }
+    if (e) { int v = atoi(e); return v >= 0 ? v : 1; }
     uint64_t n = BENCH_MAX_BURST / (len ? len : 1);
     if (n > BENCH_ITERS) n = BENCH_ITERS;
     return n ? int(n) : 1;
@@ -483,7 +489,7 @@ void run_bench(coyote::cThread &t_ctrl, loom::Xpu &A, int win,
         }
         // Generous but bounded: a size that cannot keep up should report,
         // not hold the run for the poll timeout
-        bool ok = spin64(fence, base + iters, 5e6);
+        bool ok = iters == 0 ? true : spin64(fence, base + iters, 5e6);
         auto t1 = std::chrono::steady_clock::now();
         loom::StageStats b = loom::read_stage_stats(t_ctrl);
         const long rt1 = net_stat("Retrans cnt"), pd1 = net_stat("PSN drop cnt");
@@ -963,6 +969,36 @@ int run_server(uint16_t qp_port, uint16_t peer_port, const std::string &sock) {
                         printf("    ^ that is a Loom inline message header "
                                "(op 2, len 8): a message was written as "
                                "bulk payload\n");
+
+                    // Characterise the HOLE, not just the first bad word.
+                    // Each word carries its own source index, so every word
+                    // says exactly which source word landed there and the
+                    // damage can be read off rather than guessed. The whole
+                    // question is how many bytes went missing and at what
+                    // alignment: a 64 B hole at 16 B alignment is a very
+                    // different fault from one at 64 B alignment.
+                    printf("    --- context, word index : source index "
+                           "landed there (delta) ---\n");
+                    const uint64_t lo = (w >= 24) ? ((w - 24) & ~7ULL) : 0;
+                    for (uint64_t v = lo; v < w + 40 && v < len / 8; v += 8) {
+                        printf("    +%-8lu", (unsigned long) (v * 8));
+                        for (int l = 0; l < 8; l++) {
+                            const uint64_t got = dst1[off / 8 + v + l];
+                            const uint64_t idx = got & 0xFFFFFFFFFFFFULL;
+                            const long d = (long) idx - (long) (v + l);
+                            if (got == 0)            printf("      ZERO");
+                            else if ((got >> 48) != (0xBE0 + i))
+                                                     printf("     ALIEN");
+                            else if (d == 0)         printf("         .");
+                            else                     printf(" %+9ld", d);
+                        }
+                        printf("\n");
+                    }
+                    printf("    ('.' = correct; a number is how many source "
+                           "words LATER the word that landed here came "
+                           "from, so it is the size of the hole in words; "
+                           "byte alignment of the first nonzero tells you "
+                           "the datapath width that lost it)\n");
                     ok = false;
                 }
             check(ok, ok ? "bench region landed intact" : "bench region CORRUPT");
