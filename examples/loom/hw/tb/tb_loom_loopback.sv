@@ -110,7 +110,7 @@ logic eng_busy;
 // Must track loom_engine's. The slots are shared by every outstanding
 // message, so with up to RDMA_N_WR_OUTSTANDING chunks in flight the only
 // unconditionally safe chunk is one packet.
-localparam int CHUNK_BYTES = PMTU_BYTES - 64;
+localparam int CHUNK_BYTES = RDMA_N_WR_OUTSTANDING * PMTU_BYTES - 64;
 function automatic int chunks_of(input int len);
     chunks_of = (len + CHUNK_BYTES - 1) / CHUNK_BYTES;
 endfunction
@@ -144,7 +144,18 @@ loom_table inst_table (
     .lu_pid(lu_pid), .lu_base(lu_base), .lu_len(lu_len)
 );
 
+// The peer's ack. The engine holds one outstanding RDMA write and
+// releases it on this, so a TB that never acks stalls it after one
+// chunk. Acking at the message's last beat is the earliest a real
+// ack could arrive; the point under test is the accounting, not the
+// latency.
+wire rdma_ack = m_net_tvalid && m_net_tready && m_net_tlast;
+// The engine reads its chunk size from CSR 28; drive the same value
+// loom_ctrl resets to. Zero here would switch chunking off.
+wire [27:0] chunk_bytes = RDMA_N_WR_OUTSTANDING * PMTU_BYTES - 64;
+
 loom_engine inst_engine (
+    .rdma_ack(rdma_ack), .chunk_bytes(chunk_bytes),
     .aclk(aclk), .aresetn(aresetn),
     .fifo_empty(fifo_empty), .fifo_is_desc(fifo_is_desc),
     .fifo_is_read(fifo_is_read),
@@ -1001,7 +1012,7 @@ initial begin
     // splits a descriptor at CHUNK_BYTES, so nothing exceeds 1023 beats and
     // a drop at 4096 would never fire. The case's point is unchanged -
     // steal beats mid-message and show the payload displaces.
-    drop_at_beat  = 30;         // a chunk is one packet: 64 beats
+    drop_at_beat  = 500;        // inside a chunk: 16 packets = 1024 beats
     drop_n_beats  = 2;          // hardware's smallest observed displacement
     copy(4'd1, 28'hD00000, {16'b0, SRC_VA}, 28'd1048576, {16'b0, CPL_VA});
     copy(4'd1, 28'hE00000, {16'b0, SRC_VA}, 28'd1048576, {16'b0, CPL_VA});

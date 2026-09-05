@@ -476,6 +476,8 @@ def bench_env(args, gap):
         env += f" LOOM_BENCH_OFF={args.offset}"
     if args.frm:
         env += f" LOOM_BENCH_FROM={args.frm}"
+    if args.hw_chunk is not None:
+        env += f" LOOM_CHUNK={args.hw_chunk}"
     if args.chunk:
         env += f" LOOM_BENCH_CHUNK={args.chunk}"
     if args.chunk_credit is not None:
@@ -638,6 +640,13 @@ def main():
                     help="start the sweep at this size instead of 64 B and "
                          "run everything above it (LOOM_BENCH_FROM). Bisects "
                          "how much of the ramp a large size actually needs")
+    ap.add_argument("--hw-chunk", default=None,
+                    help="set the ENGINE's chunk size in bytes (CSR 28, "
+                         "LOOM_CHUNK). 0 turns hardware chunking off, which "
+                         "is the pre-chunking behaviour - so both can be "
+                         "compared on one bitstream. Defaults to the "
+                         "hardware reset value, 65472. Not --chunk, which "
+                         "chunks in software instead")
     ap.add_argument("--chunk", default=None,
                     help="deliver the region as descriptors of this size at "
                          "successive offsets instead of one long message "

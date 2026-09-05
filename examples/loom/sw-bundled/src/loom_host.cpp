@@ -596,6 +596,13 @@ void run_bench(coyote::cThread &t_ctrl, loom::Xpu &A, int win,
         // receive-path report, which runs on the SERVER - where the engine
         // never streams a bulk descriptor, so it could only ever read zero.
         // The pull is the SENDER's, and this is the sender.
+        // LOOM_CHUNK=<bytes> overrides the engine's chunk size; 0 turns
+        // chunking off. Reported either way so a log says which mode the
+        // run was in - the two are indistinguishable from the output
+        // otherwise, and that is exactly the confusion to avoid.
+        printf("  rdma chunk: %lu B%s\n",
+               (unsigned long) loom::csr_read(t_ctrl, loom::CHUNK),
+               loom::csr_read(t_ctrl, loom::CHUNK) ? "" : "  (CHUNKING OFF)");
         const uint64_t part = loom::csr_read(t_ctrl, loom::TX_PARTIAL);
         printf("  tx partial-keep beats: %lu   (payload beats the host read "
                "returned sub-beat; the engine now forces a full keep, this "
@@ -727,6 +734,8 @@ int run_server(uint16_t qp_port, uint16_t peer_port, const std::string &sock) {
     memset(dst2, 0, BUF_SIZE);
 
     loom::BundledOrchestrator orch(t_ctrl);
+    if (const char *e = getenv("LOOM_CHUNK"))
+        loom::csr_write(t_ctrl, loom::CHUNK, strtoull(e, nullptr, 0));
     loom::Handle h1 = orch.exportBuf(t_data.getCtid(), dst1, BUF_SIZE);
     loom::Handle h2 = orch.exportBuf(t_data.getCtid(), dst2, BUF_SIZE);
     printf("server: exported handles %u, %u\n", h1, h2);
@@ -1169,6 +1178,11 @@ int run_client(const std::string &ip, uint16_t qp_port, uint16_t peer_port,
     // something that neither poisons nor returns.
     check(A.load(w1, 0x40) == loom::READ_POISON,
           "load through an rdma window answers with poison (remote reads are 6.2b)");
+
+    // The chunk register lives on the SENDER's engine, so the client needs
+    // it too - the server write above only covers the receive side.
+    if (const char *e = getenv("LOOM_CHUNK"))
+        loom::csr_write(t_ctrl, loom::CHUNK, strtoull(e, nullptr, 0));
 
     auto *src = static_cast<uint64_t *>(A.alloc(BUF_SIZE));
     auto *fence = static_cast<uint64_t *>(A.allocSmall(4096));

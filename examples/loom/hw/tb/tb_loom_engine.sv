@@ -96,7 +96,18 @@ loom_table inst_table (
     .lu_pid(lu_pid), .lu_base(lu_base), .lu_len(lu_len)
 );
 
+// The peer's ack. The engine holds one outstanding RDMA write and
+// releases it on this, so a TB that never acks stalls it after one
+// chunk. Acking at the message's last beat is the earliest a real
+// ack could arrive; the point under test is the accounting, not the
+// latency.
+wire rdma_ack = m_net_tvalid && m_net_tready && m_net_tlast;
+// The engine reads its chunk size from CSR 28; drive the same value
+// loom_ctrl resets to. Zero here would switch chunking off.
+wire [27:0] chunk_bytes = RDMA_N_WR_OUTSTANDING * PMTU_BYTES - 64;
+
 loom_engine inst_engine (
+    .rdma_ack(rdma_ack), .chunk_bytes(chunk_bytes),
     .aclk(aclk), .aresetn(aresetn),
     .fifo_empty(fifo_empty), .fifo_is_desc(fifo_is_desc),
     .fifo_is_read(fifo_is_read),
