@@ -548,6 +548,10 @@ void run_bench(coyote::cThread &t_ctrl, loom::Xpu &A, int win,
         // receive-path report, which runs on the SERVER - where the engine
         // never streams a bulk descriptor, so it could only ever read zero.
         // The pull is the SENDER's, and this is the sender.
+        const uint64_t part = loom::csr_read(t_ctrl, loom::TX_PARTIAL);
+        printf("  tx partial-keep beats: %lu   (payload beats the host read "
+               "returned sub-beat; the engine now forces a full keep, this "
+               "says whether it ever had to)\n", (unsigned long) part);
         const uint64_t pdes = loom::csr_read(t_ctrl, loom::PULL_DESYNC);
         printf("  pull desync: %lu   (beats left on the pull stream when a "
                "read was issued; nonzero means the engine forwarded a beat "

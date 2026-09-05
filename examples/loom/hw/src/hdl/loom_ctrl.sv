@@ -113,6 +113,7 @@ module loom_ctrl (
     input  logic                        cnt_rx_stall,
     input  logic                        cnt_pull_desync,
     input  logic                        cnt_rx_orphan,
+    input  logic                        cnt_tx_partial,
     input  logic                        cnt_tx_move,
     input  logic                        cnt_tx_starve,
     input  logic                        cnt_tx_stall,
@@ -198,6 +199,8 @@ localparam integer R_PULL_DESYNC  = 25;
 // did not deliver - which used to be absorbed as payload and displace the
 // rest of the message.
 localparam integer R_RX_ORPHAN    = 26;
+// Payload beats the host read handed back with a partial keep.
+localparam integer R_TX_PARTIAL   = 27;
 localparam integer R_CYC         = 48;
 localparam integer R_QUEUE_ACC   = 49;
 localparam integer R_STG_ACC     = 50;   // 7 words: 50-56
@@ -283,6 +286,7 @@ logic [63:0] rx_move, rx_starve, rx_stall, rx_st_head, rx_st_body, rx_req_cnt;
 logic [63:0] rx_stall_run, rx_stall_max;
 logic [63:0] pull_desync;
 logic [63:0] rx_orphan;
+logic [63:0] tx_partial;
 logic [63:0] tx_move, tx_starve, tx_stall;
 logic [63:0] rx_span_cnt;
 
@@ -480,6 +484,7 @@ always_ff @(posedge aclk) begin
         rx_stall_run <= 0; rx_stall_max <= 0;
         pull_desync <= 0;
         rx_orphan <= 0;
+        tx_partial <= 0;
     end else begin
         if (push_store)   dbg[0] <= dbg[0] + 1;
         if (push_desc)    dbg[1] <= dbg[1] + 1;
@@ -499,6 +504,7 @@ always_ff @(posedge aclk) begin
         if (cnt_rx_stall)  rx_stall  <= rx_stall + 1;
         if (cnt_pull_desync) pull_desync <= pull_desync + 1;
         if (cnt_rx_orphan)   rx_orphan   <= rx_orphan + 1;
+        if (cnt_tx_partial)  tx_partial  <= tx_partial + 1;
         // Run length of consecutive stalled cycles, and the longest seen
         if (cnt_rx_stall) begin
             rx_stall_run <= rx_stall_run + 1;
@@ -552,6 +558,8 @@ always_ff @(posedge aclk) begin
                     axi_rdata <= pull_desync;
                 else if (rd_idx == R_RX_ORPHAN)
                     axi_rdata <= rx_orphan;
+                else if (rd_idx == R_TX_PARTIAL)
+                    axi_rdata <= tx_partial;
                 else if (rd_idx == R_RX_ST_HEAD)
                     axi_rdata <= rx_st_head;
                 else if (rd_idx == R_RX_ST_BODY)

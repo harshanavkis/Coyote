@@ -80,6 +80,10 @@ constexpr uint32_t PULL_DESYNC   = 0x0C8;   // word 25
 // Nonzero says the shell streamed a packet to the user and then did not
 // deliver it; zero says that never happened and the leak theory is wrong.
 constexpr uint32_t RX_ORPHAN     = 0x0D0;   // word 26
+// Payload beats the host read handed back with a partial keep. The engine
+// used to forward that keep onto the wire, which would make the packetiser
+// emit fewer than 64 bytes for the beat and shift everything after it.
+constexpr uint32_t TX_PARTIAL    = 0x0D8;   // word 27
 // The stall split. loom_rx is single-outstanding on the write side, so if
 // the shell withholds m_tready until it has accepted and translated the
 // request, every packet pays that latency serially and the stalls land

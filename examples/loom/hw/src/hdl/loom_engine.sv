@@ -145,6 +145,10 @@ module loom_engine (
     // whatever streams next. Intermediate tlasts are ignored on purpose -
     // the shell may return a large read as several chunks.
     output logic                        cnt_pull_desync,
+    // A payload beat that arrived from the host read with a partial keep.
+    // Nonzero means the pull really does hand back sub-beat data and the
+    // wire used to carry it.
+    output logic                        cnt_tx_partial,
     output logic                        cnt_tx_move,
     output logic                        cnt_tx_starve,
     output logic                        cnt_tx_stall,
@@ -519,7 +523,16 @@ always_comb begin
     // (keep all ones) - nothing sub-beat ever goes on the wire
     m_net_tdata  = (state == ST_WR_DATA)  ? msg_inline_beat :
                    (state == ST_HDR_BEAT) ? msg_write_beat  : s_tdata;
-    m_net_tkeep  = stream_net ? s_tkeep : {(AXI_DATA_BITS/8){1'b1}};
+    // Every beat on the wire is a full 64 B, payload included. The header
+    // above always was; the payload was NOT - it forwarded the pull
+    // stream's keep verbatim, so a single partial beat coming back from the
+    // host read would have made the packetiser emit fewer than 64 bytes
+    // there and shifted every byte after it. A descriptor's length is a
+    // multiple of 64 by contract (loom_engine drops the rest at the source
+    // and hdr_ok requires hdr_len[5:0] == 0), so every payload beat is full
+    // and forcing this is identical when the contract holds and corrective
+    // when it does not. cnt_tx_partial says which.
+    m_net_tkeep  = {(AXI_DATA_BITS/8){1'b1}};
     m_net_tlast  = stream_net ? stream_last : (state == ST_WR_DATA);
     m_net_tvalid = ((state == ST_WR_DATA) && l_route) ||
                    (state == ST_HDR_BEAT) ||
@@ -563,6 +576,8 @@ assign cnt_drop     = (state == ST_CHECK) && !ok;
 // several tlast-terminated chunks, so "the last beat carries tlast" is
 // satisfied by any chunk boundary and detects nothing.
 assign cnt_pull_desync = (state == ST_RD_REQ) && rd_ready && s_tvalid;
+assign cnt_tx_partial  = stream_net && s_tvalid && m_net_tready &&
+                         (s_tkeep != {(AXI_DATA_BITS/8){1'b1}});
 
 assign cnt_local_wr = ((state == ST_WR_DATA) && !l_route && m_host_tready) ||
                       (stream_local && s_tvalid && stream_last && m_host_tready);
