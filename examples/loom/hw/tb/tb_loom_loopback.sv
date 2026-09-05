@@ -103,6 +103,15 @@ localparam int NET_WINDOW_BEATS = 16 * (PMTU / 64);
 wire m_net_tready = (net_beats.size() < NET_WINDOW_BEATS);
 logic eng_busy;
 
+// The engine chunks an RDMA message to fit the shell's retransmit buffer:
+// RDMA_N_WR_OUTSTANDING slots of PMTU, header included. One descriptor is
+// therefore N messages and N host writes on the far side - but still ONE
+// completion, because only the last chunk carries compl_va.
+localparam int CHUNK_BYTES = RDMA_N_WR_OUTSTANDING * PMTU_BYTES - 64;
+function automatic int chunks_of(input int len);
+    chunks_of = (len + CHUNK_BYTES - 1) / CHUNK_BYTES;
+endfunction
+
 int errors = 0;
 
 loom_ctrl inst_ctrl (
@@ -870,9 +879,9 @@ initial begin
     settle();
     check_payload(BASE1 + 48'h90000, 8192,
                   "64 KB message spanning 17 packets lands intact");
-    check(rx_txns - fwd_before == 1,
-          $sformatf("64 KB landed as ONE host write, not per packet (%0d)",
-                    rx_txns - fwd_before));
+    check(rx_txns - fwd_before == chunks_of(65536),
+          $sformatf("64 KB lands as %0d chunked writes, not one per packet (%0d)",
+                    chunks_of(65536), rx_txns - fwd_before));
 
     // --- The size that fails on hardware. A 1 MB message is 257 PMTU
     //     packets and 16384 payload beats, and the failure there was a -1
@@ -886,8 +895,8 @@ initial begin
     settle();
     check_payload(BASE1 + 48'h400000, 65536,
                   "512 KB message (129 packets) lands intact");
-    check(rx_txns - fwd_before == 1,
-          $sformatf("512 KB landed as ONE host write (%0d)",
+    check(rx_txns - fwd_before == chunks_of(524288),
+          $sformatf("512 KB lands as its chunk count (%0d)",
                     rx_txns - fwd_before));
 
     fwd_before = rx_txns;
@@ -895,8 +904,8 @@ initial begin
     settle();
     check_payload(BASE1 + 48'h800000, 131072,
                   "1 MB message (257 packets) lands intact");
-    check(rx_txns - fwd_before == 1,
-          $sformatf("1 MB landed as ONE host write (%0d)", rx_txns - fwd_before));
+    check(rx_txns - fwd_before == chunks_of(1048576),
+          $sformatf("1 MB lands as its chunk count (%0d)", rx_txns - fwd_before));
 
     // 8 MB: the size that DEADLOCKS ON HARDWARE. loom_engine parks in
     // ST_STREAM with m_net_tready low for 1.25 billion cycles and the
@@ -911,8 +920,8 @@ initial begin
     $display("       8 MB case: settled, rx_txns delta = %0d", rx_txns - fwd_before);
     check_payload(BASE1 + 48'h1000000, 1048576,
                   "8 MB message (2049 packets) lands intact");
-    check(rx_txns - fwd_before == 1,
-          $sformatf("8 MB landed as ONE host write (%0d)", rx_txns - fwd_before));
+    check(rx_txns - fwd_before == chunks_of(8388608),
+          $sformatf("8 MB lands as its chunk count (%0d)", rx_txns - fwd_before));
 
     // Same size, framed the way the RX path actually builds it: a tlast at
     // every packet boundary rather than one at the end of the message. The
@@ -926,7 +935,7 @@ initial begin
     settle();
     check_payload(BASE1 + 48'hC00000, 131072,
                   "1 MB, per-packet tlast: lands intact");
-    check(rx_txns - fwd_before == 1,
+    check(rx_txns - fwd_before == chunks_of(1048576),
           $sformatf("1 MB, per-packet tlast: ONE host write (%0d)",
                     rx_txns - fwd_before));
     tlast_per_pkt = 0;
@@ -985,7 +994,11 @@ initial begin
     beats_dropped = 0;
     fwd_before    = rx_txns;
     drop_done     = 0;
-    drop_at_beat  = 4096;       // partway into the message
+    // Partway into a MESSAGE, and a message is now a chunk: the engine
+    // splits a descriptor at CHUNK_BYTES, so nothing exceeds 1023 beats and
+    // a drop at 4096 would never fire. The case's point is unchanged -
+    // steal beats mid-message and show the payload displaces.
+    drop_at_beat  = 500;
     drop_n_beats  = 2;          // hardware's smallest observed displacement
     copy(4'd1, 28'hD00000, {16'b0, SRC_VA}, 28'd1048576, {16'b0, CPL_VA});
     copy(4'd1, 28'hE00000, {16'b0, SRC_VA}, 28'd1048576, {16'b0, CPL_VA});
@@ -1010,10 +1023,19 @@ initial begin
         end
         $display("       stolen-beat message: %0d of 131072 words wrong, %0d never written, first bad %0d",
                  wrong, never, first_bad);
-        // The hardware signature, precisely: everything arrived and the
-        // whole region was covered, but it landed in the wrong place.
-        check(never == 0,
-              "whole region still covered - nothing was lost, only displaced");
+        // Before chunking, two stolen beats displaced the ENTIRE remainder
+        // of the message: the region was fully covered and every byte after
+        // the theft was in the wrong place, silently, to the end. That is
+        // the hardware signature this case was written to reproduce.
+        //
+        // Chunked, the damage cannot leave the chunk it happened in - the
+        // next chunk carries its own header, its own target and its own
+        // length, so it re-anchors. Measured here: 65472 bytes never
+        // written, which is exactly one chunk, and everything past it
+        // intact. Bounding the blast radius is the point; a lost beat is
+        // still a lost beat.
+        check(never * 8 <= CHUNK_BYTES,
+              $sformatf("a lost beat damages ONE chunk only (%0d B)", never * 8));
         check(wrong > 0, "losing beats DOES displace the payload");
         if (first_bad >= 0 && mem.exists((BASE1 + 48'hD00000 + 48'(first_bad*8)) >> 3))
             $display("       at word %0d: got %016x, want %016x (delta %0d words)",

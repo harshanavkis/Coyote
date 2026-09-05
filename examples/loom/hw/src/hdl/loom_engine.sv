@@ -229,6 +229,40 @@ logic [LEN_BITS-1:0]   l_lim;
 // message-into-bulk corruption survives a rebuild, this fix is not it.
 logic [22:0] l_sbeats;
 
+// -------------------------------------------------------------------------
+// Chunking on the RDMA route.
+//
+// The shell buffers every outgoing packet into HBM for replay in
+// RDMA_N_WR_OUTSTANDING slots of PMTU per pid. A message longer than that
+// WRAPS the buffer, so when RC replays an early packet the slot already
+// holds a later packet's bytes; the receiver takes it, because the PSN is
+// right, and the payload is displaced by whole beats. Nothing guards it:
+// rdma_flow.sv counts outstanding REQUESTS, not packets, so one 4 MB
+// message is 1025 packets and one request and sails straight through.
+//
+// perf_rdma is immune because its payload comes from the shell's data mover
+// via dreq req_1, which can RE-READ host memory on a replay. A vFPGA
+// request has req_1 tied to zero, so user-streamed payload cannot be
+// re-read and must be buffered - into exactly this space.
+//
+// So a message must fit the buffer, header included. Derived from the
+// shell's own parameters rather than hardcoded: raise
+// RDMA_N_WR_OUTSTANDING and the chunk follows with no edit here.
+// Measured at the current config (16 x 4096 - 64 = 65472), cold, no ramp:
+//   65472 (16 packets)  INTACT, 0 retrans, 9.840 GB/s
+//  131072 (32 packets)  CORRUPT, 78 retrans
+//  262144 (64 packets)  CORRUPT, 375 retrans
+// 4194304 (1025 pkts)   CORRUPT, ~1500 retrans
+localparam integer CHUNK_BYTES = RDMA_N_WR_OUTSTANDING * PMTU_BYTES - 64;
+
+// Declared here because ST_RD_REQ latches the first chunk's target from it.
+wire [VADDR_BITS-1:0] dst_vaddr = l_base + {{(VADDR_BITS-28){1'b0}}, l_off};
+logic [27:0]           c_left;    // payload bytes of this descriptor still to send
+logic [27:0]           c_len;     // bytes in the chunk being sent
+logic [VADDR_BITS-1:0] c_va;      // where this chunk lands
+wire  [27:0] c_next = (c_left > CHUNK_BYTES[27:0]) ? CHUNK_BYTES[27:0] : c_left;
+wire         c_last = (c_left <= CHUNK_BYTES[27:0]);
+
 function automatic logic [22:0] beats_of(input logic [27:0] len);
     logic [28:0] padded;
     padded   = {1'b0, len} + 29'd63;
@@ -272,6 +306,7 @@ always_ff @(posedge aclk) begin
         l_src_pid <= 0; l_compl_va <= 0;
         rd_data <= 0; rd_lane <= 0;
         l_payload <= 0; l_sbeats <= 0;
+        c_left <= 0; c_len <= 0; c_va <= 0;
         l_valid <= 0; l_route <= 0; l_pid <= 0; l_base <= 0; l_lim <= 0;
     end else begin
         case (state)
@@ -286,6 +321,7 @@ always_ff @(posedge aclk) begin
                 l_compl_va <= fifo_compl_va;
                 l_payload <= fifo_payload;
                 l_sbeats  <= beats_of(fifo_len);
+                c_left    <= fifo_len;
                 l_valid   <= lu_valid;
                 l_route   <= lu_route;
                 l_pid     <= lu_pid;
@@ -318,7 +354,10 @@ always_ff @(posedge aclk) begin
                     (!l_route && m_host_tready)) state <= ST_IDLE;
 
             // ---- DESC: pull request, write request, stream, fence ----
-            ST_RD_REQ:    if (rd_ready) state <= ST_DMA_WR_REQ;
+            ST_RD_REQ:    if (rd_ready) begin
+                c_va  <= dst_vaddr;      // first chunk lands at the target
+                state <= ST_DMA_WR_REQ;
+            end
             // Rdma bulk now travels as a WRITE message: a header beat
             // carrying {op 1, len} + the target VA, then the payload. The
             // far side takes the destination and the LENGTH from that
@@ -327,14 +366,31 @@ always_ff @(posedge aclk) begin
             // path was doing, 256 of them for a 1 MB transfer. Local route
             // is untouched: it writes host memory directly, no wire, no
             // header.
-            ST_DMA_WR_REQ: if (wr_ready) state <= l_route ? ST_HDR_BEAT : ST_STREAM;
+            ST_DMA_WR_REQ: if (wr_ready) begin
+                c_len    <= l_route ? c_next : l_len;
+                l_sbeats <= beats_of(l_route ? c_next : l_len);
+                state    <= l_route ? ST_HDR_BEAT : ST_STREAM;
+            end
             ST_HDR_BEAT:   if (m_net_tready) state <= ST_STREAM;
             ST_STREAM:
                 if (s_tvalid &&
                     (( l_route && m_net_tready) || (!l_route && m_host_tready))) begin
                     l_sbeats <= l_sbeats - 23'd1;
-                    if (stream_last)
-                        state <= (l_compl_va != 0) ? ST_CP_REQ : ST_IDLE;
+                    if (stream_last) begin
+                        // The pull is ONE read of the whole descriptor and
+                        // keeps streaming across chunk boundaries; only the
+                        // framing on the wire changes. The fence is carried
+                        // by the LAST chunk alone (wr_req below passes
+                        // compl_va 0 otherwise), so a caller still sees one
+                        // descriptor and one completion and never learns
+                        // the chunk size.
+                        c_left <= c_left - c_len;
+                        c_va   <= c_va + {{(VADDR_BITS-28){1'b0}}, c_len};
+                        if (l_route && !c_last)
+                            state <= ST_DMA_WR_REQ;
+                        else
+                            state <= (l_compl_va != 0) ? ST_CP_REQ : ST_IDLE;
+                    end
                 end
 
             // Fence release: skipped entirely when the descriptor's
@@ -368,7 +424,6 @@ assign fifo_pop = (state == ST_IDLE) && !fifo_empty;
 // -------------------------------------------------------------------------
 // Requests
 // -------------------------------------------------------------------------
-wire [VADDR_BITS-1:0] dst_vaddr = l_base + {{(VADDR_BITS-28){1'b0}}, l_off};
 
 // Pull request (DESC only). Field meanings on Coyote's sq_rd:
 //   opcode LOCAL_READ + strm STRM_HOST: read host memory, deliver the
@@ -447,7 +502,7 @@ always_comb begin
         // carries the true target. Bulk adds one 64 B header beat to the
         // length it claims.
         wr_req.vaddr  = rdma_staging_va;
-        wr_req.len    = l_is_desc ? (l_len[LEN_BITS-1:0] + 'd64) : 'd64;
+        wr_req.len    = l_is_desc ? (c_next[LEN_BITS-1:0] + 'd64) : 'd64;
     end else begin
         // Local route: a host-memory write through the shell TLB. pid
         // names the DESTINATION process's address space (the exporter's
@@ -468,14 +523,20 @@ end
 // Wire-message header beat: lane0 = {reserved, len[27:0], op[7:0]},
 // lane1 = target VA (the exporter's VA + offset), lane2 = inline data
 wire [63:0] hdr_q0_inline = {28'b0, 28'd8, MSG_OP_WRITE_INLINE};
-wire [63:0] hdr_q1        = {{(64-VADDR_BITS){1'b0}}, dst_vaddr};
+// The header names THIS CHUNK's target and length; on the local route,
+// which is not chunked, c_va/c_len are the descriptor's own.
+// A DESC names THIS CHUNK's target, which advances across the message. A
+// STORE never goes through ST_RD_REQ, so c_va is not loaded for it and it
+// must name the descriptor's own target.
+wire [63:0] hdr_q1        = {{(64-VADDR_BITS){1'b0}},
+                             l_is_desc ? c_va : dst_vaddr};
 
 wire [AXI_DATA_BITS-1:0] msg_inline_beat =
     {{(AXI_DATA_BITS-192){1'b0}}, l_payload, hdr_q1, hdr_q0_inline};
 
 // Bulk header: same layout, op 1, and the length is the payload's - lane 2
 // is unused because the data follows as its own beats
-wire [63:0] hdr_q0_write = {28'b0, l_len, MSG_OP_WRITE};
+wire [63:0] hdr_q0_write = {28'b0, c_len, MSG_OP_WRITE};
 wire [AXI_DATA_BITS-1:0] msg_write_beat =
     {{(AXI_DATA_BITS-192){1'b0}}, 64'b0, hdr_q1, hdr_q0_write};
 
