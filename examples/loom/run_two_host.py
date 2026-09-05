@@ -476,6 +476,10 @@ def bench_env(args, gap):
         env += f" LOOM_BENCH_OFF={args.offset}"
     if args.frm:
         env += f" LOOM_BENCH_FROM={args.frm}"
+    if args.chunk:
+        env += f" LOOM_BENCH_CHUNK={args.chunk}"
+    if args.chunk_credit is not None:
+        env += f" LOOM_BENCH_CHUNK_CREDIT={args.chunk_credit}"
     if args.flush_src:
         env += " LOOM_BENCH_FLUSH_SRC=1"
     if args.src_skew:
@@ -634,6 +638,16 @@ def main():
                     help="start the sweep at this size instead of 64 B and "
                          "run everything above it (LOOM_BENCH_FROM). Bisects "
                          "how much of the ramp a large size actually needs")
+    ap.add_argument("--chunk", default=None,
+                    help="deliver the region as descriptors of this size at "
+                         "successive offsets instead of one long message "
+                         "(LOOM_BENCH_CHUNK). Tests whether chunking makes "
+                         "large writes work without fixing the shell")
+    ap.add_argument("--chunk-credit", type=int, default=None,
+                    help="descriptors left unretired while chunking "
+                         "(LOOM_BENCH_CHUNK_CREDIT, default 8). The order "
+                         "FIFO DROPS entries when full and completions are "
+                         "discarded, so an unpaced burst is lost silently")
     ap.add_argument("--flush-src", action="store_true",
                     help="evict the payload from the CPU caches before the "
                          "transfer (LOOM_BENCH_FLUSH_SRC). Tests whether the "

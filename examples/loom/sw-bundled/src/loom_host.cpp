@@ -435,6 +435,48 @@ void run_bench(coyote::cThread &t_ctrl, loom::Xpu &A, int win,
             fflush(stdout);
         }
 
+        // LOOM_BENCH_CHUNK=<bytes> delivers the SAME region as a sequence of
+        // descriptors of that size at successive offsets, instead of one
+        // long message. Every size up to 1 MB passes cold and only long
+        // messages fail, so this asks the practical question directly: can
+        // large writes be made to work by chunking, without root-causing
+        // the shell? Unlike --iters, which rewrites one offset N times,
+        // this covers the whole region exactly once.
+        const uint64_t chunk = []{
+            const char *e = getenv("LOOM_BENCH_CHUNK");
+            return e ? (strtoull(e, nullptr, 0) & ~63ULL) : 0ULL;
+        }();
+        if (chunk && chunk < len) {
+            const uint64_t warmc = loom::csr_read(t_ctrl, loom::DBG_BASE + 8 * 7);
+            uint64_t done = 0, n = 0;
+            auto tc0 = std::chrono::steady_clock::now();
+            // Pace against the fence. Nothing else bounds the descriptor
+            // rate: loom_ctrl's order FIFO DROPS an entry when full and
+            // vfpga_top ties cq_wr.ready high, so an unpaced burst of a
+            // thousand descriptors is thrown away silently. LOOM_BENCH_
+            // CHUNK_CREDIT caps how many may be unretired at once.
+            const int ccred = []{
+                const char *e = getenv("LOOM_BENCH_CHUNK_CREDIT");
+                return e ? atoi(e) : 8;
+            }();
+            for (; done < len; done += chunk, n++) {
+                const uint64_t this_len = (len - done < chunk) ? (len - done) : chunk;
+                A.copy(win, uint32_t(off + done), psrc + done / 8,
+                       this_len, fence);
+                if (ccred > 0 && int(n) + 1 > ccred)
+                    spin64_ge(fence, warmc + uint64_t(int(n) + 1 - ccred), 5e6);
+            }
+            const bool okc = spin64(fence, warmc + n, 3e7);
+            const double usc = std::chrono::duration<double, std::micro>(
+                std::chrono::steady_clock::now() - tc0).count();
+            printf("%10lu  %lu chunks of %lu B: %s, %.2f us, %.3f GB/s\n",
+                   (unsigned long) len, (unsigned long) n,
+                   (unsigned long) chunk, okc ? "all fenced" : "NEVER FENCED",
+                   usc, double(len) / (usc * 1e3));
+            fflush(stdout);
+            continue;                       // the region is written; done
+        }
+
         const uint64_t warm = loom::csr_read(t_ctrl, loom::DBG_BASE + 8 * 7);
         A.copy(win, uint32_t(off), psrc, len, fence);      // warm the path
         if (!spin64(fence, warm + 1, 5e6)) {
