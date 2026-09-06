@@ -98,7 +98,6 @@ module loom_ctrl (
     output logic [PID_BITS-1:0]         rx_pid,
     // RDMA chunk size in bytes; 0 disables chunking
     output logic [27:0]                 chunk_bytes,
-    output logic [7:0]                  max_inflight,
 
     // Read response (from loom_engine): completes the held-open AXI read
     input  logic [63:0]                 rd_resp_data,
@@ -114,10 +113,9 @@ module loom_ctrl (
     input  logic                        cnt_rx_move,
     input  logic                        cnt_rx_starve,
     input  logic                        cnt_rx_stall,
+    input  logic                        cnt_rx_bp,
     input  logic                        cnt_pull_desync,
     input  logic                        cnt_rx_orphan,
-    input  logic                        cnt_cq_all,
-    input  logic                        cnt_cq_ack,
     input  logic                        cnt_tx_partial,
     input  logic                        cnt_tx_move,
     input  logic                        cnt_tx_starve,
@@ -211,18 +209,15 @@ localparam integer R_TX_PARTIAL   = 27;
 // the two can be compared on ONE bitstream instead of two. Reset value is the
 // derived safe size, so it works without software touching it.
 localparam integer R_CHUNK        = 28;
-// Max outstanding RDMA writes, 0 = unlimited. INDEPENDENT of R_CHUNK so the
-// two halves of the invariant can be varied separately on one bitstream:
-//   chunk 0,     inflight 0  -> the original failure, one huge message
-//   chunk 0,     inflight 1  -> jigsaw's configuration exactly
-//   chunk 65472, inflight 0  -> chunked but unpaced (build_sep5's failure)
-//   chunk 65472, inflight 1  -> both bounded
-localparam integer R_INFLIGHT     = 29;
-// What arrives on cq_wr: every completion, and how many are RC_ACK. If
-// R_CQ_ALL climbs while R_CQ_ACK stays 0, the shell never sends the vFPGA an
-// ack and the pacing must not be filtered to one.
-localparam integer R_CQ_ALL       = 30;
-localparam integer R_CQ_ACK       = 31;
+// 29 is free (was max_inflight, removed with the cq_wr pacing).
+// Ingress backpressure: cycles loom_rx refused a beat the shell offered, in
+// ANY state, and the longest unbroken run of them. R_RX_STALL is
+// ST_STREAM-only and cannot see the grant wait or the request handshake,
+// which are exactly where Loom differs from perf_rdma. These must read ~0;
+// anything else is loom_rx suppressing the ACKs the sender's 1 ms
+// retransmit timer depends on.
+localparam integer R_RX_BP        = 30;
+localparam integer R_RX_BP_MAX    = 31;
 localparam integer R_CYC         = 48;
 localparam integer R_QUEUE_ACC   = 49;
 localparam integer R_STG_ACC     = 50;   // 7 words: 50-56
@@ -304,14 +299,12 @@ logic [63:0] r_dma_dst, r_dma_src_va, r_dma_len, r_dma_src_pid, r_dma_compl_va;
 logic [63:0] r_rdma_staging;
 logic [63:0] r_rx_pid;
 logic [63:0] r_chunk;
-logic [63:0] r_inflight;
 logic [63:0] dbg [N_DBG];
 logic [63:0] rx_move, rx_starve, rx_stall, rx_st_head, rx_st_body, rx_req_cnt;
 logic [63:0] rx_stall_run, rx_stall_max;
+logic [63:0] rx_bp, rx_bp_run, rx_bp_max;
 logic [63:0] pull_desync;
 logic [63:0] rx_orphan;
-logic [63:0] cq_all;
-logic [63:0] cq_ack;
 logic [63:0] tx_partial;
 logic [63:0] tx_move, tx_starve, tx_stall;
 logic [63:0] rx_span_cnt;
@@ -333,7 +326,6 @@ always_ff @(posedge aclk) begin
         r_dma_dst <= 0; r_dma_src_va <= 0; r_dma_len <= 0; r_dma_src_pid <= 0;
         r_dma_compl_va <= 0; r_rdma_staging <= 0; r_rx_pid <= 0;
         r_chunk <= RDMA_N_WR_OUTSTANDING * PMTU_BYTES - 64;
-        r_inflight <= 64'd1;
     end else if (csr_wr) begin
         case (wr_idx)
             R_TBL_IDX:     r_tbl_idx     <= axi_ctrl.wdata;
@@ -349,7 +341,6 @@ always_ff @(posedge aclk) begin
             R_RDMA_STAGING: r_rdma_staging <= axi_ctrl.wdata;
             R_RX_PID: r_rx_pid <= axi_ctrl.wdata;
             R_CHUNK:  r_chunk  <= axi_ctrl.wdata;
-            R_INFLIGHT: r_inflight <= axi_ctrl.wdata;
             default: ;
         endcase
     end
@@ -365,7 +356,6 @@ assign tbl_len    = r_tbl_len[LEN_BITS-1:0];
 assign rdma_staging_va = r_rdma_staging[VADDR_BITS-1:0];
 assign rx_pid          = r_rx_pid[PID_BITS-1:0];
 assign chunk_bytes     = r_chunk[27:0];
-assign max_inflight    = r_inflight[7:0];
 
 // -------------------------------------------------------------------------
 // Order FIFO - the ordering heart of the design
@@ -514,10 +504,9 @@ always_ff @(posedge aclk) begin
         tx_move <= 0; tx_starve <= 0; tx_stall <= 0;
         rx_st_head <= 0; rx_st_body <= 0; rx_req_cnt <= 0; rx_span_cnt <= 0;
         rx_stall_run <= 0; rx_stall_max <= 0;
+        rx_bp <= 0; rx_bp_run <= 0; rx_bp_max <= 0;
         pull_desync <= 0;
         rx_orphan <= 0;
-        cq_all <= 0;
-        cq_ack <= 0;
         tx_partial <= 0;
     end else begin
         if (push_store)   dbg[0] <= dbg[0] + 1;
@@ -538,8 +527,6 @@ always_ff @(posedge aclk) begin
         if (cnt_rx_stall)  rx_stall  <= rx_stall + 1;
         if (cnt_pull_desync) pull_desync <= pull_desync + 1;
         if (cnt_rx_orphan)   rx_orphan   <= rx_orphan + 1;
-        if (cnt_cq_all)      cq_all      <= cq_all + 1;
-        if (cnt_cq_ack)      cq_ack      <= cq_ack + 1;
         if (cnt_tx_partial)  tx_partial  <= tx_partial + 1;
         // Run length of consecutive stalled cycles, and the longest seen
         if (cnt_rx_stall) begin
@@ -547,6 +534,13 @@ always_ff @(posedge aclk) begin
             if (rx_stall_run + 1 > rx_stall_max) rx_stall_max <= rx_stall_run + 1;
         end else begin
             rx_stall_run <= 0;
+        end
+        if (cnt_rx_bp) begin
+            rx_bp     <= rx_bp + 1;
+            rx_bp_run <= rx_bp_run + 1;
+            if (rx_bp_run + 1 > rx_bp_max) rx_bp_max <= rx_bp_run + 1;
+        end else begin
+            rx_bp_run <= 0;
         end
         if (cnt_rx_stall_head) rx_st_head <= rx_st_head + 1;
         if (cnt_rx_stall_body) rx_st_body <= rx_st_body + 1;
@@ -580,7 +574,6 @@ always_ff @(posedge aclk) begin
             R_RDMA_STAGING: axi_rdata <= r_rdma_staging;
             R_RX_PID:      axi_rdata <= r_rx_pid;
             R_CHUNK:       axi_rdata <= r_chunk;
-            R_INFLIGHT:    axi_rdata <= r_inflight;
             default:
                 if (rd_idx >= R_DBG_BASE && rd_idx < R_DBG_BASE + N_DBG)
                     axi_rdata <= dbg[rd_idx - R_DBG_BASE];
@@ -592,14 +585,14 @@ always_ff @(posedge aclk) begin
                     axi_rdata <= rx_stall;
                 else if (rd_idx == R_RX_STALL_MAX)
                     axi_rdata <= rx_stall_max;
+                else if (rd_idx == R_RX_BP)
+                    axi_rdata <= rx_bp;
+                else if (rd_idx == R_RX_BP_MAX)
+                    axi_rdata <= rx_bp_max;
                 else if (rd_idx == R_PULL_DESYNC)
                     axi_rdata <= pull_desync;
                 else if (rd_idx == R_RX_ORPHAN)
                     axi_rdata <= rx_orphan;
-                else if (rd_idx == R_CQ_ALL)
-                    axi_rdata <= cq_all;
-                else if (rd_idx == R_CQ_ACK)
-                    axi_rdata <= cq_ack;
                 else if (rd_idx == R_TX_PARTIAL)
                     axi_rdata <= tx_partial;
                 else if (rd_idx == R_RX_ST_HEAD)

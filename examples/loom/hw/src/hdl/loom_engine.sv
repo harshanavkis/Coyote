@@ -149,16 +149,10 @@ module loom_engine (
     // Nonzero means the pull really does hand back sub-beat data and the
     // wire used to carry it.
     output logic                        cnt_tx_partial,
-    // The peer's ack for an RDMA write, from cq_wr. One outstanding write
-    // at a time is what keeps the chunk inside the retransmit buffer.
-    input  logic                        rdma_ack,
     // Chunk size in bytes from CSR 28. 0 disables chunking entirely, which
     // is the pre-chunking behaviour and lets both be compared on one
     // bitstream. Reset value is the derived safe size.
     input  logic [27:0]                 chunk_bytes,
-    // Max outstanding RDMA writes, 0 = unlimited. Independent of
-    // chunk_bytes: the two halves of the invariant are separate knobs.
-    input  logic [7:0]                  max_inflight,
     output logic                        cnt_tx_move,
     output logic                        cnt_tx_starve,
     output logic                        cnt_tx_stall,
@@ -271,26 +265,24 @@ logic [22:0] l_sbeats;
 //     (chunks in flight) x (packets per chunk)  <=  RDMA_N_WR_OUTSTANDING
 //
 // Sizing the chunk to the whole buffer satisfies that only if exactly one
-// chunk is ever in flight, and the engine cannot know that: vfpga_top ties
-// cq_wr.ready high and discards completions, so it has no retire signal to
-// pace against. Measured on build_sep5, same 65472 B chunk, cold 4 MB:
-//   engine chunks, back to back   476 retrans, CORRUPT at chunk 34 of 65
-//   same size, software paced       0 retrans, PASS, 9.803 GB/s
+// chunk is ever in flight, and THE ENGINE CANNOT KNOW THAT. Pacing on
+// cq_wr was tried and REMOVED - do not put it back without new evidence.
+// Measured on build_sep6, which wired the engine's credit to cq_wr with no
+// opcode filter (jigsaw's exact mechanism), cold 4 MB:
+//   engine chunks, 65472 B, 1 in flight   WEDGED, warm-up never fenced
+//   same size, software paced             0 retrans, PASS, 9.842 GB/s
+// The counters built for that run say why. Per 4 MB region:
+//   software-issued descriptors   71 acks / 65 chunks + 7 setup, one each
+//   engine-generated chunks        0 acks beyond setup, engine wedged
+// A descriptor submitted through the normal request path produces a
+// completion; a chunk the engine splits internally produces NONE. So there
+// is no retire signal to pace against in hardware, filtered or not, and
+// the opcode-filter argument was a red herring on both sides.
 //
-// Both factors are bounded here. The chunk is the whole buffer, and
-// net_inflight below holds the engine to ONE outstanding RDMA write,
-// released by cq_wr - the peer's ack, which is what frees the slots. So
-// 1 x 16 <= 16, and there is ONE header per 16 packets rather than one per
-// packet: 0.1% of the wire instead of 1.6%, and 65 requests for a 4 MB
-// transfer instead of 1040.
-//
-// Bounding only the chunk (one packet per message, 16 in flight) also
-// satisfies the invariant, but pays a header on every packet for nothing:
-// the data wants one header and then its data, not framing per packet.
-//
-// This is jigsaw's mechanism (a single in-flight bit cleared by cq_wr,
-// vfpga_top.svh:32 there) plus the chunking jigsaw lacks - which is why
-// jigsaw is exposed above 16 packets per message and Loom is not.
+// What remains here is the chunk size alone, as a runtime knob. Keeping a
+// message inside the retransmit buffer is worth doing on its own: it is
+// what lets a replay be served correctly from that buffer instead of
+// needing the re-read the shell denies a vFPGA request.
 // The safe size, kept here for the record and used as loom_ctrl's reset
 // value for CSR 28. The engine reads the CSR, so software can change it or
 // switch chunking off without a rebuild.
@@ -298,21 +290,10 @@ localparam integer CHUNK_BYTES = RDMA_N_WR_OUTSTANDING * PMTU_BYTES - 64;
 
 // Declared here because ST_RD_REQ latches the first chunk's target from it.
 wire [VADDR_BITS-1:0] dst_vaddr = l_base + {{(VADDR_BITS-28){1'b0}}, l_off};
-// One outstanding RDMA write. Set when a chunk's request is accepted on the
-// net route, cleared by the peer's ack. The chunk fits the retransmit
-// buffer only while nothing else is using it.
-// Outstanding RDMA writes, incremented on issue and decremented by the
-// peer's ack. A counter rather than jigsaw's single bit, so the depth is a
-// runtime knob and not welded to whether chunking is on.
-logic [7:0]            net_ost;
-wire  ost_full = (max_inflight != 8'd0) && (net_ost >= max_inflight);
-
 logic [27:0]           c_left;    // payload bytes of this descriptor still to send
 logic [27:0]           c_len;     // bytes in the chunk being sent
 logic [VADDR_BITS-1:0] c_va;      // where this chunk lands
-// chunk_bytes == 0 means do not chunk: one message for the whole descriptor,
-// and net_inflight then bounds nothing that matters because there is only
-// ever one message anyway.
+// chunk_bytes == 0 means do not chunk: one message for the whole descriptor.
 wire         chunk_en = (chunk_bytes != 28'd0);
 wire  [27:0] chunk_lim = chunk_en ? chunk_bytes : 28'h FFFFFFF;
 wire  [27:0] c_next = (c_left > chunk_lim) ? chunk_lim : c_left;
@@ -362,20 +343,8 @@ always_ff @(posedge aclk) begin
         rd_data <= 0; rd_lane <= 0;
         l_payload <= 0; l_sbeats <= 0;
         c_left <= 0; c_len <= 0; c_va <= 0;
-        net_ost <= 8'd0;
         l_valid <= 0; l_route <= 0; l_pid <= 0; l_base <= 0; l_lim <= 0;
     end else begin
-        // Set on issue, cleared by the ack. The ack can arrive in the same
-        // cycle a request is accepted; issue wins, so a credit is never
-        // lost and at most one write is ever outstanding.
-        // Issue and ack can land in the same cycle; handle both so a credit
-        // is neither lost nor double-counted.
-        if ((state == ST_DMA_WR_REQ) && wr_ready && l_route && !ost_full && !rdma_ack)
-            net_ost <= net_ost + 8'd1;
-        else if (rdma_ack && !((state == ST_DMA_WR_REQ) && wr_ready && l_route && !ost_full)
-                 && (net_ost != 8'd0))
-            net_ost <= net_ost - 8'd1;
-
         case (state)
             // Latch the FIFO head and its table hit in one shot; fifo_pop
             // (combinational below) retires the entry in this same cycle
@@ -433,7 +402,7 @@ always_ff @(posedge aclk) begin
             // path was doing, 256 of them for a 1 MB transfer. Local route
             // is untouched: it writes host memory directly, no wire, no
             // header.
-            ST_DMA_WR_REQ: if (wr_ready && !(l_route && ost_full)) begin
+            ST_DMA_WR_REQ: if (wr_ready) begin
                 c_len    <= l_route ? c_next : l_len;
                 l_sbeats <= beats_of(l_route ? c_next : l_len);
                 state    <= l_route ? ST_HDR_BEAT : ST_STREAM;
@@ -563,11 +532,14 @@ always_comb begin
         wr_req.remote = 1'b1;
         wr_req.actv   = 1'b1;
         wr_req.pid    = l_pid;       // QP owner
-        // Bulk goes DIRECT (RETH = true target); only sub-64 B stores
-        // use the staging-addressed inline message envelope
-        // Both forms are messages at the staging vaddr now; the header
-        // carries the true target. Bulk adds one 64 B header beat to the
-        // length it claims.
+        // BOTH forms are messages at the STAGING vaddr; the header carries
+        // the true target. Bulk adds one 64 B header beat to the length it
+        // claims. (An earlier comment here said "bulk goes DIRECT, RETH =
+        // true target" - that was stale and contradicted the line below it.
+        // It matters: because the RETH names staging, the incoming rq_wr on
+        // the far side carries NO destination information, so loom_rx cannot
+        // forward requests the way perf_rdma does and MUST parse the header
+        // to learn where the bytes go.)
         wr_req.vaddr  = rdma_staging_va;
         wr_req.len    = l_is_desc ? (c_next[LEN_BITS-1:0] + 'd64) : 'd64;
     end else begin

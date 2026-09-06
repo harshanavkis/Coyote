@@ -37,6 +37,7 @@ logic m_tready = 1;
 logic req, grant = 0, busy, cnt_rx_fwd, cnt_rx_drop, cnt_rx_orphan;
 int orphan_pulses = 0;
 logic cnt_rx_move, cnt_rx_starve, cnt_rx_stall;
+logic cnt_rx_bp;
 logic cnt_rx_stall_head, cnt_rx_stall_body, cnt_rx_req, cnt_rx_span;
 int req_pulses = 0, span_pulses = 0;
 int head_pulses = 0, body_pulses = 0;
@@ -68,7 +69,7 @@ loom_rx dut (
     .cnt_rx_fwd(cnt_rx_fwd), .cnt_rx_drop(cnt_rx_drop),
     .cnt_rx_orphan(cnt_rx_orphan),
     .cnt_rx_move(cnt_rx_move), .cnt_rx_starve(cnt_rx_starve),
-    .cnt_rx_stall(cnt_rx_stall),
+    .cnt_rx_stall(cnt_rx_stall), .cnt_rx_bp(cnt_rx_bp),
     .cnt_rx_stall_head(cnt_rx_stall_head),
     .cnt_rx_stall_body(cnt_rx_stall_body),
     .cnt_rx_req(cnt_rx_req), .cnt_rx_span(cnt_rx_span)
@@ -248,6 +249,7 @@ task dut_reset();
 endtask
 
 req_t r;
+int wr_stable_err;
 
 initial begin
     rq_req = '0;
@@ -719,6 +721,49 @@ initial begin
     if (outq.size() >= 3)
         check(outq[2].data == {28'b0, 28'd64, OP_WR},
               "lost beat: next header written as payload into previous buffer");
+
+    // --- 17. wr_ready backpressure: the request handshake gates the wire ---
+    // This is the path ST_WR_REQ used to own. The request is now issued
+    // combinationally from the header beat, so while the shell refuses it the
+    // header must STAY on the wire (unconsumed), wr_valid must stay asserted
+    // without glitching, and nothing may be written or forwarded. Once the
+    // shell accepts, the message must complete normally. wr_ready was tied
+    // high for this whole testbench before, so none of this was covered.
+    dut_reset();
+    fwd_pulses = 0;
+    @(negedge aclk); wr_ready = 0;
+    incoming(6'd0, 28'd192);
+    send_msg_beat({28'b0, 28'd128, OP_WR}, {16'b0, TARGET + 48'h800}, 64'b0, 1'b0);
+    send_msg_beat(64'hE0E0_0000, 64'b0, 64'b0, 1'b0);
+    send_msg_beat(64'hE0E0_0001, 64'b0, 64'b0, 1'b1);
+
+    // Hold it off and watch every cycle: valid asserted, never retracted,
+    // and the header still sitting on the wire.
+    wr_stable_err = 0;
+    repeat (20) begin
+        @(posedge aclk);
+        if (!wr_valid) wr_stable_err++;
+        if (s_tready)  wr_stable_err++;
+    end
+    check(wr_stable_err == 0,
+          $sformatf("wr_ready low: wr_valid held and header not consumed (%0d)",
+                    wr_stable_err));
+    check(wrq.size() == 0 && outq.size() == 0,
+          "wr_ready low: nothing written or forwarded");
+
+    @(negedge aclk); wr_ready = 1;
+    wait_quiet(400, "17: wr_ready release");
+    check(wrq.size() == 1, $sformatf("wr_ready release: one wr_req (%0d)",
+                                     wrq.size()));
+    if (wrq.size() > 0) begin
+        r = wrq.pop_front();
+        check(r.pid == RX_PID && r.vaddr == TARGET + 48'h800 && r.len == 128,
+              "wr_ready release: header-described write, fields intact");
+    end
+    check(outq.size() == 2 && outq[0].data == 64'hE0E0_0000 &&
+          outq[1].data == 64'hE0E0_0001 && outq[1].last,
+          "wr_ready release: both payload beats, header stripped");
+    outq.delete(); wrq.delete();
 
     if (errors == 0) $display("TB PASS (tb_loom_rx)");
     else             $display("TB FAIL (tb_loom_rx): %0d errors", errors);

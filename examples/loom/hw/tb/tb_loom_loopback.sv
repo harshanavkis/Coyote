@@ -115,6 +115,21 @@ function automatic int chunks_of(input int len);
     chunks_of = (len + CHUNK_BYTES - 1) / CHUNK_BYTES;
 endfunction
 
+// Host writes the receive path now issues: ONE PER PACKET, not one per
+// message. loom_rx used to cover a whole message with a single write and
+// swallow the shell's per-packet requests as credit, which handed the DMA
+// one multi-megabyte descriptor where perf_rdma hands it one per 4 KB
+// packet. Each engine chunk is framed as a 64 B header plus its payload and
+// the shell fragments that at PMTU, so the count is per chunk, summed.
+function automatic int packets_of(input int len);
+    int full, rem;
+    full = len / CHUNK_BYTES;
+    rem  = len % CHUNK_BYTES;
+    packets_of = full * ((CHUNK_BYTES + 64) / PMTU_BYTES);
+    if (rem != 0)
+        packets_of += (rem + 64 + PMTU_BYTES - 1) / PMTU_BYTES;
+endfunction
+
 int errors = 0;
 
 loom_ctrl inst_ctrl (
@@ -144,19 +159,12 @@ loom_table inst_table (
     .lu_pid(lu_pid), .lu_base(lu_base), .lu_len(lu_len)
 );
 
-// The peer's ack. The engine holds one outstanding RDMA write and
-// releases it on this, so a TB that never acks stalls it after one
-// chunk. Acking at the message's last beat is the earliest a real
-// ack could arrive; the point under test is the accounting, not the
-// latency.
-wire rdma_ack = m_net_tvalid && m_net_tready && m_net_tlast;
 // The engine reads its chunk size from CSR 28; drive the same value
 // loom_ctrl resets to. Zero here would switch chunking off.
 wire [27:0] chunk_bytes = RDMA_N_WR_OUTSTANDING * PMTU_BYTES - 64;
 
-logic [7:0] max_inflight = 8'd1;   // one outstanding write, as the CSR defaults
 loom_engine inst_engine (
-    .rdma_ack(rdma_ack), .chunk_bytes(chunk_bytes), .max_inflight(max_inflight),
+    .chunk_bytes(chunk_bytes),
     .aclk(aclk), .aresetn(aresetn),
     .fifo_empty(fifo_empty), .fifo_is_desc(fifo_is_desc),
     .fifo_is_read(fifo_is_read),
@@ -207,7 +215,9 @@ localparam [47:0] SRC_VA   = 48'h7f6a_2000_0000;   // importer's source buffer
 localparam [47:0] CPL_VA   = 48'h7f6a_3000_0000;   // importer's fence word
 localparam [PID_BITS-1:0] QP_OWNER = 6'd1;         // exporter's data ctid
 
+logic cnt_rx_bp;   // ingress backpressure, any state
 loom_rx inst_rx (
+    .cnt_rx_bp(cnt_rx_bp),
     .aclk(aclk), .aresetn(aresetn),
     .rq_req(rx_rq_req), .rq_valid(rx_rq_valid), .rq_ready(rx_rq_ready),
     .rdma_staging_va(STAGING), .rx_pid(QP_OWNER),
@@ -894,9 +904,9 @@ initial begin
     settle();
     check_payload(BASE1 + 48'h90000, 8192,
                   "64 KB message spanning 17 packets lands intact");
-    check(rx_txns - fwd_before == chunks_of(65536),
-          $sformatf("64 KB lands as %0d chunked writes, not one per packet (%0d)",
-                    chunks_of(65536), rx_txns - fwd_before));
+    check(rx_txns - fwd_before == packets_of(65536),
+          $sformatf("64 KB lands as one write per packet (%0d, want %0d)",
+                    rx_txns - fwd_before, packets_of(65536)));
 
     // --- The size that fails on hardware. A 1 MB message is 257 PMTU
     //     packets and 16384 payload beats, and the failure there was a -1
@@ -910,17 +920,18 @@ initial begin
     settle();
     check_payload(BASE1 + 48'h400000, 65536,
                   "512 KB message (129 packets) lands intact");
-    check(rx_txns - fwd_before == chunks_of(524288),
-          $sformatf("512 KB lands as its chunk count (%0d)",
-                    rx_txns - fwd_before));
+    check(rx_txns - fwd_before == packets_of(524288),
+          $sformatf("512 KB lands as one write per packet (%0d, want %0d)",
+                    rx_txns - fwd_before, packets_of(524288)));
 
     fwd_before = rx_txns;
     copy(4'd1, 28'h800000, {16'b0, SRC_VA}, 28'd1048576, {16'b0, CPL_VA});
     settle();
     check_payload(BASE1 + 48'h800000, 131072,
                   "1 MB message (257 packets) lands intact");
-    check(rx_txns - fwd_before == chunks_of(1048576),
-          $sformatf("1 MB lands as its chunk count (%0d)", rx_txns - fwd_before));
+    check(rx_txns - fwd_before == packets_of(1048576),
+          $sformatf("1 MB lands as one write per packet (%0d, want %0d)",
+                    rx_txns - fwd_before, packets_of(1048576)));
 
     // 8 MB: the size that DEADLOCKS ON HARDWARE. loom_engine parks in
     // ST_STREAM with m_net_tready low for 1.25 billion cycles and the
@@ -935,8 +946,9 @@ initial begin
     $display("       8 MB case: settled, rx_txns delta = %0d", rx_txns - fwd_before);
     check_payload(BASE1 + 48'h1000000, 1048576,
                   "8 MB message (2049 packets) lands intact");
-    check(rx_txns - fwd_before == chunks_of(8388608),
-          $sformatf("8 MB lands as its chunk count (%0d)", rx_txns - fwd_before));
+    check(rx_txns - fwd_before == packets_of(8388608),
+          $sformatf("8 MB lands as one write per packet (%0d, want %0d)",
+                    rx_txns - fwd_before, packets_of(8388608)));
 
     // Same size, framed the way the RX path actually builds it: a tlast at
     // every packet boundary rather than one at the end of the message. The
@@ -950,9 +962,9 @@ initial begin
     settle();
     check_payload(BASE1 + 48'hC00000, 131072,
                   "1 MB, per-packet tlast: lands intact");
-    check(rx_txns - fwd_before == chunks_of(1048576),
-          $sformatf("1 MB, per-packet tlast: ONE host write (%0d)",
-                    rx_txns - fwd_before));
+    check(rx_txns - fwd_before == packets_of(1048576),
+          $sformatf("1 MB, per-packet tlast: one write per packet (%0d, want %0d)",
+                    rx_txns - fwd_before, packets_of(1048576)));
     tlast_per_pkt = 0;
 
     // ---------------------------------------------------------------------

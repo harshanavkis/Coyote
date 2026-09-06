@@ -93,7 +93,21 @@ constexpr uint32_t TX_PARTIAL    = 0x0D8;   // word 27
 // so they can be varied without a bitstream:
 //   (writes in flight) x (packets per write) <= the shell's retrans slots
 constexpr uint32_t CHUNK         = 0x0E0;   // word 28: 0 = do not chunk
-constexpr uint32_t INFLIGHT      = 0x0E8;   // word 29: 0 = unlimited
+// Cycles loom_rx refused a beat the shell was offering, in ANY state, and the
+// longest unbroken run of them. RX_STALL above is ST_STREAM-only, so it is
+// blind to the grant wait and the request handshake - exactly where Loom
+// differs from perf_rdma, whose receive path is a pass-through that cannot
+// backpressure at all. This matters beyond throughput: the shell emits the
+// host write and the packet's ACK from the SAME FSM step, so backpressure
+// here stops ACKs, and a QP that goes 1 ms without one retransmits
+// (transport_timer.hpp). These must read ~0.
+constexpr uint32_t RX_BP         = 0x0F0;   // word 30
+constexpr uint32_t RX_BP_MAX     = 0x0F8;   // word 31
+// Word 29 was max_inflight, removed with the engine's cq_wr pacing. The counters answered their question first:
+// per 4 MB region, software-issued descriptors drew 71 acks for 65 chunks
+// plus 7 setup - one each - while engine-generated chunks drew NONE beyond
+// setup. A chunk the engine splits internally produces no completion, so
+// there was never a hardware retire signal to pace against.
 // The stall split. loom_rx is single-outstanding on the write side, so if
 // the shell withholds m_tready until it has accepted and translated the
 // request, every packet pays that latency serially and the stalls land

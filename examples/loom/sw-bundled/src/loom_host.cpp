@@ -740,14 +740,10 @@ int run_server(uint16_t qp_port, uint16_t peer_port, const std::string &sock) {
     // an unset variable is not the same as a zero.
     if (const char *e = getenv("LOOM_CHUNK"))
         loom::csr_write(t_ctrl, loom::CHUNK, strtoull(e, nullptr, 0));
-    if (const char *e = getenv("LOOM_INFLIGHT"))
-        loom::csr_write(t_ctrl, loom::INFLIGHT, strtoull(e, nullptr, 0));
     {
         const uint64_t cb = loom::csr_read(t_ctrl, loom::CHUNK);
-        const uint64_t mi = loom::csr_read(t_ctrl, loom::INFLIGHT);
-        printf("engine config: chunk_bytes=%lu (%s), max_inflight=%lu (%s)\n",
-               (unsigned long) cb, cb ? "chunked" : "NOT chunked",
-               (unsigned long) mi, mi ? "paced" : "UNLIMITED");
+        printf("engine config: chunk_bytes=%lu (%s)\n",
+               (unsigned long) cb, cb ? "chunked" : "NOT chunked");
         fflush(stdout);
     }
     loom::Handle h1 = orch.exportBuf(t_data.getCtid(), dst1, BUF_SIZE);
@@ -1122,6 +1118,15 @@ int run_server(uint16_t qp_port, uint16_t peer_port, const std::string &sock) {
         printf("  rx orphan beats: %lu   (beats no rq_wr request accounted "
                "for; nonzero means the receive path handed up a packet it "
                "did not deliver)\n", (unsigned long) orph);
+        const uint64_t bp  = loom::csr_read(t_ctrl, loom::RX_BP);
+        const uint64_t bpm = loom::csr_read(t_ctrl, loom::RX_BP_MAX);
+        printf("  ingress backpressure: %lu cycles, longest run %lu -> %s\n",
+               (unsigned long) bp, (unsigned long) bpm,
+               bp == 0 ? "loom_rx never refused a beat; ACK generation was "
+                         "never blocked by us"
+                       : "loom_rx HELD THE INGRESS OFF; the shell emits the "
+                         "host write and the ACK in one step, so this is ACKs "
+                         "not sent, and 1 ms without one is a retransmit");
         const uint64_t mx = loom::csr_read(t_ctrl, loom::RX_STALL_MAX);
         if (st)
             printf("  longest unbroken stall: %lu cycles of %lu total -> %s\n",
@@ -1201,14 +1206,10 @@ int run_client(const std::string &ip, uint16_t qp_port, uint16_t peer_port,
     // an unset variable is not the same as a zero.
     if (const char *e = getenv("LOOM_CHUNK"))
         loom::csr_write(t_ctrl, loom::CHUNK, strtoull(e, nullptr, 0));
-    if (const char *e = getenv("LOOM_INFLIGHT"))
-        loom::csr_write(t_ctrl, loom::INFLIGHT, strtoull(e, nullptr, 0));
     {
         const uint64_t cb = loom::csr_read(t_ctrl, loom::CHUNK);
-        const uint64_t mi = loom::csr_read(t_ctrl, loom::INFLIGHT);
-        printf("engine config: chunk_bytes=%lu (%s), max_inflight=%lu (%s)\n",
-               (unsigned long) cb, cb ? "chunked" : "NOT chunked",
-               (unsigned long) mi, mi ? "paced" : "UNLIMITED");
+        printf("engine config: chunk_bytes=%lu (%s)\n",
+               (unsigned long) cb, cb ? "chunked" : "NOT chunked");
         fflush(stdout);
     }
 

@@ -41,30 +41,17 @@ logic cnt_pull_desync;
 logic cnt_rx_orphan;
 logic cnt_tx_partial;
 logic [27:0] chunk_bytes;
-logic [7:0]  max_inflight;
-// The peer's ack for an RDMA write. Declared here because loom_engine's
-// port is wired to it above the cq_wr tie-off below.
-// cq_wr is ARBITRATED between host-bypass write completions and RDMA acks
-// (cq_arb.sv:139-145), so its valid alone does not mean "the peer acked".
-// Only RC_ACK frees a retransmit slot; counting a bypass completion as one
-// would let a second write out while the first still owns the slots, which
-// is the exact overrun this pacing exists to prevent.
-// ANY completion, no opcode filter - which is what jigsaw does
-// (jigsaw_device_controller/hw/src/vfpga_top.svh:32) and what works there.
-//
-// Filtering this to is_opcode_ack was right in principle - cq_arb merges
-// bypass write completions with RDMA acks, so an unfiltered count returns
-// credit that no ack freed - and it DEADLOCKED on hardware: the engine sent
-// exactly one chunk, byte-perfect, then waited forever. RC_ACK never arrives
-// on the vFPGA's cq_wr. The counters below say so directly instead of
-// leaving it to be inferred from a hang.
-wire rdma_ack = cq_wr.valid && cq_wr.ready;
-
-// What actually turns up on cq_wr: every completion, and how many are acks.
-// cq_ack stuck at 0 while cq_all climbs is the proof.
-wire cnt_cq_all = cq_wr.valid && cq_wr.ready;
-wire cnt_cq_ack = cq_wr.valid && cq_wr.ready && is_opcode_ack(cq_wr.data.opcode);
-// The peer's ack for an RDMA write; the engine paces on it.
+// cq_wr IS NOT A PACING SIGNAL FOR THIS ENGINE - measured, not argued.
+// build_sep6 wired the engine's credit to cq_wr with no opcode filter, which
+// is jigsaw's exact mechanism, and a chunked 4 MB transfer WEDGED. Counters
+// added for that run showed why, per 4 MB region:
+//   software-issued descriptors   71 completions passing the ack test,
+//                                 for 65 chunks + 7 setup - one each
+//   engine-generated chunks        0 beyond setup; the counters stopped
+//                                 climbing the moment the engine chunked
+// A descriptor submitted through the normal request path produces a
+// completion; a chunk the engine splits internally produces none. There is
+// nothing here to pace against, so the engine no longer tries.
 
 // Stage cycle counters: engine -> ctrl (RO CSR words 50-63)
 logic [63:0] stage_acc [7];
@@ -91,6 +78,8 @@ req_t rx_wr_req;
 logic rx_wr_valid;
 logic rx_req_arb, rx_busy;
 logic rx_cnt_move, rx_cnt_starve, rx_cnt_stall;
+// Ingress backpressure in ANY state - see loom_rx.sv
+logic rx_cnt_bp;
 logic tx_cnt_move, tx_cnt_starve, tx_cnt_stall;
 logic rx_cnt_st_head, rx_cnt_st_body, rx_cnt_req, rx_cnt_span;
 logic [AXI_DATA_BITS-1:0]   rx_tdata;
@@ -183,16 +172,16 @@ loom_ctrl inst_loom_ctrl (
     .fifo_src_pid(fifo_src_pid), .fifo_compl_va(fifo_compl_va),
     .fifo_payload(fifo_payload), .fifo_pop(fifo_pop),
     .rdma_staging_va(rdma_staging_va), .rx_pid(rx_pid),
-    .chunk_bytes(chunk_bytes), .max_inflight(max_inflight),
+    .chunk_bytes(chunk_bytes),
     .rd_resp_data(rd_resp_data), .rd_resp_valid(rd_resp_valid),
     .cnt_local_wr(cnt_local_wr), .cnt_rdma_wr(cnt_rdma_wr),
     .cnt_rx_fwd(cnt_rx_fwd), .cnt_rx_drop(cnt_rx_drop),
     .cnt_rx_orphan(cnt_rx_orphan),
     .cnt_drop(cnt_drop), .cnt_compl(cnt_compl),
     .cnt_rx_move(rx_cnt_move), .cnt_rx_starve(rx_cnt_starve),
-    .cnt_rx_stall(rx_cnt_stall), .cnt_rx_stall_head(rx_cnt_st_head),
+    .cnt_rx_stall(rx_cnt_stall), .cnt_rx_bp(rx_cnt_bp),
+    .cnt_rx_stall_head(rx_cnt_st_head),
     .cnt_rx_stall_body(rx_cnt_st_body), .cnt_rx_req(rx_cnt_req),
-    .cnt_cq_all(cnt_cq_all), .cnt_cq_ack(cnt_cq_ack),
     .cnt_pull_desync(cnt_pull_desync), .cnt_tx_partial(cnt_tx_partial),
     .cnt_tx_move(tx_cnt_move), .cnt_tx_starve(tx_cnt_starve),
     .cnt_tx_stall(tx_cnt_stall),
@@ -240,8 +229,7 @@ loom_engine inst_loom_engine (
     .cnt_drop(cnt_drop), .cnt_compl(cnt_compl),
     .stage_acc(stage_acc), .stage_cnt(stage_cnt),
     .cnt_pull_desync(cnt_pull_desync), .cnt_tx_partial(cnt_tx_partial),
-    .rdma_ack(rdma_ack),
-    .chunk_bytes(chunk_bytes), .max_inflight(max_inflight),
+    .chunk_bytes(chunk_bytes),
     .cnt_tx_move(tx_cnt_move), .cnt_tx_starve(tx_cnt_starve),
     .cnt_tx_stall(tx_cnt_stall),
     .busy(eng_busy)
@@ -300,7 +288,8 @@ loom_rx inst_loom_rx (
     .m_tready(axis_wr.tready && rx_grant), .m_tlast(rx_tlast),
     .req(rx_req_arb), .grant(rx_grant), .busy(rx_busy),
     .cnt_rx_move(rx_cnt_move), .cnt_rx_starve(rx_cnt_starve),
-    .cnt_rx_stall(rx_cnt_stall), .cnt_rx_stall_head(rx_cnt_st_head),
+    .cnt_rx_stall(rx_cnt_stall), .cnt_rx_bp(rx_cnt_bp),
+    .cnt_rx_stall_head(rx_cnt_st_head),
     .cnt_rx_stall_body(rx_cnt_st_body), .cnt_rx_req(rx_cnt_req),
     .cnt_rx_span(rx_cnt_span),
     .cnt_rx_fwd(cnt_rx_fwd), .cnt_rx_drop(cnt_rx_drop),
@@ -349,10 +338,8 @@ end
 // ---------------------------------------------------------------------------
 always_comb notify.tie_off_m();
 always_comb cq_rd.ready = 1'b1;
-// cq_wr carries the peer's ack for an RDMA write. It used to be drained and
-// discarded; the engine now uses it to hold itself to one outstanding write,
-// which is what keeps a chunk inside the shell's retransmit buffer. Still
-// always ready - this is a pulse to count, not backpressure.
+// cq_wr is drained and discarded. The engine does not pace on it; see the
+// measurement at the top of this file for why it cannot.
 always_comb cq_wr.ready = 1'b1;
 always_comb rq_rd.ready = 1'b1;
 

@@ -103,7 +103,8 @@ module loom_rx (
     // the difference is stall, not overhead, and these say which side.
     output logic                        cnt_rx_move,    // both ready
     output logic                        cnt_rx_starve,  // ingress had nothing
-    output logic                        cnt_rx_stall,   // host write not ready
+    output logic                        cnt_rx_stall,
+    output logic                        cnt_rx_bp,   // host write not ready
     // Stall split by WHERE in the packet it lands, which is what tells the
     // two candidate fixes apart. This module is single-outstanding on the
     // write side: it posts one sq_wr, streams that packet, and only then
@@ -138,7 +139,7 @@ localparam [7:0] MSG_OP_WRITE        = 8'd1;
 localparam [7:0] MSG_OP_WRITE_INLINE = 8'd2;
 
 typedef enum logic [2:0] {
-    ST_IDLE, ST_WR_REQ, ST_STREAM, ST_INLINE_DATA
+    ST_IDLE, ST_STREAM, ST_PKT_REQ, ST_INLINE_DATA
 } state_t;
 state_t state;
 
@@ -146,7 +147,25 @@ logic [7:0]            l_op;
 logic [27:0]           l_len;
 logic [VADDR_BITS-1:0] l_va;
 logic [63:0]           l_inline;
-logic [22:0]           l_beats;      // beats of this request still on the stream
+logic [22:0]           l_beats;      // beats of THIS PACKET still on the stream
+// One host write PER PACKET, not per message. Loom used to issue a single
+// write covering the whole message and swallow the shell's per-packet
+// requests as credit - 1027 of 1033 on a 4 MB transfer - which handed the
+// DMA one 4 MB descriptor where perf_rdma hands it 1024 x 4 KB. perf_rdma
+// forwards each request (sq_wr.valid = rq_wr.valid) and never loses a
+// packet; Loom's single long descriptor cannot pipeline, the host write
+// path goes bursty (measured: every stall mid-packet, none at a packet's
+// first beat), the ingress FIFO overflows and packets vanish upstream of
+// the PSN check. Across four runs loss correlated perfectly with
+// corruption: 0 lost -> intact, 12-19 lost -> corrupt.
+//
+// The addresses are OURS, not the shell's: the RETH names the STAGING
+// buffer (loom_engine.sv), so an incoming rq_wr carries no destination.
+// Only the header does. So the split is computed here - the shell
+// fragments deterministically at PMTU, and the first packet gives up 64 B
+// of its payload to the header.
+logic [VADDR_BITS-1:0] w_va;         // where THIS packet's write lands
+logic [27:0]           w_left;       // message bytes after this packet
 logic                  l_moved;      // this transaction has had at least one beat
 // A WRITE message (op 1) is ONE logical write that may span several PMTU
 // packets, so its beat budget comes from the HEADER's length, not from the
@@ -181,8 +200,8 @@ endfunction
 // instead is wrong whenever the delivered beat count differs from
 // ceil(len/64) by even one: the transaction ends off by a beat, the write
 // we asked the shell for is never satisfied, sq_wr backs up and this module
-// parks in ST_WR_REQ - which is exactly how the two-host run wedged, with
-// rx_fwd frozen at 17 of 26 and nothing rejected. The count is used ONLY
+// parks with the ingress held off - which is exactly how the two-host run
+// wedged, with rx_fwd frozen at 17 of 26 and nothing rejected. The count is used ONLY
 // where there is no tlast to wait for, and to bound the drain.
 // A spanning message ends where its header said it would and nowhere else:
 // the tlast at every intermediate packet boundary is not its boundary.
@@ -227,6 +246,24 @@ wire         covered   = (p_credit != 32'd0);
 wire         take_beat = s_tvalid && s_tready;
 wire [22:0]  cred_add  = (rq_valid && rq_ready) ? beats_of(rq_req.len) : 23'd0;
 
+// The split is the shell's own, not a guess. rdma_req_parser.sv fragments an
+// APP_WRITE at exactly PMTU: ST_PARSE_WRITE_INIT emits RC_RDMA_WRITE_FIRST
+// with plen = PMTU_BYTES and ST_PARSE_WRITE emits _MIDDLE the same way, the
+// remainder falling out as _LAST. So packet 0 is the first PMTU bytes of the
+// message - for us 64 B of header plus PMTU-64 of payload - and every packet
+// after it is a full PMTU until the tail. These two lengths therefore land
+// one host write on each wire packet exactly, which is the whole point.
+//
+// Correctness does NOT depend on that alignment holding: the writes are
+// contiguous and sum to hdr_len either way, so a different fragmentation
+// would only make a write span a packet boundary - which is what the old
+// single-write-per-message code did for the entire message. Only the
+// one-descriptor-per-packet property depends on it.
+wire [27:0] first_len = (hdr_len > (PMTU_BYTES - 28'd64)) ? (PMTU_BYTES - 28'd64)
+                                                          : hdr_len;
+wire [27:0] next_len  = (w_left  >  PMTU_BYTES[27:0])     ? PMTU_BYTES[27:0]
+                                                          : w_left;
+
 // A header beat waiting on the payload stream is what wants the shared path
 assign req      = s_tvalid || (state != ST_IDLE);
 assign busy     = (state != ST_IDLE);
@@ -238,7 +275,7 @@ always_ff @(posedge aclk) begin
     if (!aresetn) begin
         state <= ST_IDLE;
         l_op <= 0; l_len <= 0; l_va <= 0; l_inline <= 0;
-        l_beats <= 0; l_moved <= 1'b0;
+        l_beats <= 0; l_moved <= 1'b0; w_va <= 0; w_left <= 0;
         p_credit <= 0;
     end else begin
         p_credit <= p_credit + {9'b0, cred_add} - (take_beat ? 32'd1 : 32'd0);
@@ -247,18 +284,36 @@ always_ff @(posedge aclk) begin
             // and is recognised by its contents rather than announced by a
             // request. A beat that is not a header is skipped and counted;
             // with a sender that agrees with us every beat here IS one.
+            // The write request is issued COMBINATIONALLY from this same
+            // beat and the header is consumed only once the shell has taken
+            // it. There is deliberately no ST_WR_REQ: that state held
+            // s_tready LOW while it waited for wr_ready, and s_tready low is
+            // not merely a delay here - the shell's receive FSM emits the
+            // host-write command and the ACK in the SAME step, so stalling
+            // the ingress stops ACKS BEING GENERATED. The sender's retransmit
+            // timer is 1 ms since the last ack, and a replay cannot re-read a
+            // vFPGA-sourced payload (req_1 = 0 in user_req_mux.sv), so lost
+            // beats displace everything after them. perf_rdma cannot hit this
+            // because its receive path is a pass-through
+            // (rq_wr.ready = sq_wr.ready); this makes ours behave the same, so
+            // the stream stalls only when the shell itself will not take a
+            // request. Re-latching an unconsumed beat is idempotent.
             ST_IDLE: if (s_tvalid && grant && covered) begin
-                l_op     <= s_tdata[7:0];
-                l_len    <= s_tdata[35:8];
+                l_op     <= hdr_op;
+                l_len    <= hdr_len;
                 l_va     <= s_tdata[64 +: VADDR_BITS];
                 l_inline <= s_tdata[128 +: 64];
-                l_beats  <= beats_of(s_tdata[35:8]);
+                // Only THIS packet, and where the next one lands. The write
+                // being accepted here covers first_len bytes, not hdr_len.
+                l_beats  <= beats_of(first_len);
+                w_va     <= s_tdata[64 +: VADDR_BITS]
+                            + {{(VADDR_BITS-28){1'b0}}, first_len};
+                w_left   <= hdr_len - first_len;
                 l_moved  <= 1'b0;
-                if (hdr_ok) state <= ST_WR_REQ;
+                if (hdr_ok && wr_ready)
+                    state <= (hdr_op == MSG_OP_WRITE_INLINE) ? ST_INLINE_DATA
+                                                             : ST_STREAM;
             end
-
-            ST_WR_REQ: if (wr_ready)
-                state <= (l_op == MSG_OP_WRITE_INLINE) ? ST_INLINE_DATA : ST_STREAM;
 
             ST_INLINE_DATA: if (m_tready) state <= ST_IDLE;
 
@@ -267,10 +322,22 @@ always_ff @(posedge aclk) begin
             // to this message, and are ignored.
             // An uncovered beat is swallowed here without advancing the
             // message: it is not payload, whatever it looks like.
+            // stream_end now ends a PACKET's write, not the message.
             ST_STREAM: if (s_tvalid && m_tready && covered) begin
                 l_moved <= 1'b1;
                 l_beats <= l_beats - 23'd1;
-                if (stream_end) state <= ST_IDLE;
+                if (stream_end)
+                    state <= (w_left != 28'd0) ? ST_PKT_REQ : ST_IDLE;
+            end
+
+            // The next packet's write. Waits on the SHELL's wr_ready and
+            // nothing of our own, the same shape as the header's handshake.
+            ST_PKT_REQ: if (wr_ready) begin
+                l_beats <= beats_of(next_len);
+                w_va    <= w_va + {{(VADDR_BITS-28){1'b0}}, next_len};
+                w_left  <= w_left - next_len;
+                l_moved <= 1'b0;
+                state   <= ST_STREAM;
             end
 
             default: state <= ST_IDLE;
@@ -284,11 +351,17 @@ always_comb begin
     wr_req.opcode = LOCAL_WRITE;
     wr_req.strm   = STRM_HOST;
     wr_req.pid    = rx_pid;
-    wr_req.vaddr  = l_va;
-    wr_req.len    = l_len;
+    // ONE WRITE PER PACKET. The first is driven from the header beat on the
+    // wire (issued in the same cycle that beat is accepted); every later one
+    // from the running target this module keeps, because the shell's request
+    // stream names STAGING and cannot say where the bytes belong.
+    wr_req.vaddr  = (state == ST_PKT_REQ) ? w_va
+                                          : s_tdata[64 +: VADDR_BITS];
+    wr_req.len    = (state == ST_PKT_REQ) ? next_len : first_len;
     wr_req.dest   = 0;
     wr_req.last   = 1'b1;
-    wr_valid = (state == ST_WR_REQ);
+    wr_valid = ((state == ST_IDLE) && s_tvalid && grant && covered && hdr_ok)
+               || (state == ST_PKT_REQ);
 end
 
 always_comb begin
@@ -297,7 +370,10 @@ always_comb begin
     // request: those beats belong to a request this module has not taken yet
     // A header beat is taken in ST_IDLE (only while granted); payload beats
     // move when the host write path will take them
-    s_tready = ((state == ST_IDLE) && grant) ||
+    // A header is consumed only when the shell accepts its request; an
+    // uncovered or malformed beat is still drained so it cannot back up.
+    s_tready = ((state == ST_IDLE) && grant &&
+                ((covered && hdr_ok) ? wr_ready : 1'b1)) ||
                ((state == ST_STREAM) && (covered ? m_tready : 1'b1));
 
     if (state == ST_INLINE_DATA) begin
@@ -325,6 +401,16 @@ assign cnt_rx_orphan = take_beat && !covered;
 assign cnt_rx_move   = (state == ST_STREAM) &&  s_tvalid &&  m_tready && covered;
 assign cnt_rx_starve = (state == ST_STREAM) && !s_tvalid;
 assign cnt_rx_stall  = (state == ST_STREAM) &&  s_tvalid && !m_tready;
+
+// EVERY cycle this module refuses a beat the shell is offering, in ANY state.
+// cnt_rx_stall above is ST_STREAM-only and therefore blind to the grant wait
+// and to the request handshake - the two places Loom differs from perf_rdma -
+// so a run could show "0.0% stalled" while loom_rx was in fact holding the
+// ingress off. That matters more than throughput: the shell emits the host
+// write and the packet's ACK from the same FSM step, so backpressure here
+// stops ACKs, and a QP that goes 1 ms without one retransmits. This counter
+// is the direct measure of the thing being fixed - it must read ~0.
+assign cnt_rx_bp     = s_tvalid && !s_tready;
 
 assign cnt_rx_stall_head = cnt_rx_stall && !l_moved;
 assign cnt_rx_stall_body = cnt_rx_stall &&  l_moved;
