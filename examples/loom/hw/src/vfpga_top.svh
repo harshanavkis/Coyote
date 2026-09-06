@@ -49,7 +49,21 @@ logic [7:0]  max_inflight;
 // Only RC_ACK frees a retransmit slot; counting a bypass completion as one
 // would let a second write out while the first still owns the slots, which
 // is the exact overrun this pacing exists to prevent.
-wire rdma_ack = cq_wr.valid && cq_wr.ready && is_opcode_ack(cq_wr.data.opcode);
+// ANY completion, no opcode filter - which is what jigsaw does
+// (jigsaw_device_controller/hw/src/vfpga_top.svh:32) and what works there.
+//
+// Filtering this to is_opcode_ack was right in principle - cq_arb merges
+// bypass write completions with RDMA acks, so an unfiltered count returns
+// credit that no ack freed - and it DEADLOCKED on hardware: the engine sent
+// exactly one chunk, byte-perfect, then waited forever. RC_ACK never arrives
+// on the vFPGA's cq_wr. The counters below say so directly instead of
+// leaving it to be inferred from a hang.
+wire rdma_ack = cq_wr.valid && cq_wr.ready;
+
+// What actually turns up on cq_wr: every completion, and how many are acks.
+// cq_ack stuck at 0 while cq_all climbs is the proof.
+wire cnt_cq_all = cq_wr.valid && cq_wr.ready;
+wire cnt_cq_ack = cq_wr.valid && cq_wr.ready && is_opcode_ack(cq_wr.data.opcode);
 // The peer's ack for an RDMA write; the engine paces on it.
 
 // Stage cycle counters: engine -> ctrl (RO CSR words 50-63)
@@ -178,6 +192,7 @@ loom_ctrl inst_loom_ctrl (
     .cnt_rx_move(rx_cnt_move), .cnt_rx_starve(rx_cnt_starve),
     .cnt_rx_stall(rx_cnt_stall), .cnt_rx_stall_head(rx_cnt_st_head),
     .cnt_rx_stall_body(rx_cnt_st_body), .cnt_rx_req(rx_cnt_req),
+    .cnt_cq_all(cnt_cq_all), .cnt_cq_ack(cnt_cq_ack),
     .cnt_pull_desync(cnt_pull_desync), .cnt_tx_partial(cnt_tx_partial),
     .cnt_tx_move(tx_cnt_move), .cnt_tx_starve(tx_cnt_starve),
     .cnt_tx_stall(tx_cnt_stall),
