@@ -158,6 +158,7 @@ extern bool en_hmm;
 #define XDMA_CTRL_IE_DESC_COMPLETED (1UL << 2)
 #define XDMA_CTRL_NON_INCR_ADDR (1UL << 25)
 #define XDMA_CTRL_POLL_MODE_WB (1UL << 26)
+#define XDMA_CTRL_STM_WB_DISABLE (1UL << 27)
 
 // QDMA constants
 #define QDMA_N_QUEUES 512                             // Total number of queues (number may vary per device, but 512 is the absolute minimum on all devices)

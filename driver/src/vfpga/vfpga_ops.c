@@ -37,6 +37,19 @@ int vfpga_dev_open(struct inode *inode, struct file *file) {
     BUG_ON(!device);
     dbg_info("vFPGA device %d opened, hpid %d, ref_cnt %d\n", minor, current->pid, device->ref_cnt);
 
+    // Fail closed if completion writes would target an unowned DMA address.
+    if (device->bd_data->en_wb) {
+        for (int j = 0; j < WB_BLOCKS; j++) {
+            uint64_t expected = device->wb_phys_addr + j * (N_CTID_MAX * sizeof(uint32_t));
+            uint64_t actual = readq(&device->cnfg_regs->wback[j]);
+            if (actual != expected) {
+                pr_err("vFPGA %d writeback %d address mismatch: hardware=%llx allocated=%llx\n",
+                       device->id, j, actual, expected);
+                return -EIO;
+            }
+        }
+    }
+
     // Set file private data, so the attributes of the opened vfpga_dev can be accessed in other methods
     file->private_data = (void *) device;
     device->ref_cnt++;

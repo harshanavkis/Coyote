@@ -254,6 +254,11 @@ struct xdma_engine *engine_create(struct bus_driver_data *bd_data, int offset, i
     reg_val |= XDMA_CTRL_IE_DESC_STOPPED;
     reg_val |= XDMA_CTRL_IE_DESC_COMPLETED;
     reg_val |= XDMA_CTRL_RUN_STOP;
+    // Coyote's bypass descriptors do not provide a C2H metadata buffer:
+    // their source address is zero. Disable that separate XDMA writeback
+    // (PG195 C2H Channel Control bit 27), not Coyote's completion counters.
+    if (c2h)
+        reg_val |= XDMA_CTRL_STM_WB_DISABLE;
     iowrite32(reg_val, &engine->regs->ctrl);
     reg_val = ioread32(&engine->regs->status);
     dbg_info("ioread32(0x%p) = 0x%08x (dummy read flushes writes).\n", &engine->regs->status, reg_val);
