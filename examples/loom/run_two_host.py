@@ -478,6 +478,8 @@ def bench_env(args, gap):
         env += f" LOOM_BENCH_FROM={args.frm}"
     if args.hw_chunk is not None:
         env += f" LOOM_CHUNK={args.hw_chunk}"
+    if args.tx_pace is not None:
+        env += f" LOOM_TX_PACE={args.tx_pace}"
     if args.chunk:
         env += f" LOOM_BENCH_CHUNK={args.chunk}"
     if args.chunk_credit is not None:
@@ -647,6 +649,15 @@ def main():
                          "compared on one bitstream. Defaults to the "
                          "hardware reset value, 65472. Not --chunk, which "
                          "chunks in software instead")
+    ap.add_argument("--tx-pace", default=None,
+                    help="egress pacing: one idle cycle after every N "
+                         "forwarded payload beats on the rdma route, wire "
+                         "rate N/(N+1) of the engine's burst rate; 0 = off "
+                         "(CSR 6, LOOM_TX_PACE). The receiver's host write "
+                         "saturates at ~10 GB/s and the link has no flow "
+                         "control, so this is what holds the sender under "
+                         "it. Sweep N on the 4 MB single-message case: the "
+                         "highest clean N is the receiver's drain ceiling")
     ap.add_argument("--chunk", default=None,
                     help="deliver the region as descriptors of this size at "
                          "successive offsets instead of one long message "

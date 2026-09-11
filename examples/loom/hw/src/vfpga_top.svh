@@ -85,6 +85,8 @@ logic rx_cnt_bp;
 // Partial tkeep arriving from the network - see loom_rx.sv
 logic rx_cnt_partial;
 logic tx_cnt_move, tx_cnt_starve, tx_cnt_stall;
+logic tx_cnt_paced, rx_cnt_fifo_full;
+logic [7:0] pace_n;
 logic rx_cnt_st_head, rx_cnt_st_body, rx_cnt_req, rx_cnt_span;
 logic [AXI_DATA_BITS-1:0]   rx_tdata;
 logic [AXI_DATA_BITS/8-1:0] rx_tkeep;
@@ -176,7 +178,7 @@ loom_ctrl inst_loom_ctrl (
     .fifo_src_pid(fifo_src_pid), .fifo_compl_va(fifo_compl_va),
     .fifo_payload(fifo_payload), .fifo_pop(fifo_pop),
     .rdma_staging_va(rdma_staging_va), .rx_pid(rx_pid),
-    .chunk_bytes(chunk_bytes),
+    .chunk_bytes(chunk_bytes), .pace_n(pace_n),
     .rd_resp_data(rd_resp_data), .rd_resp_valid(rd_resp_valid),
     .cnt_local_wr(cnt_local_wr), .cnt_rdma_wr(cnt_rdma_wr),
     .cnt_rx_fwd(cnt_rx_fwd), .cnt_rx_drop(cnt_rx_drop),
@@ -190,6 +192,7 @@ loom_ctrl inst_loom_ctrl (
     .cnt_tx_move(tx_cnt_move), .cnt_tx_starve(tx_cnt_starve),
     .cnt_tx_starve_mid(tx_cnt_starve_mid),
     .cnt_tx_stall(tx_cnt_stall),
+    .cnt_tx_paced(tx_cnt_paced), .cnt_rx_fifo_full(rx_cnt_fifo_full),
     .cnt_rx_span(rx_cnt_span),
     .stage_acc(stage_acc), .stage_cnt(stage_cnt)
 );
@@ -238,6 +241,7 @@ loom_engine inst_loom_engine (
     .cnt_tx_move(tx_cnt_move), .cnt_tx_starve(tx_cnt_starve),
     .cnt_tx_starve_mid(tx_cnt_starve_mid),
     .cnt_tx_stall(tx_cnt_stall),
+    .cnt_tx_paced(tx_cnt_paced), .pace_n(pace_n),
     .busy(eng_busy)
 );
 
@@ -260,8 +264,15 @@ loom_engine inst_loom_engine (
 // retransmitted.
 //
 // 512 beats is ~2 us at line rate, doubling what the shell already gives.
-// The measure of whether this is the right fix is client ROCE TX against
-// server ROCE RX: if that gap closes, ingress overflow was the cause.
+// It took the loss between the stack and loom_rx to zero. It did NOT end
+// the loss, because a buffer absorbs JITTER and the deficit is SUSTAINED:
+// the host write saturates at ~10 GB/s (63% moving / 34% stalled, flat as
+// the offered rate rises) while the wire delivers ~12.2, so the whole
+// chain - this FIFO, the shell's 512, the stack, the 2048-beat rx_crossing
+// - fills in ~1.7 MB of burst and the CMAC, which has no tready, drops
+// before any counter. cnt_rx_fifo_full below is the first link of that
+// chain made visible; the pacer in loom_engine is what holds the sender
+// under the ceiling.
 // ---------------------------------------------------------------------------
 logic [511:0] rxf_tdata;
 logic [63:0]  rxf_tkeep;
@@ -280,6 +291,13 @@ axis_data_fifo_512 inst_rx_ingress_fifo (
     .m_axis_tready(rxf_tready),
     .m_axis_tlast(rxf_tlast)
 );
+
+// The shell has a beat for us and the ingress FIFO will not take it: the
+// FIFO is full. This is the one link in the loss chain nothing else counts.
+// From here the backpressure walks into the shell (stack input stalls,
+// rx_crossing fills) and the CMAC, which has no tready, drops. Nonzero on a
+// corrupt run and zero on the clean control is the confirmation.
+assign rx_cnt_fifo_full = axis_rrsp_recv[0].tvalid && !axis_rrsp_recv[0].tready;
 
 loom_rx inst_loom_rx (
     .aclk(aclk), .aresetn(aresetn),

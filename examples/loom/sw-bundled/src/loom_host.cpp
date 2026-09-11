@@ -630,11 +630,9 @@ void run_bench(coyote::cThread &t_ctrl, loom::Xpu &A, int win,
             const uint64_t smx = loom::csr_read(t_ctrl, loom::TX_SMID_MAX);
             printf("  starvation INSIDE a packet: %lu cycles, longest run %lu -> %s\n",
                    (unsigned long) sm, (unsigned long) smx,
-                   sm == 0 ? "none - every gap fell BETWEEN packets, so an "
-                             "under-run cannot explain the lost packets"
-                           : "the engine gapped mid-frame; compare against the "
-                             "packets lost at the far MAC (client TX minus "
-                             "server RX) and against the clean run");
+                   sm == 0 ? "none - every gap fell between packets"
+                           : "the engine gapped mid-frame (shape only: the "
+                             "clean control gaps MORE and loses nothing)");
         }
         const uint64_t part = loom::csr_read(t_ctrl, loom::TX_PARTIAL);
         printf("  tx partial-keep beats: %lu   (payload beats the host read "
@@ -645,6 +643,17 @@ void run_bench(coyote::cThread &t_ctrl, loom::Xpu &A, int win,
                "read was issued; nonzero means the engine forwarded a beat "
                "that was not its payload, and the message is displaced)\n",
                (unsigned long) pdes);
+        {
+            const uint64_t pn = loom::csr_read(t_ctrl, loom::TX_PACE);
+            const uint64_t pc = loom::csr_read(t_ctrl, loom::TX_PACED);
+            if (pn)
+                printf("  tx pacing: N=%lu, pacer held %lu cycles (expect ~moving/N "
+                       "= %lu; wire rate capped at %.1f%% of burst)\n",
+                       (unsigned long) pn, (unsigned long) pc,
+                       (unsigned long) (mv / pn), 100.0 * pn / (pn + 1));
+            else
+                printf("  tx pacing: off\n");
+        }
     }
 
     usleep(500000);      // let RC retransmit timers fire before sampling
@@ -773,6 +782,18 @@ int run_server(uint16_t qp_port, uint16_t peer_port, const std::string &sock) {
     // an unset variable is not the same as a zero.
     if (const char *e = getenv("LOOM_CHUNK"))
         loom::csr_write(t_ctrl, loom::CHUNK, strtoull(e, nullptr, 0));
+    // LOOM_TX_PACE=N inserts one idle cycle after every N forwarded payload
+    // beats on the rdma route (wire rate N/(N+1) of the burst rate); 0 = off.
+    // This is the flow control the link does not have: the receiver's host
+    // write saturates at ~10 GB/s and nothing else tells the sender so.
+    if (const char *e = getenv("LOOM_TX_PACE"))
+        loom::csr_write(t_ctrl, loom::TX_PACE, strtoull(e, nullptr, 0));
+    {
+        const uint64_t pn = loom::csr_read(t_ctrl, loom::TX_PACE);
+        printf("engine config: tx_pace=%lu (%s)\n", (unsigned long) pn,
+               pn ? "PACED - one idle cycle per N payload beats" : "unpaced");
+        fflush(stdout);
+    }
     {
         const uint64_t cb = loom::csr_read(t_ctrl, loom::CHUNK);
         printf("engine config: chunk_bytes=%lu (%s)\n",
@@ -1154,12 +1175,22 @@ int run_server(uint16_t qp_port, uint16_t peer_port, const std::string &sock) {
         {
             const uint64_t rp = loom::csr_read(t_ctrl, loom::RX_PARTIAL);
             printf("  rx PARTIAL-KEEP beats: %lu -> %s\n", (unsigned long) rp,
-                   rp == 0 ? "none; every beat carried a full 64 B"
-                           : "SHORT BEATS REACHED THE HOST WRITE. loom_rx "
-                             "forwards keep verbatim and positions by a "
-                             "running beat count, so every byte after one of "
-                             "these lands early and never recovers - this is "
-                             "the displacement");
+                   rp == 0 ? "none; every beat carried a full 64 B (as it must: "
+                             "every message is a multiple of 64 B)"
+                           : "a short beat reached the host write - the 64 B "
+                             "contract was broken somewhere");
+        }
+        {
+            const uint64_t ff  = loom::csr_read(t_ctrl, loom::RX_FIFO_FULL);
+            const uint64_t ffm = loom::csr_read(t_ctrl, loom::RX_FIFO_FULL_MAX);
+            printf("  ingress FIFO FULL: %lu cycles, longest run %lu -> %s\n",
+                   (unsigned long) ff, (unsigned long) ffm,
+                   ff == 0 ? "never; the shell never had a beat we could not take"
+                           : "the shell offered a beat and our ingress FIFO was "
+                             "full. From here backpressure walks into the shell "
+                             "(stack input, rx_crossing) and the CMAC, which "
+                             "has no tready, DROPS - before every counter. "
+                             "This is the loss");
         }
         const uint64_t bp  = loom::csr_read(t_ctrl, loom::RX_BP);
         const uint64_t bpm = loom::csr_read(t_ctrl, loom::RX_BP_MAX);
@@ -1250,6 +1281,18 @@ int run_client(const std::string &ip, uint16_t qp_port, uint16_t peer_port,
     // an unset variable is not the same as a zero.
     if (const char *e = getenv("LOOM_CHUNK"))
         loom::csr_write(t_ctrl, loom::CHUNK, strtoull(e, nullptr, 0));
+    // LOOM_TX_PACE=N inserts one idle cycle after every N forwarded payload
+    // beats on the rdma route (wire rate N/(N+1) of the burst rate); 0 = off.
+    // This is the flow control the link does not have: the receiver's host
+    // write saturates at ~10 GB/s and nothing else tells the sender so.
+    if (const char *e = getenv("LOOM_TX_PACE"))
+        loom::csr_write(t_ctrl, loom::TX_PACE, strtoull(e, nullptr, 0));
+    {
+        const uint64_t pn = loom::csr_read(t_ctrl, loom::TX_PACE);
+        printf("engine config: tx_pace=%lu (%s)\n", (unsigned long) pn,
+               pn ? "PACED - one idle cycle per N payload beats" : "unpaced");
+        fflush(stdout);
+    }
     {
         const uint64_t cb = loom::csr_read(t_ctrl, loom::CHUNK);
         printf("engine config: chunk_bytes=%lu (%s)\n",

@@ -153,11 +153,17 @@ module loom_engine (
     // is the pre-chunking behaviour and lets both be compared on one
     // bitstream. Reset value is the derived safe size.
     input  logic [27:0]                 chunk_bytes,
+    // Egress pacing: one idle cycle after every pace_n forwarded payload
+    // beats on the rdma route, 0 = off. Wire rate = pace_n/(pace_n+1) of
+    // the engine's burst rate. See the PACING block below for why.
+    input  logic [7:0]                  pace_n,
     output logic                        cnt_tx_move,
     output logic                        cnt_tx_starve,
     // Starvation that lands INSIDE a wire packet - see the block below.
     output logic                        cnt_tx_starve_mid,
     output logic                        cnt_tx_stall,
+    // Cycles the pacer held the net output (validates the knob took)
+    output logic                        cnt_tx_paced,
 
     output logic                        busy
 );
@@ -206,6 +212,11 @@ state_t state;
 // ahead of time instead of consulting live state per beat).
 logic                  l_is_desc, l_is_read;
 logic [27:0]           l_off, l_len;
+// Egress pacer state (defined in the PACING block further down); declared
+// here because the FSM uses the gated ready before that block.
+logic [7:0]            pace_cnt;
+logic                  pace_hold;
+wire                   m_net_rdy = m_net_tready && !pace_hold;
 logic [PID_BITS-1:0]   l_src_pid;
 logic [VADDR_BITS-1:0] l_compl_va;
 logic [63:0]           l_payload;
@@ -390,7 +401,7 @@ always_ff @(posedge aclk) begin
 
             ST_WR_REQ:    if (wr_ready) state <= ST_WR_DATA;
             ST_WR_DATA:
-                if (( l_route && m_net_tready) ||
+                if (( l_route && m_net_rdy) ||
                     (!l_route && m_host_tready)) state <= ST_IDLE;
 
             // ---- DESC: pull request, write request, stream, fence ----
@@ -411,10 +422,10 @@ always_ff @(posedge aclk) begin
                 l_sbeats <= beats_of(l_route ? c_next : l_len);
                 state    <= l_route ? ST_HDR_BEAT : ST_STREAM;
             end
-            ST_HDR_BEAT:   if (m_net_tready) state <= ST_STREAM;
+            ST_HDR_BEAT:   if (m_net_rdy) state <= ST_STREAM;
             ST_STREAM:
                 if (s_tvalid &&
-                    (( l_route && m_net_tready) || (!l_route && m_host_tready))) begin
+                    (( l_route && m_net_rdy) || (!l_route && m_host_tready))) begin
                     l_sbeats <= l_sbeats - 23'd1;
                     if (stream_last) begin
                         // The pull is ONE read of the whole descriptor and
@@ -608,10 +619,54 @@ wire [AXI_DATA_BITS/8-1:0] beat_keep = {{(AXI_DATA_BITS/8-8){1'b0}}, 8'hFF};
 wire stream_local = (state == ST_STREAM) && !l_route;
 wire stream_net   = (state == ST_STREAM) &&  l_route;
 
+// -------------------------------------------------------------------------
+// PACING - the flow control this link does not have.
+//
+// The receiver's host-write path saturates at ~10 GB/s (amy: 63% moving /
+// 34% stalled, FLAT as the offered rate rises - measured across the chunk
+// sweep). This engine bursts at 64 B/cycle, ~12.5 GB/s after its own
+// starvation, and the wire has no PFC, no DCQCN and no prog_full consumer:
+// nothing tells the sender to slow down. Above the receiver's ceiling its
+// ~3000 beats of buffering fill in ~1.7 MB, the CMAC (no tready) drops
+// beats before any counter, the PSN gap NAKs, Go-Back-N replays, and the
+// replay lands displaced. Every packet lost in 20 dead ends was lost there.
+//
+// So hold the burst rate under the receiver's drain: after every pace_n
+// forwarded payload beats, one idle cycle. Wire rate = pace_n/(pace_n+1)
+// of the burst rate. The header beat is not paced (one per message).
+//
+// AXI-Stream legality: the hold cycle always immediately FOLLOWS a
+// completed handshake (it is set by the move that reaches pace_n), so
+// tvalid is only ever withdrawn after a transfer, never while waiting.
+// The hold gates BOTH tvalid and the engine's view of tready, so the shell
+// cannot take a beat the engine does not advance past.
+//
+// pace_n is a CSR (reset 0 = off) so one bitstream sweeps the rate; the
+// highest clean setting IS the receiver's drain ceiling, measured.
+// -------------------------------------------------------------------------
+wire        pace_en   = (pace_n != 8'd0);
+wire        net_moved = stream_net && s_tvalid && m_net_rdy;
+
+always_ff @(posedge aclk) begin
+    if (!aresetn || !pace_en || !stream_net) begin
+        pace_cnt  <= 8'd0;
+        pace_hold <= 1'b0;
+    end else if (pace_hold) begin
+        pace_hold <= 1'b0;
+    end else if (net_moved) begin
+        if (pace_cnt == pace_n - 8'd1) begin
+            pace_hold <= 1'b1;
+            pace_cnt  <= 8'd0;
+        end else
+            pace_cnt  <= pace_cnt + 8'd1;
+    end
+end
+assign cnt_tx_paced = pace_hold && stream_net;
+
 always_comb begin
     // Pull stream ready while forwarding (from the selected output) or
     // while sinking the read line (always ready: nothing downstream)
-    s_tready = (stream_local && m_host_tready) || (stream_net && m_net_tready) ||
+    s_tready = (stream_local && m_host_tready) || (stream_net && m_net_rdy) ||
                (state == ST_RDP_WAIT);
 
     // Host output: store beat (local), DMA forward (local), completion beat
@@ -640,7 +695,7 @@ always_comb begin
     m_net_tlast  = stream_net ? stream_last : (state == ST_WR_DATA);
     m_net_tvalid = ((state == ST_WR_DATA) && l_route) ||
                    (state == ST_HDR_BEAT) ||
-                   (stream_net && s_tvalid);
+                   (stream_net && s_tvalid && !pace_hold);
 end
 
 // -------------------------------------------------------------------------
@@ -664,8 +719,8 @@ assign rd_resp_valid = (state == ST_RD_RESP);
 // be starved: it is generated here, not pulled.
 wire tx_stream = (state == ST_STREAM)   && l_route;
 wire tx_hdr    = (state == ST_HDR_BEAT);
-assign cnt_tx_move   = (tx_hdr    &&  m_net_tready) ||
-                       (tx_stream &&  s_tvalid && m_net_tready);
+assign cnt_tx_move   = (tx_hdr    &&  m_net_rdy) ||
+                       (tx_stream &&  s_tvalid && m_net_rdy);
 assign cnt_tx_starve =  tx_stream && !s_tvalid;
 
 // WHERE the starvation lands, which is the thing that matters and which
@@ -677,14 +732,11 @@ assign cnt_tx_starve =  tx_stream && !s_tvalid;
 // BETWEEN packets costs throughput and nothing else. A gap INSIDE one is a
 // different animal: the packetiser has begun a frame it cannot finish.
 //
-// Why this is worth a counter: Loom loses 9-12 packets at the far MAC on
-// every corrupt run and none on every clean one, while perf_rdma loses 0 of
-// 21.6M on the same link. perf_rdma's payload comes from the shell's data
-// mover and never gaps; ours is hand-fed and starves ~21% of cycles. If
-// that starvation lands mid-frame, an under-run would explain the loss, the
-// PSN cascade behind it (one lost packet makes every packet in flight
-// "completely invalid" -> NAK, Go-Back-N), and the rate dependence.
-// If this reads ~0, that story is dead and the loss is elsewhere.
+// Measured (2026-09-08): the CLEAN control gaps mid-frame MORE than the
+// corrupt runs do and loses nothing, so a mid-frame gap does not cause the
+// loss. Kept as a shape diagnostic only. The loss is on the RECEIVER - its
+// host write saturates at ~10 GB/s and the link has no flow control - and
+// the pacer above is what addresses it.
 logic [6:0] pkt_beat;
 always_ff @(posedge aclk) begin
     if (!aresetn)                     pkt_beat <= 7'd0;
@@ -706,13 +758,13 @@ assign cnt_drop     = (state == ST_CHECK) && !ok;
 // several tlast-terminated chunks, so "the last beat carries tlast" is
 // satisfied by any chunk boundary and detects nothing.
 assign cnt_pull_desync = (state == ST_RD_REQ) && rd_ready && s_tvalid;
-assign cnt_tx_partial  = stream_net && s_tvalid && m_net_tready &&
+assign cnt_tx_partial  = stream_net && s_tvalid && m_net_rdy &&
                          (s_tkeep != {(AXI_DATA_BITS/8){1'b1}});
 
 assign cnt_local_wr = ((state == ST_WR_DATA) && !l_route && m_host_tready) ||
                       (stream_local && s_tvalid && stream_last && m_host_tready);
-assign cnt_rdma_wr  = ((state == ST_WR_DATA) && l_route && m_net_tready) ||
-                      (stream_net && s_tvalid && stream_last && m_net_tready);
+assign cnt_rdma_wr  = ((state == ST_WR_DATA) && l_route && m_net_rdy) ||
+                      (stream_net && s_tvalid && stream_last && m_net_rdy);
 assign cnt_compl    = (state == ST_CP_DATA) && m_host_tready;
 
 // -------------------------------------------------------------------------
@@ -756,11 +808,11 @@ always_ff @(posedge aclk) begin
 
         if ((state == ST_WR_DATA) && !l_route && m_host_tready)
             stage_cnt[1] <= stage_cnt[1] + 1;
-        if ((state == ST_WR_DATA) && l_route && m_net_tready)
+        if ((state == ST_WR_DATA) && l_route && m_net_rdy)
             stage_cnt[2] <= stage_cnt[2] + 1;
         if (stream_local && s_tvalid && s_tlast && m_host_tready)
             stage_cnt[3] <= stage_cnt[3] + 1;
-        if (stream_net && s_tvalid && s_tlast && m_net_tready)
+        if (stream_net && s_tvalid && s_tlast && m_net_rdy)
             stage_cnt[4] <= stage_cnt[4] + 1;
         if (state == ST_RD_RESP)
             stage_cnt[5] <= stage_cnt[5] + 1;

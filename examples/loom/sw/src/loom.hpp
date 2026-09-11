@@ -115,6 +115,10 @@ constexpr uint32_t CHUNK         = 0x0E0;   // word 28: 0 = do not chunk
 // fits every measured constraint (TX 65667 vs RX 65664, orphan 0, desync 0,
 // displacement in whole beats). MUST READ 0.
 constexpr uint32_t RX_PARTIAL    = 0x0B0;   // word 22
+constexpr uint32_t TX_PACE       = 0x030;   // word 6:  pace_n, 0 = off
+constexpr uint32_t TX_PACED      = 0x038;   // word 7:  cycles the pacer held
+constexpr uint32_t RX_FIFO_FULL  = 0x070;   // word 14: ingress FIFO refused a beat
+constexpr uint32_t RX_FIFO_FULL_MAX = 0x078; // word 15: longest run of that
 constexpr uint32_t TX_SMID       = 0x0E8;   // word 29
 constexpr uint32_t TX_SMID_MAX   = 0x0B8;   // word 23
 constexpr uint32_t RX_BP         = 0x0F0;   // word 30

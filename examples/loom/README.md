@@ -302,6 +302,30 @@ cd examples/loom
   (`--hw-chunk 0`, every point pinned to `--offset 0x400000`); read that as
   a practical limit, not a mechanism — the same 4 MB as 4 × 1 MB separate
   descriptors is corrupt even at `--chunk-credit 1`.
+- `--tx-pace N` — egress pacing (CSR 6, `LOOM_TX_PACE`): `loom_engine`
+  holds one idle cycle after every N forwarded payload beats on the rdma
+  route, so the wire runs at N/(N+1) of the engine's burst rate; `0` = off
+  (the reset value). **This is the flow control the link does not have.**
+  The receiver's host-write path saturates at ~10 GB/s (amy: ~63% moving /
+  ~34% stalled, flat as the offered rate rises — see `experiments-log.txt`
+  2026-09-08 18:35–18:59) and RoCE here has no PFC, no DCQCN and no
+  `prog_full` consumer, so nothing else tells the sender to slow down.
+  Above the ceiling the ~3000 beats of RX buffering fill in ~1.7 MB of
+  burst and the CMAC, which has no `tready`, drops before any counter.
+  Sweep it on the 4 MB single message:
+
+  ```bash
+  for N in 4 6 8 12 16 32; do
+    ./run_two_host.py --size 4194304 --iters 0 --gap 20 --retries 0 --hw-chunk 0 --tx-pace $N
+  done
+  ```
+
+  The highest N that is intact with 0 retransmissions is the receiver's
+  drain ceiling, measured. The client prints `tx pacing: N=.., pacer held
+  .. cycles (expect ~moving/N)` to prove the knob took; the server prints
+  `ingress FIFO FULL` (CSR 14/15), which should be nonzero on a corrupt
+  run and zero on a clean one — that is the one link in the loss chain
+  nothing else counts.
 - `--hw-chunk BYTES` sets the engine's own chunk size (CSR 28); `0` turns
   hardware chunking off. Distinct from `--chunk`, which chunks in software.
   Engine chunking alone does not avoid the loss.

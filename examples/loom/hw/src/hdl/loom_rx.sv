@@ -414,17 +414,12 @@ assign cnt_rx_stall  = (state == ST_STREAM) &&  s_tvalid && !m_tready;
 // is the direct measure of the thing being fixed - it must read ~0.
 assign cnt_rx_bp     = s_tvalid && !s_tready;
 
-// PARTIAL KEEP ON THE RECEIVE PATH. m_tkeep is forwarded VERBATIM from the
-// network into the host write, so a beat carrying fewer than 64 valid bytes
-// writes short - and because this module positions payload by a RUNNING
-// COUNT of beats, every byte after it lands early and never recovers.
-//
-// The sender has had this counter since 358603b5 (cnt_tx_partial reads 0,
-// and the engine forces a full keep onto the wire); the receiver never had
-// one. It is the only mechanism found that satisfies EVERY measured
-// constraint at once: beat counts match at both ends (TX 65667 vs RX 65664),
-// rx_orphan is 0 (the beat IS forwarded and IS covered), pull_desync is 0
-// (that is the sender), and the payload still shifts by whole beats.
+// Partial keep on the receive path. m_tkeep is forwarded verbatim into the
+// host write and this module positions payload by a running beat count, so
+// a short beat would displace everything after it. It CANNOT happen by
+// construction - every message is a multiple of 64 B at both ends and PMTU
+// is 4096, so every packet and every beat is full - and it reads 0. Kept as
+// a cheap assertion that the contract holds.
 assign cnt_rx_partial = (state == ST_STREAM) && s_tvalid && m_tready && covered
                         && (s_tkeep != {(AXI_DATA_BITS/8){1'b1}});
 

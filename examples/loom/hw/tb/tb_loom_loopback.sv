@@ -164,8 +164,21 @@ loom_table inst_table (
 wire [27:0] chunk_bytes = RDMA_N_WR_OUTSTANDING * PMTU_BYTES - 64;
 
 logic cnt_tx_starve_mid;
+// Egress pacing under test: 0 = off (the default every case above runs
+// with); the pacing case sets it, counts holds against moved payload beats,
+// and checks the region still lands byte-exact.
+logic [7:0] pace_n = 8'd0;
+logic       cnt_tx_paced, cnt_tx_move_o;
+int         paced_cycles = 0, net_moved_beats = 0;
+// plain always, not always_ff: the test sequence zeroes these between cases
+always @(posedge aclk) begin
+    if (cnt_tx_paced) paced_cycles <= paced_cycles + 1;
+    // payload beats only: the header beat is not paced
+    if (inst_engine.net_moved) net_moved_beats <= net_moved_beats + 1;
+end
 loom_engine inst_engine (
     .cnt_tx_starve_mid(cnt_tx_starve_mid),
+    .cnt_tx_paced(cnt_tx_paced), .pace_n(pace_n),
     .chunk_bytes(chunk_bytes),
     .aclk(aclk), .aresetn(aresetn),
     .fifo_empty(fifo_empty), .fifo_is_desc(fifo_is_desc),
@@ -1014,12 +1027,11 @@ initial begin
           $sformatf("1 MB lands as one write per packet (%0d, want %0d)",
                     rx_txns - fwd_before, packets_of(1048576)));
 
-    // 8 MB: the size that DEADLOCKS ON HARDWARE. loom_engine parks in
-    // ST_STREAM with m_net_tready low for 1.25 billion cycles and the
-    // descriptor never fences, while perf_rdma does single 8/32/128 MB
-    // WRITEs on the same shell at a flat ~10.7 GB/s - so it is not a shell
-    // limit. 1 MB works here and on hardware; this case exists to find where
-    // between them Loom stops. 2049 packets, 131073 beats.
+    // 8 MB: 2049 packets, 131073 beats. On hardware a lone message this
+    // size loses packets because the receiver's host write saturates at
+    // ~10 GB/s and the link has no flow control (see loom_engine's PACING
+    // block); this model has no such limit, so the case checks only that
+    // the engine and loom_rx frame and land a message of this scale.
     fwd_before = rx_txns;
     $display("       8 MB case: issuing (2049 packets, 131073 beats)");
     copy(4'd1, 28'h1000000, {16'b0, SRC_VA}, 28'd8388608, {16'b0, CPL_VA});
@@ -1047,6 +1059,49 @@ initial begin
           $sformatf("1 MB, per-packet tlast: one write per packet (%0d, want %0d)",
                     rx_txns - fwd_before, packets_of(1048576)));
     tlast_per_pkt = 0;
+
+    // --- EGRESS PACING. The receiver's host write saturates at ~10 GB/s
+    //     on hardware and the link has no flow control, so loom_engine can
+    //     hold one idle cycle after every pace_n payload beats. Two things
+    //     must hold: the region still lands byte-exact (the hold withdraws
+    //     tvalid only after a completed handshake, and the engine must not
+    //     lose or duplicate the beat it paused on), and the hold count must
+    //     be what the knob says - one per pace_n moved beats, per chunk,
+    //     which is how the hardware run proves the CSR took.
+    check(paced_cycles == 0, "pacing off: the pacer never held");
+    pace_n = 8'd4;
+    paced_cycles = 0; net_moved_beats = 0;
+    fwd_before = rx_txns;
+    copy(4'd1, 28'h1400000, {16'b0, SRC_VA}, 28'd524288, {16'b0, CPL_VA});
+    settle();
+    check_payload(BASE1 + 48'h1400000, 65536,
+                  "paced N=4: 512 KB message lands intact");
+    check(rx_txns - fwd_before == packets_of(524288),
+          $sformatf("paced N=4: one write per packet (%0d, want %0d)",
+                    rx_txns - fwd_before, packets_of(524288)));
+    // floor(beats/4) per chunk: the pacer restarts at every chunk, so the
+    // total is short of moved/4 by at most one hold per chunk.
+    $display("       paced N=4: %0d holds for %0d payload beats (moved/4 = %0d)",
+             paced_cycles, net_moved_beats, net_moved_beats / 4);
+    check(paced_cycles > 0 &&
+          paced_cycles <= net_moved_beats / 4 &&
+          paced_cycles >= net_moved_beats / 4 - (524288 / 65472 + 2),
+          $sformatf("paced N=4: pacer held %0d cycles for %0d payload beats (want ~%0d)",
+                    paced_cycles, net_moved_beats, net_moved_beats / 4));
+    pace_n = 8'd1;    // the harshest setting: every other cycle
+    paced_cycles = 0; net_moved_beats = 0;
+    fwd_before = rx_txns;
+    copy(4'd1, 28'h1500000, {16'b0, SRC_VA}, 28'd262144, {16'b0, CPL_VA});
+    settle();
+    check_payload(BASE1 + 48'h1500000, 32768,
+                  "paced N=1: 256 KB message lands intact");
+    $display("       paced N=1: %0d holds for %0d payload beats",
+             paced_cycles, net_moved_beats);
+    check(paced_cycles >= net_moved_beats - (262144 / 65472 + 2) &&
+          paced_cycles <= net_moved_beats,
+          $sformatf("paced N=1: pacer held %0d cycles for %0d payload beats",
+                    paced_cycles, net_moved_beats));
+    pace_n = 8'd0;
 
     // ---------------------------------------------------------------------
     // Soak the engine the way hardware drives it: a gappy pull at roughly

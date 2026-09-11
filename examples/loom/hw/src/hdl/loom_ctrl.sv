@@ -98,6 +98,8 @@ module loom_ctrl (
     output logic [PID_BITS-1:0]         rx_pid,
     // RDMA chunk size in bytes; 0 disables chunking
     output logic [27:0]                 chunk_bytes,
+    // Egress pacing: idle cycle after every pace_n rdma payload beats, 0 = off
+    output logic [7:0]                  pace_n,
 
     // Read response (from loom_engine): completes the held-open AXI read
     input  logic [63:0]                 rd_resp_data,
@@ -114,6 +116,12 @@ module loom_ctrl (
     input  logic                        cnt_rx_starve,
     input  logic                        cnt_rx_stall,
     input  logic                        cnt_rx_bp,
+    // The pacer held the net output this cycle (sender side)
+    input  logic                        cnt_tx_paced,
+    // The shell offered a beat and OUR ingress FIFO refused it (receiver
+    // side). This is the one unobserved link in the loss chain: ingress
+    // FIFO full -> stack stalls -> rx_crossing overflows -> CMAC drops.
+    input  logic                        cnt_rx_fifo_full,
     input  logic                        cnt_rx_partial,
     input  logic                        cnt_pull_desync,
     input  logic                        cnt_rx_orphan,
@@ -230,6 +238,14 @@ localparam integer R_TX_SMID_MAX  = 23;
 // which are exactly where Loom differs from perf_rdma. These must read ~0;
 // anything else is loom_rx suppressing the ACKs the sender's 1 ms
 // retransmit timer depends on.
+// Egress pacing knob and its proof-of-life (sender side).
+localparam integer R_TX_PACE      = 6;    // pace_n, 0 = off
+localparam integer R_TX_PACED     = 7;    // cycles the pacer held
+// Ingress FIFO full while the shell had a beat (receiver side), and the
+// longest unbroken run of it. Nonzero here on a corrupt run and zero on the
+// clean control closes the loss chain at the vFPGA boundary.
+localparam integer R_RX_FIFO_FULL     = 14;
+localparam integer R_RX_FIFO_FULL_MAX = 15;
 localparam integer R_RX_BP        = 30;
 localparam integer R_RX_BP_MAX    = 31;
 localparam integer R_CYC         = 48;
@@ -317,6 +333,8 @@ logic [63:0] dbg [N_DBG];
 logic [63:0] rx_move, rx_starve, rx_stall, rx_st_head, rx_st_body, rx_req_cnt;
 logic [63:0] rx_stall_run, rx_stall_max;
 logic [63:0] rx_bp, rx_bp_run, rx_bp_max;
+logic [63:0] r_pace, tx_paced;
+logic [63:0] rx_ff, rx_ff_run, rx_ff_max;
 logic [63:0] tx_smid, tx_smid_run, tx_smid_max;
 logic [63:0] rx_partial;
 logic [63:0] pull_desync;
@@ -342,6 +360,7 @@ always_ff @(posedge aclk) begin
         r_dma_dst <= 0; r_dma_src_va <= 0; r_dma_len <= 0; r_dma_src_pid <= 0;
         r_dma_compl_va <= 0; r_rdma_staging <= 0; r_rx_pid <= 0;
         r_chunk <= RDMA_N_WR_OUTSTANDING * PMTU_BYTES - 64;
+        r_pace  <= 0;
     end else if (csr_wr) begin
         case (wr_idx)
             R_TBL_IDX:     r_tbl_idx     <= axi_ctrl.wdata;
@@ -357,6 +376,7 @@ always_ff @(posedge aclk) begin
             R_RDMA_STAGING: r_rdma_staging <= axi_ctrl.wdata;
             R_RX_PID: r_rx_pid <= axi_ctrl.wdata;
             R_CHUNK:  r_chunk  <= axi_ctrl.wdata;
+            R_TX_PACE: r_pace  <= axi_ctrl.wdata;
             default: ;
         endcase
     end
@@ -372,6 +392,7 @@ assign tbl_len    = r_tbl_len[LEN_BITS-1:0];
 assign rdma_staging_va = r_rdma_staging[VADDR_BITS-1:0];
 assign rx_pid          = r_rx_pid[PID_BITS-1:0];
 assign chunk_bytes     = r_chunk[27:0];
+assign pace_n          = r_pace[7:0];
 
 // -------------------------------------------------------------------------
 // Order FIFO - the ordering heart of the design
@@ -521,6 +542,7 @@ always_ff @(posedge aclk) begin
         rx_st_head <= 0; rx_st_body <= 0; rx_req_cnt <= 0; rx_span_cnt <= 0;
         rx_stall_run <= 0; rx_stall_max <= 0;
         rx_bp <= 0; rx_bp_run <= 0; rx_bp_max <= 0;
+        tx_paced <= 0; rx_ff <= 0; rx_ff_run <= 0; rx_ff_max <= 0;
         tx_smid <= 0; tx_smid_run <= 0; tx_smid_max <= 0;
         rx_partial <= 0;
         pull_desync <= 0;
@@ -553,6 +575,14 @@ always_ff @(posedge aclk) begin
         end else begin
             rx_stall_run <= 0;
         end
+        if (cnt_tx_paced) tx_paced <= tx_paced + 1;
+        if (cnt_rx_fifo_full) begin
+            rx_ff     <= rx_ff + 1;
+            rx_ff_run <= rx_ff_run + 1;
+            if (rx_ff_run + 1 > rx_ff_max) rx_ff_max <= rx_ff_run + 1;
+        end else
+            rx_ff_run <= 0;
+
         if (cnt_rx_bp) begin
             rx_bp     <= rx_bp + 1;
             rx_bp_run <= rx_bp_run + 1;
@@ -600,6 +630,7 @@ always_ff @(posedge aclk) begin
             R_RDMA_STAGING: axi_rdata <= r_rdma_staging;
             R_RX_PID:      axi_rdata <= r_rx_pid;
             R_CHUNK:       axi_rdata <= r_chunk;
+            R_TX_PACE:     axi_rdata <= r_pace;
             default:
                 if (rd_idx >= R_DBG_BASE && rd_idx < R_DBG_BASE + N_DBG)
                     axi_rdata <= dbg[rd_idx - R_DBG_BASE];
@@ -617,6 +648,12 @@ always_ff @(posedge aclk) begin
                     axi_rdata <= tx_smid;
                 else if (rd_idx == R_TX_SMID_MAX)
                     axi_rdata <= tx_smid_max;
+                else if (rd_idx == R_TX_PACED)
+                    axi_rdata <= tx_paced;
+                else if (rd_idx == R_RX_FIFO_FULL)
+                    axi_rdata <= rx_ff;
+                else if (rd_idx == R_RX_FIFO_FULL_MAX)
+                    axi_rdata <= rx_ff_max;
                 else if (rd_idx == R_RX_BP)
                     axi_rdata <= rx_bp;
                 else if (rd_idx == R_RX_BP_MAX)
