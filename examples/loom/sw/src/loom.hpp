@@ -101,6 +101,22 @@ constexpr uint32_t CHUNK         = 0x0E0;   // word 28: 0 = do not chunk
 // host write and the packet's ACK from the SAME FSM step, so backpressure
 // here stops ACKs, and a QP that goes 1 ms without one retransmits
 // (transport_timer.hpp). These must read ~0.
+// Starved cycles landing INSIDE a wire packet, and the longest such run.
+// TX_STARVE counts every starved cycle; these say WHERE it lands. A gap
+// between packets costs throughput; a gap inside one means the packetiser
+// began a frame it could not finish. Loom loses 9-12 packets at the far MAC
+// on corrupt runs and 0 on clean ones, while perf_rdma - whose payload comes
+// from the shell's data mover and never gaps - loses 0 of 21.6M on the same
+// link. ~0 here kills that explanation; nonzero and rate-scaling confirms it.
+// Payload beats arriving from the network with a PARTIAL tkeep. loom_rx
+// forwards keep verbatim into the host write and positions by a running beat
+// count, so ONE short beat shifts every byte after it, permanently, while the
+// BEAT counts at both ends still match. That is the only mechanism found that
+// fits every measured constraint (TX 65667 vs RX 65664, orphan 0, desync 0,
+// displacement in whole beats). MUST READ 0.
+constexpr uint32_t RX_PARTIAL    = 0x0B0;   // word 22
+constexpr uint32_t TX_SMID       = 0x0E8;   // word 29
+constexpr uint32_t TX_SMID_MAX   = 0x0B8;   // word 23
 constexpr uint32_t RX_BP         = 0x0F0;   // word 30
 constexpr uint32_t RX_BP_MAX     = 0x0F8;   // word 31
 // Word 29 was max_inflight, removed with the engine's cq_wr pacing. The counters answered their question first:

@@ -163,7 +163,9 @@ loom_table inst_table (
 // loom_ctrl resets to. Zero here would switch chunking off.
 wire [27:0] chunk_bytes = RDMA_N_WR_OUTSTANDING * PMTU_BYTES - 64;
 
+logic cnt_tx_starve_mid;
 loom_engine inst_engine (
+    .cnt_tx_starve_mid(cnt_tx_starve_mid),
     .chunk_bytes(chunk_bytes),
     .aclk(aclk), .aresetn(aresetn),
     .fifo_empty(fifo_empty), .fifo_is_desc(fifo_is_desc),
@@ -210,14 +212,17 @@ logic rx_req_arb, rx_busy, rx_fwd, rx_drop;
 
 localparam [47:0] STAGING  = 48'h7d24_8ca0_0000;   // exporter's staging VA
 localparam [47:0] BASE1    = 48'h7f1b_d420_0000;   // exported dst1
+// Large sizes driven UNDER the gappy pull - hardware's actual condition.
+localparam logic [27:0] big_sizes [3] = '{28'd1048576, 28'd4194304, 28'd8388608};
 localparam [47:0] BASE2    = 48'h7f9e_8860_0000;   // exported dst2
 localparam [47:0] SRC_VA   = 48'h7f6a_2000_0000;   // importer's source buffer
 localparam [47:0] CPL_VA   = 48'h7f6a_3000_0000;   // importer's fence word
 localparam [PID_BITS-1:0] QP_OWNER = 6'd1;         // exporter's data ctid
 
 logic cnt_rx_bp;   // ingress backpressure, any state
+logic cnt_rx_partial;
 loom_rx inst_rx (
-    .cnt_rx_bp(cnt_rx_bp),
+    .cnt_rx_bp(cnt_rx_bp), .cnt_rx_partial(cnt_rx_partial),
     .aclk(aclk), .aresetn(aresetn),
     .rq_req(rx_rq_req), .rq_valid(rx_rq_valid), .rq_ready(rx_rq_ready),
     .rdma_staging_va(STAGING), .rx_pid(QP_OWNER),
@@ -535,6 +540,82 @@ initial forever begin
         wr_cursor = wr_cursor + 64;
     end
 end
+
+
+// -------------------------------------------------------------------------
+// WIRE CONTRACT MONITOR - independent of loom_rx.
+//
+// Every check in this TB so far validates the payload THROUGH loom_rx, and
+// both ends are our code: if loom_engine emits a malformed message and
+// loom_rx decodes it with the same wrong assumption, everything passes while
+// hardware fails, because on hardware the SHELL sits in between and frames
+// the message from the LENGTH IN THE REQUEST, not from our header.
+//
+// So check the engine's output against the shell's contract directly:
+//   wr_req.len is what the shell will fragment and transmit, so the engine
+//   must then emit EXACTLY ceil(len/64) beats - one header beat plus the
+//   payload - with a full tkeep on every one of them.
+// A mismatch here is a malformed message on the wire, and it is invisible to
+// every other check in this file.
+// -------------------------------------------------------------------------
+logic [47:0] wc_vaddr = 0;
+logic [27:0] wc_len   = 0;
+int  wc_expect  = 0;      // beats the shell will take for the current message
+int  wc_seen    = 0;      // beats the engine actually emitted
+int  wc_msgs    = 0;
+int  wc_badlen  = 0;      // emitted beat count != ceil(wr_req.len/64)
+int  wc_badkeep = 0;      // a beat with a partial tkeep
+int  wc_orphan  = 0;      // payload beat with no request outstanding
+bit  wc_active  = 0;
+
+always @(posedge aclk) begin
+    if (eng_wr_valid && eng_wr_ready && eng_wr_req.opcode != LOCAL_WRITE) begin
+        if (wc_active && wc_seen != wc_expect) begin
+            wc_badlen++;
+            if (wc_badlen <= 5)
+                $display("       WIRE: msg %0d vaddr 0x%012x len %0d claimed %0d beats, emitted %0d @%0t",
+                         wc_msgs, wc_vaddr, wc_len, wc_expect, wc_seen, $time);
+        end
+        wc_vaddr  = eng_wr_req.vaddr;
+        wc_len    = eng_wr_req.len;
+        wc_expect = int((eng_wr_req.len + 63) / 64);
+        wc_seen   = 0;
+        wc_active = 1;
+        wc_msgs++;
+    end
+    if (m_net_tvalid && m_net_tready) begin
+        if (!wc_active) wc_orphan++;
+        else            wc_seen++;
+        if (m_net_tkeep !== {(AXI_DATA_BITS/8){1'b1}}) begin
+            wc_badkeep++;
+            if (wc_badkeep <= 5)
+                $display("       WIRE: partial tkeep 0x%016x on beat %0d of msg %0d",
+                         m_net_tkeep, wc_seen, wc_msgs);
+        end
+    end
+end
+
+task automatic wire_contract_report();
+    // close out the last message
+    // The last message is left mid-flight by the injected-damage case: that
+    // case makes the shell MODEL stop draining, so the engine correctly
+    // stalls. Only count it when no damage was injected.
+    if (wc_active && wc_seen != wc_expect) begin
+        if (beats_dropped == 0) begin
+            wc_badlen++;
+            $display("       WIRE: msg %0d vaddr 0x%012x len %0d claimed %0d beats, emitted %0d @%0t (FINAL)",
+                     wc_msgs, wc_vaddr, wc_len, wc_expect, wc_seen, $time);
+        end else begin
+            $display("       WIRE: final msg stalled at %0d of %0d beats - expected, the damage case stopped the model draining",
+                     wc_seen, wc_expect);
+        end
+    end
+    $display("       WIRE CONTRACT: %0d messages, %0d length mismatches, %0d partial keeps, %0d orphan beats",
+             wc_msgs, wc_badlen, wc_badkeep, wc_orphan);
+    check(wc_badlen  == 0, $sformatf("every message emits exactly the beats its request claims (%0d bad)", wc_badlen));
+    check(wc_badkeep == 0, $sformatf("no partial tkeep ever reaches the wire (%0d bad)", wc_badkeep));
+    check(wc_orphan  == 0, $sformatf("no payload beat without an outstanding request (%0d)", wc_orphan));
+endtask
 
 // -------------------------------------------------------------------------
 // Helpers
@@ -1007,6 +1088,36 @@ initial begin
                         bad_msgs));
     end
     pull_gap_pct  = 0;
+    // --- LARGE size UNDER A GAPPY PULL. The soak above runs 256 KB
+    //     messages and the MB-scale cases above all feed the engine beats as
+    //     fast as it takes them. Hardware does neither: it pulls at ~78% duty
+    //     AND the descriptor is megabytes. That corner has never been
+    //     covered, and it is exactly where the two-host runs corrupt. If the
+    //     engine's framing or beat accounting is rate-dependent at scale,
+    //     this finds it; if it stays clean, the sender's framing is not the
+    //     fault and the problem is on the wire or beyond.
+    begin
+        int bad = 0;
+        foreach (big_sizes[k]) begin
+            automatic logic [27:0] blen = big_sizes[k];
+            automatic logic [27:0] boff = 28'h1000000;
+            automatic int words = int'(blen) / 8;
+            fwd_before = rx_txns;
+            copy(4'd1, boff, {16'b0, SRC_VA}, blen, {16'b0, CPL_VA});
+            settle();
+            bad = 0;
+            for (int i = 0; i < words; i++) begin
+                logic [47:0] va = BASE1 + 48'(boff) + 48'(i*8);
+                if (!mem.exists(va >> 3) || mem[va >> 3] != src_word(i)) bad++;
+            end
+            $display("       gappy %0d B: %0d of %0d words bad, %0d writes",
+                     blen, bad, words, rx_txns - fwd_before);
+            check(bad == 0, $sformatf("gappy pull at %0d B lands intact (%0d bad)",
+                                      blen, bad));
+        end
+    end
+
+    pull_gap_pct  = 0;
     pull_gap_max  = 0;
     pull_seg_rand = 0;
 
@@ -1137,6 +1248,10 @@ initial begin
         check(net_owed == 0,
               $sformatf("no request left short of payload (%0d owed)",
                         net_owed));
+
+    // Drain anything still in flight, or the final message reads as truncated.
+    settle(); settle();
+    wire_contract_report();
 
     if (errors == 0) $display("TB PASS (tb_loom_loopback)");
     else             $display("TB FAIL (tb_loom_loopback): %0d errors", errors);

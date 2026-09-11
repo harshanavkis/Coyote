@@ -155,6 +155,8 @@ module loom_engine (
     input  logic [27:0]                 chunk_bytes,
     output logic                        cnt_tx_move,
     output logic                        cnt_tx_starve,
+    // Starvation that lands INSIDE a wire packet - see the block below.
+    output logic                        cnt_tx_starve_mid,
     output logic                        cnt_tx_stall,
 
     output logic                        busy
@@ -287,6 +289,8 @@ logic [22:0] l_sbeats;
 // value for CSR 28. The engine reads the CSR, so software can change it or
 // switch chunking off without a rebuild.
 localparam integer CHUNK_BYTES = RDMA_N_WR_OUTSTANDING * PMTU_BYTES - 64;
+// Wire packet in 64 B beats - the shell fragments at PMTU.
+localparam integer PKT_BEATS = PMTU_BYTES / 64;
 
 // Declared here because ST_RD_REQ latches the first chunk's target from it.
 wire [VADDR_BITS-1:0] dst_vaddr = l_base + {{(VADDR_BITS-28){1'b0}}, l_off};
@@ -663,6 +667,32 @@ wire tx_hdr    = (state == ST_HDR_BEAT);
 assign cnt_tx_move   = (tx_hdr    &&  m_net_tready) ||
                        (tx_stream &&  s_tvalid && m_net_tready);
 assign cnt_tx_starve =  tx_stream && !s_tvalid;
+
+// WHERE the starvation lands, which is the thing that matters and which
+// cnt_tx_starve cannot tell you.
+//
+// The shell fragments this message at PMTU (rdma_req_parser.sv emits
+// plen = PMTU_BYTES per fragment), so on the wire a packet is
+// PMTU_BYTES/64 = 64 beats, counted from the message's header beat. A gap
+// BETWEEN packets costs throughput and nothing else. A gap INSIDE one is a
+// different animal: the packetiser has begun a frame it cannot finish.
+//
+// Why this is worth a counter: Loom loses 9-12 packets at the far MAC on
+// every corrupt run and none on every clean one, while perf_rdma loses 0 of
+// 21.6M on the same link. perf_rdma's payload comes from the shell's data
+// mover and never gaps; ours is hand-fed and starves ~21% of cycles. If
+// that starvation lands mid-frame, an under-run would explain the loss, the
+// PSN cascade behind it (one lost packet makes every packet in flight
+// "completely invalid" -> NAK, Go-Back-N), and the rate dependence.
+// If this reads ~0, that story is dead and the loss is elsewhere.
+logic [6:0] pkt_beat;
+always_ff @(posedge aclk) begin
+    if (!aresetn)                     pkt_beat <= 7'd0;
+    else if (state == ST_HDR_BEAT)    pkt_beat <= 7'd0;   // message restarts a packet
+    else if (cnt_tx_move)             pkt_beat <= (pkt_beat == PKT_BEATS-1) ? 7'd0
+                                                                           : pkt_beat + 7'd1;
+end
+assign cnt_tx_starve_mid = cnt_tx_starve && (pkt_beat != 7'd0);
 assign cnt_tx_stall  = (tx_hdr    && !m_net_tready) ||
                        (tx_stream &&  s_tvalid && !m_net_tready);
 

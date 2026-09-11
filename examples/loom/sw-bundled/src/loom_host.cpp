@@ -125,7 +125,29 @@ constexpr uint64_t BENCH_SIZES[] = {
     // aligned, so 2 MB reads exactly one huge page and 4 MB reads two.
     // 3 MB reads two as well: if it fails, the boundary is the huge page,
     // not a byte count somewhere between 2 and 4 MB. Run it with --offset.
-    3145728                               // 3 MB
+    3145728,                              // 3 MB
+    // The 1-2 MB bisect (2026-09-08..11), every point pinned to --offset
+    // 0x400000 so only the size varied, unchunked, gap 20:
+    //   1.00 / 1.25 / 1.50 / 1.75 MB   INTACT, 0 retransmissions
+    //   1.8125 MB   12 retrans  4 lost   1.875 MB   99 retrans  20 lost
+    //   1.9375 MB   43 retrans 11 lost   2.0 MB     64 retrans  15 lost
+    // So a SINGLE unchunked message is clean up to 1.75 MiB and corrupt from
+    // 1.8125 MiB on this bitstream. Read it as a practical limit, not a
+    // mechanism: the retransmission counts are not monotonic in size and
+    // the first bad word wanders 194882-232258, and the same 4 MB delivered
+    // as 4 x 1 MB separate descriptors (credit 1, fully serialised) is
+    // CORRUPT while a standalone 1 MB is clean. What tracks the loss
+    // monotonically is the sustained RATE: 4 MB software-chunked is clean
+    // at 65472/73728/81920 B (9.835/10.180/10.347 GB/s, 0 retrans) and
+    // corrupt from 90112 B up (10.552 GB/s, 144 retrans, rising with rate).
+    // Destination address (three offsets) and source address (src-skew 64K
+    // and 1M, identical results) are both irrelevant.
+    // APPENDED, never inserted - indices 0..18 and every packed offset above
+    // keep the values the banked measurements were taken with. Like 3 MB
+    // these sit past BUF_SIZE in the packed layout and are SKIPPED unless
+    // run with --offset.
+    1310720, 1572864, 1835008,            // 1.25, 1.5, 1.75 MB
+    1900544, 1966080, 2031616             // 1.8125, 1.875, 1.9375 MB
 };
 // 8 MB exists so a run can send the whole thing as ONE descriptor rather
 // than N iterations of a smaller one. Iterating was only ever a way to reach
@@ -603,6 +625,17 @@ void run_bench(coyote::cThread &t_ctrl, loom::Xpu &A, int win,
         printf("  rdma chunk: %lu B%s\n",
                (unsigned long) loom::csr_read(t_ctrl, loom::CHUNK),
                loom::csr_read(t_ctrl, loom::CHUNK) ? "" : "  (CHUNKING OFF)");
+        {
+            const uint64_t sm  = loom::csr_read(t_ctrl, loom::TX_SMID);
+            const uint64_t smx = loom::csr_read(t_ctrl, loom::TX_SMID_MAX);
+            printf("  starvation INSIDE a packet: %lu cycles, longest run %lu -> %s\n",
+                   (unsigned long) sm, (unsigned long) smx,
+                   sm == 0 ? "none - every gap fell BETWEEN packets, so an "
+                             "under-run cannot explain the lost packets"
+                           : "the engine gapped mid-frame; compare against the "
+                             "packets lost at the far MAC (client TX minus "
+                             "server RX) and against the clean run");
+        }
         const uint64_t part = loom::csr_read(t_ctrl, loom::TX_PARTIAL);
         printf("  tx partial-keep beats: %lu   (payload beats the host read "
                "returned sub-beat; the engine now forces a full keep, this "
@@ -1118,15 +1151,26 @@ int run_server(uint16_t qp_port, uint16_t peer_port, const std::string &sock) {
         printf("  rx orphan beats: %lu   (beats no rq_wr request accounted "
                "for; nonzero means the receive path handed up a packet it "
                "did not deliver)\n", (unsigned long) orph);
+        {
+            const uint64_t rp = loom::csr_read(t_ctrl, loom::RX_PARTIAL);
+            printf("  rx PARTIAL-KEEP beats: %lu -> %s\n", (unsigned long) rp,
+                   rp == 0 ? "none; every beat carried a full 64 B"
+                           : "SHORT BEATS REACHED THE HOST WRITE. loom_rx "
+                             "forwards keep verbatim and positions by a "
+                             "running beat count, so every byte after one of "
+                             "these lands early and never recovers - this is "
+                             "the displacement");
+        }
         const uint64_t bp  = loom::csr_read(t_ctrl, loom::RX_BP);
         const uint64_t bpm = loom::csr_read(t_ctrl, loom::RX_BP_MAX);
         printf("  ingress backpressure: %lu cycles, longest run %lu -> %s\n",
                (unsigned long) bp, (unsigned long) bpm,
-               bp == 0 ? "loom_rx never refused a beat; ACK generation was "
-                         "never blocked by us"
-                       : "loom_rx HELD THE INGRESS OFF; the shell emits the "
-                         "host write and the ACK in one step, so this is ACKs "
-                         "not sent, and 1 ms without one is a retransmit");
+               "NOT a fault signal - measured INVERSELY correlated with "
+               "corruption. The clean 9.84 GB/s run carries the HIGHEST "
+               "backpressure seen (28198 cycles, RX stalled 27.6%) while both "
+               "corrupt ~12.5 GB/s runs sit near 17000 / 7%. High values mean "
+               "the sender is being throttled, which is the safe state. Read "
+               "the RATE, not this.");
         const uint64_t mx = loom::csr_read(t_ctrl, loom::RX_STALL_MAX);
         if (st)
             printf("  longest unbroken stall: %lu cycles of %lu total -> %s\n",

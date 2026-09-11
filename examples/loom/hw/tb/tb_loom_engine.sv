@@ -100,7 +100,9 @@ loom_table inst_table (
 // loom_ctrl resets to. Zero here would switch chunking off.
 wire [27:0] chunk_bytes = RDMA_N_WR_OUTSTANDING * PMTU_BYTES - 64;
 
+logic cnt_tx_starve_mid;
 loom_engine inst_engine (
+    .cnt_tx_starve_mid(cnt_tx_starve_mid),
     .chunk_bytes(chunk_bytes),
     .aclk(aclk), .aresetn(aresetn),
     .fifo_empty(fifo_empty), .fifo_is_desc(fifo_is_desc),

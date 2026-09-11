@@ -37,6 +37,7 @@ logic m_tready = 1;
 logic req, grant = 0, busy, cnt_rx_fwd, cnt_rx_drop, cnt_rx_orphan;
 int orphan_pulses = 0;
 logic cnt_rx_move, cnt_rx_starve, cnt_rx_stall;
+logic cnt_rx_partial;
 logic cnt_rx_bp;
 logic cnt_rx_stall_head, cnt_rx_stall_body, cnt_rx_req, cnt_rx_span;
 int req_pulses = 0, span_pulses = 0;
@@ -69,7 +70,7 @@ loom_rx dut (
     .cnt_rx_fwd(cnt_rx_fwd), .cnt_rx_drop(cnt_rx_drop),
     .cnt_rx_orphan(cnt_rx_orphan),
     .cnt_rx_move(cnt_rx_move), .cnt_rx_starve(cnt_rx_starve),
-    .cnt_rx_stall(cnt_rx_stall), .cnt_rx_bp(cnt_rx_bp),
+    .cnt_rx_stall(cnt_rx_stall), .cnt_rx_bp(cnt_rx_bp), .cnt_rx_partial(cnt_rx_partial),
     .cnt_rx_stall_head(cnt_rx_stall_head),
     .cnt_rx_stall_body(cnt_rx_stall_body),
     .cnt_rx_req(cnt_rx_req), .cnt_rx_span(cnt_rx_span)

@@ -114,11 +114,13 @@ module loom_ctrl (
     input  logic                        cnt_rx_starve,
     input  logic                        cnt_rx_stall,
     input  logic                        cnt_rx_bp,
+    input  logic                        cnt_rx_partial,
     input  logic                        cnt_pull_desync,
     input  logic                        cnt_rx_orphan,
     input  logic                        cnt_tx_partial,
     input  logic                        cnt_tx_move,
     input  logic                        cnt_tx_starve,
+    input  logic                        cnt_tx_starve_mid,
     input  logic                        cnt_tx_stall,
     input  logic                        cnt_rx_stall_head,
     input  logic                        cnt_rx_stall_body,
@@ -209,6 +211,18 @@ localparam integer R_TX_PARTIAL   = 27;
 // the two can be compared on ONE bitstream instead of two. Reset value is the
 // derived safe size, so it works without software touching it.
 localparam integer R_CHUNK        = 28;
+// Starved cycles that land INSIDE a wire packet, and the longest such run.
+// cnt_tx_starve counts every starved cycle; these two say whether the gap
+// falls between packets (costs throughput) or inside one (the packetiser has
+// begun a frame it cannot finish). Loom loses 9-12 packets at the far MAC on
+// corrupt runs and 0 on clean ones; perf_rdma, whose payload never gaps,
+// loses 0 of 21.6M. ~0 here kills that explanation cheaply.
+// Payload beats arriving from the network with a PARTIAL tkeep. loom_rx
+// forwards keep verbatim into the host write and positions by a running beat
+// count, so a short beat shifts every byte after it permanently. Must be 0.
+localparam integer R_RX_PARTIAL   = 22;
+localparam integer R_TX_SMID      = 29;
+localparam integer R_TX_SMID_MAX  = 23;
 // 29 is free (was max_inflight, removed with the cq_wr pacing).
 // Ingress backpressure: cycles loom_rx refused a beat the shell offered, in
 // ANY state, and the longest unbroken run of them. R_RX_STALL is
@@ -303,6 +317,8 @@ logic [63:0] dbg [N_DBG];
 logic [63:0] rx_move, rx_starve, rx_stall, rx_st_head, rx_st_body, rx_req_cnt;
 logic [63:0] rx_stall_run, rx_stall_max;
 logic [63:0] rx_bp, rx_bp_run, rx_bp_max;
+logic [63:0] tx_smid, tx_smid_run, tx_smid_max;
+logic [63:0] rx_partial;
 logic [63:0] pull_desync;
 logic [63:0] rx_orphan;
 logic [63:0] tx_partial;
@@ -505,6 +521,8 @@ always_ff @(posedge aclk) begin
         rx_st_head <= 0; rx_st_body <= 0; rx_req_cnt <= 0; rx_span_cnt <= 0;
         rx_stall_run <= 0; rx_stall_max <= 0;
         rx_bp <= 0; rx_bp_run <= 0; rx_bp_max <= 0;
+        tx_smid <= 0; tx_smid_run <= 0; tx_smid_max <= 0;
+        rx_partial <= 0;
         pull_desync <= 0;
         rx_orphan <= 0;
         tx_partial <= 0;
@@ -541,6 +559,14 @@ always_ff @(posedge aclk) begin
             if (rx_bp_run + 1 > rx_bp_max) rx_bp_max <= rx_bp_run + 1;
         end else begin
             rx_bp_run <= 0;
+        end
+        if (cnt_rx_partial)  rx_partial <= rx_partial + 1;
+        if (cnt_tx_starve_mid) begin
+            tx_smid     <= tx_smid + 1;
+            tx_smid_run <= tx_smid_run + 1;
+            if (tx_smid_run + 1 > tx_smid_max) tx_smid_max <= tx_smid_run + 1;
+        end else begin
+            tx_smid_run <= 0;
         end
         if (cnt_rx_stall_head) rx_st_head <= rx_st_head + 1;
         if (cnt_rx_stall_body) rx_st_body <= rx_st_body + 1;
@@ -585,6 +611,12 @@ always_ff @(posedge aclk) begin
                     axi_rdata <= rx_stall;
                 else if (rd_idx == R_RX_STALL_MAX)
                     axi_rdata <= rx_stall_max;
+                else if (rd_idx == R_RX_PARTIAL)
+                    axi_rdata <= rx_partial;
+                else if (rd_idx == R_TX_SMID)
+                    axi_rdata <= tx_smid;
+                else if (rd_idx == R_TX_SMID_MAX)
+                    axi_rdata <= tx_smid_max;
                 else if (rd_idx == R_RX_BP)
                     axi_rdata <= rx_bp;
                 else if (rd_idx == R_RX_BP_MAX)

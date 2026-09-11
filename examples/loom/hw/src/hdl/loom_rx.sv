@@ -105,6 +105,8 @@ module loom_rx (
     output logic                        cnt_rx_starve,  // ingress had nothing
     output logic                        cnt_rx_stall,
     output logic                        cnt_rx_bp,   // host write not ready
+    // A payload beat arriving from the network with a PARTIAL tkeep.
+    output logic                        cnt_rx_partial,
     // Stall split by WHERE in the packet it lands, which is what tells the
     // two candidate fixes apart. This module is single-outstanding on the
     // write side: it posts one sq_wr, streams that packet, and only then
@@ -411,6 +413,20 @@ assign cnt_rx_stall  = (state == ST_STREAM) &&  s_tvalid && !m_tready;
 // stops ACKs, and a QP that goes 1 ms without one retransmits. This counter
 // is the direct measure of the thing being fixed - it must read ~0.
 assign cnt_rx_bp     = s_tvalid && !s_tready;
+
+// PARTIAL KEEP ON THE RECEIVE PATH. m_tkeep is forwarded VERBATIM from the
+// network into the host write, so a beat carrying fewer than 64 valid bytes
+// writes short - and because this module positions payload by a RUNNING
+// COUNT of beats, every byte after it lands early and never recovers.
+//
+// The sender has had this counter since 358603b5 (cnt_tx_partial reads 0,
+// and the engine forces a full keep onto the wire); the receiver never had
+// one. It is the only mechanism found that satisfies EVERY measured
+// constraint at once: beat counts match at both ends (TX 65667 vs RX 65664),
+// rx_orphan is 0 (the beat IS forwarded and IS covered), pull_desync is 0
+// (that is the sender), and the payload still shifts by whole beats.
+assign cnt_rx_partial = (state == ST_STREAM) && s_tvalid && m_tready && covered
+                        && (s_tkeep != {(AXI_DATA_BITS/8){1'b1}});
 
 assign cnt_rx_stall_head = cnt_rx_stall && !l_moved;
 assign cnt_rx_stall_body = cnt_rx_stall &&  l_moved;

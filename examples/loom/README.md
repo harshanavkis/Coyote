@@ -281,6 +281,33 @@ cd examples/loom
 - `--retries` reflashes and retries after a wedge — never use it when
   measuring a failure rate. `--settle`, `--credit`, `--skip-bulk`,
   `--no-flash`, `--out`: see `--help`.
+- `--chunk BYTES --chunk-credit N` delivers the region as a sequence of
+  descriptors of that size with N left unretired. **This is the safe way to
+  move anything large today.** Measured 2026-09-11 on a 4 MB region:
+
+  ```
+  chunk B   GB/s    retrans
+   65472    9.835      0   intact
+   73728   10.180      0   intact
+   81920   10.347      0   intact   <- best clean point
+   90112   10.552    144   CORRUPT
+   98304   10.687    245   CORRUPT
+  262144   11.850    547   CORRUPT
+  ```
+
+  Loss rises monotonically with sustained rate above a knee at
+  ~10.35–10.55 GB/s. `--chunk 81920 --chunk-credit 64` is byte-exact with
+  0 retransmissions at 10.347 GB/s and is the number to quote. Unchunked, a
+  single message is clean up to **1.75 MiB** and corrupt from 1.8125 MiB
+  (`--hw-chunk 0`, every point pinned to `--offset 0x400000`); read that as
+  a practical limit, not a mechanism — the same 4 MB as 4 × 1 MB separate
+  descriptors is corrupt even at `--chunk-credit 1`.
+- `--hw-chunk BYTES` sets the engine's own chunk size (CSR 28); `0` turns
+  hardware chunking off. Distinct from `--chunk`, which chunks in software.
+  Engine chunking alone does not avoid the loss.
+- The six bisect sizes 1.25 / 1.5 / 1.75 / 1.8125 / 1.875 / 1.9375 MiB are
+  appended to `BENCH_SIZES` and fall past `BUF_SIZE` in the packed layout,
+  so they are skipped unless run with `--offset`.
 
 Every point does teardown → flash → setup on **both** cards first (from
 `~/coyote-bitstreams/loom/hw/bitstreams/cyt_top.bit`; override with `BIT`).
