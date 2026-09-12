@@ -553,14 +553,18 @@ logic [27:0] wr_left = 0;
 int rx_txns = 0;                      // loom_rx transactions completed
 int wr_q_max = 0;                     // deepest the queue got (proves pipelining)
 int wr_orphan_beats = 0;              // data with no descriptor to land against
+int wr_last_reqs = 0;                 // requests posted with last=1 (one per MESSAGE)
+int rx_tlasts = 0;                    // tlast beats on the host write stream (one per MESSAGE)
 initial forever begin
     @(posedge aclk);
     if (rx_wr_valid && rx_wr_ready) begin
         wr_q.push_back('{rx_wr_req.vaddr, rx_wr_req.len});
         rx_txns++;
+        if (rx_wr_req.last) wr_last_reqs++;
         if (wr_q.size() > wr_q_max) wr_q_max = wr_q.size();
     end
     if (rx_m_tvalid && rx_m_tready) begin
+        if (rx_m_tlast) rx_tlasts++;
         if (wr_left == 0) begin
             if (wr_q.size() == 0) begin
                 wr_orphan_beats++;
@@ -757,6 +761,7 @@ endtask
 
 int n_writes_before;
 int landed, ovf, fwd_before;
+int last_before = 0, tlast_before = 0;
 logic [63:0] ovf_before;
 
 initial begin
@@ -1043,7 +1048,7 @@ initial begin
           $sformatf("512 KB lands as one write per packet (%0d, want %0d)",
                     rx_txns - fwd_before, packets_of(524288)));
 
-    fwd_before = rx_txns;
+    fwd_before = rx_txns; last_before = wr_last_reqs; tlast_before = rx_tlasts;
     copy(4'd1, 28'h800000, {16'b0, SRC_VA}, 28'd1048576, {16'b0, CPL_VA});
     settle();
     check_payload(BASE1 + 48'h800000, 131072,
@@ -1056,6 +1061,18 @@ initial begin
     $display("       1 MB: host-write queue reached depth %0d (loom_rx allows %0d), orphan beats %0d",
              wr_q_max, 8, wr_orphan_beats);
     check(wr_q_max >= 2, $sformatf("1 MB: writes are pipelined (queue depth %0d >= 2)", wr_q_max));
+    // last=1 (and its tlast) costs a completion writeback in the shell, so
+    // it goes on each MESSAGE's final packet only. The engine chunks this
+    // 1 MB into ceil(1048576/65472) = 17 wire messages of 257 packets in
+    // all, so 17 of the 257 writes carry last, not 257.
+    $display("       1 MB: %0d request(s) with last=1, %0d tlast beat(s), %0d messages",
+             wr_last_reqs - last_before, rx_tlasts - tlast_before, (1048576 + 65472 - 1) / 65472);
+    check(wr_last_reqs - last_before == (1048576 + 65472 - 1) / 65472,
+          $sformatf("1 MB: one last=1 request per message (%0d, want %0d)",
+                    wr_last_reqs - last_before, (1048576 + 65472 - 1) / 65472));
+    check(rx_tlasts - tlast_before == (1048576 + 65472 - 1) / 65472,
+          $sformatf("1 MB: one tlast per message (%0d, want %0d)",
+                    rx_tlasts - tlast_before, (1048576 + 65472 - 1) / 65472));
     check(wr_orphan_beats == 0, $sformatf("1 MB: no data beat arrived without a posted write (%0d)", wr_orphan_beats));
 
     // 8 MB: 2049 packets, 131073 beats. On hardware a lone message this

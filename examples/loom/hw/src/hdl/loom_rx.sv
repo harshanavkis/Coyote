@@ -415,7 +415,20 @@ always_comb begin
     wr_req.vaddr  = (state == ST_IDLE) ? s_tdata[64 +: VADDR_BITS] : q_va;
     wr_req.len    = (state == ST_IDLE) ? first_len : q_len;
     wr_req.dest   = 0;
-    wr_req.last   = 1'b1;
+    // last ONLY on the message's final packet. With EN_WB every write
+    // completed with last=1 also costs a completion WRITEBACK - a separate
+    // small PCIe write of the completion count (cnfg_slave.sv meta_done_wr
+    // -> wback[1]) - on the same host-write path as the data. Setting it on
+    // every packet was 1033 writebacks per 4 MB, ~28 stalled cycles per
+    // 64-beat packet, and a receiver ceiling of ~10 GB/s that pipelining
+    // the requests could not lift (build_sep12: knee unchanged). perf_rdma's
+    // receiver forwards rq_wr.last, which the stack raises only on the LAST
+    // packet, so it pays that once per message; this does the same. The
+    // shell terminates a last=0 write by its byte count (that is how every
+    // FIRST/MIDDLE fragment already works) and the stream must then carry
+    // no tlast for it - see m_tlast below.
+    wr_req.last   = (state == ST_IDLE) ? (hdr_len <= first_len)
+                                       : (q_left <= q_len);
     wr_valid = ((state == ST_IDLE) && s_tvalid && grant && covered && hdr_ok)
                || gen_on;
 end
@@ -441,10 +454,11 @@ always_comb begin
     end else begin
         m_tdata  = s_tdata;
         m_tkeep  = s_tkeep;
-        // The write we issued must be terminated even when the incoming
-        // stream carries no tlast of its own (rq_wr.last low): the beat
-        // budget ends the transaction, so it ends the stream too
-        m_tlast  = stream_end;
+        // tlast only where the write was posted with last=1: the message's
+        // final packet. Intermediate packets end by byte count, as their
+        // requests said they would; a tlast there would terminate a
+        // descriptor the shell is not expecting to see terminated.
+        m_tlast  = stream_end && (w_left == 28'd0);
         m_tvalid = (state == ST_STREAM) && s_tvalid && covered;
     end
 end
