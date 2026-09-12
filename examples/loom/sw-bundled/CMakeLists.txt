@@ -24,5 +24,8 @@ add_executable(loom_host ${TARGET_DIR}/loom_host.cpp)
 target_link_libraries(loom_host PUBLIC Coyote pthread)
 
 # FPGA-free peering protocol test (no cThread; runs anywhere)
+add_executable(csr_probe ${TARGET_DIR}/csr_probe.cpp)
+target_link_libraries(csr_probe PUBLIC Coyote pthread)
+
 add_executable(test_peering ${TARGET_DIR}/test_peering.cpp)
 target_link_libraries(test_peering PUBLIC Coyote pthread)

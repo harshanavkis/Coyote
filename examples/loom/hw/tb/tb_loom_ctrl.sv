@@ -381,6 +381,27 @@ initial begin
                         mx));
     end
 
+    // 20: the hardware sequence that clobbered CSR 6. On the card, a write
+    //     to TBL_IDX left word 4 = 0 and word 6 = {0x400c012, last araddr},
+    //     and a write to TBL_LEN left word 6 = 0. Reproduce it exactly:
+    //     read something first (so there IS a last araddr), then write
+    //     TX_PACE, then a table register, then read both back.
+    begin
+        logic [63:0] v4, v6, v6b;
+        axil_read(16'(41 * 8), v6);                 // last read = word 41
+        axil_write(16'(6 * 8), 64'd8);              // TX_PACE = 8
+        axil_write(16'(4 * 8), 64'h1234);           // TBL_LEN
+        axil_read(16'(6 * 8), v6);
+        check(v6 == 64'd8, $sformatf("20: TX_PACE survives a TBL_LEN write (%0h)", v6));
+        axil_write(16'(0 * 8), 64'd2);              // TBL_IDX = 2
+        axil_read(16'(4 * 8), v4);
+        axil_read(16'(6 * 8), v6b);
+        check(v4 == 64'h1234, $sformatf("20: TBL_LEN survives a TBL_IDX write (%0h)", v4));
+        check(v6b == 64'd8,   $sformatf("20: TX_PACE survives a TBL_IDX write (%0h)", v6b));
+        $display("       20: after TBL_IDX write: w4=%0h w6=%0h", v4, v6b);
+        axil_write(16'(6 * 8), 64'd0);
+    end
+
     if (errors == 0) $display("TB PASS (tb_loom_ctrl)");
     else             $display("TB FAIL (tb_loom_ctrl): %0d errors", errors);
     $finish;

@@ -1357,6 +1357,22 @@ int run_client(const std::string &ip, uint16_t qp_port, uint16_t peer_port,
     check(dropped, "store to released window dropped at source");
     dump_counters(t_ctrl, "client final");
 
+    // Re-arm the pacing knob right before the bench. On hardware a write to
+    // any table register (TBL_IDX/CFG/LEN/COMMIT - words 0-5) also clobbers
+    // words 4 and 6 of the same 64-byte line with stale or address-derived
+    // data; releaseWindow above does exactly that and wiped CSR 6 in every
+    // run of the first sweep. Simulation does not reproduce it, so it is the
+    // ctrl mapping or the shell's AXI-Lite bridge, not loom_ctrl (see the
+    // README TODO on pgprot_writecombine for MMAP_CTRL). Nothing in line 0
+    // is written after this point, so a rewrite here holds for the bench.
+    if (const char *e = getenv("LOOM_TX_PACE")) {
+        const uint64_t want = strtoull(e, nullptr, 0);
+        loom::csr_write(t_ctrl, loom::TX_PACE, want);
+        const uint64_t got = loom::csr_read(t_ctrl, loom::TX_PACE);
+        printf("engine config: tx_pace re-armed before bench: %lu (%s)\n",
+               (unsigned long) got, got == want ? "ok" : "DID NOT TAKE");
+        fflush(stdout);
+    }
     if (bench_mode()) run_bench(t_ctrl, A, w1, src, fence);
 
     check(peer.done(), "DONE barrier acknowledged");
