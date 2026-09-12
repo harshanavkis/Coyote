@@ -103,7 +103,7 @@ wire [27:0] chunk_bytes = RDMA_N_WR_OUTSTANDING * PMTU_BYTES - 64;
 logic cnt_tx_starve_mid;
 loom_engine inst_engine (
     .cnt_tx_starve_mid(cnt_tx_starve_mid),
-    .chunk_bytes(chunk_bytes),
+    .chunk_bytes(chunk_bytes), .pace_num(8'd0), .pace_den(8'd0), .cnt_tx_paced(),
     .aclk(aclk), .aresetn(aresetn),
     .fifo_empty(fifo_empty), .fifo_is_desc(fifo_is_desc),
     .fifo_is_read(fifo_is_read),

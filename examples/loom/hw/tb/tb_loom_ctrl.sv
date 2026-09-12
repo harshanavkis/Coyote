@@ -382,24 +382,31 @@ initial begin
     end
 
     // 20: the hardware sequence that clobbered CSR 6. On the card, a write
-    //     to TBL_IDX left word 4 = 0 and word 6 = {0x400c012, last araddr},
-    //     and a write to TBL_LEN left word 6 = 0. Reproduce it exactly:
-    //     read something first (so there IS a last araddr), then write
-    //     TX_PACE, then a table register, then read both back.
+    //     to any table register also clobbered words 4 and 6 of line 0 with
+    //     stale or address-derived data; the RTL never did (this case ran
+    //     against word 6 and passed while hardware failed). TX_PACE now
+    //     lives at word 64 on an otherwise-empty line, and data-register
+    //     writes require a full strobe. Check both.
     begin
-        logic [63:0] v4, v6, v6b;
-        axil_read(16'(41 * 8), v6);                 // last read = word 41
-        axil_write(16'(6 * 8), 64'd8);              // TX_PACE = 8
+        logic [63:0] v4, vp, vq;
+        axil_read(16'(41 * 8), vp);                 // last read = word 41
+        axil_write(16'(64 * 8), 64'h2829);          // TX_PACE = 41/64 -> {den=0x28, num=0x29}
         axil_write(16'(4 * 8), 64'h1234);           // TBL_LEN
-        axil_read(16'(6 * 8), v6);
-        check(v6 == 64'd8, $sformatf("20: TX_PACE survives a TBL_LEN write (%0h)", v6));
         axil_write(16'(0 * 8), 64'd2);              // TBL_IDX = 2
+        axil_write(16'(5 * 8), 64'd1);              // TBL_COMMIT
         axil_read(16'(4 * 8), v4);
-        axil_read(16'(6 * 8), v6b);
-        check(v4 == 64'h1234, $sformatf("20: TBL_LEN survives a TBL_IDX write (%0h)", v4));
-        check(v6b == 64'd8,   $sformatf("20: TX_PACE survives a TBL_IDX write (%0h)", v6b));
-        $display("       20: after TBL_IDX write: w4=%0h w6=%0h", v4, v6b);
-        axil_write(16'(6 * 8), 64'd0);
+        axil_read(16'(64 * 8), vp);
+        check(v4 == 64'h1234, $sformatf("20: TBL_LEN survives table writes (%0h)", v4));
+        check(vp == 64'h2829, $sformatf("20: TX_PACE (word 64) survives table writes (%0h)", vp));
+        // a partial-strobe beat must not land
+        axil_write(16'(64 * 8), 64'hDEAD, 8'h0F);
+        axil_read(16'(64 * 8), vq);
+        check(vq == 64'h2829, $sformatf("20: partial-strobe write to TX_PACE ignored (%0h)", vq));
+        axil_write(16'(64 * 8), 64'h0, 8'h00);
+        axil_read(16'(64 * 8), vq);
+        check(vq == 64'h2829, $sformatf("20: zero-strobe write to TX_PACE ignored (%0h)", vq));
+        $display("       20: w4=%0h w64=%0h after table writes and strobe-0/partial writes", v4, vq);
+        axil_write(16'(64 * 8), 64'd0);
     end
 
     if (errors == 0) $display("TB PASS (tb_loom_ctrl)");

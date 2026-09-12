@@ -167,7 +167,7 @@ logic cnt_tx_starve_mid;
 // Egress pacing under test: 0 = off (the default every case above runs
 // with); the pacing case sets it, counts holds against moved payload beats,
 // and checks the region still lands byte-exact.
-logic [7:0] pace_n = 8'd0;
+logic [7:0] pace_num = 8'd0, pace_den = 8'd0;
 logic       cnt_tx_paced, cnt_tx_move_o;
 int         paced_cycles = 0, net_moved_beats = 0;
 // plain always, not always_ff: the test sequence zeroes these between cases
@@ -178,7 +178,7 @@ always @(posedge aclk) begin
 end
 loom_engine inst_engine (
     .cnt_tx_starve_mid(cnt_tx_starve_mid),
-    .cnt_tx_paced(cnt_tx_paced), .pace_n(pace_n),
+    .cnt_tx_paced(cnt_tx_paced), .pace_num(pace_num), .pace_den(pace_den),
     .chunk_bytes(chunk_bytes),
     .aclk(aclk), .aresetn(aresetn),
     .fifo_empty(fifo_empty), .fifo_is_desc(fifo_is_desc),
@@ -274,6 +274,10 @@ int   pull_beats;
 // possible stimulus, and it is why every TB passes while hardware displaces.
 // These introduce idle cycles between beats and vary where the response's
 // tlast falls, so the engine is driven the way the shell actually drives it.
+// The default pull drops tvalid after every handshake - one beat per two
+// cycles, 50% duty at best. That is fine for framing checks but cannot
+// exercise a rate cap above 1/2; pull_fast streams back-to-back at 100%.
+bit pull_fast     = 0;
 int pull_gap_pct  = 0;      // chance of an idle cycle before each beat
 int pull_gap_max  = 0;      // up to this many idle cycles
 int pull_seg_rand = 0;      // randomise the response's chunk boundaries
@@ -310,8 +314,10 @@ initial forever begin
                              ? ($urandom_range(63) == 0)
                              : (PULL_SEG != 0 && ((b + 1) % PULL_SEG == 0)));
             do @(posedge aclk); while (!pull_tready);
-            @(negedge aclk);
-            pull_tvalid = 0; pull_tlast = 0;
+            if (!pull_fast || b == pull_beats - 1) begin
+                @(negedge aclk);
+                pull_tvalid = 0; pull_tlast = 0;
+            end
         end
         // The surplus beat: valid data, correct framing, simply one more
         // than was asked for.
@@ -534,17 +540,36 @@ end
 logic [63:0] mem [logic [47:0]];      // keyed by vaddr >> 3
 logic [47:0] writes[$];               // vaddr of every word written, in order
 
-logic [47:0] wr_cursor;
-logic [27:0] wr_left;
+// The shell QUEUES host-write descriptors and lands the data stream
+// against them in order, so loom_rx may post the next packet's write while
+// the current one is still streaming (that is the point of its request
+// generator). Model exactly that: a FIFO of {vaddr, len}; data consumes
+// the head and pops it when its byte budget is spent. A single cursor
+// here would let a request overwrite the one still being written.
+typedef struct { logic [47:0] va; logic [27:0] len; } wr_desc_t;
+wr_desc_t wr_q[$];
+logic [47:0] wr_cursor = 0;
+logic [27:0] wr_left = 0;
 int rx_txns = 0;                      // loom_rx transactions completed
+int wr_q_max = 0;                     // deepest the queue got (proves pipelining)
+int wr_orphan_beats = 0;              // data with no descriptor to land against
 initial forever begin
     @(posedge aclk);
     if (rx_wr_valid && rx_wr_ready) begin
-        wr_cursor = rx_wr_req.vaddr;
-        wr_left   = rx_wr_req.len;
+        wr_q.push_back('{rx_wr_req.vaddr, rx_wr_req.len});
         rx_txns++;
+        if (wr_q.size() > wr_q_max) wr_q_max = wr_q.size();
     end
     if (rx_m_tvalid && rx_m_tready) begin
+        if (wr_left == 0) begin
+            if (wr_q.size() == 0) begin
+                wr_orphan_beats++;
+            end else begin
+                wr_cursor = wr_q[0].va;
+                wr_left   = wr_q[0].len;
+                wr_q.pop_front();
+            end
+        end
         for (int l = 0; l < 8 && wr_left > 0; l++) begin
             mem[(wr_cursor + l*8) >> 3] = rx_m_tdata[64*l +: 64];
             writes.push_back(wr_cursor + l*8);
@@ -1026,6 +1051,12 @@ initial begin
     check(rx_txns - fwd_before == packets_of(1048576),
           $sformatf("1 MB lands as one write per packet (%0d, want %0d)",
                     rx_txns - fwd_before, packets_of(1048576)));
+    // The request generator must run AHEAD of the data: with the sink
+    // always ready, several packet writes should be queued at once.
+    $display("       1 MB: host-write queue reached depth %0d (loom_rx allows %0d), orphan beats %0d",
+             wr_q_max, 8, wr_orphan_beats);
+    check(wr_q_max >= 2, $sformatf("1 MB: writes are pipelined (queue depth %0d >= 2)", wr_q_max));
+    check(wr_orphan_beats == 0, $sformatf("1 MB: no data beat arrived without a posted write (%0d)", wr_orphan_beats));
 
     // 8 MB: 2049 packets, 131073 beats. On hardware a lone message this
     // size loses packets because the receiver's host write saturates at
@@ -1061,47 +1092,47 @@ initial begin
     tlast_per_pkt = 0;
 
     // --- EGRESS PACING. The receiver's host write saturates at ~10 GB/s
-    //     on hardware and the link has no flow control, so loom_engine can
-    //     hold one idle cycle after every pace_n payload beats. Two things
-    //     must hold: the region still lands byte-exact (the hold withdraws
-    //     tvalid only after a completed handshake, and the engine must not
-    //     lose or duplicate the beat it paused on), and the hold count must
-    //     be what the knob says - one per pace_n moved beats, per chunk,
-    //     which is how the hardware run proves the CSR took.
+    //     on hardware and the link has no flow control, so loom_engine caps
+    //     payload beats at pace_num/pace_den of cycles with a one-beat
+    //     credit accumulator. Two things must hold: the region still lands
+    //     byte-exact (the hold gates tvalid only after a completed handshake
+    //     and the engine must not lose or duplicate the beat it paused on),
+    //     and the hold count must be what the fraction says - moved beats
+    //     cost den each, every cycle earns num, so holds ~= moved*(den-num)/num
+    //     - which is how the hardware run proves the CSR took.
     check(paced_cycles == 0, "pacing off: the pacer never held");
-    pace_n = 8'd4;
+    pull_fast = 1;                             // a cap only binds if the pull can exceed it
+    pace_num = 8'd1; pace_den = 8'd2;          // 50%: hold one per beat
     paced_cycles = 0; net_moved_beats = 0;
     fwd_before = rx_txns;
     copy(4'd1, 28'h1400000, {16'b0, SRC_VA}, 28'd524288, {16'b0, CPL_VA});
     settle();
     check_payload(BASE1 + 48'h1400000, 65536,
-                  "paced N=4: 512 KB message lands intact");
+                  "paced 1/2: 512 KB message lands intact");
     check(rx_txns - fwd_before == packets_of(524288),
-          $sformatf("paced N=4: one write per packet (%0d, want %0d)",
+          $sformatf("paced 1/2: one write per packet (%0d, want %0d)",
                     rx_txns - fwd_before, packets_of(524288)));
-    // floor(beats/4) per chunk: the pacer restarts at every chunk, so the
-    // total is short of moved/4 by at most one hold per chunk.
-    $display("       paced N=4: %0d holds for %0d payload beats (moved/4 = %0d)",
-             paced_cycles, net_moved_beats, net_moved_beats / 4);
-    check(paced_cycles > 0 &&
-          paced_cycles <= net_moved_beats / 4 &&
-          paced_cycles >= net_moved_beats / 4 - (524288 / 65472 + 2),
-          $sformatf("paced N=4: pacer held %0d cycles for %0d payload beats (want ~%0d)",
-                    paced_cycles, net_moved_beats, net_moved_beats / 4));
-    pace_n = 8'd1;    // the harshest setting: every other cycle
+    $display("       paced 1/2: %0d holds for %0d payload beats (want ~%0d)",
+             paced_cycles, net_moved_beats, net_moved_beats);
+    check(paced_cycles >= net_moved_beats - (524288 / 65472 + 2) &&
+          paced_cycles <= net_moved_beats + (524288 / 65472 + 2),
+          $sformatf("paced 1/2: pacer held %0d cycles for %0d payload beats",
+                    paced_cycles, net_moved_beats));
+    pace_num = 8'd41; pace_den = 8'd64;        // ~64%: the hardware target
     paced_cycles = 0; net_moved_beats = 0;
     fwd_before = rx_txns;
     copy(4'd1, 28'h1500000, {16'b0, SRC_VA}, 28'd262144, {16'b0, CPL_VA});
     settle();
     check_payload(BASE1 + 48'h1500000, 32768,
-                  "paced N=1: 256 KB message lands intact");
-    $display("       paced N=1: %0d holds for %0d payload beats",
-             paced_cycles, net_moved_beats);
-    check(paced_cycles >= net_moved_beats - (262144 / 65472 + 2) &&
-          paced_cycles <= net_moved_beats,
-          $sformatf("paced N=1: pacer held %0d cycles for %0d payload beats",
-                    paced_cycles, net_moved_beats));
-    pace_n = 8'd0;
+                  "paced 41/64: 256 KB message lands intact");
+    $display("       paced 41/64: %0d holds for %0d payload beats (want ~%0d)",
+             paced_cycles, net_moved_beats, net_moved_beats * 23 / 41);
+    check(paced_cycles >= net_moved_beats * 23 / 41 - (262144 / 65472 + 2) * 2 &&
+          paced_cycles <= net_moved_beats * 23 / 41 + (262144 / 65472 + 2) * 2,
+          $sformatf("paced 41/64: pacer held %0d cycles for %0d payload beats (want ~%0d)",
+                    paced_cycles, net_moved_beats, net_moved_beats * 23 / 41));
+    pace_num = 8'd0; pace_den = 8'd0;
+    pull_fast = 0;
 
     // ---------------------------------------------------------------------
     // Soak the engine the way hardware drives it: a gappy pull at roughly

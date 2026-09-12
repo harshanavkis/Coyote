@@ -98,8 +98,10 @@ module loom_ctrl (
     output logic [PID_BITS-1:0]         rx_pid,
     // RDMA chunk size in bytes; 0 disables chunking
     output logic [27:0]                 chunk_bytes,
-    // Egress pacing: idle cycle after every pace_n rdma payload beats, 0 = off
-    output logic [7:0]                  pace_n,
+    // Egress pacing: payload beats may move at most pace_num/pace_den of
+    // cycles on the rdma route; off when either is 0 or num >= den
+    output logic [7:0]                  pace_num,
+    output logic [7:0]                  pace_den,
 
     // Read response (from loom_engine): completes the held-open AXI read
     input  logic [63:0]                 rd_resp_data,
@@ -238,9 +240,15 @@ localparam integer R_TX_SMID_MAX  = 23;
 // which are exactly where Loom differs from perf_rdma. These must read ~0;
 // anything else is loom_rx suppressing the ACKs the sender's 1 ms
 // retransmit timer depends on.
-// Egress pacing knob and its proof-of-life (sender side).
-localparam integer R_TX_PACE      = 6;    // pace_n, 0 = off
-localparam integer R_TX_PACED     = 7;    // cycles the pacer held
+// Egress pacing knob and its proof-of-life (sender side). Word 64, NOT 6:
+// on hardware a write to any window-table register (words 0-5) also
+// clobbers words 4 and 6 of the same 64-byte line with stale or
+// address-derived data (csr_probe.cpp reproduces it; tb_loom_ctrl case 20
+// shows the RTL does not), so a knob that must survive the functional
+// phase cannot share line 0. Words 64-511 are otherwise unused; this line
+// (64-71) holds nothing else. [7:0] = num, [15:8] = den.
+localparam integer R_TX_PACE      = 64;
+localparam integer R_TX_PACED     = 65;   // cycles the pacer held
 // Ingress FIFO full while the shell had a beat (receiver side), and the
 // longest unbroken run of it. Nonzero here on a corrupt run and zero on the
 // clean control closes the loss chain at the vFPGA boundary.
@@ -361,7 +369,11 @@ always_ff @(posedge aclk) begin
         r_dma_compl_va <= 0; r_rdma_staging <= 0; r_rx_pid <= 0;
         r_chunk <= RDMA_N_WR_OUTSTANDING * PMTU_BYTES - 64;
         r_pace  <= 0;
-    end else if (csr_wr) begin
+    end else if (csr_wr && (&axi_ctrl.wstrb)) begin
+        // Full-strobe writes only. Every write software issues is a whole
+        // 64-bit word; a beat with partial or no byte enables is not one of
+        // ours and must not land (the phantom writes seen on hardware are
+        // the reason this is explicit - see R_TX_PACE above).
         case (wr_idx)
             R_TBL_IDX:     r_tbl_idx     <= axi_ctrl.wdata;
             R_TBL_CFG:     r_tbl_cfg     <= axi_ctrl.wdata;
@@ -392,7 +404,8 @@ assign tbl_len    = r_tbl_len[LEN_BITS-1:0];
 assign rdma_staging_va = r_rdma_staging[VADDR_BITS-1:0];
 assign rx_pid          = r_rx_pid[PID_BITS-1:0];
 assign chunk_bytes     = r_chunk[27:0];
-assign pace_n          = r_pace[7:0];
+assign pace_num        = r_pace[7:0];
+assign pace_den        = r_pace[15:8];
 
 // -------------------------------------------------------------------------
 // Order FIFO - the ordering heart of the design

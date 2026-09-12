@@ -153,10 +153,12 @@ module loom_engine (
     // is the pre-chunking behaviour and lets both be compared on one
     // bitstream. Reset value is the derived safe size.
     input  logic [27:0]                 chunk_bytes,
-    // Egress pacing: one idle cycle after every pace_n forwarded payload
-    // beats on the rdma route, 0 = off. Wire rate = pace_n/(pace_n+1) of
-    // the engine's burst rate. See the PACING block below for why.
-    input  logic [7:0]                  pace_n,
+    // Egress pacing as a fraction of the burst rate: payload beats on the
+    // rdma route may move at most pace_num/pace_den of cycles (a rate
+    // accumulator with one beat of credit, so no bursts). Off when either
+    // is 0 or num >= den. See the PACING block below for why.
+    input  logic [7:0]                  pace_num,
+    input  logic [7:0]                  pace_den,
     output logic                        cnt_tx_move,
     output logic                        cnt_tx_starve,
     // Starvation that lands INSIDE a wire packet - see the block below.
@@ -214,7 +216,7 @@ logic                  l_is_desc, l_is_read;
 logic [27:0]           l_off, l_len;
 // Egress pacer state (defined in the PACING block further down); declared
 // here because the FSM uses the gated ready before that block.
-logic [7:0]            pace_cnt;
+logic [15:0]           pace_acc;     // credit, in units of 1/pace_den beat
 logic                  pace_hold;
 wire                   m_net_rdy = m_net_tready && !pace_hold;
 logic [PID_BITS-1:0]   l_src_pid;
@@ -624,41 +626,60 @@ wire stream_net   = (state == ST_STREAM) &&  l_route;
 //
 // The receiver's host-write path saturates at ~10 GB/s (amy: 63% moving /
 // 34% stalled, FLAT as the offered rate rises - measured across the chunk
-// sweep). This engine bursts at 64 B/cycle, ~12.5 GB/s after its own
-// starvation, and the wire has no PFC, no DCQCN and no prog_full consumer:
-// nothing tells the sender to slow down. Above the receiver's ceiling its
-// ~3000 beats of buffering fill in ~1.7 MB, the CMAC (no tready) drops
-// beats before any counter, the PSN gap NAKs, Go-Back-N replays, and the
-// replay lands displaced. Every packet lost in 20 dead ends was lost there.
+// sweep, and again with this pacer: rx stall 0 and ingress-FIFO-full 0 at
+// 8 GB/s, 32k and 29k at 10.6). This engine bursts at 64 B/cycle; the wire
+// has no PFC, no DCQCN and no prog_full consumer, so nothing tells the
+// sender to slow down. Above the receiver's ceiling its ~3000 beats of
+// buffering fill in ~1.7 MB, the CMAC (no tready) drops beats before any
+// counter, the PSN gap NAKs, Go-Back-N replays, and the replay lands
+// displaced. Paced under the ceiling, a lone 4 MB message lands byte-exact
+// with 0 retransmissions - the first time in 119 runs (2026-09-12).
 //
-// So hold the burst rate under the receiver's drain: after every pace_n
-// forwarded payload beats, one idle cycle. Wire rate = pace_n/(pace_n+1)
-// of the burst rate. The header beat is not paced (one per message).
+// RATE ACCUMULATOR, not 1-in-N. The first version held one cycle after
+// every N beats; on hardware that was NOT BINDING for N >= 4, because the
+// hold let the host pull catch up and simply replaced the pull's own ~21%
+// starvation instead of adding to it, and it had no setting between 50%
+// and 67%. This one caps the fraction of cycles a payload beat may move at
+// pace_num/pace_den exactly: every cycle in ST_STREAM earns pace_num
+// units of credit, a beat costs pace_den, credit saturates at two beats so
+// starvation cannot bank more than a two-beat burst. 41/64 is ~10.25 GB/s
+// at 250 MHz x 64 B.
 //
-// AXI-Stream legality: the hold cycle always immediately FOLLOWS a
-// completed handshake (it is set by the move that reaches pace_n), so
-// tvalid is only ever withdrawn after a transfer, never while waiting.
-// The hold gates BOTH tvalid and the engine's view of tready, so the shell
-// cannot take a beat the engine does not advance past.
+// AXI-Stream legality: pace_hold gates BOTH tvalid and the engine's view of
+// tready, and it can only change on a clock edge; a beat that is offered
+// (tvalid high, credit present) stays offered until it moves, because
+// credit only ever DROPS on a move. The header beat is not paced.
 //
-// pace_n is a CSR (reset 0 = off) so one bitstream sweeps the rate; the
-// highest clean setting IS the receiver's drain ceiling, measured.
+// pace_num/pace_den are CSRs (reset 0 = off) so one bitstream sweeps the
+// rate; the highest clean setting IS the receiver's drain ceiling.
 // -------------------------------------------------------------------------
-wire        pace_en   = (pace_n != 8'd0);
+wire        pace_en   = (pace_num != 8'd0) && (pace_den != 8'd0) && (pace_num < pace_den);
 wire        net_moved = stream_net && s_tvalid && m_net_rdy;
+wire [15:0] pace_cost = {8'd0, pace_den};
+// Credit ceiling: TWO beats, not one. With a one-beat cap the surplus
+// earned during a hold cycle is discarded, so every fraction above 1/2
+// collapses to alternate cycles (41/64 measured 50% in sim). Two beats is
+// enough that nothing is ever discarded in steady state (credit after a
+// hold is at most den-1+num < 2*den) and bounds any post-starvation burst
+// to two back-to-back beats.
+wire [15:0] pace_cap  = {7'd0, pace_den, 1'b0};
 
+// Outside ST_STREAM (and when off) the pacer parks with exactly one beat
+// of credit and no hold, so the first payload beat of a message moves at
+// once. A move is only possible while pace_hold is low, which by
+// construction means pace_acc >= pace_den, so the subtraction below never
+// underflows.
 always_ff @(posedge aclk) begin
     if (!aresetn || !pace_en || !stream_net) begin
-        pace_cnt  <= 8'd0;
+        pace_acc  <= pace_cost;
         pace_hold <= 1'b0;
-    end else if (pace_hold) begin
-        pace_hold <= 1'b0;
-    end else if (net_moved) begin
-        if (pace_cnt == pace_n - 8'd1) begin
-            pace_hold <= 1'b1;
-            pace_cnt  <= 8'd0;
-        end else
-            pace_cnt  <= pace_cnt + 8'd1;
+    end else begin
+        // earn, spend, saturate at one beat; hold whenever credit < 1 beat
+        logic [16:0] nxt;
+        nxt = {1'b0, pace_acc} + {9'd0, pace_num} - (net_moved ? {1'b0, pace_cost} : 17'd0);
+        if (nxt > {1'b0, pace_cap}) nxt = {1'b0, pace_cap};
+        pace_acc  <= nxt[15:0];
+        pace_hold <= (nxt[15:0] < pace_cost);
     end
 end
 assign cnt_tx_paced = pace_hold && stream_net;

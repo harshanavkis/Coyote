@@ -86,7 +86,7 @@ logic rx_cnt_bp;
 logic rx_cnt_partial;
 logic tx_cnt_move, tx_cnt_starve, tx_cnt_stall;
 logic tx_cnt_paced, rx_cnt_fifo_full;
-logic [7:0] pace_n;
+logic [7:0] pace_num, pace_den;
 logic rx_cnt_st_head, rx_cnt_st_body, rx_cnt_req, rx_cnt_span;
 logic [AXI_DATA_BITS-1:0]   rx_tdata;
 logic [AXI_DATA_BITS/8-1:0] rx_tkeep;
@@ -178,7 +178,7 @@ loom_ctrl inst_loom_ctrl (
     .fifo_src_pid(fifo_src_pid), .fifo_compl_va(fifo_compl_va),
     .fifo_payload(fifo_payload), .fifo_pop(fifo_pop),
     .rdma_staging_va(rdma_staging_va), .rx_pid(rx_pid),
-    .chunk_bytes(chunk_bytes), .pace_n(pace_n),
+    .chunk_bytes(chunk_bytes), .pace_num(pace_num), .pace_den(pace_den),
     .rd_resp_data(rd_resp_data), .rd_resp_valid(rd_resp_valid),
     .cnt_local_wr(cnt_local_wr), .cnt_rdma_wr(cnt_rdma_wr),
     .cnt_rx_fwd(cnt_rx_fwd), .cnt_rx_drop(cnt_rx_drop),
@@ -241,7 +241,7 @@ loom_engine inst_loom_engine (
     .cnt_tx_move(tx_cnt_move), .cnt_tx_starve(tx_cnt_starve),
     .cnt_tx_starve_mid(tx_cnt_starve_mid),
     .cnt_tx_stall(tx_cnt_stall),
-    .cnt_tx_paced(tx_cnt_paced), .pace_n(pace_n),
+    .cnt_tx_paced(tx_cnt_paced), .pace_num(pace_num), .pace_den(pace_den),
     .busy(eng_busy)
 );
 

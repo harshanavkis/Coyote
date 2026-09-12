@@ -324,6 +324,27 @@ bool poll_payload(volatile uint64_t *dst_words) {
 // Issue BENCH_ITERS descriptors of each size back to back and wait for the
 // last fence, so the measurement covers a pipeline in steady state rather
 // than a series of round trips through software.
+// LOOM_TX_PACE is "NUM/DEN" (payload beats may move NUM out of every DEN
+// cycles on the rdma route, e.g. 41/64 ~= 10.25 GB/s at 250 MHz x 64 B) or
+// a bare N, kept for the old 1-in-N meaning: N/(N+1). Returns the CSR word
+// {den[15:8], num[7:0]}, 0 = off.
+static uint64_t parse_pace(const char *e) {
+    unsigned num = 0, den = 0;
+    if (sscanf(e, "%u/%u", &num, &den) == 2) { /* explicit fraction */ }
+    else { num = unsigned(strtoul(e, nullptr, 0)); den = num ? num + 1 : 0; }
+    if (num == 0 || den == 0 || num >= den || num > 255 || den > 255) return 0;
+    return (uint64_t(den) << 8) | num;
+}
+static void print_pace(uint64_t v, const char *when) {
+    const unsigned num = v & 0xFF, den = (v >> 8) & 0xFF;
+    if (num && den)
+        printf("engine config: tx_pace %s: %u/%u (%.1f%% of burst, ~%.2f GB/s cap)\n",
+               when, num, den, 100.0 * num / den, 16.0 * num / den);
+    else
+        printf("engine config: tx_pace %s: off\n", when);
+    fflush(stdout);
+}
+
 void run_bench(coyote::cThread &t_ctrl, loom::Xpu &A, int win,
                uint64_t *src, volatile uint64_t *fence) {
     printf("\n== remote transmit benchmark (<=%d iters/size, <=%lu MB burst, "
@@ -644,13 +665,15 @@ void run_bench(coyote::cThread &t_ctrl, loom::Xpu &A, int win,
                "that was not its payload, and the message is displaced)\n",
                (unsigned long) pdes);
         {
-            const uint64_t pn = loom::csr_read(t_ctrl, loom::TX_PACE);
+            const uint64_t pv = loom::csr_read(t_ctrl, loom::TX_PACE);
             const uint64_t pc = loom::csr_read(t_ctrl, loom::TX_PACED);
-            if (pn)
-                printf("  tx pacing: N=%lu, pacer held %lu cycles (expect ~moving/N "
-                       "= %lu; wire rate capped at %.1f%% of burst)\n",
-                       (unsigned long) pn, (unsigned long) pc,
-                       (unsigned long) (mv / pn), 100.0 * pn / (pn + 1));
+            const unsigned num = pv & 0xFF, den = (pv >> 8) & 0xFF;
+            if (num && den)
+                // moving beats cost den each and every cycle earns num, so
+                // the pacer must hold ~moving*(den-num)/num cycles
+                printf("  tx pacing: %u/%u, pacer held %lu cycles (expect ~%lu; "
+                       "cap %.2f GB/s)\n", num, den, (unsigned long) pc,
+                       (unsigned long) (mv * (den - num) / num), 16.0 * num / den);
             else
                 printf("  tx pacing: off\n");
         }
@@ -787,13 +810,8 @@ int run_server(uint16_t qp_port, uint16_t peer_port, const std::string &sock) {
     // This is the flow control the link does not have: the receiver's host
     // write saturates at ~10 GB/s and nothing else tells the sender so.
     if (const char *e = getenv("LOOM_TX_PACE"))
-        loom::csr_write(t_ctrl, loom::TX_PACE, strtoull(e, nullptr, 0));
-    {
-        const uint64_t pn = loom::csr_read(t_ctrl, loom::TX_PACE);
-        printf("engine config: tx_pace=%lu (%s)\n", (unsigned long) pn,
-               pn ? "PACED - one idle cycle per N payload beats" : "unpaced");
-        fflush(stdout);
-    }
+        loom::csr_write(t_ctrl, loom::TX_PACE, parse_pace(e));
+    print_pace(loom::csr_read(t_ctrl, loom::TX_PACE), "at init");
     {
         const uint64_t cb = loom::csr_read(t_ctrl, loom::CHUNK);
         printf("engine config: chunk_bytes=%lu (%s)\n",
@@ -1286,13 +1304,8 @@ int run_client(const std::string &ip, uint16_t qp_port, uint16_t peer_port,
     // This is the flow control the link does not have: the receiver's host
     // write saturates at ~10 GB/s and nothing else tells the sender so.
     if (const char *e = getenv("LOOM_TX_PACE"))
-        loom::csr_write(t_ctrl, loom::TX_PACE, strtoull(e, nullptr, 0));
-    {
-        const uint64_t pn = loom::csr_read(t_ctrl, loom::TX_PACE);
-        printf("engine config: tx_pace=%lu (%s)\n", (unsigned long) pn,
-               pn ? "PACED - one idle cycle per N payload beats" : "unpaced");
-        fflush(stdout);
-    }
+        loom::csr_write(t_ctrl, loom::TX_PACE, parse_pace(e));
+    print_pace(loom::csr_read(t_ctrl, loom::TX_PACE), "at init");
     {
         const uint64_t cb = loom::csr_read(t_ctrl, loom::CHUNK);
         printf("engine config: chunk_bytes=%lu (%s)\n",
@@ -1366,12 +1379,10 @@ int run_client(const std::string &ip, uint16_t qp_port, uint16_t peer_port,
     // README TODO on pgprot_writecombine for MMAP_CTRL). Nothing in line 0
     // is written after this point, so a rewrite here holds for the bench.
     if (const char *e = getenv("LOOM_TX_PACE")) {
-        const uint64_t want = strtoull(e, nullptr, 0);
+        const uint64_t want = parse_pace(e);
         loom::csr_write(t_ctrl, loom::TX_PACE, want);
         const uint64_t got = loom::csr_read(t_ctrl, loom::TX_PACE);
-        printf("engine config: tx_pace re-armed before bench: %lu (%s)\n",
-               (unsigned long) got, got == want ? "ok" : "DID NOT TAKE");
-        fflush(stdout);
+        print_pace(got, got == want ? "re-armed before bench" : "re-armed before bench DID NOT TAKE");
     }
     if (bench_mode()) run_bench(t_ctrl, A, w1, src, fence);
 

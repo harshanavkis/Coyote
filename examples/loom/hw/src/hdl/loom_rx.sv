@@ -141,7 +141,7 @@ localparam [7:0] MSG_OP_WRITE        = 8'd1;
 localparam [7:0] MSG_OP_WRITE_INLINE = 8'd2;
 
 typedef enum logic [2:0] {
-    ST_IDLE, ST_STREAM, ST_PKT_REQ, ST_INLINE_DATA
+    ST_IDLE, ST_STREAM, ST_PKT_WAIT, ST_INLINE_DATA
 } state_t;
 state_t state;
 
@@ -168,6 +168,34 @@ logic [22:0]           l_beats;      // beats of THIS PACKET still on the stream
 // of its payload to the header.
 logic [VADDR_BITS-1:0] w_va;         // where THIS packet's write lands
 logic [27:0]           w_left;       // message bytes after this packet
+
+// PIPELINED HOST WRITES. This module used to be single-outstanding on the
+// write side: post one sq_wr, stream that packet, only then post the next.
+// The shell's DMA then had exactly one descriptor to work with and could
+// not overlap the next one's setup with this one's data; on hardware the
+// receiver's host-write path stalled ~34% of cycles, essentially all of it
+// mid-packet, and saturated at ~10 GB/s - while perf_rdma's receiver,
+// whose pass-through hands the shell every packet's write as soon as it is
+// announced, takes >= 11.4 on the same host. That ~10 GB/s ceiling is what
+// the sender has to be paced under (loom_engine PACING); raising it is the
+// point of this.
+//
+// So the requests run AHEAD of the data. A generator posts the packet
+// writes of the current message in order - the same deterministic PMTU
+// split the data side walks - keeping up to RX_WR_OUTSTANDING of them
+// unretired, and the data side moves from one packet to the next without
+// a handshake whenever the next write is already posted. The shell queues
+// descriptors in order, so the data stream (still one tlast per packet)
+// lands against them exactly as before. Nothing about WHERE bytes land
+// changes: the addresses are the header's, computed here, as always.
+localparam integer     RX_WR_OUTSTANDING = 8;
+logic [VADDR_BITS-1:0] q_va;         // next write to POST
+logic [27:0]           q_left;       // message bytes not yet posted
+logic [3:0]            outstanding;  // posted, data not yet complete
+wire  [27:0]           q_len   = (q_left > PMTU_BYTES[27:0]) ? PMTU_BYTES[27:0] : q_left;
+wire                   gen_on  = (state == ST_STREAM || state == ST_PKT_WAIT) &&
+                                 (q_left != 28'd0) && (outstanding < RX_WR_OUTSTANDING[3:0]);
+wire                   post_now = gen_on && wr_ready;
 logic                  l_moved;      // this transaction has had at least one beat
 // A WRITE message (op 1) is ONE logical write that may span several PMTU
 // packets, so its beat budget comes from the HEADER's length, not from the
@@ -273,33 +301,40 @@ assign busy     = (state != ST_IDLE);
 // Last payload beat of the message
 wire stream_end = (l_beats <= 23'd1);
 
+// A packet's data completes on its last forwarded beat
+wire pkt_done   = (state == ST_STREAM) && s_tvalid && m_tready && covered && stream_end;
+// At that moment, is the NEXT packet's write already posted (counting a
+// post landing this very cycle)? Then the data side just keeps going.
+wire next_ready = ({1'b0, outstanding} + {4'b0, post_now}) >= 5'd2;
+
 always_ff @(posedge aclk) begin
     if (!aresetn) begin
         state <= ST_IDLE;
         l_op <= 0; l_len <= 0; l_va <= 0; l_inline <= 0;
         l_beats <= 0; l_moved <= 1'b0; w_va <= 0; w_left <= 0;
         p_credit <= 0;
+        q_va <= 0; q_left <= 0; outstanding <= 0;
     end else begin
         p_credit <= p_credit + {9'b0, cred_add} - (take_beat ? 32'd1 : 32'd0);
+
+        // Request generator: runs whenever a message is in progress
+        if (post_now) begin
+            q_va   <= q_va + {{(VADDR_BITS-28){1'b0}}, q_len};
+            q_left <= q_left - q_len;
+        end
+        outstanding <= outstanding + {3'b0, post_now} - {3'b0, pkt_done};
+
         case (state)
             // The header beat arrives on the payload stream like any other,
             // and is recognised by its contents rather than announced by a
             // request. A beat that is not a header is skipped and counted;
             // with a sender that agrees with us every beat here IS one.
-            // The write request is issued COMBINATIONALLY from this same
-            // beat and the header is consumed only once the shell has taken
-            // it. There is deliberately no ST_WR_REQ: that state held
-            // s_tready LOW while it waited for wr_ready, and s_tready low is
-            // not merely a delay here - the shell's receive FSM emits the
-            // host-write command and the ACK in the SAME step, so stalling
-            // the ingress stops ACKS BEING GENERATED. The sender's retransmit
-            // timer is 1 ms since the last ack, and a replay cannot re-read a
-            // vFPGA-sourced payload (req_1 = 0 in user_req_mux.sv), so lost
-            // beats displace everything after them. perf_rdma cannot hit this
-            // because its receive path is a pass-through
-            // (rq_wr.ready = sq_wr.ready); this makes ours behave the same, so
-            // the stream stalls only when the shell itself will not take a
-            // request. Re-latching an unconsumed beat is idempotent.
+            // The FIRST packet's write is issued COMBINATIONALLY from this
+            // same beat and the header is consumed only once the shell has
+            // taken it - there is deliberately no wait state here, because
+            // holding s_tready low stalls the shell's receive FSM, which
+            // emits the host-write command and the ACK in the same step.
+            // Re-latching an unconsumed beat is idempotent.
             ST_IDLE: if (s_tvalid && grant && covered) begin
                 l_op     <= hdr_op;
                 l_len    <= hdr_len;
@@ -312,29 +347,48 @@ always_ff @(posedge aclk) begin
                             + {{(VADDR_BITS-28){1'b0}}, first_len};
                 w_left   <= hdr_len - first_len;
                 l_moved  <= 1'b0;
-                if (hdr_ok && wr_ready)
+                if (hdr_ok && wr_ready) begin
                     state <= (hdr_op == MSG_OP_WRITE_INLINE) ? ST_INLINE_DATA
                                                              : ST_STREAM;
+                    // the generator takes over from packet 2
+                    q_va        <= s_tdata[64 +: VADDR_BITS]
+                                   + {{(VADDR_BITS-28){1'b0}}, first_len};
+                    q_left      <= hdr_len - first_len;
+                    outstanding <= 4'd1;   // packet 1, posted right here
+                end
             end
 
-            ST_INLINE_DATA: if (m_tready) state <= ST_IDLE;
+            ST_INLINE_DATA: if (m_tready) begin
+                state       <= ST_IDLE;
+                outstanding <= 4'd0;
+            end
 
             // Forward exactly the payload the header promised, however many
             // packets it spans. Intermediate tlasts belong to packets, not
-            // to this message, and are ignored.
-            // An uncovered beat is swallowed here without advancing the
-            // message: it is not payload, whatever it looks like.
-            // stream_end now ends a PACKET's write, not the message.
+            // to this message, and are ignored. An uncovered beat is
+            // swallowed here without advancing the message. stream_end ends
+            // a PACKET's write; if the next packet's write is already posted
+            // the stream continues straight into it.
             ST_STREAM: if (s_tvalid && m_tready && covered) begin
                 l_moved <= 1'b1;
                 l_beats <= l_beats - 23'd1;
-                if (stream_end)
-                    state <= (w_left != 28'd0) ? ST_PKT_REQ : ST_IDLE;
+                if (stream_end) begin
+                    if (w_left == 28'd0)
+                        state <= ST_IDLE;
+                    else if (next_ready) begin
+                        l_beats <= beats_of(next_len);
+                        w_va    <= w_va + {{(VADDR_BITS-28){1'b0}}, next_len};
+                        w_left  <= w_left - next_len;
+                        l_moved <= 1'b0;
+                    end else
+                        state <= ST_PKT_WAIT;
+                end
             end
 
-            // The next packet's write. Waits on the SHELL's wr_ready and
-            // nothing of our own, the same shape as the header's handshake.
-            ST_PKT_REQ: if (wr_ready) begin
+            // The next packet's write has not been posted yet (the shell is
+            // slow to take requests, or the generator hit its limit). Wait
+            // for it; the generator keeps running meanwhile.
+            ST_PKT_WAIT: if (outstanding != 4'd0) begin
                 l_beats <= beats_of(next_len);
                 w_va    <= w_va + {{(VADDR_BITS-28){1'b0}}, next_len};
                 w_left  <= w_left - next_len;
@@ -355,15 +409,15 @@ always_comb begin
     wr_req.pid    = rx_pid;
     // ONE WRITE PER PACKET. The first is driven from the header beat on the
     // wire (issued in the same cycle that beat is accepted); every later one
-    // from the running target this module keeps, because the shell's request
-    // stream names STAGING and cannot say where the bytes belong.
-    wr_req.vaddr  = (state == ST_PKT_REQ) ? w_va
-                                          : s_tdata[64 +: VADDR_BITS];
-    wr_req.len    = (state == ST_PKT_REQ) ? next_len : first_len;
+    // by the request generator, AHEAD of the data, from the running target
+    // this module keeps - the shell's request stream names STAGING and
+    // cannot say where the bytes belong.
+    wr_req.vaddr  = (state == ST_IDLE) ? s_tdata[64 +: VADDR_BITS] : q_va;
+    wr_req.len    = (state == ST_IDLE) ? first_len : q_len;
     wr_req.dest   = 0;
     wr_req.last   = 1'b1;
     wr_valid = ((state == ST_IDLE) && s_tvalid && grant && covered && hdr_ok)
-               || (state == ST_PKT_REQ);
+               || gen_on;
 end
 
 always_comb begin
