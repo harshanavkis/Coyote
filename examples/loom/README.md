@@ -321,13 +321,18 @@ cd examples/loom
   50%       7.95         0         0         0      0   intact
   ```
 
-  and at 50% every size 8/16/32/64 MiB as one unchunked message is intact
-  with 0 retransmissions. 41/64 is ~10.25 GB/s at 250 MHz × 64 B. Sweep
-  it on the 4 MB single message:
+  With one completion per message on the receive side (2026-09-13 build)
+  the receiver drains ~10.4 GB/s, and **`--tx-pace 41/64` (10.25 GB/s) is
+  the safe point: 64 MiB as one unchunked message, byte-exact, 0
+  retransmissions, zero receiver stall.** 40/64 is equally clean; 42/64
+  and 44/64 wedge on 64 MiB; 43/64 gets through with the ingress FIFO full
+  for 26k cycles, which is luck, not margin. A setting counts as safe only
+  when 64 MiB survives it with zero stall - 4 MB alone passes at rates
+  that wedge 64 MiB. Sweep on 64 MiB, not 4 MB:
 
   ```bash
-  for P in 40/64 41/64 42/64 44/64 48/64; do
-    ./run_two_host.py --size 4194304 --iters 0 --gap 20 --retries 0 --hw-chunk 0 --tx-pace $P
+  for P in 40/64 41/64 42/64 44/64; do
+    ./run_two_host.py --size 67108864 --iters 0 --gap 20 --retries 0 --hw-chunk 0 --tx-pace $P
   done
   ```
 
