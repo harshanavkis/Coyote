@@ -119,6 +119,13 @@ constexpr uint32_t RX_PARTIAL    = 0x0B0;   // word 22
 // clobbers words 4 and 6 of line 0 on hardware (see loom_ctrl.sv R_TX_PACE).
 constexpr uint32_t TX_PACE       = 0x200;   // word 64: [7:0] num, [15:8] den; off if 0
 constexpr uint32_t TX_PACED      = 0x208;   // word 65: cycles the pacer held
+// Transmit window (loom_engine.sv header). Same CSR line.
+constexpr uint32_t TX_CTL        = 0x210;   // word 66: [7:0] window (packets unacked), 0 = none
+constexpr uint32_t TX_STATE      = 0x218;   // word 67 RO: [7:0] packets unacked right now
+constexpr uint32_t TX_ACKS       = 0x220;   // word 68 RO: packet acks received
+constexpr uint32_t TX_WINFULL    = 0x228;   // word 69 RO: cycles a packet waited on the window
+constexpr uint32_t TX_REQWAIT    = 0x230;   // word 70 RO: cycles a packet waited on sq_wr.ready
+constexpr uint32_t TX_FIFO_FULL  = 0x238;   // word 71 RO: cycles the pull was held by the tx FIFO
 constexpr uint32_t RX_FIFO_FULL  = 0x070;   // word 14: ingress FIFO refused a beat
 constexpr uint32_t RX_FIFO_FULL_MAX = 0x078; // word 15: longest run of that
 constexpr uint32_t TX_SMID       = 0x0E8;   // word 29

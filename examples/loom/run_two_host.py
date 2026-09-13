@@ -480,6 +480,8 @@ def bench_env(args, gap):
         env += f" LOOM_CHUNK={args.hw_chunk}"
     if args.tx_pace is not None:
         env += f" LOOM_TX_PACE={args.tx_pace}"
+    if args.tx_window is not None:
+        env += f" LOOM_TX_WINDOW={args.tx_window}"
     if args.chunk:
         env += f" LOOM_BENCH_CHUNK={args.chunk}"
     if args.chunk_credit is not None:
@@ -659,6 +661,13 @@ def main():
                          "250 MHz x 64 B. Sweep it on the 4 MB single "
                          "message; the highest clean setting is the "
                          "receiver's drain ceiling")
+    ap.add_argument("--tx-window", type=int, default=None,
+                    help="transmit window: packets posted to the RoCE stack "
+                         "and not yet acked (CSR 66, LOOM_TX_WINDOW). The "
+                         "engine posts one request per PMTU packet and the "
+                         "shell acks each; this bounds how many are in "
+                         "flight to the far stack. Bitstream default 8; the "
+                         "shell caps at 16; 0 = no Loom window")
     ap.add_argument("--chunk", default=None,
                     help="deliver the region as descriptors of this size at "
                          "successive offsets instead of one long message "

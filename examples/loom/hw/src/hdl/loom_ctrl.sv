@@ -102,6 +102,13 @@ module loom_ctrl (
     // cycles on the rdma route; off when either is 0 or num >= den
     output logic [7:0]                  pace_num,
     output logic [7:0]                  pace_den,
+    // Transmit window (word 66) and its live state (word 67)
+    output logic [7:0]                  tx_window,
+    input  logic [7:0]                  tx_inflight,
+    input  logic                        cnt_tx_ack,
+    input  logic                        cnt_tx_winfull,
+    input  logic                        cnt_tx_reqwait,
+    input  logic                        cnt_tx_fifo_full,
 
     // Read response (from loom_engine): completes the held-open AXI read
     input  logic [63:0]                 rd_resp_data,
@@ -249,6 +256,15 @@ localparam integer R_TX_SMID_MAX  = 23;
 // (64-71) holds nothing else. [7:0] = num, [15:8] = den.
 localparam integer R_TX_PACE      = 64;
 localparam integer R_TX_PACED     = 65;   // cycles the pacer held
+// Transmit window (loom_engine header). Same line as TX_PACE, for the same
+// reason. [7:0] window: packets posted and not yet acked, 0 = no window.
+// Reset: 8.
+localparam integer R_TX_CTL       = 66;
+localparam integer R_TX_STATE     = 67;   // RO [7:0] packets unacked right now
+localparam integer R_TX_ACKS      = 68;   // RO acks received
+localparam integer R_TX_WINFULL   = 69;   // RO cycles a packet waited on the window
+localparam integer R_TX_REQWAIT   = 70;   // RO cycles a packet waited on sq_wr.ready
+localparam integer R_TX_FIFO_FULL = 71;   // RO cycles the pull was held by our FIFO
 // Ingress FIFO full while the shell had a beat (receiver side), and the
 // longest unbroken run of it. Nonzero here on a corrupt run and zero on the
 // clean control closes the loss chain at the vFPGA boundary.
@@ -342,6 +358,7 @@ logic [63:0] rx_move, rx_starve, rx_stall, rx_st_head, rx_st_body, rx_req_cnt;
 logic [63:0] rx_stall_run, rx_stall_max;
 logic [63:0] rx_bp, rx_bp_run, rx_bp_max;
 logic [63:0] r_pace, tx_paced;
+logic [63:0] r_tx_ctl, tx_acks, tx_winfull, tx_reqwait, tx_fifo_full;
 logic [63:0] rx_ff, rx_ff_run, rx_ff_max;
 logic [63:0] tx_smid, tx_smid_run, tx_smid_max;
 logic [63:0] rx_partial;
@@ -369,6 +386,7 @@ always_ff @(posedge aclk) begin
         r_dma_compl_va <= 0; r_rdma_staging <= 0; r_rx_pid <= 0;
         r_chunk <= RDMA_N_WR_OUTSTANDING * PMTU_BYTES - 64;
         r_pace  <= 0;
+        r_tx_ctl <= 64'd8;                     // window 8
     end else if (csr_wr && (&axi_ctrl.wstrb)) begin
         // Full-strobe writes only. Every write software issues is a whole
         // 64-bit word; a beat with partial or no byte enables is not one of
@@ -389,6 +407,7 @@ always_ff @(posedge aclk) begin
             R_RX_PID: r_rx_pid <= axi_ctrl.wdata;
             R_CHUNK:  r_chunk  <= axi_ctrl.wdata;
             R_TX_PACE: r_pace  <= axi_ctrl.wdata;
+            R_TX_CTL:  r_tx_ctl <= axi_ctrl.wdata;
             default: ;
         endcase
     end
@@ -406,6 +425,7 @@ assign rx_pid          = r_rx_pid[PID_BITS-1:0];
 assign chunk_bytes     = r_chunk[27:0];
 assign pace_num        = r_pace[7:0];
 assign pace_den        = r_pace[15:8];
+assign tx_window       = r_tx_ctl[7:0];
 
 // -------------------------------------------------------------------------
 // Order FIFO - the ordering heart of the design
@@ -556,6 +576,7 @@ always_ff @(posedge aclk) begin
         rx_stall_run <= 0; rx_stall_max <= 0;
         rx_bp <= 0; rx_bp_run <= 0; rx_bp_max <= 0;
         tx_paced <= 0; rx_ff <= 0; rx_ff_run <= 0; rx_ff_max <= 0;
+        tx_acks <= 0; tx_winfull <= 0; tx_reqwait <= 0; tx_fifo_full <= 0;
         tx_smid <= 0; tx_smid_run <= 0; tx_smid_max <= 0;
         rx_partial <= 0;
         pull_desync <= 0;
@@ -589,6 +610,10 @@ always_ff @(posedge aclk) begin
             rx_stall_run <= 0;
         end
         if (cnt_tx_paced) tx_paced <= tx_paced + 1;
+        if (cnt_tx_ack)       tx_acks      <= tx_acks + 1;
+        if (cnt_tx_winfull)   tx_winfull   <= tx_winfull + 1;
+        if (cnt_tx_reqwait)   tx_reqwait   <= tx_reqwait + 1;
+        if (cnt_tx_fifo_full) tx_fifo_full <= tx_fifo_full + 1;
         if (cnt_rx_fifo_full) begin
             rx_ff     <= rx_ff + 1;
             rx_ff_run <= rx_ff_run + 1;
@@ -644,6 +669,12 @@ always_ff @(posedge aclk) begin
             R_RX_PID:      axi_rdata <= r_rx_pid;
             R_CHUNK:       axi_rdata <= r_chunk;
             R_TX_PACE:     axi_rdata <= r_pace;
+            R_TX_CTL:      axi_rdata <= r_tx_ctl;
+            R_TX_STATE:    axi_rdata <= {56'b0, tx_inflight};
+            R_TX_ACKS:     axi_rdata <= tx_acks;
+            R_TX_WINFULL:  axi_rdata <= tx_winfull;
+            R_TX_REQWAIT:  axi_rdata <= tx_reqwait;
+            R_TX_FIFO_FULL: axi_rdata <= tx_fifo_full;
             default:
                 if (rd_idx >= R_DBG_BASE && rd_idx < R_DBG_BASE + N_DBG)
                     axi_rdata <= dbg[rd_idx - R_DBG_BASE];

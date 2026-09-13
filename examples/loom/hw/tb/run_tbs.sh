@@ -21,7 +21,7 @@ if [ ! -f "$LYNX_PKG" ]; then
     exit 1
 fi
 
-TBS="tb_loom_table tb_loom_ctrl tb_loom_engine tb_loom_rx tb_loom_top tb_loom_loopback"
+TBS="${TBS:-tb_loom_table tb_loom_ctrl tb_loom_engine tb_loom_rx tb_loom_top tb_loom_loopback}"
 SRCS="$LYNX_PKG $AXI_INTF $COYOTE_ROOT/hw/hdl/pkg/lynx_intf.sv \
       ../src/hdl/loom_table.sv ../src/hdl/loom_ctrl.sv \
       ../src/hdl/loom_engine.sv ../src/hdl/loom_rx.sv \
@@ -32,7 +32,12 @@ SRCS="$LYNX_PKG $AXI_INTF $COYOTE_ROOT/hw/hdl/pkg/lynx_intf.sv \
 
 mkdir -p work && cd work
 
+# The engine's transmit FIFO is an XPM primitive: xelab links it from the
+# precompiled xpm library, which in turn needs glbl compiled and elaborated.
+GLBL=/share/xilinx/Vivado/2023.2/data/verilog/src/glbl.v
+
 echo "== xvlog =="
+xvlog $GLBL > xvlog_glbl.log 2>&1 || { tail -5 xvlog_glbl.log; echo "COMPILE FAILED (glbl)"; exit 1; }
 xvlog -sv $(for f in $SRCS; do echo ../$f; done) \
     -i ../../src -i ../$COYOTE_ROOT/hw/hdl/pkg \
     ../tb_loom_table.sv ../tb_loom_ctrl.sv ../tb_loom_engine.sv \
@@ -42,7 +47,7 @@ xvlog -sv $(for f in $SRCS; do echo ../$f; done) \
 fail=0
 for tb in $TBS; do
     echo "== $tb =="
-    xelab -debug typical "$tb" -s "${tb}_sim" > "xelab_${tb}.log" 2>&1 \
+    xelab -debug typical -L xpm "$tb" glbl -s "${tb}_sim" > "xelab_${tb}.log" 2>&1 \
         || { tail -30 "xelab_${tb}.log"; echo "ELAB FAILED: $tb"; fail=1; continue; }
     xsim -R "${tb}_sim" > "xsim_${tb}.log" 2>&1
     if grep -q "TB PASS ($tb)" "xsim_${tb}.log"; then

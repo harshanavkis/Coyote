@@ -44,6 +44,8 @@ user logic and user-space software; the shell and driver stay stock.
 | 6.1 | loomd-loomd TCP, QP setup, remote export/import | partial: peering + QP setup + staging exchange shipped with 6.2a; per-binding QPs + per-window staging pending |
 | 6.2a | two-host BUNDLED configuration (one process per host) — the cross-host bring-up vehicle | code done, peering test 17x PASS; EXECUTION pending two-host testbed |
 | 6.2b | full deployment topology (per side: loomd + 2 apps); remote reads via shell RDMA READ (T6) | pending |
+| 7a | receiver on its own host stream (`N_STRM_AXI 2`, loom_rx writes dest 1, as perf_rdma's receiver) | done; clean ceiling 10.25 → 11.0 GB/s on 64 MiB |
+| 7b | transmit pacer: one request per PMTU packet under an ACK-clocked window (`--tx-window`), Loom-owned 256 KB tx buffer, pull untouched | done; **11.84 GB/s, 64 MiB x20 x5 runs, 0 retrans** = perf_rdma's number |
 
 **Bitstream: BUILDS on U280** (2026-08-04, Vivado 2023.2 → `cyt_top.bit`).
 u280 must be an HBM device for any `EN_RDMA` build; see
@@ -340,6 +342,43 @@ cd examples/loom
   prints `tx pacing: NUM/DEN, pacer held .. cycles (expect ~..)` to prove
   the knob took; the server prints `ingress FIFO FULL` (CSR 14/15), which
   is nonzero on every corrupt run and zero on every clean one.
+- `--tx-window W` — the transmit window (CSR 66, `LOOM_TX_WINDOW`; reset
+  8, `0` = none). **This replaces the pace constant.** `loom_engine`
+  posts one request per PMTU packet with `last=1`, so the shell returns
+  one `cq_wr` per packet acked by the far stack, and the engine posts the
+  next packet only while fewer than W are unacked. The pull is untouched
+  (one `LOCAL_READ` per descriptor, the copy-engine model); its beats
+  land in a 256 KB URAM buffer and leave only as the far side acks. Rate
+  is `W x 4 KB / ack RTT` (~5.2 us here) up to the pipe's ceiling, and
+  the far side's stalls stop the sender instead of losing packets.
+  Measured 2026-09-13, 64 MiB x5, pacer off:
+
+  ```
+  W     GB/s    retrans  rx stall  FIFO full   result
+   8    6.291      0         0         0       intact
+  10    7.847      0         0         0       intact
+  12    9.396      0         0         0       intact
+  16   11.819      0     74852     72701       intact
+  20   11.824      0     45534     43554       intact
+  24   11.748      0     38886     37090       intact
+  32   11.750      0    109621    107539       intact
+  64   wedged @588 packets, 9 lost, 64 retrans
+   0   wedged @2722 packets, 10 lost (no window: the shell's own 16 is
+       not enforced on this path - 717 acked of 2722 posted)
+  ```
+
+  W must stay under the receiver's ~40-packet upstream buffer
+  (`rx_crossing` 2048 + `incoming_traffic_fifo` 512 beats). **The number
+  to quote: `--tx-window 32 --tx-pace 0`, 64 MiB x20, five runs without
+  reflash: 11.837 / 11.838 / 11.858 / 11.838 / 11.839 GB/s, 0
+  retransmissions, byte-exact** (perf_rdma re-measured the same day:
+  11.65-11.82). The client prints `tx window`, `tx acks`, `window full`
+  (cycles the window bound the sender), `sq_wr wait` and `tx FIFO held
+  the pull` (CSR 66-71).
+
+  ```bash
+  ./run_two_host.py --size 67108864 --iters 20 --gap 20 --retries 0 --hw-chunk 0 --tx-pace 0 --tx-window 32
+  ```
   **Hardware caveat:** a CSR write to any window-table register (words
   0–5) also clobbers words 4 and 6 of that 64-byte line (see
   `sw-bundled/src/csr_probe.cpp`; simulation does not reproduce it). The

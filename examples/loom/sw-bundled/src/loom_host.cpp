@@ -335,6 +335,19 @@ static uint64_t parse_pace(const char *e) {
     if (num == 0 || den == 0 || num >= den || num > 255 || den > 255) return 0;
     return (uint64_t(den) << 8) | num;
 }
+// LOOM_TX_WINDOW=N packets posted and not yet acked (0 = no window). Unset
+// = bitstream default (8). Returns the TX_CTL word.
+static uint64_t tx_ctl_from_env(uint64_t cur) {
+    uint64_t v = cur;
+    if (const char *e = getenv("LOOM_TX_WINDOW"))
+        v = (v & ~0xFFull) | (strtoul(e, nullptr, 0) & 0xFF);
+    return v;
+}
+static void print_tx_ctl(uint64_t v, const char *when) {
+    printf("engine config: tx window %s: %lu packets unacked%s\n",
+           when, (unsigned long) (v & 0xFF), (v & 0xFF) ? "" : " (no window)");
+    fflush(stdout);
+}
 static void print_pace(uint64_t v, const char *when) {
     const unsigned num = v & 0xFF, den = (v >> 8) & 0xFF;
     if (num && den)
@@ -677,6 +690,24 @@ void run_bench(coyote::cThread &t_ctrl, loom::Xpu &A, int win,
             else
                 printf("  tx pacing: off\n");
         }
+        {
+            const uint64_t ctl  = loom::csr_read(t_ctrl, loom::TX_CTL);
+            const uint64_t st   = loom::csr_read(t_ctrl, loom::TX_STATE);
+            const uint64_t acks = loom::csr_read(t_ctrl, loom::TX_ACKS);
+            const uint64_t wf   = loom::csr_read(t_ctrl, loom::TX_WINFULL);
+            const uint64_t rw   = loom::csr_read(t_ctrl, loom::TX_REQWAIT);
+            const uint64_t ff   = loom::csr_read(t_ctrl, loom::TX_FIFO_FULL);
+            printf("  tx window: %lu packets; %lu unacked at the end\n",
+                   (unsigned long) (ctl & 0xFF), (unsigned long) (st & 0xFF));
+            printf("  tx acks: %lu packets acked; window full %lu cycles; sq_wr wait %lu cycles; "
+                   "tx FIFO held the pull %lu cycles\n",
+                   (unsigned long) acks, (unsigned long) wf, (unsigned long) rw,
+                   (unsigned long) ff);
+            printf("    -> %s\n",
+                   wf ? "the far side's acks bounded the sender (window binding)"
+                      : "the window never bound: the sender never had more unacked "
+                        "than the window allows");
+        }
     }
 
     usleep(500000);      // let RC retransmit timers fire before sampling
@@ -812,6 +843,8 @@ int run_server(uint16_t qp_port, uint16_t peer_port, const std::string &sock) {
     if (const char *e = getenv("LOOM_TX_PACE"))
         loom::csr_write(t_ctrl, loom::TX_PACE, parse_pace(e));
     print_pace(loom::csr_read(t_ctrl, loom::TX_PACE), "at init");
+    loom::csr_write(t_ctrl, loom::TX_CTL, tx_ctl_from_env(loom::csr_read(t_ctrl, loom::TX_CTL)));
+    print_tx_ctl(loom::csr_read(t_ctrl, loom::TX_CTL), "at init");
     {
         const uint64_t cb = loom::csr_read(t_ctrl, loom::CHUNK);
         printf("engine config: chunk_bytes=%lu (%s)\n",
@@ -1306,6 +1339,8 @@ int run_client(const std::string &ip, uint16_t qp_port, uint16_t peer_port,
     if (const char *e = getenv("LOOM_TX_PACE"))
         loom::csr_write(t_ctrl, loom::TX_PACE, parse_pace(e));
     print_pace(loom::csr_read(t_ctrl, loom::TX_PACE), "at init");
+    loom::csr_write(t_ctrl, loom::TX_CTL, tx_ctl_from_env(loom::csr_read(t_ctrl, loom::TX_CTL)));
+    print_tx_ctl(loom::csr_read(t_ctrl, loom::TX_CTL), "at init");
     {
         const uint64_t cb = loom::csr_read(t_ctrl, loom::CHUNK);
         printf("engine config: chunk_bytes=%lu (%s)\n",
@@ -1383,6 +1418,12 @@ int run_client(const std::string &ip, uint16_t qp_port, uint16_t peer_port,
         loom::csr_write(t_ctrl, loom::TX_PACE, want);
         const uint64_t got = loom::csr_read(t_ctrl, loom::TX_PACE);
         print_pace(got, got == want ? "re-armed before bench" : "re-armed before bench DID NOT TAKE");
+    }
+    {
+        const uint64_t want = tx_ctl_from_env(loom::csr_read(t_ctrl, loom::TX_CTL));
+        loom::csr_write(t_ctrl, loom::TX_CTL, want);
+        const uint64_t got = loom::csr_read(t_ctrl, loom::TX_CTL);
+        print_tx_ctl(got, got == want ? "re-armed before bench" : "re-armed before bench DID NOT TAKE");
     }
     if (bench_mode()) run_bench(t_ctrl, A, w1, src, fence);
 

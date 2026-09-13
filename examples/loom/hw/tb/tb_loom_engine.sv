@@ -101,9 +101,36 @@ loom_table inst_table (
 wire [27:0] chunk_bytes = RDMA_N_WR_OUTSTANDING * PMTU_BYTES - 64;
 
 logic cnt_tx_starve_mid;
+
+// ---- transmit window / ack model ----
+// The shell acknowledges every rdma request that carries last=1 (one cq_wr
+// each); here an ack returns ACK_DELAY cycles after the request handshake.
+logic [7:0] tx_window = 8'd0;      // 0 = no window (most cases don't care)
+int         ACK_DELAY = 20;
+logic       ack_valid;
+logic [7:0] tx_inflight;
+logic       cnt_tx_ack, cnt_tx_winfull, cnt_tx_reqwait, cnt_tx_fifo_full;
+int         ack_due[$];
+int         cyc = 0;
+int         acks_seen = 0, max_inflight = 0;
+always @(posedge aclk) begin
+    cyc++;
+    if (wr_valid && wr_ready && wr_req.remote && wr_req.last)
+        ack_due.push_back(cyc + ACK_DELAY);
+    if (ack_valid) acks_seen++;
+    if (tx_inflight > max_inflight) max_inflight = tx_inflight;
+end
+always @(negedge aclk) begin
+    ack_valid = (ack_due.size() > 0) && (ack_due[0] <= cyc);
+    if (ack_valid) void'(ack_due.pop_front());
+end
+
 loom_engine inst_engine (
     .cnt_tx_starve_mid(cnt_tx_starve_mid),
     .chunk_bytes(chunk_bytes), .pace_num(8'd0), .pace_den(8'd0), .cnt_tx_paced(),
+    .tx_window(tx_window), .ack_valid(ack_valid), .tx_inflight(tx_inflight),
+    .cnt_tx_ack(cnt_tx_ack), .cnt_tx_winfull(cnt_tx_winfull),
+    .cnt_tx_reqwait(cnt_tx_reqwait), .cnt_tx_fifo_full(cnt_tx_fifo_full),
     .aclk(aclk), .aresetn(aresetn),
     .fifo_empty(fifo_empty), .fifo_is_desc(fifo_is_desc),
     .fifo_is_read(fifo_is_read),
@@ -335,14 +362,14 @@ initial begin
     check(wrq.size() == 2, "dma rdma: dma wr_req + completion wr_req");
     if (wrq.size() == 2) begin
         r = wrq.pop_front();
-        // Bulk is a WRITE message now, not a direct write: staging-addressed
-        // like a store, and 64 B longer for the header it carries. The true
-        // target moved out of the RETH and into that header, which is what
-        // lets the far side issue one host write for the whole message
-        // rather than one per PMTU packet.
-        check(r.opcode == APP_WRITE && r.strm == STRM_RDMA && r.pid == 6'd3 &&
-              r.vaddr == STAGING && r.len == 128 + 64 && r.remote,
-              "dma rdma: WRITE message at staging, len includes the header");
+        // Bulk is a WRITE message: staging-addressed like a store, 64 B
+        // longer for the header it carries, and since the engine packetises
+        // it is posted RAW with the RC opcode - here ONLY, it fits one
+        // packet - and last=1 for its own ack.
+        check(r.opcode == RC_RDMA_WRITE_ONLY && r.strm == STRM_RDMA &&
+              r.pid == 6'd3 && r.vaddr == STAGING && r.len == 128 + 64 &&
+              r.remote && r.rdma && r.actv && r.mode && r.last,
+              "dma rdma: ONLY packet at staging, RAW, len includes the header");
         r = wrq.pop_front();
         check(r.vaddr == CPL_VA, "dma rdma: completion wr_req");
     end else wrq.delete();
@@ -361,6 +388,93 @@ initial begin
     netq.delete();
     check(hostq.size() == 1 && hostq[0].data == 64'd2, "dma rdma: completion value 2");
     hostq.delete();
+
+    // --- 4b. Multi-packet message under a window of 2 ---
+    // 8192 B payload + 64 B header = 8256 B = FIRST 4096 (header + 63
+    // beats), MIDDLE 4096 (64 beats), LAST 64 (1 beat). With acks 200
+    // cycles out and a window of 2, the LAST request must wait for the
+    // FIRST's ack.
+    begin
+        int t_ack1, t_req3;
+        repeat (30) @(posedge aclk);            // case 4's ack lands first
+        tx_window = 8'd2; ACK_DELAY = 200; acks_seen = 0; max_inflight = 0;
+        descriptor(4'd2, 28'h1000, {16'b0, SRC_VA}, 28'd8192, 6'd0);
+        fork send_beats(128, 64'hCC00); join_none
+        t_ack1 = 0; t_req3 = 0;
+        fork
+            begin
+                do @(posedge aclk); while (!ack_valid);
+                t_ack1 = cyc;
+            end
+            begin
+                do @(posedge aclk); while (wrq.size() < 3);
+                t_req3 = cyc;
+            end
+        join_none
+        wait_idle();
+        check(rdq.size() == 1 && rdq[0].len == 8192, "pkts: one pull for the whole descriptor");
+        rdq.delete();
+        check(wrq.size() == 3, $sformatf("pkts: three packet requests (%0d)", wrq.size()));
+        if (wrq.size() == 3) begin
+            check(wrq[0].opcode == RC_RDMA_WRITE_FIRST  && wrq[0].len == 4096 &&
+                  wrq[0].vaddr == STAGING && wrq[0].last && wrq[0].mode,
+                  "pkts: FIRST 4096 at staging, last=1");
+            check(wrq[1].opcode == RC_RDMA_WRITE_MIDDLE && wrq[1].len == 4096 &&
+                  wrq[1].vaddr == STAGING + 4096 && wrq[1].last,
+                  "pkts: MIDDLE 4096 at staging+4096");
+            check(wrq[2].opcode == RC_RDMA_WRITE_LAST   && wrq[2].len == 64 &&
+                  wrq[2].vaddr == STAGING + 8192 && wrq[2].last,
+                  "pkts: LAST 64 at staging+8192");
+        end
+        wrq.delete();
+        check(netq.size() == 129, $sformatf("pkts: header + 128 payload beats (%0d)", netq.size()));
+        if (netq.size() == 129) begin
+            check(netq[0].data == {28'b0, 28'd8192, 8'd1} && netq[0].q1 == {16'b0, BASE_C + 48'h1000},
+                  "pkts: header names the whole message");
+            check(netq[63].last && netq[127].last && netq[128].last,
+                  "pkts: one tlast per packet, at beats 64, 128 and 129");
+            check(!netq[62].last && !netq[64].last && !netq[100].last,
+                  "pkts: no tlast inside a packet");
+            check(netq[1].data == 64'hCC00 && netq[64].data == 64'hCC3F &&
+                  netq[128].data == 64'hCC7F, "pkts: payload order preserved across packets");
+        end
+        netq.delete();
+        check(max_inflight <= 2, $sformatf("pkts: never more than 2 unacked (%0d)", max_inflight));
+        check(t_req3 != 0 && t_ack1 != 0 && t_req3 > t_ack1,
+              $sformatf("pkts: third request waited for the first ack (req3 @%0d, ack1 @%0d)",
+                        t_req3, t_ack1));
+        // Window accounting settles back to zero once everything is acked
+        repeat (250) @(posedge aclk);
+        check(acks_seen == 3, $sformatf("pkts: three acks came back (%0d)", acks_seen));
+        check(tx_inflight == 0, $sformatf("pkts: inflight back to 0 (%0d)", tx_inflight));
+        tx_window = 8'd0; ACK_DELAY = 20;
+    end
+
+    // --- 4c. The transmit FIFO holds the pull while the stack refuses ---
+    // Requests are refused (wr_ready 0) for the whole feed: the source keeps
+    // streaming into Loom's buffer, nothing reaches the wire, and it all
+    // goes out once the stack takes the request.
+    begin
+        int held;
+        wr_ready = 0; held = 0;
+        descriptor(4'd2, 28'h3000, {16'b0, SRC_VA}, 28'd4096, 6'd0);
+        fork
+            send_beats(64, 64'hDD00);
+            repeat (300) begin @(posedge aclk); if (cnt_tx_fifo_full) held++; end
+        join
+        check(s_tvalid == 0, "fifo: the whole feed was absorbed with the stack refusing");
+        check(netq.size() == 0, "fifo: nothing on the wire without a request");
+        check(held == 0, "fifo: 64 beats did not fill a 4096-beat buffer");
+        @(negedge aclk); wr_ready = 1;
+        wait_idle();
+        // 4096 B payload + header = 4160 B: FIRST 4096 (header + 63 beats),
+        // LAST 64 (one beat) - 65 beats in all
+        check(netq.size() == 65, $sformatf("fifo: header + 64 beats went out after release (%0d)", netq.size()));
+        if (netq.size() == 65)
+            check(netq[63].last && netq[64].last && !netq[62].last,
+                  "fifo: FIRST 4096 then LAST 64 framing");
+        netq.delete(); wrq.delete(); rdq.delete(); hostq.delete();
+    end
 
     // --- 5. Drops: unprogrammed window; out-of-bounds descriptor ---
     axil_write(16'h5040, 64'hBAD0);                 // window 5 not programmed
@@ -634,6 +748,13 @@ initial begin
     // header beat + 4 payload beats
     check(tx_move == 5,
           $sformatf("tx accounting: one move per beat sent (%0d of 5)", tx_move));
+    netq.delete();
+    // Starvation: the pull delivers late, so the engine sits in ST_STREAM
+    // with an empty buffer
+    tx_move = 0; tx_starve = 0; tx_stall = 0;
+    descriptor(4'd2, 28'h840, {16'b0, SRC_VA}, 28'd256, 6'd0);
+    fork begin repeat (40) @(posedge aclk); send_beats(4, 64'hE200); end join_none
+    wait_idle();
     check(tx_starve > 0,
           "tx accounting: starve fires while the pull has not delivered");
     netq.delete();

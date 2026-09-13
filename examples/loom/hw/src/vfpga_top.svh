@@ -45,17 +45,17 @@ logic cnt_tx_partial;
 // Starvation landing INSIDE a wire packet - see loom_engine.sv
 logic tx_cnt_starve_mid;
 logic [27:0] chunk_bytes;
-// cq_wr IS NOT A PACING SIGNAL FOR THIS ENGINE - measured, not argued.
-// build_sep6 wired the engine's credit to cq_wr with no opcode filter, which
-// is jigsaw's exact mechanism, and a chunked 4 MB transfer WEDGED. Counters
-// added for that run showed why, per 4 MB region:
-//   software-issued descriptors   71 completions passing the ack test,
-//                                 for 65 chunks + 7 setup - one each
-//   engine-generated chunks        0 beyond setup; the counters stopped
-//                                 climbing the moment the engine chunked
-// A descriptor submitted through the normal request path produces a
-// completion; a chunk the engine splits internally produces none. There is
-// nothing here to pace against, so the engine no longer tries.
+// cq_wr IS the engine's ack signal now - one per PACKET. build_sep6 tried
+// to pace on it and wedged because the engine's internally split chunks
+// carried last=0 and so produced no completion at all (71 acks for 65
+// software chunks, 0 for engine chunks). req_t.last is what gates the ack
+// (rdma_flow.sv: ack_que_in.valid = s_ack.data.last); the engine now posts
+// one request per PMTU packet with last=1, so every packet acks. Only
+// remote acks count: local writes (stores, fences, loom_rx's landings on
+// the far side) complete on the same interface with remote clear.
+wire ack_valid = cq_wr.valid && cq_wr.data.remote;
+logic [7:0] tx_window, tx_inflight;
+logic       cnt_tx_ack, cnt_tx_winfull, cnt_tx_reqwait, cnt_tx_fifo_full;
 
 // Stage cycle counters: engine -> ctrl (RO CSR words 50-63)
 logic [63:0] stage_acc [7];
@@ -188,6 +188,9 @@ loom_ctrl inst_loom_ctrl (
     .fifo_payload(fifo_payload), .fifo_pop(fifo_pop),
     .rdma_staging_va(rdma_staging_va), .rx_pid(rx_pid),
     .chunk_bytes(chunk_bytes), .pace_num(pace_num), .pace_den(pace_den),
+    .tx_window(tx_window), .tx_inflight(tx_inflight),
+    .cnt_tx_ack(cnt_tx_ack), .cnt_tx_winfull(cnt_tx_winfull),
+    .cnt_tx_reqwait(cnt_tx_reqwait), .cnt_tx_fifo_full(cnt_tx_fifo_full),
     .rd_resp_data(rd_resp_data), .rd_resp_valid(rd_resp_valid),
     .cnt_local_wr(cnt_local_wr), .cnt_rdma_wr(cnt_rdma_wr),
     .cnt_rx_fwd(cnt_rx_fwd), .cnt_rx_drop(cnt_rx_drop),
@@ -251,6 +254,9 @@ loom_engine inst_loom_engine (
     .cnt_tx_starve_mid(tx_cnt_starve_mid),
     .cnt_tx_stall(tx_cnt_stall),
     .cnt_tx_paced(tx_cnt_paced), .pace_num(pace_num), .pace_den(pace_den),
+    .tx_window(tx_window), .ack_valid(ack_valid), .tx_inflight(tx_inflight),
+    .cnt_tx_ack(cnt_tx_ack), .cnt_tx_winfull(cnt_tx_winfull),
+    .cnt_tx_reqwait(cnt_tx_reqwait), .cnt_tx_fifo_full(cnt_tx_fifo_full),
     .busy(eng_busy)
 );
 
@@ -379,8 +385,7 @@ end
 // ---------------------------------------------------------------------------
 always_comb notify.tie_off_m();
 always_comb cq_rd.ready = 1'b1;
-// cq_wr is drained and discarded. The engine does not pace on it; see the
-// measurement at the top of this file for why it cannot.
+// cq_wr is always taken; the engine counts the remote ones (ack_valid above)
 always_comb cq_wr.ready = 1'b1;
 always_comb rq_rd.ready = 1'b1;
 

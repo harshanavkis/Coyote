@@ -45,6 +45,23 @@ import lynxTypes::*;
  *   remote loads arrive with the two-host phase) still ALWAYS responds:
  *   poison (all-ones) + cnt_drop, so the issuing CPU is never wedged.
  *
+ * TRANSMIT PACING (rdma DESC), 2026-09-13. The source is a copy engine
+ * that streams: the pull is ONE LOCAL_READ for the whole descriptor and
+ * its beats arrive at whatever rate the host side delivers. Loom does not
+ * meter the source. It holds the data in ITS OWN FIFO (TX_FIFO_BEATS,
+ * URAM) and moves it into the RoCE stack only as the stack can take it:
+ *   - one sq_wr per PMTU packet (RDMA_MODE_RAW, FIRST/MIDDLE/LAST/ONLY
+ *     chosen here, so the wire and loom_rx see exactly what the shell's
+ *     own parser produced before), each with last=1 so rdma_flow returns
+ *     one cq_wr per PACKET (req_t.last is what gates the ack; it is not
+ *     on the wire);
+ *   - a WINDOW: inflight = posted - acked, a packet is posted only while
+ *     inflight < tx_window (CSR, <= the shell's 16). The far stack's
+ *     acceptance, not a constant, bounds what is in flight;
+ *   TX_PACE (the fractional pacer) stays as a manual cap, off by default.
+ * If the FIFO fills, the pull's tready drops - the only influence Loom has
+ * on a streaming source, counted (cnt_tx_fifo_full), never relied on.
+ *
  * Invalid window / bounds violation: entry dropped (writes) or answered
  * with poison (reads), cnt_drop pulsed either way.
  * Sub-8B stores (wstrb != 0xFF) are issued as full 8 B writes for now
@@ -149,10 +166,18 @@ module loom_engine (
     // Nonzero means the pull really does hand back sub-beat data and the
     // wire used to carry it.
     output logic                        cnt_tx_partial,
-    // Chunk size in bytes from CSR 28. 0 disables chunking entirely, which
-    // is the pre-chunking behaviour and lets both be compared on one
-    // bitstream. Reset value is the derived safe size.
+    // CSR 28, kept for software compatibility; the engine no longer chunks
+    // a descriptor into messages - it packetises it (see the header).
     input  logic [27:0]                 chunk_bytes,
+    // Transmit window (see the header). tx_window 0 = no window.
+    input  logic [7:0]                  tx_window,
+    // One pulse per remote-write acknowledgement (cq_wr with remote set)
+    input  logic                        ack_valid,
+    output logic [7:0]                  tx_inflight,
+    output logic                        cnt_tx_ack,
+    output logic                        cnt_tx_winfull,  // a packet waited on the window
+    output logic                        cnt_tx_reqwait,  // a packet waited on sq_wr.ready
+    output logic                        cnt_tx_fifo_full,// the pull was held: our FIFO full
     // Egress pacing as a fraction of the burst rate: payload beats on the
     // rdma route may move at most pace_num/pace_den of cycles (a rate
     // accumulator with one beat of credit, so no bursts). Off when either
@@ -180,10 +205,13 @@ module loom_engine (
 //   -- DESC path --
 //   ST_RD_REQ     issue the pull request (sq_rd); the shell starts
 //                 translating and streaming the source buffer
-//   ST_DMA_WR_REQ issue the matching write request before any data moves,
-//                 so the shell knows where the forwarded stream goes
-//   ST_STREAM     forward pull beats to the selected output; leave on the
-//                 handshake of the tlast beat
+//   ST_DMA_WR_REQ local: the one write request for the descriptor.
+//                 rdma: the request for the NEXT PACKET, posted only while
+//                 the window allows (inflight < tx_window)
+//   ST_HDR_BEAT   rdma, packet 0 only: the 64 B Loom header beat
+//   ST_STREAM     forward buffered pull beats to the selected output; on
+//                 the packet's last beat go back to ST_DMA_WR_REQ if the
+//                 message has more packets, else finish
 //   ST_CP_REQ/    optional fence: one more write request + one beat
 //   ST_CP_DATA    carrying the incremented completion count
 //
@@ -249,72 +277,32 @@ logic [LEN_BITS-1:0]   l_lim;
 logic [22:0] l_sbeats;
 
 // -------------------------------------------------------------------------
-// Chunking on the RDMA route.
+// Packetising on the RDMA route.
 //
-// The shell buffers every outgoing packet into HBM for replay in
-// RDMA_N_WR_OUTSTANDING slots of PMTU per pid. A message longer than that
-// WRAPS the buffer, so when RC replays an early packet the slot already
-// holds a later packet's bytes; the receiver takes it, because the PSN is
-// right, and the payload is displaced by whole beats. Nothing guards it:
-// rdma_flow.sv counts outstanding REQUESTS, not packets, so one 4 MB
-// message is 1025 packets and one request and sails straight through.
+// A descriptor is ONE Loom message: a 64 B header beat followed by the
+// payload. It goes to the stack as one request PER PMTU PACKET, framed
+// here the way the shell's parser framed it before (FIRST/MIDDLE/LAST, or
+// ONLY when it fits one packet), so nothing on the wire or in loom_rx
+// changes. Packet 0 carries the header beat and PMTU-64 bytes of payload;
+// every later packet carries PMTU until the tail. Each request is posted
+// under the window and carries last=1 for its own ack.
 //
-// perf_rdma is immune because its payload comes from the shell's data mover
-// via dreq req_1, which can RE-READ host memory on a replay. A vFPGA
-// request has req_1 tied to zero, so user-streamed payload cannot be
-// re-read and must be buffered - into exactly this space.
-//
-// So a message must fit the buffer, header included. Derived from the
-// shell's own parameters rather than hardcoded: raise
-// RDMA_N_WR_OUTSTANDING and the chunk follows with no edit here.
-// Measured at the current config (16 x 4096 - 64 = 65472), cold, no ramp:
-//   65472 (16 packets)  INTACT, 0 retrans, 9.840 GB/s
-//  131072 (32 packets)  CORRUPT, 78 retrans
-//  262144 (64 packets)  CORRUPT, 375 retrans
-// 4194304 (1025 pkts)   CORRUPT, ~1500 retrans
-// The slots are per PID, SHARED BY EVERY OUTSTANDING MESSAGE - not per
-// message. rdma_flow.sv admits RDMA_N_WR_OUTSTANDING requests, and the
-// engine issues chunks back to back with nothing limiting concurrency, so
-// the real invariant is
-//
-//     (chunks in flight) x (packets per chunk)  <=  RDMA_N_WR_OUTSTANDING
-//
-// Sizing the chunk to the whole buffer satisfies that only if exactly one
-// chunk is ever in flight, and THE ENGINE CANNOT KNOW THAT. Pacing on
-// cq_wr was tried and REMOVED - do not put it back without new evidence.
-// Measured on build_sep6, which wired the engine's credit to cq_wr with no
-// opcode filter (jigsaw's exact mechanism), cold 4 MB:
-//   engine chunks, 65472 B, 1 in flight   WEDGED, warm-up never fenced
-//   same size, software paced             0 retrans, PASS, 9.842 GB/s
-// The counters built for that run say why. Per 4 MB region:
-//   software-issued descriptors   71 acks / 65 chunks + 7 setup, one each
-//   engine-generated chunks        0 acks beyond setup, engine wedged
-// A descriptor submitted through the normal request path produces a
-// completion; a chunk the engine splits internally produces NONE. So there
-// is no retire signal to pace against in hardware, filtered or not, and
-// the opcode-filter argument was a red herring on both sides.
-//
-// What remains here is the chunk size alone, as a runtime knob. Keeping a
-// message inside the retransmit buffer is worth doing on its own: it is
-// what lets a replay be served correctly from that buffer instead of
-// needing the re-read the shell denies a vFPGA request.
-// The safe size, kept here for the record and used as loom_ctrl's reset
-// value for CSR 28. The engine reads the CSR, so software can change it or
-// switch chunking off without a rebuild.
-localparam integer CHUNK_BYTES = RDMA_N_WR_OUTSTANDING * PMTU_BYTES - 64;
+// The old message chunking (CSR 28) is gone: with one request per packet
+// every packet owns one retransmit slot, which is what the chunk size was
+// bounding.
 // Wire packet in 64 B beats - the shell fragments at PMTU.
 localparam integer PKT_BEATS = PMTU_BYTES / 64;
+// Loom's own transmit buffer, beats. 4096 x 64 B = 256 KB, in URAM.
+localparam integer TX_FIFO_BEATS = 4096;
 
-// Declared here because ST_RD_REQ latches the first chunk's target from it.
 wire [VADDR_BITS-1:0] dst_vaddr = l_base + {{(VADDR_BITS-28){1'b0}}, l_off};
-logic [27:0]           c_left;    // payload bytes of this descriptor still to send
-logic [27:0]           c_len;     // bytes in the chunk being sent
-logic [VADDR_BITS-1:0] c_va;      // where this chunk lands
-// chunk_bytes == 0 means do not chunk: one message for the whole descriptor.
-wire         chunk_en = (chunk_bytes != 28'd0);
-wire  [27:0] chunk_lim = chunk_en ? chunk_bytes : 28'h FFFFFFF;
-wire  [27:0] c_next = (c_left > chunk_lim) ? chunk_lim : c_left;
-wire         c_last = (c_left <= chunk_lim);
+logic [28:0] p_left;     // message bytes (header included) not yet posted
+logic        p_first;    // the next packet is the message's first
+wire  [28:0] p_len  = (p_left > PMTU_BYTES) ? 29'(PMTU_BYTES) : p_left;
+wire         p_more = (p_left > PMTU_BYTES);
+// Offset of the next packet inside the message, for the RETH/staging vaddr
+wire  [28:0] p_off  = ({1'b0, l_len} + 29'd64) - p_left;
+wire _unused_chunk = ^chunk_bytes;
 
 function automatic logic [22:0] beats_of(input logic [27:0] len);
     logic [28:0] padded;
@@ -322,8 +310,57 @@ function automatic logic [22:0] beats_of(input logic [27:0] len);
     beats_of = padded[28:6];
 endfunction
 
-// Last payload beat this descriptor may forward
+// Last payload beat of the current packet (rdma) / descriptor (local)
 wire stream_last = (l_sbeats <= 23'd1);
+
+// -------------------------------------------------------------------------
+// Transmit buffer. The pull stream lands here unconditionally while there
+// is room; everything below reads f_* instead of the pull directly. The
+// local route and the aperture line read pass through it untouched.
+// -------------------------------------------------------------------------
+logic [AXI_DATA_BITS-1:0]   f_tdata;
+logic [AXI_DATA_BITS/8-1:0] f_tkeep;
+logic                       f_tvalid, f_tready, f_tlast;
+
+xpm_fifo_axis #(
+    .CLOCKING_MODE("common_clock"),
+    .FIFO_MEMORY_TYPE("ultra"),
+    .PACKET_FIFO("false"),
+    .FIFO_DEPTH(TX_FIFO_BEATS),
+    .TDATA_WIDTH(AXI_DATA_BITS),
+    .USE_ADV_FEATURES("0000")
+) inst_tx_fifo (
+    .s_aresetn(aresetn), .s_aclk(aclk), .m_aclk(aclk),
+    .s_axis_tvalid(s_tvalid), .s_axis_tready(s_tready),
+    .s_axis_tdata(s_tdata), .s_axis_tstrb('0), .s_axis_tkeep(s_tkeep),
+    .s_axis_tlast(s_tlast), .s_axis_tid('0), .s_axis_tdest('0), .s_axis_tuser('0),
+    .m_axis_tvalid(f_tvalid), .m_axis_tready(f_tready),
+    .m_axis_tdata(f_tdata), .m_axis_tstrb(), .m_axis_tkeep(f_tkeep),
+    .m_axis_tlast(f_tlast), .m_axis_tid(), .m_axis_tdest(), .m_axis_tuser(),
+    .prog_full_axis(), .wr_data_count_axis(), .almost_full_axis(),
+    .prog_empty_axis(), .rd_data_count_axis(), .almost_empty_axis(),
+    .injectsbiterr_axis(1'b0), .injectdbiterr_axis(1'b0),
+    .sbiterr_axis(), .dbiterr_axis()
+);
+assign cnt_tx_fifo_full = s_tvalid && !s_tready;
+
+// -------------------------------------------------------------------------
+// Window: packets posted to the stack and not yet acknowledged.
+// -------------------------------------------------------------------------
+logic [7:0] inflight;
+wire        win_ok   = (tx_window == 8'd0) || (inflight < tx_window);
+wire        rdma_req = l_route && ((state == ST_WR_REQ) || (state == ST_DMA_WR_REQ));
+logic       wr_valid_i;
+wire        wr_hs    = wr_valid_i && wr_ready;
+always_ff @(posedge aclk) begin
+    if (!aresetn) inflight <= 8'd0;
+    else if (wr_hs && rdma_req && !ack_valid) inflight <= inflight + 8'd1;
+    else if (ack_valid && !(wr_hs && rdma_req) && (inflight != 8'd0)) inflight <= inflight - 8'd1;
+end
+assign tx_inflight    = inflight;
+assign cnt_tx_ack     = ack_valid;
+assign cnt_tx_winfull = rdma_req && !win_ok;
+assign cnt_tx_reqwait = rdma_req &&  win_ok && !wr_ready;
 
 logic [63:0] compl_cnt;
 logic [63:0] rd_data;      // lane-selected read result (or poison)
@@ -359,7 +396,7 @@ always_ff @(posedge aclk) begin
         l_src_pid <= 0; l_compl_va <= 0;
         rd_data <= 0; rd_lane <= 0;
         l_payload <= 0; l_sbeats <= 0;
-        c_left <= 0; c_len <= 0; c_va <= 0;
+        p_left <= 0; p_first <= 0;
         l_valid <= 0; l_route <= 0; l_pid <= 0; l_base <= 0; l_lim <= 0;
     end else begin
         case (state)
@@ -374,7 +411,6 @@ always_ff @(posedge aclk) begin
                 l_compl_va <= fifo_compl_va;
                 l_payload <= fifo_payload;
                 l_sbeats  <= beats_of(fifo_len);
-                c_left    <= fifo_len;
                 l_valid   <= lu_valid;
                 l_route   <= lu_route;
                 l_pid     <= lu_pid;
@@ -401,65 +437,56 @@ always_ff @(posedge aclk) begin
 
             // ---- STORE: one write request, then one data beat ----
 
-            ST_WR_REQ:    if (wr_ready) state <= ST_WR_DATA;
+            ST_WR_REQ:    if (wr_hs) state <= ST_WR_DATA;
             ST_WR_DATA:
                 if (( l_route && m_net_rdy) ||
                     (!l_route && m_host_tready)) state <= ST_IDLE;
 
-            // ---- DESC: pull request, write request, stream, fence ----
+            // ---- DESC: pull request, then per-packet requests + stream ----
             ST_RD_REQ:    if (rd_ready) begin
-                c_va  <= dst_vaddr;      // first chunk lands at the target
-                state <= ST_DMA_WR_REQ;
+                p_left  <= {1'b0, l_len} + 29'd64;   // header + payload
+                p_first <= 1'b1;
+                state   <= ST_DMA_WR_REQ;
             end
-            // Rdma bulk now travels as a WRITE message: a header beat
-            // carrying {op 1, len} + the target VA, then the payload. The
-            // far side takes the destination and the LENGTH from that
-            // header, so it can issue ONE host write for the whole message
-            // instead of one per PMTU packet - which is what the receive
-            // path was doing, 256 of them for a 1 MB transfer. Local route
-            // is untouched: it writes host memory directly, no wire, no
-            // header.
-            ST_DMA_WR_REQ: if (wr_ready) begin
-                c_len    <= l_route ? c_next : l_len;
-                l_sbeats <= beats_of(l_route ? c_next : l_len);
-                state    <= l_route ? ST_HDR_BEAT : ST_STREAM;
+            // One request per PMTU packet on the rdma route (posted under
+            // the window), one for the whole descriptor on the local route.
+            // The header beat goes out with packet 0 only.
+            ST_DMA_WR_REQ: if (wr_hs) begin
+                if (l_route) begin
+                    l_sbeats <= p_first ? 23'((p_len - 29'd64) >> 6) : 23'(p_len >> 6);
+                    state    <= p_first ? ST_HDR_BEAT : ST_STREAM;
+                end else begin
+                    l_sbeats <= beats_of(l_len);
+                    state    <= ST_STREAM;
+                end
             end
             ST_HDR_BEAT:   if (m_net_rdy) state <= ST_STREAM;
             ST_STREAM:
-                if (s_tvalid &&
+                if (f_tvalid &&
                     (( l_route && m_net_rdy) || (!l_route && m_host_tready))) begin
                     l_sbeats <= l_sbeats - 23'd1;
                     if (stream_last) begin
-                        // The pull is ONE read of the whole descriptor and
-                        // keeps streaming across chunk boundaries; only the
-                        // framing on the wire changes. The fence is carried
-                        // by the LAST chunk alone (wr_req below passes
-                        // compl_va 0 otherwise), so a caller still sees one
-                        // descriptor and one completion and never learns
-                        // the chunk size.
-                        c_left <= c_left - c_len;
-                        c_va   <= c_va + {{(VADDR_BITS-28){1'b0}}, c_len};
-                        if (l_route && !c_last)
+                        p_left  <= p_left - p_len;
+                        p_first <= 1'b0;
+                        if (l_route && p_more)
                             state <= ST_DMA_WR_REQ;
                         else
                             state <= (l_compl_va != 0) ? ST_CP_REQ : ST_IDLE;
                     end
                 end
 
-            // Fence release: skipped entirely when the descriptor's
-            // completion VA is 0
             // ---- READ: aligned line pull, lane select, respond ----
             ST_RDP_REQ:   if (rd_ready) state <= ST_RDP_WAIT;
             ST_RDP_WAIT:
-                if (s_tvalid) begin
-                    rd_data <= s_tdata[64*rd_lane +: 64];
-                    if (s_tlast) state <= ST_RD_RESP;
+                if (f_tvalid) begin
+                    rd_data <= f_tdata[64*rd_lane +: 64];
+                    if (f_tlast) state <= ST_RD_RESP;
                 end
             ST_RD_RESP:   state <= ST_IDLE;    // rd_resp_valid pulses below
 
             // Fence release: skipped entirely when the descriptor's
             // completion VA is 0
-            ST_CP_REQ:    if (wr_ready) state <= ST_CP_DATA;
+            ST_CP_REQ:    if (wr_hs) state <= ST_CP_DATA;
             ST_CP_DATA:
                 if (m_host_tready) begin
                     compl_cnt <= compl_cnt + 1;
@@ -523,6 +550,23 @@ always_comb begin
         wr_req.pid    = l_src_pid;
         wr_req.vaddr  = l_compl_va;
         wr_req.len    = 8;
+    end else if (l_route && l_is_desc) begin
+        // One packet of the message, framed here (see Packetising above).
+        // RAW mode hands the opcode straight to the stack; the fields are
+        // the ones the shell's parser would have derived from a PARSE
+        // request, plus last=1 on every packet for its own ack.
+        wr_req.opcode = p_first ? (p_more ? RC_RDMA_WRITE_FIRST  : RC_RDMA_WRITE_ONLY)
+                                : (p_more ? RC_RDMA_WRITE_MIDDLE : RC_RDMA_WRITE_LAST);
+        wr_req.strm   = STRM_RDMA;
+        wr_req.mode   = 1'b1;        // RDMA_MODE_RAW
+        wr_req.rdma   = 1'b1;
+        wr_req.remote = 1'b1;
+        wr_req.actv   = 1'b1;
+        wr_req.pid    = l_pid;       // QP owner
+        // Staging + offset in the message, as the parser advances it; only
+        // packet 0's goes into a RETH and the far side ignores it anyway.
+        wr_req.vaddr  = rdma_staging_va + {{(VADDR_BITS-29){1'b0}}, p_off};
+        wr_req.len    = p_len[LEN_BITS-1:0];
     end else if (l_route) begin
         // All rdma writes go out as wire MESSAGES at the staging vaddr:
         // stores are one 64 B beat, bulk is a 64 B header + the payload
@@ -558,7 +602,7 @@ always_comb begin
         // forward requests the way perf_rdma does and MUST parse the header
         // to learn where the bytes go.)
         wr_req.vaddr  = rdma_staging_va;
-        wr_req.len    = l_is_desc ? (c_next[LEN_BITS-1:0] + 'd64) : 'd64;
+        wr_req.len    = 'd64;
     end else begin
         // Local route: a host-memory write through the shell TLB. pid
         // names the DESTINATION process's address space (the exporter's
@@ -573,26 +617,26 @@ always_comb begin
         wr_req.len    = l_is_desc ? l_len[LEN_BITS-1:0] : 'd8;
     end
 
-    wr_valid = (state == ST_WR_REQ) || (state == ST_DMA_WR_REQ) || (state == ST_CP_REQ);
+    // Rdma requests wait for the window; local ones and the fence do not
+    wr_valid_i = ((state == ST_WR_REQ)     && (!l_route || win_ok)) ||
+                 ((state == ST_DMA_WR_REQ) && (!l_route || win_ok)) ||
+                  (state == ST_CP_REQ);
+    wr_valid = wr_valid_i;
 end
 
 // Wire-message header beat: lane0 = {reserved, len[27:0], op[7:0]},
 // lane1 = target VA (the exporter's VA + offset), lane2 = inline data
 wire [63:0] hdr_q0_inline = {28'b0, 28'd8, MSG_OP_WRITE_INLINE};
-// The header names THIS CHUNK's target and length; on the local route,
-// which is not chunked, c_va/c_len are the descriptor's own.
-// A DESC names THIS CHUNK's target, which advances across the message. A
-// STORE never goes through ST_RD_REQ, so c_va is not loaded for it and it
-// must name the descriptor's own target.
-wire [63:0] hdr_q1        = {{(64-VADDR_BITS){1'b0}},
-                             l_is_desc ? c_va : dst_vaddr};
+// The header names the MESSAGE's target and length - the whole
+// descriptor, however many packets carry it
+wire [63:0] hdr_q1        = {{(64-VADDR_BITS){1'b0}}, dst_vaddr};
 
 wire [AXI_DATA_BITS-1:0] msg_inline_beat =
     {{(AXI_DATA_BITS-192){1'b0}}, l_payload, hdr_q1, hdr_q0_inline};
 
 // Bulk header: same layout, op 1, and the length is the payload's - lane 2
 // is unused because the data follows as its own beats
-wire [63:0] hdr_q0_write = {28'b0, c_len, MSG_OP_WRITE};
+wire [63:0] hdr_q0_write = {28'b0, l_len, MSG_OP_WRITE};
 wire [AXI_DATA_BITS-1:0] msg_write_beat =
     {{(AXI_DATA_BITS-192){1'b0}}, 64'b0, hdr_q1, hdr_q0_write};
 
@@ -608,7 +652,8 @@ wire [AXI_DATA_BITS-1:0] msg_write_beat =
 //   - forwarded DMA beats: passed through combinationally from
 //     axis_host_recv (data/keep/last untouched), so the engine adds no
 //     buffering or latency - backpressure from the selected output
-//     propagates straight back into the shell's pull engine via s_tready.
+//     propagates back into the transmit FIFO, and from there to the
+//     shell's pull engine via s_tready only once the FIFO is full.
 // The host and net outputs are driven from the same sources but gated by
 // the latched route, so exactly one of them carries traffic per
 // transaction.
@@ -654,7 +699,7 @@ wire stream_net   = (state == ST_STREAM) &&  l_route;
 // rate; the highest clean setting IS the receiver's drain ceiling.
 // -------------------------------------------------------------------------
 wire        pace_en   = (pace_num != 8'd0) && (pace_den != 8'd0) && (pace_num < pace_den);
-wire        net_moved = stream_net && s_tvalid && m_net_rdy;
+wire        net_moved = stream_net && f_tvalid && m_net_rdy;
 wire [15:0] pace_cost = {8'd0, pace_den};
 // Credit ceiling: TWO beats, not one. With a one-beat cap the surplus
 // earned during a hold cycle is discarded, so every fraction above 1/2
@@ -664,13 +709,18 @@ wire [15:0] pace_cost = {8'd0, pace_den};
 // to two back-to-back beats.
 wire [15:0] pace_cap  = {7'd0, pace_den, 1'b0};
 
-// Outside ST_STREAM (and when off) the pacer parks with exactly one beat
+// Outside a message (and when off) the pacer parks with exactly one beat
 // of credit and no hold, so the first payload beat of a message moves at
-// once. A move is only possible while pace_hold is low, which by
-// construction means pace_acc >= pace_den, so the subtraction below never
-// underflows.
+// once. Inside a message it keeps running across the per-packet request
+// states, so the rate is exact over the message and not one free beat per
+// packet; it must NOT run during the header beat, whose tvalid is not
+// gated by pace_hold (a hold there would re-present the beat). A move is
+// only possible while pace_hold is low, which by construction means
+// pace_acc >= pace_den, so the subtraction below never underflows.
+wire pace_run = stream_net ||
+                ((state == ST_DMA_WR_REQ) && l_route && l_is_desc && !p_first);
 always_ff @(posedge aclk) begin
-    if (!aresetn || !pace_en || !stream_net) begin
+    if (!aresetn || !pace_en || !pace_run) begin
         pace_acc  <= pace_cost;
         pace_hold <= 1'b0;
     end else begin
@@ -687,22 +737,22 @@ assign cnt_tx_paced = pace_hold && stream_net;
 always_comb begin
     // Pull stream ready while forwarding (from the selected output) or
     // while sinking the read line (always ready: nothing downstream)
-    s_tready = (stream_local && m_host_tready) || (stream_net && m_net_rdy) ||
+    f_tready = (stream_local && m_host_tready) || (stream_net && m_net_rdy) ||
                (state == ST_RDP_WAIT);
 
     // Host output: store beat (local), DMA forward (local), completion beat
-    m_host_tdata  = stream_local ? s_tdata : beat_data;
-    m_host_tkeep  = stream_local ? s_tkeep : beat_keep;
+    m_host_tdata  = stream_local ? f_tdata : beat_data;
+    m_host_tkeep  = stream_local ? f_tkeep : beat_keep;
     m_host_tlast  = stream_local ? stream_last : 1'b1;
     m_host_tvalid = ((state == ST_WR_DATA) && !l_route) ||
-                    (stream_local && s_tvalid) ||
+                    (stream_local && f_tvalid) ||
                     (state == ST_CP_DATA);
 
     // Net output: inline message beat (rdma store) or forwarded DMA
     // beats (rdma bulk, raw payload). The message beat is a full 64 B
     // (keep all ones) - nothing sub-beat ever goes on the wire
     m_net_tdata  = (state == ST_WR_DATA)  ? msg_inline_beat :
-                   (state == ST_HDR_BEAT) ? msg_write_beat  : s_tdata;
+                   (state == ST_HDR_BEAT) ? msg_write_beat  : f_tdata;
     // Every beat on the wire is a full 64 B, payload included. The header
     // above always was; the payload was NOT - it forwarded the pull
     // stream's keep verbatim, so a single partial beat coming back from the
@@ -713,10 +763,12 @@ always_comb begin
     // and forcing this is identical when the contract holds and corrective
     // when it does not. cnt_tx_partial says which.
     m_net_tkeep  = {(AXI_DATA_BITS/8){1'b1}};
+    // One tlast per PACKET (stream_last counts the packet's beats), which
+    // is what a last=1 request asks for on its stream
     m_net_tlast  = stream_net ? stream_last : (state == ST_WR_DATA);
     m_net_tvalid = ((state == ST_WR_DATA) && l_route) ||
                    (state == ST_HDR_BEAT) ||
-                   (stream_net && s_tvalid && !pace_hold);
+                   (stream_net && f_tvalid && !pace_hold);
 end
 
 // -------------------------------------------------------------------------
@@ -741,8 +793,8 @@ assign rd_resp_valid = (state == ST_RD_RESP);
 wire tx_stream = (state == ST_STREAM)   && l_route;
 wire tx_hdr    = (state == ST_HDR_BEAT);
 assign cnt_tx_move   = (tx_hdr    &&  m_net_rdy) ||
-                       (tx_stream &&  s_tvalid && m_net_rdy);
-assign cnt_tx_starve =  tx_stream && !s_tvalid;
+                       (tx_stream &&  f_tvalid && m_net_rdy);
+assign cnt_tx_starve =  tx_stream && !f_tvalid;
 
 // WHERE the starvation lands, which is the thing that matters and which
 // cnt_tx_starve cannot tell you.
@@ -761,13 +813,13 @@ assign cnt_tx_starve =  tx_stream && !s_tvalid;
 logic [6:0] pkt_beat;
 always_ff @(posedge aclk) begin
     if (!aresetn)                     pkt_beat <= 7'd0;
-    else if (state == ST_HDR_BEAT)    pkt_beat <= 7'd0;   // message restarts a packet
+    else if (state == ST_DMA_WR_REQ)  pkt_beat <= 7'd0;   // every request starts a packet
     else if (cnt_tx_move)             pkt_beat <= (pkt_beat == PKT_BEATS-1) ? 7'd0
                                                                            : pkt_beat + 7'd1;
 end
 assign cnt_tx_starve_mid = cnt_tx_starve && (pkt_beat != 7'd0);
 assign cnt_tx_stall  = (tx_hdr    && !m_net_tready) ||
-                       (tx_stream &&  s_tvalid && !m_net_tready);
+                       (tx_stream &&  f_tvalid && !m_net_tready);
 
 assign cnt_drop     = (state == ST_CHECK) && !ok;
 // Residue on the pull stream at the moment a new read is issued. Nothing
@@ -778,14 +830,17 @@ assign cnt_drop     = (state == ST_CHECK) && !ok;
 // Deliberately NOT keyed on s_tlast. The shell may return a large read as
 // several tlast-terminated chunks, so "the last beat carries tlast" is
 // satisfied by any chunk boundary and detects nothing.
-assign cnt_pull_desync = (state == ST_RD_REQ) && rd_ready && s_tvalid;
-assign cnt_tx_partial  = stream_net && s_tvalid && m_net_rdy &&
-                         (s_tkeep != {(AXI_DATA_BITS/8){1'b1}});
+assign cnt_pull_desync = (state == ST_RD_REQ) && rd_ready && f_tvalid;
+assign cnt_tx_partial  = stream_net && f_tvalid && m_net_rdy &&
+                         (f_tkeep != {(AXI_DATA_BITS/8){1'b1}});
 
+// A descriptor's last beat on the rdma route is the last beat of its
+// LAST packet; the per-message counters key on that, not on every packet
+wire desc_net_done = stream_net && f_tvalid && stream_last && !p_more && m_net_rdy;
 assign cnt_local_wr = ((state == ST_WR_DATA) && !l_route && m_host_tready) ||
-                      (stream_local && s_tvalid && stream_last && m_host_tready);
+                      (stream_local && f_tvalid && stream_last && m_host_tready);
 assign cnt_rdma_wr  = ((state == ST_WR_DATA) && l_route && m_net_rdy) ||
-                      (stream_net && s_tvalid && stream_last && m_net_rdy);
+                      desc_net_done;
 assign cnt_compl    = (state == ST_CP_DATA) && m_host_tready;
 
 // -------------------------------------------------------------------------
@@ -831,9 +886,9 @@ always_ff @(posedge aclk) begin
             stage_cnt[1] <= stage_cnt[1] + 1;
         if ((state == ST_WR_DATA) && l_route && m_net_rdy)
             stage_cnt[2] <= stage_cnt[2] + 1;
-        if (stream_local && s_tvalid && s_tlast && m_host_tready)
+        if (stream_local && f_tvalid && stream_last && m_host_tready)
             stage_cnt[3] <= stage_cnt[3] + 1;
-        if (stream_net && s_tvalid && s_tlast && m_net_rdy)
+        if (desc_net_done)
             stage_cnt[4] <= stage_cnt[4] + 1;
         if (state == ST_RD_RESP)
             stage_cnt[5] <= stage_cnt[5] + 1;

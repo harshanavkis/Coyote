@@ -103,31 +103,11 @@ localparam int NET_WINDOW_BEATS = 16 * (PMTU / 64);
 wire m_net_tready = (net_beats.size() < NET_WINDOW_BEATS);
 logic eng_busy;
 
-// The engine chunks an RDMA message to fit the shell's retransmit buffer:
-// RDMA_N_WR_OUTSTANDING slots of PMTU, header included. One descriptor is
-// therefore N messages and N host writes on the far side - but still ONE
-// completion, because only the last chunk carries compl_va.
-// Must track loom_engine's. The slots are shared by every outstanding
-// message, so with up to RDMA_N_WR_OUTSTANDING chunks in flight the only
-// unconditionally safe chunk is one packet.
-localparam int CHUNK_BYTES = RDMA_N_WR_OUTSTANDING * PMTU_BYTES - 64;
-function automatic int chunks_of(input int len);
-    chunks_of = (len + CHUNK_BYTES - 1) / CHUNK_BYTES;
-endfunction
-
-// Host writes the receive path now issues: ONE PER PACKET, not one per
-// message. loom_rx used to cover a whole message with a single write and
-// swallow the shell's per-packet requests as credit, which handed the DMA
-// one multi-megabyte descriptor where perf_rdma hands it one per 4 KB
-// packet. Each engine chunk is framed as a 64 B header plus its payload and
-// the shell fragments that at PMTU, so the count is per chunk, summed.
+// A descriptor is ONE message: a 64 B header plus the payload, sent as one
+// request per PMTU packet (the engine packetises; nothing is chunked any
+// more). Host writes the receive path issues: ONE PER PACKET.
 function automatic int packets_of(input int len);
-    int full, rem;
-    full = len / CHUNK_BYTES;
-    rem  = len % CHUNK_BYTES;
-    packets_of = full * ((CHUNK_BYTES + 64) / PMTU_BYTES);
-    if (rem != 0)
-        packets_of += (rem + 64 + PMTU_BYTES - 1) / PMTU_BYTES;
+    packets_of = (len + 64 + PMTU_BYTES - 1) / PMTU_BYTES;
 endfunction
 
 int errors = 0;
@@ -159,9 +139,29 @@ loom_table inst_table (
     .lu_pid(lu_pid), .lu_base(lu_base), .lu_len(lu_len)
 );
 
-// The engine reads its chunk size from CSR 28; drive the same value
-// loom_ctrl resets to. Zero here would switch chunking off.
+// CSR 28 still exists for software; the engine ignores it now.
 wire [27:0] chunk_bytes = RDMA_N_WR_OUTSTANDING * PMTU_BYTES - 64;
+
+// Transmit window and its acks. The shell acks every packet request
+// (last=1) once the far stack has taken it; here the ack returns ACK_DELAY
+// cycles after the far side accepts the packet's rq_wr.
+logic [7:0] tx_window = 8'd8;
+int         ACK_DELAY = 64;
+logic       ack_valid;
+logic [7:0] tx_inflight;
+logic       cnt_tx_ack, cnt_tx_winfull, cnt_tx_reqwait, cnt_tx_fifo_full;
+int         ack_due[$];
+int         cyc = 0;
+int         max_inflight = 0, winfull_cycles = 0;
+always @(posedge aclk) begin
+    cyc++;
+    if (tx_inflight > max_inflight) max_inflight = tx_inflight;
+    if (cnt_tx_winfull) winfull_cycles++;
+end
+always @(negedge aclk) begin
+    ack_valid = (ack_due.size() > 0) && (ack_due[0] <= cyc);
+    if (ack_valid) void'(ack_due.pop_front());
+end
 
 logic cnt_tx_starve_mid;
 // Egress pacing under test: 0 = off (the default every case above runs
@@ -180,6 +180,9 @@ loom_engine inst_engine (
     .cnt_tx_starve_mid(cnt_tx_starve_mid),
     .cnt_tx_paced(cnt_tx_paced), .pace_num(pace_num), .pace_den(pace_den),
     .chunk_bytes(chunk_bytes),
+    .tx_window(tx_window), .ack_valid(ack_valid), .tx_inflight(tx_inflight),
+    .cnt_tx_ack(cnt_tx_ack), .cnt_tx_winfull(cnt_tx_winfull),
+    .cnt_tx_reqwait(cnt_tx_reqwait), .cnt_tx_fifo_full(cnt_tx_fifo_full),
     .aclk(aclk), .aresetn(aresetn),
     .fifo_empty(fifo_empty), .fifo_is_desc(fifo_is_desc),
     .fifo_is_read(fifo_is_read),
@@ -342,8 +345,16 @@ end
 // packets on the far side. Requests and payload are captured first so the
 // fragmenter can present them with the shell's framing.
 // -------------------------------------------------------------------------
-typedef struct { logic [47:0] vaddr; logic [27:0] len; } wreq_t;
+typedef struct { logic [47:0] vaddr; logic [27:0] len; logic [4:0] op; } wreq_t;
 wreq_t net_reqs[$];
+// The engine frames the message itself: FIRST/MIDDLE/LAST/ONLY per packet
+// (an inline store is APP_WRITE, a one-packet message). The far side's
+// rq_wr.last is what the RX path derives from the wire opcode: high on
+// LAST and ONLY.
+function automatic bit msg_end(input logic [4:0] op);
+    msg_end = (op == RC_RDMA_WRITE_LAST) || (op == RC_RDMA_WRITE_ONLY) ||
+              (op == APP_WRITE);
+endfunction
 int fences = 0;
 
 // Beat accounting. A request claims `len` bytes; the engine must put
@@ -358,7 +369,7 @@ int net_extra = 0;                     // beats nobody asked for
 always @(posedge aclk) begin
     if (eng_wr_valid && eng_wr_ready) begin
         if (eng_wr_req.strm == STRM_RDMA) begin
-            net_reqs.push_back('{eng_wr_req.vaddr, eng_wr_req.len});
+            net_reqs.push_back('{eng_wr_req.vaddr, eng_wr_req.len, eng_wr_req.opcode});
             net_owed += int((eng_wr_req.len + 63) / 64);
         end else
             fences++;                       // local completion write
@@ -432,34 +443,40 @@ bit drop_done     = 0;      // steal from ONE message, as one retransmit would
 typedef struct { int beats; bit last_frag; } frame_t;
 frame_t net_frames[$];
 
-// Request driver: ceil(len/PMTU) fragments per message, vaddr advancing,
-// rq_wr.last only on the final one
+// Request driver: one rq_wr per packet request the engine posted (the
+// engine already framed at PMTU), rq_wr.last from the opcode. With
+// req_pkts > 1 the model merges that many consecutive packets of one
+// message into a single rq_wr, the shape a merging RX path would present.
+// Every packet request is acked ACK_DELAY cycles after its rq_wr lands.
 task deliver_reqs();
     wreq_t w;
-    int nfrag, frag_len, guard, span;
+    int guard, frag_len, npk;
+    logic last;
     w = net_reqs.pop_front();
-    span  = PMTU * req_pkts;
-    nfrag = (w.len + span - 1) / span;
-    for (int f = 0; f < nfrag; f++) begin
-        frag_len = (f == nfrag - 1) ? (w.len - f*span) : span;
-        @(negedge aclk);
-        rx_rq_req = '0;
-        rx_rq_req.pid   = QP_OWNER;
-        rx_rq_req.vaddr = w.vaddr + f*span;
-        rx_rq_req.len   = frag_len;
-        rx_rq_req.last  = (f == nfrag - 1);
-        rx_rq_valid = 1;
-        net_frames.push_back('{(frag_len + 63) / 64, (f == nfrag - 1)});
-        guard = 0;
-        do begin @(posedge aclk); guard++; end
-        while (!rx_rq_ready && guard < 20000);
-        @(negedge aclk);
-        rx_rq_valid = 0;
-        if (guard >= 20000) begin
-            check(1'b0, $sformatf(
-                "far side never accepted the request @%0h (stuck)", w.vaddr));
-            return;
-        end
+    frag_len = w.len; npk = 1; last = msg_end(w.op);
+    while (!last && npk < req_pkts && net_reqs.size() > 0) begin
+        wreq_t n;
+        n = net_reqs.pop_front();
+        frag_len += n.len; npk++; last = msg_end(n.op);
+    end
+    @(negedge aclk);
+    rx_rq_req = '0;
+    rx_rq_req.pid   = QP_OWNER;
+    rx_rq_req.vaddr = w.vaddr;
+    rx_rq_req.len   = frag_len;
+    rx_rq_req.last  = last;
+    rx_rq_valid = 1;
+    net_frames.push_back('{(frag_len + 63) / 64, last});
+    guard = 0;
+    do begin @(posedge aclk); guard++; end
+    while (!rx_rq_ready && guard < 20000);
+    @(negedge aclk);
+    rx_rq_valid = 0;
+    for (int k = 0; k < npk; k++) ack_due.push_back(cyc + ACK_DELAY);
+    if (guard >= 20000) begin
+        check(1'b0, $sformatf(
+            "far side never accepted the request @%0h (stuck)", w.vaddr));
+        return;
     end
 endtask
 
@@ -1062,17 +1079,16 @@ initial begin
              wr_q_max, 8, wr_orphan_beats);
     check(wr_q_max >= 2, $sformatf("1 MB: writes are pipelined (queue depth %0d >= 2)", wr_q_max));
     // last=1 (and its tlast) costs a completion writeback in the shell, so
-    // it goes on each MESSAGE's final packet only. The engine chunks this
-    // 1 MB into ceil(1048576/65472) = 17 wire messages of 257 packets in
-    // all, so 17 of the 257 writes carry last, not 257.
-    $display("       1 MB: %0d request(s) with last=1, %0d tlast beat(s), %0d messages",
-             wr_last_reqs - last_before, rx_tlasts - tlast_before, (1048576 + 65472 - 1) / 65472);
-    check(wr_last_reqs - last_before == (1048576 + 65472 - 1) / 65472,
-          $sformatf("1 MB: one last=1 request per message (%0d, want %0d)",
-                    wr_last_reqs - last_before, (1048576 + 65472 - 1) / 65472));
-    check(rx_tlasts - tlast_before == (1048576 + 65472 - 1) / 65472,
-          $sformatf("1 MB: one tlast per message (%0d, want %0d)",
-                    rx_tlasts - tlast_before, (1048576 + 65472 - 1) / 65472));
+    // it goes on the MESSAGE's final packet only: 1 MB is one message of
+    // 257 packets, so exactly one of the 257 writes carries last.
+    $display("       1 MB: %0d request(s) with last=1, %0d tlast beat(s), 1 message",
+             wr_last_reqs - last_before, rx_tlasts - tlast_before);
+    check(wr_last_reqs - last_before == 1,
+          $sformatf("1 MB: one last=1 request per message (%0d, want 1)",
+                    wr_last_reqs - last_before));
+    check(rx_tlasts - tlast_before == 1,
+          $sformatf("1 MB: one tlast per message (%0d, want 1)",
+                    rx_tlasts - tlast_before));
     check(wr_orphan_beats == 0, $sformatf("1 MB: no data beat arrived without a posted write (%0d)", wr_orphan_beats));
 
     // 8 MB: 2049 packets, 131073 beats. On hardware a lone message this
@@ -1131,8 +1147,11 @@ initial begin
                     rx_txns - fwd_before, packets_of(524288)));
     $display("       paced 1/2: %0d holds for %0d payload beats (want ~%0d)",
              paced_cycles, net_moved_beats, net_moved_beats);
-    check(paced_cycles >= net_moved_beats - (524288 / 65472 + 2) &&
-          paced_cycles <= net_moved_beats + (524288 / 65472 + 2),
+    // The cycles spent posting each packet's request earn credit too, so
+    // up to one hold per packet is replaced by an idle request cycle - the
+    // rate over time is still the cap
+    check(paced_cycles >= net_moved_beats - (packets_of(524288) + 2) &&
+          paced_cycles <= net_moved_beats + (packets_of(524288) + 2),
           $sformatf("paced 1/2: pacer held %0d cycles for %0d payload beats",
                     paced_cycles, net_moved_beats));
     pace_num = 8'd41; pace_den = 8'd64;        // ~64%: the hardware target
@@ -1144,8 +1163,8 @@ initial begin
                   "paced 41/64: 256 KB message lands intact");
     $display("       paced 41/64: %0d holds for %0d payload beats (want ~%0d)",
              paced_cycles, net_moved_beats, net_moved_beats * 23 / 41);
-    check(paced_cycles >= net_moved_beats * 23 / 41 - (262144 / 65472 + 2) * 2 &&
-          paced_cycles <= net_moved_beats * 23 / 41 + (262144 / 65472 + 2) * 2,
+    check(paced_cycles >= net_moved_beats * 23 / 41 - (packets_of(262144) + 2) * 2 &&
+          paced_cycles <= net_moved_beats * 23 / 41 + (packets_of(262144) + 2) * 2,
           $sformatf("paced 41/64: pacer held %0d cycles for %0d payload beats (want ~%0d)",
                     paced_cycles, net_moved_beats, net_moved_beats * 23 / 41));
     pace_num = 8'd0; pace_den = 8'd0;
@@ -1235,11 +1254,9 @@ initial begin
     beats_dropped = 0;
     fwd_before    = rx_txns;
     drop_done     = 0;
-    // Partway into a MESSAGE, and a message is now a chunk: the engine
-    // splits a descriptor at CHUNK_BYTES, so nothing exceeds 1023 beats and
-    // a drop at 4096 would never fire. The case's point is unchanged -
-    // steal beats mid-message and show the payload displaces.
-    drop_at_beat  = 500;        // inside a chunk: 16 packets = 1024 beats
+    // Partway into the MESSAGE (a message is the whole descriptor again;
+    // the engine packetises rather than chunks).
+    drop_at_beat  = 500;
     drop_n_beats  = 2;          // hardware's smallest observed displacement
     copy(4'd1, 28'hD00000, {16'b0, SRC_VA}, 28'd1048576, {16'b0, CPL_VA});
     copy(4'd1, 28'hE00000, {16'b0, SRC_VA}, 28'd1048576, {16'b0, CPL_VA});
@@ -1264,19 +1281,15 @@ initial begin
         end
         $display("       stolen-beat message: %0d of 131072 words wrong, %0d never written, first bad %0d",
                  wrong, never, first_bad);
-        // Before chunking, two stolen beats displaced the ENTIRE remainder
-        // of the message: the region was fully covered and every byte after
-        // the theft was in the wrong place, silently, to the end. That is
-        // the hardware signature this case was written to reproduce.
-        //
-        // Chunked, the damage cannot leave the chunk it happened in - the
-        // next chunk carries its own header, its own target and its own
-        // length, so it re-anchors. Measured here: 65472 bytes never
-        // written, which is exactly one chunk, and everything past it
-        // intact. Bounding the blast radius is the point; a lost beat is
-        // still a lost beat.
-        check(never * 8 <= CHUNK_BYTES,
-              $sformatf("a lost beat damages ONE chunk only (%0d B)", never * 8));
+        // Two stolen beats displace the remainder of the message: the
+        // region is covered except for the tail the stolen beats would have
+        // filled, and every byte after the theft is in the wrong place,
+        // silently. That is the hardware signature this case reproduces.
+        // The tail the stolen beats would have filled is either never
+        // written or - because the next message's beats flow into the
+        // still-open packet write - covered with the wrong data.
+        check(never * 8 <= beats_dropped * 64,
+              $sformatf("at most the stolen beats' worth is never written (%0d B)", never * 8));
         check(wrong > 0, "losing beats DOES displace the payload");
         if (first_bad >= 0 && mem.exists((BASE1 + 48'hD00000 + 48'(first_bad*8)) >> 3))
             $display("       at word %0d: got %016x, want %016x (delta %0d words)",
