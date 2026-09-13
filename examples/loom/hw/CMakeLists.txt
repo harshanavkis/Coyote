@@ -9,7 +9,12 @@ message("*** Loom switch prototype [Hardware] ***")
 
 # Infrastructure settings
 set(EN_STRM 1)
-set(N_STRM_AXI 1)
+# Two host streams, as perf_rdma builds: [0] is the engine's (stores, DMA
+# writes, fences, the pull), [1] is loom_rx's landing stream for incoming
+# rdma writes. Each dest has its own queue, credits and FIFO in the shell
+# (local_credits_host_wr), so the receive path no longer shares the
+# engine's stream, its arbiter slot or its EN_CRED_LOCAL accounting.
+set(N_STRM_AXI 2)
 set(EN_RDMA 1)
 
 # Single vFPGA: all emulated XPU processes attach to it as cThreads

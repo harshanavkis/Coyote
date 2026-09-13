@@ -6,10 +6,12 @@
  * sq_wr/axis_host_send, rdma via sq_wr/axis_rreq_send); loom_rx forwards
  * incoming RDMA writes (rq_wr + axis_rrsp_recv) as local writes.
  *
- * The engine and rx share sq_wr and axis_host_send[0]; a registered
- * arbiter grants the path to one of them for whole transactions
- * (engine priority). The engine is gated by masking its FIFO-empty input
- * rather than by an engine-side grant port.
+ * The engine and rx share sq_wr; a registered arbiter grants it to one of
+ * them for whole transactions (engine priority). The engine is gated by
+ * masking its FIFO-empty input rather than by an engine-side grant port.
+ * Data goes out on separate host streams: the engine on axis_host_send[0],
+ * rx on axis_host_send[1] (wr_req.dest 1), as perf_rdma's receiver does -
+ * separate queue, credits and FIFO in the shell for each.
  */
 
 // ---------------------------------------------------------------------------
@@ -108,13 +110,20 @@ AXI4SR axis_wr (.*);
 axisr_reg inst_reg_wr   (.aclk(aclk), .aresetn(aresetn),
                          .s_axis(axis_wr), .m_axis(axis_host_send[0]));
 
-// Arbiter: exclusive, whole-transaction ownership of {sq_wr, axis_host_send}
+// rx's own landing stream (dest 1). Registered like the engine's.
+AXI4SR axis_wr_rx (.*);
+axisr_reg inst_reg_wr_rx (.aclk(aclk), .aresetn(aresetn),
+                          .s_axis(axis_wr_rx), .m_axis(axis_host_send[1]));
+
+// Arbiter: exclusive, whole-transaction ownership of sq_wr
 //
 // Why it exists: the engine (stores, DMA writes, fences) and rx
-// (forwarded incoming writes) both need the single sq_wr request channel
-// and the single host output stream. Interleaving beats of two
-// transactions on one stream would corrupt both, so ownership is granted
-// for WHOLE transactions.
+// (forwarded incoming writes) both need the single sq_wr request channel.
+// The data streams are separate since dest 1 (axis_host_send[0] engine,
+// [1] rx), so only the request channel is shared now; ownership is still
+// granted for WHOLE transactions, which keeps the request/data pairing of
+// each producer trivially in order and costs nothing on the receiver,
+// where the engine is idle during a transfer.
 //
 // Why it is registered: a combinational arbiter here closes a loop -
 // the grant would depend on the engine's pop decision, which depends on
@@ -309,7 +318,7 @@ loom_rx inst_loom_rx (
     .s_tvalid(rxf_tvalid), .s_tready(rxf_tready),
     .s_tlast(rxf_tlast),
     .m_tdata(rx_tdata), .m_tkeep(rx_tkeep), .m_tvalid(rx_tvalid),
-    .m_tready(axis_wr.tready && rx_grant), .m_tlast(rx_tlast),
+    .m_tready(axis_wr_rx.tready && rx_grant), .m_tlast(rx_tlast),
     .req(rx_req_arb), .grant(rx_grant), .busy(rx_busy),
     .cnt_rx_move(rx_cnt_move), .cnt_rx_starve(rx_cnt_starve),
     .cnt_rx_stall(rx_cnt_stall), .cnt_rx_bp(rx_cnt_bp), .cnt_rx_partial(rx_cnt_partial),
@@ -327,9 +336,9 @@ loom_rx inst_loom_rx (
 // the corresponding readys are masked on the way INTO each producer
 // (see the eng/rx instantiations above: `sq_wr.ready && eng_grant` etc.),
 // so an ungranted producer can neither drive nor mistakenly complete a
-// handshake. Resources with a single user need no mux: sq_rd and the
-// pull stream belong to the engine, the rdma TX stream to the engine,
-// the rdma RX stream to loom_rx.
+// handshake. Resources with a single user need no mux: sq_rd, the pull
+// stream and axis_host_send[0] belong to the engine, the rdma TX stream
+// to the engine, the rdma RX stream and axis_host_send[1] to loom_rx.
 // ---------------------------------------------------------------------------
 always_comb begin
     sq_wr.data  = rx_grant ? rx_wr_req  : eng_wr_req;
@@ -342,11 +351,19 @@ always_comb begin
 end
 
 always_comb begin
-    axis_wr.tdata  = rx_grant ? rx_tdata  : eng_host_tdata;
-    axis_wr.tkeep  = rx_grant ? rx_tkeep  : eng_host_tkeep;
-    axis_wr.tlast  = rx_grant ? rx_tlast  : eng_host_tlast;
-    axis_wr.tvalid = rx_grant ? rx_tvalid : (eng_host_tvalid && eng_grant);
+    axis_wr.tdata  = eng_host_tdata;
+    axis_wr.tkeep  = eng_host_tkeep;
+    axis_wr.tlast  = eng_host_tlast;
+    axis_wr.tvalid = eng_host_tvalid && eng_grant;
     axis_wr.tid    = '0;
+end
+
+always_comb begin
+    axis_wr_rx.tdata  = rx_tdata;
+    axis_wr_rx.tkeep  = rx_tkeep;
+    axis_wr_rx.tlast  = rx_tlast;
+    axis_wr_rx.tvalid = rx_tvalid && rx_grant;
+    axis_wr_rx.tid    = '0;
 end
 
 always_comb begin
@@ -367,5 +384,6 @@ always_comb cq_rd.ready = 1'b1;
 always_comb cq_wr.ready = 1'b1;
 always_comb rq_rd.ready = 1'b1;
 
+always_comb axis_host_recv[1].tie_off_s();   // only the engine pulls, on [0]
 always_comb axis_rreq_recv[0].tie_off_s();
 always_comb axis_rrsp_send[0].tie_off_m();

@@ -6,7 +6,8 @@ import lynxTypes::*;
  * tb_loom_top — top-level test of the generated wrapper
  * (design_user_logic_c0_0, which includes vfpga_top.svh verbatim).
  *
- * Focus: engine/rx arbitration on the shared {sq_wr, axis_host_send[0]}
+ * Focus: engine/rx arbitration on the shared sq_wr; the engine lands on
+ * axis_host_send[0], rx on axis_host_send[1] (dest 1)
  * path — mutual exclusion (continuous assertion), transaction atomicity
  * under races in both directions, starvation recovery, and a mixed soak
  * with exact counter accounting (completion disabled for clean sums).
@@ -62,7 +63,11 @@ initial begin
     axis_host_recv[0].tvalid = 0; axis_host_recv[0].tdata = '0;
     axis_host_recv[0].tkeep = '0; axis_host_recv[0].tlast = 0;
     axis_host_recv[0].tid = '0;
+    axis_host_recv[1].tvalid = 0; axis_host_recv[1].tdata = '0;
+    axis_host_recv[1].tkeep = '0; axis_host_recv[1].tlast = 0;
+    axis_host_recv[1].tid = '0;
     axis_host_send[0].tready = 1;
+    axis_host_send[1].tready = 1;
     axis_rreq_send[0].tready = 1;
     axis_rreq_recv[0].tvalid = 0; axis_rreq_recv[0].tdata = '0;
     axis_rreq_recv[0].tkeep = '0; axis_rreq_recv[0].tlast = 0;
@@ -76,12 +81,13 @@ end
 
 // ---- capture ----
 req_t wrq[$], rdq[$];
-int host_beats = 0, net_beats = 0;
+int host_beats = 0, rx_beats = 0, net_beats = 0;
 
 always @(posedge aclk) begin
     if (sq_wr.valid && sq_wr.ready) wrq.push_back(sq_wr.data);
     if (sq_rd.valid && sq_rd.ready) rdq.push_back(sq_rd.data);
     if (axis_host_send[0].tvalid && axis_host_send[0].tready) host_beats++;
+    if (axis_host_send[1].tvalid && axis_host_send[1].tready) rx_beats++;
     if (axis_rreq_send[0].tvalid && axis_rreq_send[0].tready) net_beats++;
 end
 
@@ -266,6 +272,8 @@ initial begin
               "T2: DMA wr first");
         check(wrq[1].vaddr == 48'h7f9e_8860_0000 && wrq[1].pid == 6'd2,
               "T2: rx wr second");
+        check(wrq[0].dest == 0 && wrq[1].dest == 1,
+              "T2: engine writes dest 0, rx writes dest 1");
     end
     check(rx_done == 1, "T2: rx completed");
     wrq.delete(); rdq.delete(); host_beats = 0;
@@ -311,9 +319,13 @@ initial begin
     check(wrq.size() == n_stores + n_descs + n_rx,
           $sformatf("T5: wr_req count %0d, expected %0d",
                     wrq.size(), n_stores + n_descs + n_rx));
-    check(host_beats == n_stores + desc_beats + n_rx,
+    check(host_beats == n_stores + desc_beats,
           $sformatf("T5: host beats %0d, expected %0d",
-                    host_beats, n_stores + desc_beats + n_rx));
+                    host_beats, n_stores + desc_beats));
+    check(rx_beats == 3 + n_rx,
+          $sformatf("T5: rx beats on stream 1 %0d, expected %0d",
+                    rx_beats, 3 + n_rx));
+
     check(net_beats == 0, "T5: nothing on net (all local)");
 
     // Counters (completion disabled -> local_wr = stores + descs)

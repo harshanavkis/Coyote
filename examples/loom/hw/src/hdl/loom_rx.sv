@@ -414,7 +414,12 @@ always_comb begin
     // cannot say where the bytes belong.
     wr_req.vaddr  = (state == ST_IDLE) ? s_tdata[64 +: VADDR_BITS] : q_va;
     wr_req.len    = (state == ST_IDLE) ? first_len : q_len;
-    wr_req.dest   = 0;
+    // dest 1: this module's OWN host stream (axis_host_send[1]), the way
+    // perf_rdma's receiver lands incoming writes. dest 0 is the engine's
+    // stream, shared through the arbiter and accounted by the shell's
+    // per-dest local write credits; the receiver was the only thing on
+    // this path still differing from perf_rdma's wiring (2026-09-13).
+    wr_req.dest   = 1;
     // last ONLY on the message's final packet. With EN_WB every write
     // completed with last=1 also costs a completion WRITEBACK - a separate
     // small PCIe write of the completion count (cnfg_slave.sv meta_done_wr
