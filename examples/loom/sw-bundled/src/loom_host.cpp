@@ -667,19 +667,6 @@ void run_bench(coyote::cThread &t_ctrl, loom::Xpu &A, int win,
         // receive-path report, which runs on the SERVER - where the engine
         // never streams a bulk descriptor, so it could only ever read zero.
         // The pull is the SENDER's, and this is the sender.
-        {
-            const uint64_t sm  = loom::csr_read(t_ctrl, loom::TX_SMID);
-            const uint64_t smx = loom::csr_read(t_ctrl, loom::TX_SMID_MAX);
-            printf("  starvation INSIDE a packet: %lu cycles, longest run %lu -> %s\n",
-                   (unsigned long) sm, (unsigned long) smx,
-                   sm == 0 ? "none - every gap fell between packets"
-                           : "the engine gapped mid-frame (shape only: the "
-                             "clean control gaps MORE and loses nothing)");
-        }
-        const uint64_t part = loom::csr_read(t_ctrl, loom::TX_PARTIAL);
-        printf("  tx partial-keep beats: %lu   (payload beats the host read "
-               "returned sub-beat; the engine now forces a full keep, this "
-               "says whether it ever had to)\n", (unsigned long) part);
         const uint64_t pdes = loom::csr_read(t_ctrl, loom::PULL_DESYNC);
         printf("  pull desync: %lu   (beats left on the pull stream when a "
                "read was issued; nonzero means the engine forwarded a beat "
@@ -1207,22 +1194,11 @@ int run_server(uint16_t qp_port, uint16_t peer_port, const std::string &sock) {
                    100.0 * double(st) / double(tot));
         const uint64_t acc = loom::csr_read(t_ctrl, loom::RX_REQ);
         const uint64_t don = loom::csr_read(t_ctrl, loom::DBG_BASE + 8 * 4);
-        const uint64_t spn = loom::csr_read(t_ctrl, loom::RX_SPAN);
         // accepted counts PACKETS (every request is drained), completed
         // counts MESSAGES. The ratio is packets per message; there is no
         // identity between them to check.
-        printf("rq_wr: %lu accepted (packets), %lu completed (messages), "
-               "%lu arrived mid-stream\n",
-               (unsigned long) acc, (unsigned long) don, (unsigned long) spn);
-        const uint64_t hd = loom::csr_read(t_ctrl, loom::RX_STALL_HEAD);
-        const uint64_t bd = loom::csr_read(t_ctrl, loom::RX_STALL_BODY);
-        if (st)
-            printf("  of the stalls: %lu before the packet's first beat, "
-                   "%lu after -> %s\n", (unsigned long) hd,
-                   (unsigned long) bd,
-                   hd > bd ? "single-outstanding request latency; overlap the "
-                             "next sq_wr with the current stream"
-                           : "a bursty host write path; buffer it");
+        printf("rq_wr: %lu accepted (packets), %lu completed (messages)\n",
+               (unsigned long) acc, (unsigned long) don);
         // Sum vs worst run: the ingress FIFO is 512 beats in the shell plus
         // 512 in user logic, so a worst run well under that is a burst the
         // buffer can swallow. A worst run comparable to the total means the
@@ -1238,14 +1214,6 @@ int run_server(uint16_t qp_port, uint16_t peer_port, const std::string &sock) {
         printf("  rx orphan beats: %lu   (beats no rq_wr request accounted "
                "for; nonzero means the receive path handed up a packet it "
                "did not deliver)\n", (unsigned long) orph);
-        {
-            const uint64_t rp = loom::csr_read(t_ctrl, loom::RX_PARTIAL);
-            printf("  rx PARTIAL-KEEP beats: %lu -> %s\n", (unsigned long) rp,
-                   rp == 0 ? "none; every beat carried a full 64 B (as it must: "
-                             "every message is a multiple of 64 B)"
-                           : "a short beat reached the host write - the 64 B "
-                             "contract was broken somewhere");
-        }
         {
             const uint64_t ff  = loom::csr_read(t_ctrl, loom::RX_FIFO_FULL);
             const uint64_t ffm = loom::csr_read(t_ctrl, loom::RX_FIFO_FULL_MAX);

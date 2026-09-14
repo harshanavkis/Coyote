@@ -105,19 +105,6 @@ module loom_rx (
     output logic                        cnt_rx_starve,  // ingress had nothing
     output logic                        cnt_rx_stall,
     output logic                        cnt_rx_bp,   // host write not ready
-    // A payload beat arriving from the network with a PARTIAL tkeep.
-    output logic                        cnt_rx_partial,
-    // Stall split by WHERE in the packet it lands, which is what tells the
-    // two candidate fixes apart. This module is single-outstanding on the
-    // write side: it posts one sq_wr, streams that packet, and only then
-    // takes the next request - so if the shell withholds m_tready until it
-    // has accepted and translated the request, every packet pays that
-    // latency serially and the stalls bunch up BEFORE its first beat.
-    // Head-heavy means overlap the next request with the current stream;
-    // body-heavy means the host write path is bursty and wants a buffer;
-    // neither means its sustained bandwidth is simply the ceiling.
-    output logic                        cnt_rx_stall_head,
-    output logic                        cnt_rx_stall_body,
 
     // Requests ACCEPTED off rq_wr. cnt_rx_fwd counts the ones this module
     // finished, and the difference between the two is the question that
@@ -125,15 +112,7 @@ module loom_rx (
     // when completions came up short of the packets the shell must have
     // sent, nothing said whether the requests never arrived or arrived and
     // were never finished. Those have opposite causes and opposite fixes.
-    output logic                        cnt_rx_req,
-
-    // Continuation requests absorbed by a spanning message. A bulk transfer
-    // is one logical write across many packets, so most of its rq_wr's are
-    // swallowed here rather than becoming transactions - and nothing else
-    // observes that. If the absorption ever mis-counts, the payload lands
-    // wrong with no counter moving, which is the situation this whole
-    // investigation started in. Expect (packets per message - 1) per bulk.
-    output logic                        cnt_rx_span
+    output logic                        cnt_rx_req
 );
 
 // Wire-message header ops (keep in sync with loom_engine.sv)
@@ -196,7 +175,6 @@ wire  [27:0]           q_len   = (q_left > PMTU_BYTES[27:0]) ? PMTU_BYTES[27:0] 
 wire                   gen_on  = (state == ST_STREAM || state == ST_PKT_WAIT) &&
                                  (q_left != 28'd0) && (outstanding < RX_WR_OUTSTANDING[3:0]);
 wire                   post_now = gen_on && wr_ready;
-logic                  l_moved;      // this transaction has had at least one beat
 // A WRITE message (op 1) is ONE logical write that may span several PMTU
 // packets, so its beat budget comes from the HEADER's length, not from the
 // request's, and the intermediate rq_wr's and tlasts belong to packets
@@ -311,7 +289,7 @@ always_ff @(posedge aclk) begin
     if (!aresetn) begin
         state <= ST_IDLE;
         l_op <= 0; l_len <= 0; l_va <= 0; l_inline <= 0;
-        l_beats <= 0; l_moved <= 1'b0; w_va <= 0; w_left <= 0;
+        l_beats <= 0; w_va <= 0; w_left <= 0;
         p_credit <= 0;
         q_va <= 0; q_left <= 0; outstanding <= 0;
     end else begin
@@ -346,7 +324,6 @@ always_ff @(posedge aclk) begin
                 w_va     <= s_tdata[64 +: VADDR_BITS]
                             + {{(VADDR_BITS-28){1'b0}}, first_len};
                 w_left   <= hdr_len - first_len;
-                l_moved  <= 1'b0;
                 if (hdr_ok && wr_ready) begin
                     state <= (hdr_op == MSG_OP_WRITE_INLINE) ? ST_INLINE_DATA
                                                              : ST_STREAM;
@@ -370,7 +347,6 @@ always_ff @(posedge aclk) begin
             // a PACKET's write; if the next packet's write is already posted
             // the stream continues straight into it.
             ST_STREAM: if (s_tvalid && m_tready && covered) begin
-                l_moved <= 1'b1;
                 l_beats <= l_beats - 23'd1;
                 if (stream_end) begin
                     if (w_left == 28'd0)
@@ -379,7 +355,6 @@ always_ff @(posedge aclk) begin
                         l_beats <= beats_of(next_len);
                         w_va    <= w_va + {{(VADDR_BITS-28){1'b0}}, next_len};
                         w_left  <= w_left - next_len;
-                        l_moved <= 1'b0;
                     end else
                         state <= ST_PKT_WAIT;
                 end
@@ -392,7 +367,6 @@ always_ff @(posedge aclk) begin
                 l_beats <= beats_of(next_len);
                 w_va    <= w_va + {{(VADDR_BITS-28){1'b0}}, next_len};
                 w_left  <= w_left - next_len;
-                l_moved <= 1'b0;
                 state   <= ST_STREAM;
             end
 
@@ -487,20 +461,6 @@ assign cnt_rx_stall  = (state == ST_STREAM) &&  s_tvalid && !m_tready;
 // is the direct measure of the thing being fixed - it must read ~0.
 assign cnt_rx_bp     = s_tvalid && !s_tready;
 
-// Partial keep on the receive path. m_tkeep is forwarded verbatim into the
-// host write and this module positions payload by a running beat count, so
-// a short beat would displace everything after it. It CANNOT happen by
-// construction - every message is a multiple of 64 B at both ends and PMTU
-// is 4096, so every packet and every beat is full - and it reads 0. Kept as
-// a cheap assertion that the contract holds.
-assign cnt_rx_partial = (state == ST_STREAM) && s_tvalid && m_tready && covered
-                        && (s_tkeep != {(AXI_DATA_BITS/8){1'b1}});
-
-assign cnt_rx_stall_head = cnt_rx_stall && !l_moved;
-assign cnt_rx_stall_body = cnt_rx_stall &&  l_moved;
-
 assign cnt_rx_req = rq_valid && rq_ready;   // drained, not acted on
-
-assign cnt_rx_span = rq_valid && rq_ready && (state == ST_STREAM);
 
 endmodule

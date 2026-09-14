@@ -160,7 +160,6 @@ always @(negedge aclk) begin
     if (ack_valid) void'(ack_due.pop_front());
 end
 
-logic cnt_tx_starve_mid;
 // Egress pacing under test: 0 = off (the default every case above runs
 // with); the pacing case sets it, counts holds against moved payload beats,
 // and checks the region still lands byte-exact.
@@ -174,7 +173,6 @@ always @(posedge aclk) begin
     if (inst_engine.net_moved) net_moved_beats <= net_moved_beats + 1;
 end
 loom_engine inst_engine (
-    .cnt_tx_starve_mid(cnt_tx_starve_mid),
     .cnt_tx_paced(cnt_tx_paced), .pace_num(pace_num), .pace_den(pace_den),
     .tx_window(tx_window), .ack_valid(ack_valid), .tx_inflight(tx_inflight),
     .cnt_tx_ack(cnt_tx_ack), .cnt_tx_winfull(cnt_tx_winfull),
@@ -232,9 +230,8 @@ localparam [47:0] CPL_VA   = 48'h7f6a_3000_0000;   // importer's fence word
 localparam [PID_BITS-1:0] QP_OWNER = 6'd1;         // exporter's data ctid
 
 logic cnt_rx_bp;   // ingress backpressure, any state
-logic cnt_rx_partial;
 loom_rx inst_rx (
-    .cnt_rx_bp(cnt_rx_bp), .cnt_rx_partial(cnt_rx_partial),
+    .cnt_rx_bp(cnt_rx_bp),
     .aclk(aclk), .aresetn(aresetn),
     .rq_req(rx_rq_req), .rq_valid(rx_rq_valid), .rq_ready(rx_rq_ready),
     .rdma_staging_va(STAGING), .rx_pid(QP_OWNER),

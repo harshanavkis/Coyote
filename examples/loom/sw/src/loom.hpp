@@ -80,10 +80,6 @@ constexpr uint32_t PULL_DESYNC   = 0x0C8;   // word 25
 // Nonzero says the shell streamed a packet to the user and then did not
 // deliver it; zero says that never happened and the leak theory is wrong.
 constexpr uint32_t RX_ORPHAN     = 0x0D0;   // word 26
-// Payload beats the host read handed back with a partial keep. The engine
-// used to forward that keep onto the wire, which would make the packetiser
-// emit fewer than 64 bytes for the beat and shift everything after it.
-constexpr uint32_t TX_PARTIAL    = 0x0D8;   // word 27
 // Word 28 was the rdma chunk size; the engine packetises now and the word is
 // unused.
 // Cycles loom_rx refused a beat the shell was offering, in ANY state, and the
@@ -94,20 +90,6 @@ constexpr uint32_t TX_PARTIAL    = 0x0D8;   // word 27
 // host write and the packet's ACK from the SAME FSM step, so backpressure
 // here stops ACKs, and a QP that goes 1 ms without one retransmits
 // (transport_timer.hpp). These must read ~0.
-// Starved cycles landing INSIDE a wire packet, and the longest such run.
-// TX_STARVE counts every starved cycle; these say WHERE it lands. A gap
-// between packets costs throughput; a gap inside one means the packetiser
-// began a frame it could not finish. Loom loses 9-12 packets at the far MAC
-// on corrupt runs and 0 on clean ones, while perf_rdma - whose payload comes
-// from the shell's data mover and never gaps - loses 0 of 21.6M on the same
-// link. ~0 here kills that explanation; nonzero and rate-scaling confirms it.
-// Payload beats arriving from the network with a PARTIAL tkeep. loom_rx
-// forwards keep verbatim into the host write and positions by a running beat
-// count, so ONE short beat shifts every byte after it, permanently, while the
-// BEAT counts at both ends still match. That is the only mechanism found that
-// fits every measured constraint (TX 65667 vs RX 65664, orphan 0, desync 0,
-// displacement in whole beats). MUST READ 0.
-constexpr uint32_t RX_PARTIAL    = 0x0B0;   // word 22
 // Word 64/65, on an otherwise-empty CSR line: a write to any table register
 // clobbers words 4 and 6 of line 0 on hardware (see loom_ctrl.sv R_TX_PACE).
 constexpr uint32_t TX_PACE       = 0x200;   // word 64: [7:0] num, [15:8] den; off if 0
@@ -121,38 +103,17 @@ constexpr uint32_t TX_REQWAIT    = 0x230;   // word 70 RO: cycles a packet waite
 constexpr uint32_t TX_FIFO_FULL  = 0x238;   // word 71 RO: cycles the pull was held by the tx FIFO
 constexpr uint32_t RX_FIFO_FULL  = 0x070;   // word 14: ingress FIFO refused a beat
 constexpr uint32_t RX_FIFO_FULL_MAX = 0x078; // word 15: longest run of that
-constexpr uint32_t TX_SMID       = 0x0E8;   // word 29
-constexpr uint32_t TX_SMID_MAX   = 0x0B8;   // word 23
 constexpr uint32_t RX_BP         = 0x0F0;   // word 30
 constexpr uint32_t RX_BP_MAX     = 0x0F8;   // word 31
-// Word 29 was max_inflight, removed with the engine's cq_wr pacing. The counters answered their question first:
-// per 4 MB region, software-issued descriptors drew 71 acks for 65 chunks
-// plus 7 setup - one each - while engine-generated chunks drew NONE beyond
-// setup. A chunk the engine splits internally produces no completion, so
-// there was never a hardware retire signal to pace against.
-// The stall split. loom_rx is single-outstanding on the write side, so if
-// the shell withholds m_tready until it has accepted and translated the
-// request, every packet pays that latency serially and the stalls land
-// BEFORE its first beat. Head-heavy: overlap the next request with the
-// current stream. Body-heavy: the host write path is bursty, buffer it.
-// Neither: its sustained bandwidth is the ceiling and neither fix helps.
-constexpr uint32_t RX_STALL_HEAD = 0x168;
-constexpr uint32_t RX_STALL_BODY = 0x170;
 // Requests accepted off rq_wr, against DBG rx_fwd (completed). A gap says
 // requests arrived and were not finished; equality with a shortfall against
 // the packets the sender must have sent says they never arrived at all.
 constexpr uint32_t RX_REQ        = 0x178;
-// Continuation requests absorbed by a spanning message (RO word 17). A bulk
-// transfer is ONE write across many packets, so most of its rq_wr's are
-// swallowed rather than becoming transactions. Expect, per bulk message,
-// ceil((len + 64) / PMTU) - 1. Anything else means the receive side is
-// pairing requests with payload differently than the sender framed it.
 // Whose address space incoming rdma writes land in (RW word 21). The QP
 // owner's cThread is fixed for the connection, so the exporter writes it
 // once at QP setup and the receive path never reads a pid off a request -
 // jigsaw's controller uses a configured pid the same way.
 constexpr uint32_t RX_PID        = 0xA8;
-constexpr uint32_t RX_SPAN       = 0xA0;
 
 constexpr uint32_t STG_CYC       = 0x180;  // free-running cycle counter
 constexpr uint32_t STG_QUEUE_ACC = 0x188;  // order-FIFO residency sum (t-queue)

@@ -37,9 +37,7 @@ logic [VADDR_BITS-1:0] rdma_staging_va;
 
 logic cnt_local_wr, cnt_rdma_wr, cnt_rx_fwd, cnt_rx_drop, cnt_drop, cnt_compl;
 logic cnt_rx_stall = 0;
-logic cnt_rx_partial = 0;
 logic cnt_rx_bp = 0;
-logic cnt_tx_starve_mid = 0;
 
 // Stage counter inputs: driven with distinct constants so the CSR read
 // mux (words 50-63) can be checked without an engine
@@ -64,8 +62,7 @@ loom_ctrl dut (
     .cnt_local_wr(cnt_local_wr), .cnt_rdma_wr(cnt_rdma_wr),
     .cnt_rx_fwd(cnt_rx_fwd), .cnt_rx_drop(cnt_rx_drop),
     .cnt_drop(cnt_drop), .cnt_compl(cnt_compl),
-    .cnt_rx_stall(cnt_rx_stall), .cnt_rx_bp(cnt_rx_bp), .cnt_rx_partial(cnt_rx_partial),
-    .cnt_tx_starve_mid(cnt_tx_starve_mid),
+    .cnt_rx_stall(cnt_rx_stall), .cnt_rx_bp(cnt_rx_bp),
     .stage_acc(stage_acc), .stage_cnt(stage_cnt)
 );
 

@@ -165,10 +165,6 @@ module loom_engine (
     // whatever streams next. Intermediate tlasts are ignored on purpose -
     // the shell may return a large read as several chunks.
     output logic                        cnt_pull_desync,
-    // A payload beat that arrived from the host read with a partial keep.
-    // Nonzero means the pull really does hand back sub-beat data and the
-    // wire used to carry it.
-    output logic                        cnt_tx_partial,
     // Transmit window (see the header). tx_window 0 = no window.
     input  logic [7:0]                  tx_window,
     // One pulse per remote-write acknowledgement (cq_wr with remote set)
@@ -186,8 +182,6 @@ module loom_engine (
     input  logic [7:0]                  pace_den,
     output logic                        cnt_tx_move,
     output logic                        cnt_tx_starve,
-    // Starvation that lands INSIDE a wire packet - see the block below.
-    output logic                        cnt_tx_starve_mid,
     output logic                        cnt_tx_stall,
     // Cycles the pacer held the net output (validates the knob took)
     output logic                        cnt_tx_paced,
@@ -747,7 +741,7 @@ always_comb begin
     // multiple of 64 by contract (loom_engine drops the rest at the source
     // and hdr_ok requires hdr_len[5:0] == 0), so every payload beat is full
     // and forcing this is identical when the contract holds and corrective
-    // when it does not. cnt_tx_partial says which.
+    // when it does not.
     m_net_tkeep  = {(AXI_DATA_BITS/8){1'b1}};
     // One tlast per PACKET (stream_last counts the packet's beats), which
     // is what a last=1 request asks for on its stream
@@ -782,28 +776,6 @@ assign cnt_tx_move   = (tx_hdr    &&  m_net_rdy) ||
                        (tx_stream &&  f_tvalid && m_net_rdy);
 assign cnt_tx_starve =  tx_stream && !f_tvalid;
 
-// WHERE the starvation lands, which is the thing that matters and which
-// cnt_tx_starve cannot tell you.
-//
-// The shell fragments this message at PMTU (rdma_req_parser.sv emits
-// plen = PMTU_BYTES per fragment), so on the wire a packet is
-// PMTU_BYTES/64 = 64 beats, counted from the message's header beat. A gap
-// BETWEEN packets costs throughput and nothing else. A gap INSIDE one is a
-// different animal: the packetiser has begun a frame it cannot finish.
-//
-// Measured (2026-09-08): the CLEAN control gaps mid-frame MORE than the
-// corrupt runs do and loses nothing, so a mid-frame gap does not cause the
-// loss. Kept as a shape diagnostic only. The loss is on the RECEIVER - its
-// host write saturates at ~10 GB/s and the link has no flow control - and
-// the pacer above is what addresses it.
-logic [6:0] pkt_beat;
-always_ff @(posedge aclk) begin
-    if (!aresetn)                     pkt_beat <= 7'd0;
-    else if (state == ST_DMA_WR_REQ)  pkt_beat <= 7'd0;   // every request starts a packet
-    else if (cnt_tx_move)             pkt_beat <= (pkt_beat == PKT_BEATS-1) ? 7'd0
-                                                                           : pkt_beat + 7'd1;
-end
-assign cnt_tx_starve_mid = cnt_tx_starve && (pkt_beat != 7'd0);
 assign cnt_tx_stall  = (tx_hdr    && !m_net_tready) ||
                        (tx_stream &&  f_tvalid && !m_net_tready);
 
@@ -817,8 +789,6 @@ assign cnt_drop     = (state == ST_CHECK) && !ok;
 // several tlast-terminated chunks, so "the last beat carries tlast" is
 // satisfied by any chunk boundary and detects nothing.
 assign cnt_pull_desync = (state == ST_RD_REQ) && rd_ready && f_tvalid;
-assign cnt_tx_partial  = stream_net && f_tvalid && m_net_rdy &&
-                         (f_tkeep != {(AXI_DATA_BITS/8){1'b1}});
 
 // A descriptor's last beat on the rdma route is the last beat of its
 // LAST packet; the per-message counters key on that, not on every packet

@@ -37,11 +37,9 @@ logic m_tready = 1;
 logic req, grant = 0, busy, cnt_rx_fwd, cnt_rx_drop, cnt_rx_orphan;
 int orphan_pulses = 0;
 logic cnt_rx_move, cnt_rx_starve, cnt_rx_stall;
-logic cnt_rx_partial;
 logic cnt_rx_bp;
-logic cnt_rx_stall_head, cnt_rx_stall_body, cnt_rx_req, cnt_rx_span;
-int req_pulses = 0, span_pulses = 0;
-int head_pulses = 0, body_pulses = 0;
+logic cnt_rx_req;
+int req_pulses = 0;
 int move_pulses = 0, starve_pulses = 0, stall_pulses = 0;
 
 int errors = 0;
@@ -70,10 +68,8 @@ loom_rx dut (
     .cnt_rx_fwd(cnt_rx_fwd), .cnt_rx_drop(cnt_rx_drop),
     .cnt_rx_orphan(cnt_rx_orphan),
     .cnt_rx_move(cnt_rx_move), .cnt_rx_starve(cnt_rx_starve),
-    .cnt_rx_stall(cnt_rx_stall), .cnt_rx_bp(cnt_rx_bp), .cnt_rx_partial(cnt_rx_partial),
-    .cnt_rx_stall_head(cnt_rx_stall_head),
-    .cnt_rx_stall_body(cnt_rx_stall_body),
-    .cnt_rx_req(cnt_rx_req), .cnt_rx_span(cnt_rx_span)
+    .cnt_rx_stall(cnt_rx_stall), .cnt_rx_bp(cnt_rx_bp),
+    .cnt_rx_req(cnt_rx_req)
 );
 
 req_t wrq[$];
@@ -100,10 +96,7 @@ always @(posedge aclk) begin
     if (cnt_rx_move) move_pulses++;
     if (cnt_rx_starve) starve_pulses++;
     if (cnt_rx_stall) stall_pulses++;
-    if (cnt_rx_stall_head) head_pulses++;
-    if (cnt_rx_stall_body) body_pulses++;
     if (cnt_rx_req) req_pulses++;
-    if (cnt_rx_span) span_pulses++;
 end
 
 // Print what the DUT actually issued: a framing bug shows up as the wrong
@@ -602,16 +595,7 @@ initial begin
     check(stall_pulses > 0,
           "accounting: stall fires when the host write path is not ready");
     check(outq.size() == 4, "accounting: all four beats still forwarded");
-    check(head_pulses + body_pulses == stall_pulses,
-          "accounting: head and body partition the stalls exactly");
-    // The stall above was applied AFTER beats had already moved, so it is
-    // body. A head stall is the shell withholding m_tready before the
-    // packet's first beat, which is the single-outstanding cost this is
-    // meant to expose.
-    check(body_pulses > 0 && head_pulses == 0,
-          $sformatf("accounting: a mid-packet stall counts as body (%0d head, %0d body)",
-                    head_pulses, body_pulses));
-    head_pulses = 0; body_pulses = 0; stall_pulses = 0;
+    stall_pulses = 0;
     outq.delete(); wrq.delete();
     @(negedge aclk); m_tready = 0;                 // refuse before ANY beat
     incoming(6'd1, 28'd192, TARGET, 1'b1);
@@ -621,9 +605,7 @@ initial begin
     repeat (8) @(posedge aclk);
     @(negedge aclk); m_tready = 1;
     wait_idle_to(400, "13b: head stall");
-    check(head_pulses > 0,
-          $sformatf("accounting: a stall before the first beat counts as head (%0d)",
-                    head_pulses));
+    check(outq.size() == 2, "accounting: both beats forwarded after a stall before the first");
     // Requests accepted vs completed. On hardware these came apart and
     // nothing could say whether the missing ones never arrived or arrived
     // and never finished; both transactions above accepted exactly one
@@ -636,7 +618,7 @@ initial begin
     //     them. Nothing else observes that absorption, so if it ever
     //     mis-counts the payload lands wrong with no counter moving.
     dut_reset();
-    req_pulses = 0; span_pulses = 0;
+    req_pulses = 0;
     outq.delete(); wrq.delete();
     incoming(6'd2, 28'd128, STAGING);                 // 2 beats: hdr + 1
     send_msg_beat({28'b0, 28'd192, OP_WR}, {16'b0, TARGET + 48'h2000}, 64'b0, 1'b0);
@@ -654,9 +636,6 @@ initial begin
     check(outq.size() == 3, "spanning: all three payload beats forwarded");
     check(req_pulses == 3,
           $sformatf("spanning: three requests accepted (%0d)", req_pulses));
-    check(span_pulses == 2,
-          $sformatf("spanning: two of them absorbed as continuations (%0d)",
-                    span_pulses));
 
     // --- 15. A BEAT THE SHELL NEVER ANNOUNCED IS NOT PAYLOAD.
     //     RC delivers in order, so loom_rx cannot MISS beats - a lost

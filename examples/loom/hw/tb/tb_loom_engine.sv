@@ -96,7 +96,6 @@ loom_table inst_table (
     .lu_pid(lu_pid), .lu_base(lu_base), .lu_len(lu_len)
 );
 
-logic cnt_tx_starve_mid;
 
 // ---- transmit window / ack model ----
 // The shell acknowledges every rdma request that carries last=1 (one cq_wr
@@ -122,7 +121,6 @@ always @(negedge aclk) begin
 end
 
 loom_engine inst_engine (
-    .cnt_tx_starve_mid(cnt_tx_starve_mid),
     .pace_num(8'd0), .pace_den(8'd0), .cnt_tx_paced(),
     .tx_window(tx_window), .ack_valid(ack_valid), .tx_inflight(tx_inflight),
     .cnt_tx_ack(cnt_tx_ack), .cnt_tx_winfull(cnt_tx_winfull),
