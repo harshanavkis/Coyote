@@ -208,6 +208,56 @@ tmux new-session -d -s loom_sock \
   own simulator, which is why the daemon is a thread here; only process
   isolation is degenerate, the protocol paths are production.
 
+### The transmit benchmark (the number to quote)
+
+Two hosts, one card each, the same bitstream on both (default:
+`~/coyote-bitstreams/loom/hw/bitstreams/cyt_top.bit`, override with `BIT=`).
+Software built on **both** hosts (`/scratch` is per host):
+
+```bash
+nix-shell Coyote/shell.nix --run "cd Coyote/examples/loom/sw-bundled/build && make -j8"
+```
+
+Then, from `examples/loom/` on clara — the runner flashes both cards, starts
+the server on amy, runs the client, and appends both logs to
+`experiments-log.txt`:
+
+```bash
+./run_two_host.py --size 67108864 --iters 20 --gap 20 --retries 0 --tx-window 32
+```
+
+That is 20 x 64 MiB as one descriptor each, 32 packets allowed in flight,
+no manual pacing. Expected (2026-09-14, five consecutive runs, the last
+four with `--no-flash`):
+
+```
+    bytes iters  ...   GB/s  retrans psndrop landed
+ 67108864    20  ...  11.84       0       0    yes
+whole run: 0 retransmissions, 0 PSN drops
+[amy] PASS: bench region landed intact
+```
+
+11.84-11.86 GB/s, byte-exact, is the link: `09_perf_rdma` measures
+11.65-11.82 on the same pair, and 100 GbE with 4 KB packets tops out near
+12.25. What to read besides the rate:
+
+- client `tx acks: N packets acked; window full C cycles; sq_wr wait 0;
+  tx FIFO held the pull F` — N must equal the packets sent; C > 0 says the
+  far side's acks bounded the sender (the mechanism at work); `sq_wr wait`
+  reads 0 everywhere so far.
+- server `stalled (host write not ready)` and `ingress FIFO FULL` — still
+  nonzero at W >= 16 (bursts of ~100 cycles, single runs up to 45k), and
+  harmless: the window keeps them from becoming loss.
+- `whole run: 0 retransmissions` and `landed intact` are the verdict; the
+  per-size `retrans` column samples too early.
+
+`--tx-window 16` (the bitstream default, i.e. no flag) gives 11.82; 8 gives
+6.3 (rate = W x 4 KB / ~5.2 us ack RTT); 64 overruns the receiver's ~40
+packet buffer and wedges; 0 (no window) wedges ~2700 packets in. The
+measurement stops at the sender's fence (last beat handed to the stack),
+which is exact to 0.01% at this size but not a delivery-based number for
+small messages - see the ping-pong bench below when it exists.
+
 ### 6.2a: the bundled two-host binary (`sw-bundled/`)
 
 One process per host carrying the daemon role (BundledOrchestrator + local
