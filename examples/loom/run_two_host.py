@@ -478,6 +478,8 @@ def bench_env(args, gap):
         env += f" LOOM_TX_PACE={args.tx_pace}"
     if args.tx_window is not None:
         env += f" LOOM_TX_WINDOW={args.tx_window}"
+    if args.pingpong:
+        env += " LOOM_BENCH_PINGPONG=1"
     if args.skip_bulk:
         env += " LOOM_SKIP_BULK=1"
     return env
@@ -512,6 +514,16 @@ def summarize(args, gap, result, verdicts=None):
     """One row of the sweep."""
     srv_out, cli_out, srv_n0, srv_n1, cli_n0, cli_n1 = result
     cli_txt, srv_txt = "".join(cli_out), "".join(srv_out)
+    if args.pingpong:
+        # The client prints one row per size; the verdict is the server's
+        rows = [l for l in cli_out if re.match(r"^\s*\d+\s+\d+\s+[\d.]+\s+[\d.]+\s+[\d.]+\s+(yes|NO)", l)]
+        rt = re.search(r"whole run: (\d+) retransmissions", cli_txt)
+        print(f"{BOLD}ping-pong (one way = RTT/2), window {args.tx_window or 'default'}, "
+              f"{verdict(result)}, {rt.group(1) if rt else '?'} retransmissions{RESET}")
+        print("     bytes rounds       rtt_us   one_way_us       GB/s   landed")
+        for l in rows:
+            print("  " + l.rstrip())
+        return
     m = re.search(rf"^\s*{args.size}\s+\d+\s+\d+\s+\d+\s+[\d.]+\s+([\d.]+)",
                   cli_txt, re.M)
     rt = re.search(r"whole run: (\d+) retransmissions", cli_txt)
@@ -637,6 +649,12 @@ def main():
                          "flight to the far stack. Bitstream default 16; 32 "
                          "is the largest clean setting (the receiver buffers "
                          "~40 packets above its ack point); 0 = no window")
+    ap.add_argument("--pingpong", action="store_true",
+                    help="the delivery-based benchmark instead of the push "
+                         "one: amy lands each transfer, writes it back, clara "
+                         "lands that; one way = RTT/2 (perf_rdma's method). "
+                         "--iters = timed rounds per size; the size and "
+                         "window knobs apply as usual")
     ap.add_argument("--skip-bulk", action="store_true")
     ap.add_argument("--retries", type=int, default=2,
                     help="reflash both cards and retry after a wedge")

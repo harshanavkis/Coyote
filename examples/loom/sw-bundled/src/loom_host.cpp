@@ -217,6 +217,9 @@ uint64_t bench_word(int idx, uint64_t i) {
 constexpr int BENCH_N = int(sizeof(BENCH_SIZES) / sizeof(BENCH_SIZES[0]));
 
 bool bench_mode() { return getenv("LOOM_BENCH") != nullptr; }
+// LOOM_BENCH_PINGPONG=1: the delivery-based benchmark (perf_rdma's
+// definition) instead of the push benchmark. See run_pingpong / serve_pong.
+bool pingpong_mode() { return getenv("LOOM_BENCH_PINGPONG") != nullptr; }
 
 // The vFPGA's own account of what it did, which is the only first-hand
 // evidence when a write does not arrive: dbg[4] counts transactions loom_rx
@@ -344,6 +347,139 @@ static void print_pace(uint64_t v, const char *when) {
                when, num, den, 100.0 * num / den, 16.0 * num / den);
     else
         printf("engine config: tx_pace %s: off\n", when);
+    fflush(stdout);
+}
+
+// -------------------------------------------------------------------------
+// PING-PONG: the delivery-based benchmark, perf_rdma's definition.
+//
+// The push benchmark above stops its clock at the sender's fence - the
+// last beat handed to the RoCE stack - which is exact to 0.01% for 64 MiB
+// and meaningless for 4 KB. This one stops it when the bytes have LANDED
+// on the far host and come back:
+//
+//   clara: copy(len) -> store(LEN) -> store(FLAG = k)   [order FIFO keeps
+//          the flag behind the data; RC delivers in order; loom_rx writes
+//          in order - the flag cannot become visible before the payload]
+//   amy:   spin on FLAG == k in its OWN memory (the GPU model: no interrupt,
+//          no device register, a peer-written word), then copy the same
+//          bytes back into clara's pong buffer, LEN, FLAG = k
+//   clara: spin on its pong FLAG == k
+//
+// One round trip = two deliveries; the reported one-way time is RTT/2 and
+// the rate is len / (RTT/2). Both sides use the same rdma windows, the
+// same engine, the same window/pacing knobs. The reverse path is set up
+// through the peering socket (PeerOp::PONG): clara hands amy its staging
+// VA and a buffer to write into, amy programs an rdma window onto it.
+// -------------------------------------------------------------------------
+// The flag and length words are aperture STORES, which address one 4 KB
+// page per window ((win << 12) | off), so they live inside it, clear of
+// the offsets the functional phase uses. The payload is a descriptor
+// offset (28 bits) and sits at 64 MiB.
+constexpr uint64_t PP_FLAG_OFF = 0xF00;              // flag word, both sides
+constexpr uint64_t PP_LEN_OFF  = 0xF08;              // length word, both sides
+constexpr uint64_t PP_DATA_OFF = 64ULL * 1024 * 1024; // payload, both sides
+constexpr uint64_t PP_MAGIC    = 0x5049'4E47'0000'0000ULL;   // "PING" | k
+
+// Server side: answer every ping until the client's DONE arrives.
+template <class DoneFn>
+void serve_pong(loom::Xpu &S, int win, uint64_t *buf,
+                volatile uint64_t *fence, DoneFn done) {
+    volatile uint64_t *flag = buf + PP_FLAG_OFF / 8;
+    volatile uint64_t *lenw = buf + PP_LEN_OFF / 8;
+    uint64_t k = 0, served = 0, bytes = 0;
+    printf("server: ping-pong service on window %d\n", win);
+    fflush(stdout);
+    while (!done()) {
+        // poll the flag, checking for DONE every ~1 ms of spinning
+        bool got = false;
+        for (int i = 0; i < 20000 && !got; i++)
+            if (*flag == (PP_MAGIC | (k + 1))) got = true;
+        if (!got) continue;
+        k++;
+        const uint64_t len = *lenw;
+        const uint64_t c = *fence;
+        S.copy(win, uint32_t(PP_DATA_OFF), buf + PP_DATA_OFF / 8, len, fence);
+        if (!spin64(fence, c + 1, 5e6)) {
+            printf("server: pong %lu never fenced - stopping\n", (unsigned long) k);
+            break;
+        }
+        S.store(win, uint32_t(PP_LEN_OFF), len);
+        S.store(win, uint32_t(PP_FLAG_OFF), PP_MAGIC | k);
+        served++; bytes += len;
+    }
+    printf("server: ping-pong served %lu rounds, %lu bytes each way\n",
+           (unsigned long) served, (unsigned long) bytes);
+    fflush(stdout);
+}
+
+// Client side: for every size, a warm-up round then ITERS timed rounds.
+void run_pingpong(loom::Xpu &A, int win, uint64_t *src, uint64_t *pong,
+                  volatile uint64_t *fence) {
+    volatile uint64_t *pflag = pong + PP_FLAG_OFF / 8;
+    uint64_t k = 0;
+    const long rt0 = net_stat("Retrans cnt"), pd0 = net_stat("PSN drop cnt");
+    std::vector<uint64_t> only_set;             // LOOM_BENCH_ONLY, as run_bench
+    if (const char *o = getenv("LOOM_BENCH_ONLY"))
+        for (const char *q = o; *q; ) {
+            only_set.push_back(strtoull(q, nullptr, 0));
+            while (*q && *q != ',') q++;
+            if (*q == ',') q++;
+        }
+    auto wanted = [&](uint64_t l) {
+        if (only_set.empty()) return true;
+        for (uint64_t v : only_set) if (v == l) return true;
+        return false;
+    };
+    printf("\n== ping-pong benchmark (delivery-based: amy lands it, writes it "
+           "back, clara lands that; one way = RTT/2)\n");
+    printf("%10s %6s %12s %12s %10s %8s\n",
+           "bytes", "rounds", "rtt_us", "one_way_us", "GB/s", "landed");
+    fflush(stdout);
+    for (size_t i = 0; i < sizeof(BENCH_SIZES) / sizeof(BENCH_SIZES[0]); i++) {
+        const uint64_t len = BENCH_SIZES[i];
+        if (!wanted(len)) continue;
+        if (PP_DATA_OFF + len > BUF_SIZE) continue;
+        for (uint64_t w = 0; w < len / 8; w++) src[w] = bench_word(i, w);
+        memset(pong + PP_DATA_OFF / 8, 0, len);
+        const int rounds = bench_iters(len) > 0 ? bench_iters(len) : 1;
+        bool ok = true;
+        double total_us = 0.0;
+        // warm-up round + timed rounds; each round is one full trip
+        for (int r = 0; r <= rounds && ok; r++) {
+            k++;
+            const uint64_t c = *fence;
+            auto t0 = std::chrono::steady_clock::now();
+            A.copy(win, uint32_t(PP_DATA_OFF), src, len, fence);
+            A.store(win, uint32_t(PP_LEN_OFF), len);
+            A.store(win, uint32_t(PP_FLAG_OFF), PP_MAGIC | k);
+            if (!spin64(pflag, PP_MAGIC | k, 5e6)) {
+                printf("%10lu   round %d: pong never arrived (fence %s)\n",
+                       (unsigned long) len, r,
+                       (*fence >= c + 1) ? "retired" : "NOT retired");
+                ok = false;
+                break;
+            }
+            const double us = std::chrono::duration<double, std::micro>(
+                std::chrono::steady_clock::now() - t0).count();
+            if (r > 0) total_us += us;
+        }
+        // The bytes that came back are the bytes that landed there
+        bool same = ok;
+        for (uint64_t w = 0; same && w < len / 8; w++)
+            if (pong[PP_DATA_OFF / 8 + w] != bench_word(i, w)) same = false;
+        if (ok) {
+            const double rtt = total_us / rounds;
+            printf("%10lu %6d %12.2f %12.2f %10.3f %8s\n",
+                   (unsigned long) len, rounds, rtt, rtt / 2,
+                   double(len) / (rtt / 2 * 1e3), same ? "yes" : "NO");
+        }
+        fflush(stdout);
+        if (!ok || !same) { printf("ping-pong: stopping at this size\n"); break; }
+    }
+    usleep(500000);      // let RC retransmit timers fire before sampling
+    printf("whole run: %ld retransmissions, %ld PSN drops (this side)\n",
+           net_stat("Retrans cnt") - rt0, net_stat("PSN drop cnt") - pd0);
     fflush(stdout);
 }
 
@@ -702,6 +838,7 @@ int run_server(uint16_t qp_port, uint16_t peer_port, const std::string &sock) {
     memset(dst2, 0, BUF_SIZE);
 
     loom::BundledOrchestrator orch(t_ctrl);
+    orch.setQpOwner(t_data.getCtid());       // for the ping-pong reply path
     // Engine knobs, read back and printed: a knob that silently did not
     // take is how a whole experiment gets misread, and the defaults live in
     // the bitstream, so an unset variable is not the same as a zero.
@@ -861,7 +998,24 @@ int run_server(uint16_t qp_port, uint16_t peer_port, const std::string &sock) {
         }
         if (!started) f_last = f;
     }
-    if (!probe)
+    if (pingpong_mode()) {
+        // This side transmits too: an Xpu on the data cThread (the QP
+        // owner), its own fence word, the window PONG programmed
+        std::mutex io_mtx_s;
+        loom::Xpu S(t_data, orch, io_mtx_s);
+        auto *fence_s = static_cast<uint64_t *>(S.allocSmall(4096));
+        if (!fence_s) { printf("FAIL: alloc fence\n"); return 1; }
+        memset(fence_s, 0, 4096);
+        auto t0 = std::chrono::steady_clock::now();
+        while (orch.pongWindow() == loom::NO_WINDOW && peer.doneCount() < 1 &&
+               std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() < done_secs)
+            usleep(1000);
+        if (orch.pongWindow() != loom::NO_WINDOW)
+            serve_pong(S, orch.pongWindow(), dst1, fence_s,
+                       [&] { return peer.doneCount() >= 1; });
+        else
+            printf("server: no PONG setup arrived\n");
+    } else if (!probe)
         for (int i = 0; i < done_secs * 100 && peer.doneCount() < 1; i++)
             usleep(10000);
     check(peer.doneCount() >= 1, "client DONE received");
@@ -873,7 +1027,7 @@ int run_server(uint16_t qp_port, uint16_t peer_port, const std::string &sock) {
                (unsigned long) (f_last - f_first),
                (unsigned long) (c_last - c_first));
 
-    if (bench_mode()) {
+    if (bench_mode() && !pingpong_mode()) {
         printf("\n== exporter check of the benchmark regions\n");
         std::vector<uint64_t> only_e_set;
         if (const char *o = getenv("LOOM_BENCH_ONLY"))
@@ -1275,7 +1429,19 @@ int run_client(const std::string &ip, uint16_t qp_port, uint16_t peer_port,
         const uint64_t got = loom::csr_read(t_ctrl, loom::TX_CTL);
         print_tx_ctl(got, got == want ? "re-armed before bench" : "re-armed before bench DID NOT TAKE");
     }
-    if (bench_mode()) run_bench(t_ctrl, A, w1, src, fence);
+    if (pingpong_mode()) {
+        // Reverse path: our own receive buffer, loom_rx landing under our
+        // QP owner's pid, and amy told where to write and which RETH to use
+        auto *pong = static_cast<uint64_t *>(A.alloc(BUF_SIZE));
+        if (!pong) { printf("FAIL: alloc pong\n"); return failures + 1; }
+        memset(pong, 0, BUF_SIZE);
+        loom::set_rx_pid(t_ctrl, t_data.getCtid());
+        check(peer.pong(reinterpret_cast<uint64_t>(staging_local),
+                        reinterpret_cast<uint64_t>(pong), BUF_SIZE),
+              "server accepted the PONG window");
+        run_pingpong(A, w1, src, pong, fence);
+    } else if (bench_mode())
+        run_bench(t_ctrl, A, w1, src, fence);
 
     check(peer.done(), "DONE barrier acknowledged");
     t_data.connSync(true);

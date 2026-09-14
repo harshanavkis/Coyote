@@ -258,6 +258,47 @@ measurement stops at the sender's fence (last beat handed to the stack),
 which is exact to 0.01% at this size but not a delivery-based number for
 small messages - see the ping-pong bench below when it exists.
 
+### The ping-pong benchmark (delivery-based)
+
+The push benchmark stops its clock at the sender's fence. This one stops
+it when the bytes have **landed on the far host and come back** - the same
+definition `09_perf_rdma` uses, and the only honest one for small sizes:
+
+```bash
+./run_two_host.py --pingpong --size 0 --iters 32 --gap 0 --retries 0 --tx-window 32
+```
+
+Per round: clara `copy`s the payload into amy's window, then `store`s a
+length word and a flag word behind it (the order FIFO keeps them behind
+the data, RC delivers in order, `loom_rx` writes in order, so the flag
+cannot become visible first); amy spins on the flag **in its own memory**
+(the GPU model - no interrupt, no device register), copies the same bytes
+back into a buffer of clara's through an rdma window of its own, and
+stores its flag; clara spins on that. `--iters` timed rounds per size
+after one warm-up; one way = RTT/2; the bytes that came back are compared
+against what was sent, so both directions are verified. The reverse path
+is set up over the peering socket (`PeerOp::PONG`: clara's staging VA and
+receive buffer; amy programs an rdma window onto it). Measured 2026-09-14,
+window 32:
+
+```
+     bytes rounds      rtt_us  one_way_us     GB/s
+        64     32       14.99        7.49    0.009
+      4096     32       16.82        8.41    0.487
+     65536     32       25.85       12.93    5.070
+    262144     32       59.51       29.76    8.810
+   1048576     32      193.93       96.97   10.814
+   4194304     32      738.57      369.28   11.358
+  16777216     32     2939.58     1469.79   11.415
+  67108864     32    11697.22     5848.61   11.474
+```
+
+So the fixed cost is ~7.5 us one way (two software polls, two aperture
+stores, two engine passes), and delivery at 64 MiB is 11.47 GB/s - ~3%
+under the push number, the per-message fill and drain the fence does not
+see. perf_rdma's throughput method pipelines 32 messages before waiting
+for the echo, so its 11.7 sits between the two.
+
 ### 6.2a: the bundled two-host binary (`sw-bundled/`)
 
 One process per host carrying the daemon role (BundledOrchestrator + local

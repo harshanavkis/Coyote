@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <mutex>
 #include <vector>
@@ -97,6 +98,29 @@ public:
         out = segs_[h - 1];
         return true;
     }
+    // Exporter side: which local ctid owns the QP, for writes going the
+    // other way (the ping-pong reply). The importer side sets this through
+    // attachPeer.
+    void setQpOwner(uint32_t ctid) {
+        std::lock_guard<std::mutex> g(m_);
+        qp_owner_ = ctid;
+        qp_owner_set_ = true;
+    }
+    // PONG: an rdma window onto the far side's buffer, exactly as importBuf
+    // programs one for a resolved handle, plus this engine's staging CSR set
+    // to the far side's staging (the RETH its loom_rx expects).
+    bool pongSetup(uint64_t staging_va, uint64_t buf_va, uint64_t len) override {
+        std::lock_guard<std::mutex> g(m_);
+        if (!qp_owner_set_) return false;
+        set_rdma_staging(ctrl_, reinterpret_cast<const void *>(staging_va));
+        const int win = alloc_win();
+        if (win == NO_WINDOW) return false;
+        program_window(ctrl_, win, /*rdma=*/true, qp_owner_,
+                       reinterpret_cast<const void *>(buf_va), len);
+        pong_win_.store(win);
+        return true;
+    }
+    int pongWindow() const { return pong_win_.load(); }
 
 private:
     coyote::cThread &ctrl_;
@@ -115,6 +139,8 @@ private:
     }
     PeerClient *peer_ = nullptr;
     uint32_t qp_owner_ = 0;
+    bool qp_owner_set_ = false;
+    std::atomic<int> pong_win_{NO_WINDOW};
 };
 
 } // namespace loom
