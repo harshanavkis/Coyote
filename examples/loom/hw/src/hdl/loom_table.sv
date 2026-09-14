@@ -5,7 +5,10 @@ import lynxTypes::*;
  *
  * Window table: one entry per 4 KB aperture window (1..15; index 0 unused).
  *   route = 0 (local): write via sq_wr {LOCAL_WRITE, STRM_HOST, pid, base+off}
- *   route = 1 (rdma):  write via sq_wr {APP_WRITE, STRM_RDMA, pid = QP owner, base+off}
+ *   route = 1 (rdma):  write via sq_wr {APP_WRITE, STRM_RDMA, pid = QP owner, base+off};
+ *                      dst_pid = the exporter's ctid on the far host, carried
+ *                      in the message header so the far loom_rx lands the
+ *                      bytes in THAT address space (one QP serves every XPU)
  * base is always the exporter's own VA; len is the segment bounds.
  * Programmed only through the CSR page (loom_ctrl).
  */
@@ -19,6 +22,7 @@ module loom_table (
     input  logic                    prog_valid,
     input  logic                    prog_route,
     input  logic [PID_BITS-1:0]     prog_pid,
+    input  logic [PID_BITS-1:0]     prog_dst_pid,
     input  logic [VADDR_BITS-1:0]   prog_base,
     input  logic [LEN_BITS-1:0]     prog_len,
 
@@ -27,6 +31,7 @@ module loom_table (
     output logic                    lu_valid,
     output logic                    lu_route,
     output logic [PID_BITS-1:0]     lu_pid,
+    output logic [PID_BITS-1:0]     lu_dst_pid,
     output logic [VADDR_BITS-1:0]   lu_base,
     output logic [LEN_BITS-1:0]     lu_len
 );
@@ -42,6 +47,7 @@ localparam integer N_WIN = 16;
 logic                  e_valid [N_WIN];
 logic                  e_route [N_WIN];
 logic [PID_BITS-1:0]   e_pid   [N_WIN];
+logic [PID_BITS-1:0]   e_dpid  [N_WIN];
 logic [VADDR_BITS-1:0] e_base  [N_WIN];
 logic [LEN_BITS-1:0]   e_len   [N_WIN];
 
@@ -52,6 +58,7 @@ always_ff @(posedge aclk) begin
         e_valid[prog_idx] <= prog_valid;
         e_route[prog_idx] <= prog_route;
         e_pid[prog_idx]   <= prog_pid;
+        e_dpid[prog_idx]  <= prog_dst_pid;
         e_base[prog_idx]  <= prog_base;
         e_len[prog_idx]   <= prog_len;
     end
@@ -60,6 +67,7 @@ end
 assign lu_valid = e_valid[lu_idx];
 assign lu_route = e_route[lu_idx];
 assign lu_pid   = e_pid[lu_idx];
+assign lu_dst_pid = e_dpid[lu_idx];
 assign lu_base  = e_base[lu_idx];
 assign lu_len   = e_len[lu_idx];
 

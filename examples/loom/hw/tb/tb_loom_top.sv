@@ -143,7 +143,7 @@ initial forever begin
         rq_wr.valid = 0;
         // Inline wire message: {op WRITE_INLINE, len 8} | target VA | data
         axis_rrsp_recv[0].tdata  = '0;
-        axis_rrsp_recv[0].tdata[63:0]    = {28'b0, 28'd8, 8'd2};
+        axis_rrsp_recv[0].tdata[63:0]    = {22'b0, 6'd2, 28'd8, 8'd2};   // dst pid 2
         axis_rrsp_recv[0].tdata[127:64]  = {16'b0, 48'h7f9e_8860_0000};
         axis_rrsp_recv[0].tdata[191:128] = 64'hEE00;
         axis_rrsp_recv[0].tkeep  = {64{1'b1}};

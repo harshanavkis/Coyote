@@ -78,6 +78,7 @@ module loom_ctrl (
     output logic                        tbl_valid,
     output logic                        tbl_route,
     output logic [PID_BITS-1:0]         tbl_pid,
+    output logic [PID_BITS-1:0]         tbl_dst_pid,   // word 2 [15:8]
     output logic [VADDR_BITS-1:0]       tbl_base,
     output logic [LEN_BITS-1:0]         tbl_len,
 
@@ -95,7 +96,6 @@ module loom_ctrl (
 
     // RDMA staging VA (to loom_engine): RETH vaddr for outgoing messages
     output logic [VADDR_BITS-1:0]       rdma_staging_va,
-    output logic [PID_BITS-1:0]         rx_pid,
     // Egress pacing: payload beats may move at most pace_num/pace_den of
     // cycles on the rdma route; off when either is 0 or num >= den
     output logic [7:0]                  pace_num,
@@ -167,10 +167,9 @@ localparam integer R_DMA_COMPL_VA = 13;
 // a line boundary, so from here only a write to this register can reach it,
 // and the rest of its line (17-23) is unused.
 localparam integer R_RDMA_STAGING = 16;
-// Whose address space incoming rdma writes land in. The QP owner's cThread
-// is fixed for the connection, so this is written once at QP setup and the
-// receive path never has to read it off a request.
-localparam integer R_RX_PID      = 21;
+// Word 21 was RX_PID (one landing pid for every incoming write). The
+// message header carries the destination pid now (window table word 2
+// [15:8] on the sender); the word reads 0.
 localparam integer R_DBG_BASE    = 32;
 localparam integer N_DBG         = 10;
 // Receive-path cycle accounting (RO 42-44). Words 42-47 were unused; these
@@ -324,7 +323,6 @@ wire [CSR_BITS-1:0] rd_idx = axi_araddr[ADDR_LSB +: CSR_BITS];
 logic [63:0] r_tbl_idx, r_tbl_cfg, r_tbl_pid, r_tbl_base, r_tbl_len;
 logic [63:0] r_dma_dst, r_dma_src_va, r_dma_len, r_dma_src_pid, r_dma_compl_va;
 logic [63:0] r_rdma_staging;
-logic [63:0] r_rx_pid;
 logic [63:0] dbg [N_DBG];
 logic [63:0] rx_move, rx_starve, rx_stall, rx_req_cnt;
 logic [63:0] rx_stall_run, rx_stall_max;
@@ -351,7 +349,7 @@ always_ff @(posedge aclk) begin
     if (!aresetn) begin
         r_tbl_idx <= 0; r_tbl_cfg <= 0; r_tbl_pid <= 0; r_tbl_base <= 0; r_tbl_len <= 0;
         r_dma_dst <= 0; r_dma_src_va <= 0; r_dma_len <= 0; r_dma_src_pid <= 0;
-        r_dma_compl_va <= 0; r_rdma_staging <= 0; r_rx_pid <= 0;
+        r_dma_compl_va <= 0; r_rdma_staging <= 0;
         r_pace  <= 0;
         r_tx_ctl <= 64'd16;                    // window 16
     end else if (csr_wr && (&axi_ctrl.wstrb)) begin
@@ -371,7 +369,6 @@ always_ff @(posedge aclk) begin
             R_DMA_SRC_PID: r_dma_src_pid <= axi_ctrl.wdata;
             R_DMA_COMPL_VA: r_dma_compl_va <= axi_ctrl.wdata;
             R_RDMA_STAGING: r_rdma_staging <= axi_ctrl.wdata;
-            R_RX_PID: r_rx_pid <= axi_ctrl.wdata;
             R_TX_PACE: r_pace  <= axi_ctrl.wdata;
             R_TX_CTL:  r_tx_ctl <= axi_ctrl.wdata;
             default: ;
@@ -384,10 +381,10 @@ assign tbl_idx    = r_tbl_idx[3:0];
 assign tbl_valid  = r_tbl_cfg[0];
 assign tbl_route  = r_tbl_cfg[1];
 assign tbl_pid    = r_tbl_pid[PID_BITS-1:0];
+assign tbl_dst_pid = r_tbl_pid[8 +: PID_BITS];
 assign tbl_base   = r_tbl_base[VADDR_BITS-1:0];
 assign tbl_len    = r_tbl_len[LEN_BITS-1:0];
 assign rdma_staging_va = r_rdma_staging[VADDR_BITS-1:0];
-assign rx_pid          = r_rx_pid[PID_BITS-1:0];
 assign pace_num        = r_pace[7:0];
 assign pace_den        = r_pace[15:8];
 assign tx_window       = r_tx_ctl[7:0];
@@ -616,7 +613,6 @@ always_ff @(posedge aclk) begin
             R_DMA_SRC_PID: axi_rdata <= r_dma_src_pid;
             R_DMA_COMPL_VA: axi_rdata <= r_dma_compl_va;
             R_RDMA_STAGING: axi_rdata <= r_rdma_staging;
-            R_RX_PID:      axi_rdata <= r_rx_pid;
             R_TX_PACE:     axi_rdata <= r_pace;
             R_TX_CTL:      axi_rdata <= r_tx_ctl;
             R_TX_STATE:    axi_rdata <= {48'b0, tx_inflight};

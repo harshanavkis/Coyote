@@ -58,7 +58,6 @@ module loom_rx (
 
     // Whose address space incoming writes land in: the QP owner's cThread,
     // fixed for the connection and written by loomd at QP setup
-    input  logic [PID_BITS-1:0]         rx_pid,
     /* verilator lint_on UNUSED */
 
     // Write requests out (to sq_wr via arbiter)
@@ -125,6 +124,7 @@ typedef enum logic [2:0] {
 state_t state;
 
 logic [7:0]            l_op;
+logic [PID_BITS-1:0]   l_pid;        // landing address space, from the header
 logic [27:0]           l_len;
 logic [VADDR_BITS-1:0] l_va;
 logic [63:0]           l_inline;
@@ -220,11 +220,16 @@ endfunction
 // written to. loom_engine only ever emits the two forms below, so anything
 // else is a beat that is not a header (or a sender that disagrees with us),
 // and is dropped and counted rather than translated.
-//   inline: lane0 == {28'b0, 28'd8, op2}, target 8 B aligned
-//   write:  lane0 == {28'b0, len, op1}, len a nonzero multiple of 64 B
+//   inline: lane0 == {0, dst_pid, 28'd8, op2}, target 8 B aligned
+//   write:  lane0 == {0, dst_pid, len, op1}, len a nonzero multiple of 64 B
+// dst_pid (bits [36 +: PID_BITS]) is the address space the bytes land in -
+// the exporter's ctid on THIS host, as the importer learned it when it
+// resolved the handle. One QP serves every XPU on a host, so the QP owner
+// cannot be the landing pid. Trusted from the wire, like the target VA.
 wire [27:0] hdr_len = s_tdata[35:8];
 wire [7:0]  hdr_op  = s_tdata[7:0];
-wire hdr_ok = (s_tdata[63:36] == 28'b0) &&
+wire [PID_BITS-1:0] hdr_pid = s_tdata[36 +: PID_BITS];
+wire hdr_ok = (s_tdata[63:36+PID_BITS] == '0) &&
               ((hdr_op == MSG_OP_WRITE_INLINE &&
                 hdr_len == 28'd8 && s_tdata[64 +: 3] == 3'b0) ||
                (hdr_op == MSG_OP_WRITE &&
@@ -288,7 +293,7 @@ wire next_ready = ({1'b0, outstanding} + {4'b0, post_now}) >= 5'd2;
 always_ff @(posedge aclk) begin
     if (!aresetn) begin
         state <= ST_IDLE;
-        l_op <= 0; l_len <= 0; l_va <= 0; l_inline <= 0;
+        l_op <= 0; l_pid <= 0; l_len <= 0; l_va <= 0; l_inline <= 0;
         l_beats <= 0; w_va <= 0; w_left <= 0;
         p_credit <= 0;
         q_va <= 0; q_left <= 0; outstanding <= 0;
@@ -315,6 +320,7 @@ always_ff @(posedge aclk) begin
             // Re-latching an unconsumed beat is idempotent.
             ST_IDLE: if (s_tvalid && grant && covered) begin
                 l_op     <= hdr_op;
+                l_pid    <= hdr_pid;
                 l_len    <= hdr_len;
                 l_va     <= s_tdata[64 +: VADDR_BITS];
                 l_inline <= s_tdata[128 +: 64];
@@ -375,12 +381,12 @@ always_ff @(posedge aclk) begin
     end
 end
 
-// The local write names the header's target under the QP owner's pid
+// The local write names the header's target under the header's pid
 always_comb begin
     wr_req = '0;
     wr_req.opcode = LOCAL_WRITE;
     wr_req.strm   = STRM_HOST;
-    wr_req.pid    = rx_pid;
+    wr_req.pid    = (state == ST_IDLE) ? hdr_pid : l_pid;
     // ONE WRITE PER PACKET. The first is driven from the header beat on the
     // wire (issued in the same cycle that beat is accepted); every later one
     // by the request generator, AHEAD of the data, from the running target

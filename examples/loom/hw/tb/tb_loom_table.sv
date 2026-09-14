@@ -14,13 +14,13 @@ always #2 aclk = ~aclk;
 logic                  commit;
 logic [3:0]            prog_idx;
 logic                  prog_valid, prog_route;
-logic [PID_BITS-1:0]   prog_pid;
+logic [PID_BITS-1:0]   prog_pid, prog_dst_pid;
 logic [VADDR_BITS-1:0] prog_base;
 logic [LEN_BITS-1:0]   prog_len;
 
 logic [3:0]            lu_idx;
 logic                  lu_valid, lu_route;
-logic [PID_BITS-1:0]   lu_pid;
+logic [PID_BITS-1:0]   lu_pid, lu_dst_pid;
 logic [VADDR_BITS-1:0] lu_base;
 logic [LEN_BITS-1:0]   lu_len;
 
@@ -29,10 +29,10 @@ int errors = 0;
 loom_table dut (
     .aclk(aclk), .aresetn(aresetn),
     .commit(commit), .prog_idx(prog_idx), .prog_valid(prog_valid),
-    .prog_route(prog_route), .prog_pid(prog_pid), .prog_base(prog_base),
+    .prog_route(prog_route), .prog_pid(prog_pid), .prog_dst_pid(prog_dst_pid), .prog_base(prog_base),
     .prog_len(prog_len),
     .lu_idx(lu_idx), .lu_valid(lu_valid), .lu_route(lu_route),
-    .lu_pid(lu_pid), .lu_base(lu_base), .lu_len(lu_len)
+    .lu_pid(lu_pid), .lu_dst_pid(lu_dst_pid), .lu_base(lu_base), .lu_len(lu_len)
 );
 
 task check(input bit cond, input string msg);
@@ -48,7 +48,7 @@ task program_entry(input [3:0] idx, input v, input r,
                    input [LEN_BITS-1:0] len);
     @(negedge aclk);
     prog_idx = idx; prog_valid = v; prog_route = r;
-    prog_pid = pid; prog_base = base; prog_len = len;
+    prog_pid = pid; prog_dst_pid = pid + 6'd8; prog_base = base; prog_len = len;
     commit = 1;
     @(negedge aclk);
     commit = 0;
@@ -56,7 +56,7 @@ endtask
 
 initial begin
     commit = 0; prog_idx = 0; prog_valid = 0; prog_route = 0;
-    prog_pid = 0; prog_base = 0; prog_len = 0; lu_idx = 0;
+    prog_pid = 0; prog_dst_pid = 0; prog_base = 0; prog_len = 0; lu_idx = 0;
 
     repeat (5) @(negedge aclk);
     aresetn = 1;
@@ -71,7 +71,7 @@ initial begin
     // 2. Program a local entry, look it up
     program_entry(4'd1, 1'b1, 1'b0, 6'd1, 48'h7f1b_d420_0000, 28'h040_0000);
     lu_idx = 4'd1;
-    #1 check(lu_valid && !lu_route && lu_pid == 6'd1 &&
+    #1 check(lu_valid && !lu_route && lu_pid == 6'd1 && lu_dst_pid == 6'd9 &&
              lu_base == 48'h7f1b_d420_0000 && lu_len == 28'h040_0000,
              "local entry 1 mismatch");
 

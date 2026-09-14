@@ -109,11 +109,8 @@ constexpr uint32_t RX_BP_MAX     = 0x0F8;   // word 31
 // requests arrived and were not finished; equality with a shortfall against
 // the packets the sender must have sent says they never arrived at all.
 constexpr uint32_t RX_REQ        = 0x178;
-// Whose address space incoming rdma writes land in (RW word 21). The QP
-// owner's cThread is fixed for the connection, so the exporter writes it
-// once at QP setup and the receive path never reads a pid off a request -
-// jigsaw's controller uses a configured pid the same way.
-constexpr uint32_t RX_PID        = 0xA8;
+// Word 21 was RX_PID; the landing pid travels in the message header now
+// (window table word 2 [15:8] on the sender).
 
 constexpr uint32_t STG_CYC       = 0x180;  // free-running cycle counter
 constexpr uint32_t STG_QUEUE_ACC = 0x188;  // order-FIFO residency sum (t-queue)
@@ -161,11 +158,17 @@ inline uint64_t csr_read(coyote::cThread &t, uint32_t byte_off) {
 }
 
 // Program one window-table entry
+// pid: local route - the destination cThread (the TLB translates base+off
+// under it); rdma route - the QP owner (selects the wire). dst_pid: rdma
+// route only - the exporter's ctid on the FAR host, carried in the message
+// header so the far loom_rx lands the bytes in that XPU's address space
+// (one QP serves every XPU on a host).
 inline void program_window(coyote::cThread &t, uint32_t win, bool rdma,
-                           uint32_t pid, const void *base, uint64_t len) {
+                           uint32_t pid, const void *base, uint64_t len,
+                           uint32_t dst_pid = 0) {
     csr_write(t, TBL_IDX,  win);
     csr_write(t, TBL_CFG,  0b01 | (rdma ? 0b10 : 0b00));
-    csr_write(t, TBL_PID,  pid);
+    csr_write(t, TBL_PID,  (uint64_t(dst_pid & 0xFF) << 8) | (pid & 0xFF));
     csr_write(t, TBL_BASE, reinterpret_cast<uint64_t>(base));
     csr_write(t, TBL_LEN,  len);
     csr_write(t, TBL_COMMIT, 1);
@@ -194,10 +197,6 @@ inline uint64_t aperture_read(coyote::cThread &t, uint32_t win, uint32_t off) {
 // target rides the message header (op-len-vaddr).
 inline void set_rdma_staging(coyote::cThread &t, const void *va) {
     csr_write(t, RDMA_STAGING_VA, reinterpret_cast<uint64_t>(va));
-}
-
-inline void set_rx_pid(coyote::cThread &t, uint32_t ctid) {
-    csr_write(t, RX_PID, ctid);
 }
 
 // Bulk transfer: configure the DMA engine, then it moves the data.

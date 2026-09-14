@@ -53,7 +53,7 @@ AXI4L axi_ctrl (.aclk(aclk), .aresetn(aresetn));
 logic                  tbl_commit;
 logic [3:0]            tbl_idx;
 logic                  tbl_valid, tbl_route;
-logic [PID_BITS-1:0]   tbl_pid;
+logic [PID_BITS-1:0]   tbl_pid, tbl_dst_pid;
 logic [VADDR_BITS-1:0] tbl_base;
 logic [LEN_BITS-1:0]   tbl_len;
 
@@ -66,7 +66,7 @@ logic [63:0]           fifo_payload;
 
 logic [3:0]            lu_idx;
 logic                  lu_valid, lu_route;
-logic [PID_BITS-1:0]   lu_pid;
+logic [PID_BITS-1:0]   lu_pid, lu_dst_pid;
 logic [VADDR_BITS-1:0] lu_base;
 logic [LEN_BITS-1:0]   lu_len;
 
@@ -74,7 +74,6 @@ logic cnt_local_wr, cnt_rdma_wr, cnt_drop, cnt_compl;
 logic [63:0] rd_resp_data;
 logic        rd_resp_valid;
 logic [VADDR_BITS-1:0] rdma_staging_va;
-logic [PID_BITS-1:0]   ctrl_rx_pid;
 logic [63:0] stage_acc [7];
 logic [63:0] stage_cnt [7];
 
@@ -115,14 +114,14 @@ int errors = 0;
 loom_ctrl inst_ctrl (
     .aclk(aclk), .aresetn(aresetn), .axi_ctrl(axi_ctrl),
     .tbl_commit(tbl_commit), .tbl_idx(tbl_idx), .tbl_valid(tbl_valid),
-    .tbl_route(tbl_route), .tbl_pid(tbl_pid), .tbl_base(tbl_base),
+    .tbl_route(tbl_route), .tbl_pid(tbl_pid), .tbl_dst_pid(tbl_dst_pid), .tbl_base(tbl_base),
     .tbl_len(tbl_len),
     .fifo_empty(fifo_empty), .fifo_is_desc(fifo_is_desc),
     .fifo_is_read(fifo_is_read),
     .fifo_win(fifo_win), .fifo_off(fifo_off), .fifo_len(fifo_len),
     .fifo_src_pid(fifo_src_pid), .fifo_compl_va(fifo_compl_va),
     .fifo_payload(fifo_payload), .fifo_pop(fifo_pop),
-    .rdma_staging_va(rdma_staging_va), .rx_pid(ctrl_rx_pid),
+    .rdma_staging_va(rdma_staging_va),
     .rd_resp_data(rd_resp_data), .rd_resp_valid(rd_resp_valid),
     .cnt_local_wr(cnt_local_wr), .cnt_rdma_wr(cnt_rdma_wr),
     .cnt_rx_fwd(1'b0), .cnt_rx_drop(1'b0), .cnt_drop(cnt_drop),
@@ -133,10 +132,10 @@ loom_ctrl inst_ctrl (
 loom_table inst_table (
     .aclk(aclk), .aresetn(aresetn),
     .commit(tbl_commit), .prog_idx(tbl_idx), .prog_valid(tbl_valid),
-    .prog_route(tbl_route), .prog_pid(tbl_pid), .prog_base(tbl_base),
+    .prog_route(tbl_route), .prog_pid(tbl_pid), .prog_dst_pid(tbl_dst_pid), .prog_base(tbl_base),
     .prog_len(tbl_len),
     .lu_idx(lu_idx), .lu_valid(lu_valid), .lu_route(lu_route),
-    .lu_pid(lu_pid), .lu_base(lu_base), .lu_len(lu_len)
+    .lu_pid(lu_pid), .lu_dst_pid(lu_dst_pid), .lu_base(lu_base), .lu_len(lu_len)
 );
 
 // Transmit window and its acks. The shell acks every packet request
@@ -184,7 +183,7 @@ loom_engine inst_engine (
     .fifo_src_pid(fifo_src_pid), .fifo_compl_va(fifo_compl_va),
     .fifo_payload(fifo_payload), .fifo_pop(fifo_pop),
     .lu_idx(lu_idx), .lu_valid(lu_valid), .lu_route(lu_route),
-    .lu_pid(lu_pid), .lu_base(lu_base), .lu_len(lu_len),
+    .lu_pid(lu_pid), .lu_dst_pid(lu_dst_pid), .lu_base(lu_base), .lu_len(lu_len),
     .rdma_staging_va(rdma_staging_va),
     .rd_req(eng_rd_req), .rd_valid(eng_rd_valid), .rd_ready(eng_rd_ready),
     .wr_req(eng_wr_req), .wr_valid(eng_wr_valid), .wr_ready(eng_wr_ready),
@@ -227,14 +226,15 @@ localparam logic [27:0] big_sizes [3] = '{28'd1048576, 28'd4194304, 28'd8388608}
 localparam [47:0] BASE2    = 48'h7f9e_8860_0000;   // exported dst2
 localparam [47:0] SRC_VA   = 48'h7f6a_2000_0000;   // importer's source buffer
 localparam [47:0] CPL_VA   = 48'h7f6a_3000_0000;   // importer's fence word
-localparam [PID_BITS-1:0] QP_OWNER = 6'd1;         // exporter's data ctid
+localparam [PID_BITS-1:0] QP_OWNER = 6'd1;         // the QP owner (both hosts' data ctid here)
+localparam [PID_BITS-1:0] FAR_PID  = 6'd3;         // the exporter XPU's ctid on the far host
 
 logic cnt_rx_bp;   // ingress backpressure, any state
 loom_rx inst_rx (
     .cnt_rx_bp(cnt_rx_bp),
     .aclk(aclk), .aresetn(aresetn),
     .rq_req(rx_rq_req), .rq_valid(rx_rq_valid), .rq_ready(rx_rq_ready),
-    .rdma_staging_va(STAGING), .rx_pid(QP_OWNER),
+    .rdma_staging_va(STAGING),
     .wr_req(rx_wr_req), .wr_valid(rx_wr_valid), .wr_ready(rx_wr_ready),
     .s_tdata(rx_s_tdata), .s_tkeep(rx_s_tkeep), .s_tvalid(rx_s_tvalid),
     .s_tready(rx_s_tready), .s_tlast(rx_s_tlast),
@@ -564,11 +564,13 @@ int rx_txns = 0;                      // loom_rx transactions completed
 int wr_q_max = 0;                     // deepest the queue got (proves pipelining)
 int wr_orphan_beats = 0;              // data with no descriptor to land against
 int wr_last_reqs = 0;                 // requests posted with last=1 (one per MESSAGE)
+int wr_bad_pid = 0;                   // writes not under the header's (the window's) dst pid
 int rx_tlasts = 0;                    // tlast beats on the host write stream (one per MESSAGE)
 initial forever begin
     @(posedge aclk);
     if (rx_wr_valid && rx_wr_ready) begin
         wr_q.push_back('{rx_wr_req.vaddr, rx_wr_req.len});
+        if (rx_wr_req.pid != FAR_PID) wr_bad_pid++;
         rx_txns++;
         if (rx_wr_req.last) wr_last_reqs++;
         if (wr_q.size() > wr_q_max) wr_q_max = wr_q.size();
@@ -695,7 +697,7 @@ endtask
 task import_win(input [3:0] idx, input [63:0] base, input [63:0] len);
     axil_write(16'd0,  {60'b0, idx});
     axil_write(16'd8,  64'b11);                  // valid + rdma route
-    axil_write(16'd16, {58'b0, QP_OWNER});
+    axil_write(16'd16, {50'b0, FAR_PID, 2'b0, QP_OWNER});   // [15:8] dst pid
     axil_write(16'd24, base);
     axil_write(16'd32, len);
     axil_write(16'd40, 64'd1);
@@ -1076,6 +1078,8 @@ initial begin
     // 257 packets, so exactly one of the 257 writes carries last.
     $display("       1 MB: %0d request(s) with last=1, %0d tlast beat(s), 1 message",
              wr_last_reqs - last_before, rx_tlasts - tlast_before);
+    check(wr_bad_pid == 0,
+          $sformatf("1 MB: every far-side write under the window's dst pid (%0d were not)", wr_bad_pid));
     check(wr_last_reqs - last_before == 1,
           $sformatf("1 MB: one last=1 request per message (%0d, want 1)",
                     wr_last_reqs - last_before));

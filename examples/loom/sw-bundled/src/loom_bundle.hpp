@@ -62,11 +62,15 @@ public:
 
         Segment s{};
         bool rdma = false;
+        uint32_t dst_pid = 0;
         if (peer_) {
-            // Cross-host: the handle lives in the far daemon's registry
+            // Cross-host: the handle lives in the far daemon's registry.
+            // The far ctid becomes the header's landing pid; the local QP
+            // owner selects the wire.
             if (!peer_->resolve(h, s))
                 return NO_WINDOW;                    // refused remotely
-            s.ctid = qp_owner_;                      // local QP selects the wire
+            dst_pid = s.ctid;
+            s.ctid = qp_owner_;
             rdma = true;
         } else {
             if (h == BAD_HANDLE || h > segs_.size())
@@ -77,10 +81,23 @@ public:
         const int win = alloc_win();
         if (win == NO_WINDOW) return NO_WINDOW;      // aperture exhausted
         program_window(ctrl_, win, rdma, s.ctid,
-                       reinterpret_cast<const void *>(s.va), s.len);
+                       reinterpret_cast<const void *>(s.va), s.len, dst_pid);
         return win;
     }
 
+    // Local import regardless of the peer: a window onto a segment THIS
+    // host exported (another XPU in this process). route=local, pid = the
+    // exporter XPU's ctid - the cross-pid write through the shell's TLB.
+    int importLocal(Handle h) {
+        std::lock_guard<std::mutex> g(m_);
+        if (h == BAD_HANDLE || h > segs_.size()) return NO_WINDOW;
+        const Segment s = segs_[h - 1];
+        const int win = alloc_win();
+        if (win == NO_WINDOW) return NO_WINDOW;
+        program_window(ctrl_, win, /*rdma=*/false, s.ctid,
+                       reinterpret_cast<const void *>(s.va), s.len);
+        return win;
+    }
     void releaseWindow(int win) override {
         std::lock_guard<std::mutex> g(m_);
         if (win < 1 || win > 15) return;
@@ -109,18 +126,27 @@ public:
     // PONG: an rdma window onto the far side's buffer, exactly as importBuf
     // programs one for a resolved handle, plus this engine's staging CSR set
     // to the far side's staging (the RETH its loom_rx expects).
-    bool pongSetup(uint64_t staging_va, uint64_t buf_va, uint64_t len) override {
+    bool pongSetup(uint64_t staging_va, uint64_t buf_va, uint64_t len,
+                   uint32_t far_ctid, int &win_out) override {
         std::lock_guard<std::mutex> g(m_);
         if (!qp_owner_set_) return false;
         set_rdma_staging(ctrl_, reinterpret_cast<const void *>(staging_va));
         const int win = alloc_win();
         if (win == NO_WINDOW) return false;
         program_window(ctrl_, win, /*rdma=*/true, qp_owner_,
-                       reinterpret_cast<const void *>(buf_va), len);
-        pong_win_.store(win);
+                       reinterpret_cast<const void *>(buf_va), len, far_ctid);
+        pong_wins_.push_back(win);
+        n_pong_.store(int(pong_wins_.size()));
+        win_out = win;
         return true;
     }
-    int pongWindow() const { return pong_win_.load(); }
+    // Reverse windows in the order the far side handed them over (its XPU
+    // order); NO_WINDOW if fewer have arrived
+    int pongWindow(int idx = 0) {
+        if (n_pong_.load() <= idx) return NO_WINDOW;
+        std::lock_guard<std::mutex> g(m_);
+        return pong_wins_[idx];
+    }
 
 private:
     coyote::cThread &ctrl_;
@@ -140,7 +166,8 @@ private:
     PeerClient *peer_ = nullptr;
     uint32_t qp_owner_ = 0;
     bool qp_owner_set_ = false;
-    std::atomic<int> pong_win_{NO_WINDOW};
+    std::vector<int> pong_wins_;
+    std::atomic<int> n_pong_{0};
 };
 
 } // namespace loom

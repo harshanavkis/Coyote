@@ -91,6 +91,7 @@ module loom_engine (
     input  logic                        lu_valid,
     input  logic                        lu_route,
     input  logic [PID_BITS-1:0]         lu_pid,
+    input  logic [PID_BITS-1:0]         lu_dst_pid,
     input  logic [VADDR_BITS-1:0]       lu_base,
     input  logic [LEN_BITS-1:0]         lu_len,
 
@@ -246,6 +247,7 @@ logic [VADDR_BITS-1:0] l_compl_va;
 logic [63:0]           l_payload;
 logic                  l_valid, l_route;
 logic [PID_BITS-1:0]   l_pid;
+logic [PID_BITS-1:0]   l_dst_pid;   // far ctid, goes into the message header
 logic [VADDR_BITS-1:0] l_base;
 logic [LEN_BITS-1:0]   l_lim;
 
@@ -388,7 +390,7 @@ always_ff @(posedge aclk) begin
         rd_data <= 0; rd_lane <= 0;
         l_payload <= 0; l_sbeats <= 0;
         p_left <= 0; p_first <= 0;
-        l_valid <= 0; l_route <= 0; l_pid <= 0; l_base <= 0; l_lim <= 0;
+        l_valid <= 0; l_route <= 0; l_pid <= 0; l_dst_pid <= 0; l_base <= 0; l_lim <= 0;
     end else begin
         case (state)
             // Latch the FIFO head and its table hit in one shot; fifo_pop
@@ -405,6 +407,7 @@ always_ff @(posedge aclk) begin
                 l_valid   <= lu_valid;
                 l_route   <= lu_route;
                 l_pid     <= lu_pid;
+                l_dst_pid <= lu_dst_pid;
                 l_base    <= lu_base;
                 l_lim     <= lu_len;
                 state     <= ST_CHECK;
@@ -617,7 +620,9 @@ end
 
 // Wire-message header beat: lane0 = {reserved, len[27:0], op[7:0]},
 // lane1 = target VA (the exporter's VA + offset), lane2 = inline data
-wire [63:0] hdr_q0_inline = {28'b0, 28'd8, MSG_OP_WRITE_INLINE};
+// Lane 0: {zero[21:0], dst_pid[5:0], len[27:0], op[7:0]} - the destination
+// pid names the far XPU's address space (keep in sync with loom_rx hdr_ok)
+wire [63:0] hdr_q0_inline = {{(28-PID_BITS){1'b0}}, l_dst_pid, 28'd8, MSG_OP_WRITE_INLINE};
 // The header names the MESSAGE's target and length - the whole
 // descriptor, however many packets carry it
 wire [63:0] hdr_q1        = {{(64-VADDR_BITS){1'b0}}, dst_vaddr};
@@ -627,7 +632,7 @@ wire [AXI_DATA_BITS-1:0] msg_inline_beat =
 
 // Bulk header: same layout, op 1, and the length is the payload's - lane 2
 // is unused because the data follows as its own beats
-wire [63:0] hdr_q0_write = {28'b0, l_len, MSG_OP_WRITE};
+wire [63:0] hdr_q0_write = {{(28-PID_BITS){1'b0}}, l_dst_pid, l_len, MSG_OP_WRITE};
 wire [AXI_DATA_BITS-1:0] msg_write_beat =
     {{(AXI_DATA_BITS-192){1'b0}}, 64'b0, hdr_q1, hdr_q0_write};
 

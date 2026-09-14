@@ -52,13 +52,15 @@ localparam [47:0] STAGING = 48'h7f00_0000_0000;
 // Incoming writes land under the QP owner's pid, which is a CSR now rather
 // than a field of each request - jigsaw's controller uses a configured pid
 // the same way, and it is fixed for the life of the connection.
+// The header names the landing pid; the TB's messages carry this one
 localparam [PID_BITS-1:0] RX_PID = 6'd2;
+localparam [63:0] HDR_PID = 64'(RX_PID) << 36;
 localparam [47:0] TARGET  = 48'h7f9e_8860_0000;
 
 loom_rx dut (
     .aclk(aclk), .aresetn(aresetn),
     .rq_req(rq_req), .rq_valid(rq_valid), .rq_ready(rq_ready),
-    .rdma_staging_va(STAGING), .rx_pid(RX_PID),
+    .rdma_staging_va(STAGING),
     .wr_req(wr_req), .wr_valid(wr_valid), .wr_ready(wr_ready),
     .s_tdata(s_tdata), .s_tkeep(s_tkeep), .s_tvalid(s_tvalid),
     .s_tready(s_tready), .s_tlast(s_tlast),
@@ -259,7 +261,7 @@ initial begin
     repeat (10) @(posedge aclk);
     check(rq_ready && !busy && !req,
           "a request alone is drained and starts nothing");
-    sq.push_back('{{28'b0, 28'd8, OP_INL}, {16'b0, TARGET}, 64'hAA, 1'b1});
+    sq.push_back('{(HDR_PID | {28'b0, 28'd8, OP_INL}), {16'b0, TARGET}, 64'hAA, 1'b1});
     repeat (4) @(posedge aclk);
     check(req && !busy,
           "a waiting header beat asks for the path but cannot start without grant");
@@ -270,7 +272,7 @@ initial begin
     // --- 2. Inline store message: exact 8 B write, no clobber ---
     @(negedge aclk); grant = 1;
     incoming(6'd2, 28'd64);
-    send_msg_beat({28'b0, 28'd8, OP_INL}, {16'b0, TARGET + 48'h40},
+    send_msg_beat((HDR_PID | {28'b0, 28'd8, OP_INL}), {16'b0, TARGET + 48'h40},
                   64'hEE00_0000_0000_0001, 1'b1);
     wait_idle();
     check(wrq.size() == 1, "inline: one wr_req");
@@ -286,9 +288,23 @@ initial begin
     outq.delete();
     check(fwd_pulses == 1, "inline: one fwd pulse");
 
+    // --- 2b. The landing pid is the HEADER's, per message: two XPUs on
+    //     this host receive back to back, each into its own address space
+    incoming(6'd0, 28'd64);
+    send_msg_beat(((64'd5 << 36) | {28'b0, 28'd8, OP_INL}), {16'b0, TARGET + 48'h48}, 64'h55, 1'b1);
+    incoming(6'd0, 28'd64);
+    send_msg_beat(((64'd9 << 36) | {28'b0, 28'd8, OP_INL}), {16'b0, TARGET + 48'h50}, 64'h99, 1'b1);
+    wait_idle();
+    check(wrq.size() == 2, "pid: two writes");
+    if (wrq.size() == 2)
+        check(wrq[0].pid == 6'd5 && wrq[1].pid == 6'd9,
+              $sformatf("pid: each write lands under its header's pid (%0d, %0d)",
+                        wrq[0].pid, wrq[1].pid));
+    wrq.delete(); outq.delete(); fwd_pulses = 1;   // case 3 expects the running count
+
     // --- 3. Bulk message: header + 2 payload beats ---
     incoming(6'd0, 28'd192);
-    send_msg_beat({28'b0, 28'd128, OP_WR}, {16'b0, TARGET + 48'h100}, 64'b0, 1'b0);
+    send_msg_beat((HDR_PID | {28'b0, 28'd128, OP_WR}), {16'b0, TARGET + 48'h100}, 64'b0, 1'b0);
     send_msg_beat(64'hB0B0_0000, 64'b0, 64'b0, 1'b0);
     send_msg_beat(64'hB0B0_0001, 64'b0, 64'b0, 1'b1);
     wait_idle();
@@ -307,7 +323,7 @@ initial begin
     // --- 4. Backpressure: inline data held until output ready ---
     @(negedge aclk); m_tready = 0;
     incoming(6'd1, 28'd64);
-    send_msg_beat({28'b0, 28'd8, OP_INL}, {16'b0, TARGET + 48'h200},
+    send_msg_beat((HDR_PID | {28'b0, 28'd8, OP_INL}), {16'b0, TARGET + 48'h200},
                   64'hDD01, 1'b1);
     repeat (15) @(posedge aclk);
     check(outq.size() == 0 && busy, "backpressure: inline beat held");
@@ -319,7 +335,7 @@ initial begin
 
     // --- 5. Unknown op: drained, nothing written ---
     incoming(6'd0, 28'd128);
-    send_msg_beat({28'b0, 28'd8, 8'd9}, {16'b0, TARGET}, 64'hBAD0, 1'b0);
+    send_msg_beat((HDR_PID | {28'b0, 28'd8, 8'd9}), {16'b0, TARGET}, 64'hBAD0, 1'b0);
     send_msg_beat(64'hBAD1, 64'b0, 64'b0, 1'b1);
     wait_idle();
     check(wrq.size() == 0 && outq.size() == 0, "unknown op: no write, drained");
@@ -330,7 +346,7 @@ initial begin
     //     destination. The request is 64 B longer than its payload for the
     //     header it carries.
     incoming(6'd3, 28'd192, TARGET + 48'h300);   // vaddr deliberately ignored
-    send_msg_beat({28'b0, 28'd128, OP_WR}, {16'b0, TARGET + 48'h300}, 64'b0, 1'b0);
+    send_msg_beat((HDR_PID | {28'b0, 28'd128, OP_WR}), {16'b0, TARGET + 48'h300}, 64'b0, 1'b0);
     send_msg_beat(64'hD1D1_0000, 64'hAAAA, 64'hBBBB, 1'b0);
     send_msg_beat(64'hD1D1_0001, 64'b0, 64'b0, 1'b1);
     wait_idle();
@@ -348,7 +364,7 @@ initial begin
     // The target really is the header's, not the request's: send them
     // deliberately different and the header must win.
     incoming(6'd3, 28'd128, TARGET + 48'h9999);
-    send_msg_beat({28'b0, 28'd64, OP_WR}, {16'b0, TARGET + 48'h700}, 64'b0, 1'b0);
+    send_msg_beat((HDR_PID | {28'b0, 28'd64, OP_WR}), {16'b0, TARGET + 48'h700}, 64'b0, 1'b0);
     send_msg_beat(64'hC0C0_0001, 64'b0, 64'b0, 1'b1);
     wait_idle();
     check(wrq.size() == 1, "header wins: one wr_req");
@@ -361,10 +377,10 @@ initial begin
 
     // --- 6. Back-to-back inline messages ---
     incoming(6'd0, 28'd64);
-    send_msg_beat({28'b0, 28'd8, OP_INL}, {16'b0, TARGET}, 64'h1111, 1'b1);
+    send_msg_beat((HDR_PID | {28'b0, 28'd8, OP_INL}), {16'b0, TARGET}, 64'h1111, 1'b1);
     wait_idle();
     incoming(6'd1, 28'd64);
-    send_msg_beat({28'b0, 28'd8, OP_INL}, {16'b0, TARGET + 48'h1000}, 64'h2222, 1'b1);
+    send_msg_beat((HDR_PID | {28'b0, 28'd8, OP_INL}), {16'b0, TARGET + 48'h1000}, 64'h2222, 1'b1);
     wait_idle();
     check(wrq.size() == 2 && wrq[0].pid == RX_PID && wrq[1].pid == RX_PID &&
           wrq[1].vaddr == TARGET + 48'h1000, "back-to-back wr_reqs");
@@ -388,12 +404,12 @@ initial begin
     // --- 7. Next request pending while the previous payload streams ---
     dut_reset();
     incoming(6'd4, 28'd256, TARGET + 48'h400);
-    send_msg_beat({28'b0, 28'd192, OP_WR}, {16'b0, TARGET + 48'h400}, 64'b0, 1'b0);
+    send_msg_beat((HDR_PID | {28'b0, 28'd192, OP_WR}), {16'b0, TARGET + 48'h400}, 64'b0, 1'b0);
     send_msg_beat(64'hC0C0_0000, 64'b0, 64'b0, 1'b0);
     present_pending(6'd5, 28'd64, STAGING);
     send_msg_beat(64'hC0C0_0001, 64'b0, 64'b0, 1'b0);
     send_msg_beat(64'hC0C0_0002, 64'b0, 64'b0, 1'b1);
-    send_msg_beat({28'b0, 28'd8, OP_INL}, {16'b0, TARGET + 48'h500},
+    send_msg_beat((HDR_PID | {28'b0, 28'd8, OP_INL}), {16'b0, TARGET + 48'h500},
                   64'h7777, 1'b1);
     wait_quiet(400, "7: request pending across a direct write");
     dump_wrq("case 7");
@@ -408,13 +424,13 @@ initial begin
     // stopped landing writes
     dut_reset();
     incoming(6'd1, 28'd128, TARGET + 48'h10000);
-    send_msg_beat({28'b0, 28'd64, OP_WR}, {16'b0, TARGET + 48'h10000}, 64'b0, 1'b0);
+    send_msg_beat((HDR_PID | {28'b0, 28'd64, OP_WR}), {16'b0, TARGET + 48'h10000}, 64'b0, 1'b0);
     send_msg_beat(64'hBEEF_0000, 64'b0, 64'b0, 1'b1);
     present_pending(6'd1, 28'd128, TARGET + 48'h20000);
-    send_msg_beat({28'b0, 28'd64, OP_WR}, {16'b0, TARGET + 48'h20000}, 64'b0, 1'b0);
+    send_msg_beat((HDR_PID | {28'b0, 28'd64, OP_WR}), {16'b0, TARGET + 48'h20000}, 64'b0, 1'b0);
     send_msg_beat(64'hBEEF_0002, 64'b0, 64'b0, 1'b1);
     present_pending(6'd1, 28'd64, STAGING);
-    send_msg_beat({28'b0, 28'd8, OP_INL}, {16'b0, TARGET + 48'h800},
+    send_msg_beat((HDR_PID | {28'b0, 28'd8, OP_INL}), {16'b0, TARGET + 48'h800},
                   64'hF1A6, 1'b1);
     wait_quiet(400, "8: bulk, bulk, flag store");
     dump_wrq("case 8");
@@ -428,10 +444,10 @@ initial begin
     // instead waits for a tlast that belongs to the NEXT message
     dut_reset();
     incoming(6'd2, 28'd128, TARGET + 48'h600, 1'b0);
-    send_msg_beat({28'b0, 28'd64, OP_WR}, {16'b0, TARGET + 48'h600}, 64'b0, 1'b0);
+    send_msg_beat((HDR_PID | {28'b0, 28'd64, OP_WR}), {16'b0, TARGET + 48'h600}, 64'b0, 1'b0);
     send_msg_beat(64'hA5A5_0001, 64'b0, 64'b0, 1'b0);   // len reached, no tlast
     present_pending(6'd2, 28'd64, STAGING);
-    send_msg_beat({28'b0, 28'd8, OP_INL}, {16'b0, TARGET + 48'h700},
+    send_msg_beat((HDR_PID | {28'b0, 28'd8, OP_INL}), {16'b0, TARGET + 48'h700},
                   64'h5555, 1'b1);
     wait_quiet(400, "9: request with last=0");
     dump_wrq("case 9");
@@ -448,7 +464,7 @@ initial begin
     // up pointed into page 0
     dut_reset();
     incoming(6'd3, 28'd128, STAGING);
-    send_msg_beat({28'b0, 28'd8, OP_INL}, {16'b0, TARGET + 48'h900},
+    send_msg_beat((HDR_PID | {28'b0, 28'd8, OP_INL}), {16'b0, TARGET + 48'h900},
                   64'h9999, 1'b0);
     // A trailer is a malformed sender: an inline message is ONE beat by
     // contract. There is no request framing to absorb it any more - the
@@ -459,7 +475,7 @@ initial begin
     wait_quiet(200, "10: multi-beat inline message");
     drain_beats(50, "10: trailing beat of a multi-beat inline message");
     incoming(6'd3, 28'd64, STAGING);
-    send_msg_beat({28'b0, 28'd8, OP_INL}, {16'b0, TARGET + 48'hA00},
+    send_msg_beat((HDR_PID | {28'b0, 28'd8, OP_INL}), {16'b0, TARGET + 48'hA00},
                   64'hAAAA, 1'b1);
     wait_quiet(300, "10: message after a multi-beat one");
     dump_wrq("case 10");
@@ -476,16 +492,17 @@ initial begin
     dut_reset();
     drop_pulses = 0;
     incoming(6'd0, 28'd64);
-    send_msg_beat({28'b0, 28'd16, OP_INL}, {16'b0, TARGET}, 64'h1, 1'b1);
+    send_msg_beat((HDR_PID | {28'b0, 28'd16, OP_INL}), {16'b0, TARGET}, 64'h1, 1'b1);
     wait_quiet(200, "11: inline with a length other than 8");
     incoming(6'd0, 28'd64);
-    send_msg_beat({28'b0, 28'd8, OP_INL}, {16'b0, TARGET + 48'h4}, 64'h2, 1'b1);
+    send_msg_beat((HDR_PID | {28'b0, 28'd8, OP_INL}), {16'b0, TARGET + 48'h4}, 64'h2, 1'b1);
     wait_quiet(200, "11: inline with an unaligned target");
     incoming(6'd0, 28'd64);
-    send_msg_beat({28'hF, 28'd8, OP_INL}, {16'b0, TARGET}, 64'h3, 1'b1);
+    // bits [41:36] are the pid now; the reserved field is what is above it
+    send_msg_beat({28'hF000, 28'd8, OP_INL}, {16'b0, TARGET}, 64'h3, 1'b1);
     wait_quiet(200, "11: reserved field set");
     incoming(6'd0, 28'd64);
-    send_msg_beat({28'b0, 28'd100, OP_WR}, {16'b0, TARGET}, 64'h4, 1'b1);
+    send_msg_beat((HDR_PID | {28'b0, 28'd100, OP_WR}), {16'b0, TARGET}, 64'h4, 1'b1);
     wait_quiet(200, "11: bulk length not a 64 B multiple");
     incoming(6'd0, 28'd64);        // a payload beat where a header belongs
     send_msg_beat(64'h5A5A_0000_0000_0018, 64'h5A5A_0000_0000_0019,
@@ -504,7 +521,7 @@ initial begin
     dut_reset();
     drop_pulses = 0;
     incoming(6'd6, 28'd192, TARGET + 48'hB00);
-    send_msg_beat({28'b0, 28'd100, OP_WR}, {16'b0, TARGET + 48'hB00}, 64'b0, 1'b0);
+    send_msg_beat((HDR_PID | {28'b0, 28'd100, OP_WR}), {16'b0, TARGET + 48'hB00}, 64'b0, 1'b0);
     // These follow a header that was rejected, so they are read as headers
     // themselves. 0xDEAD_0001 would parse as a VALID op-1 write of
     // 0xDEAD00 bytes to address 0 - the hazard this architecture carries in
@@ -514,7 +531,7 @@ initial begin
     send_msg_beat(64'h5A5A_0000_0000_0021, 64'b0, 64'b0, 1'b1);
     wait_quiet(200, "12: header claiming 100 B");
     incoming(6'd6, 28'd64, STAGING);
-    send_msg_beat({28'b0, 28'd8, OP_INL}, {16'b0, TARGET + 48'hC00},
+    send_msg_beat((HDR_PID | {28'b0, 28'd8, OP_INL}), {16'b0, TARGET + 48'hC00},
                   64'hCC, 1'b1);
     wait_quiet(200, "12: message after a rejected length");
     dump_wrq("case 12");
@@ -541,12 +558,12 @@ initial begin
     // is written to an address that came from payload.
     drop_pulses = 0;
     incoming(6'd7, 28'd192, TARGET + 48'hD00);
-    send_msg_beat({28'b0, 28'd64, OP_WR}, {16'b0, TARGET + 48'hD00}, 64'b0, 1'b0);
+    send_msg_beat((HDR_PID | {28'b0, 28'd64, OP_WR}), {16'b0, TARGET + 48'hD00}, 64'b0, 1'b0);
     send_msg_beat(64'hFEED_0001, 64'b0, 64'b0, 1'b0);
     send_msg_beat(64'hFEED_0002, 64'b0, 64'b0, 1'b1);   // one beat too many
     wait_quiet(300, "13: last=1 stream longer than its length");
     incoming(6'd7, 28'd64, STAGING);
-    send_msg_beat({28'b0, 28'd8, OP_INL}, {16'b0, TARGET + 48'hE00},
+    send_msg_beat((HDR_PID | {28'b0, 28'd8, OP_INL}), {16'b0, TARGET + 48'hE00},
                   64'hEE, 1'b1);
     wait_quiet(300, "13: message after an over-long stream");
     dump_wrq("case 13");
@@ -575,7 +592,7 @@ initial begin
     move_pulses = 0; starve_pulses = 0; stall_pulses = 0; req_pulses = 0;
     outq.delete(); wrq.delete();
     incoming(6'd1, 28'd320, TARGET, 1'b1);        // header + 4 payload beats
-    send_msg_beat({28'b0, 28'd256, OP_WR}, {16'b0, TARGET}, 64'b0, 1'b0);
+    send_msg_beat((HDR_PID | {28'b0, 28'd256, OP_WR}), {16'b0, TARGET}, 64'b0, 1'b0);
     // starved: give it one beat, then leave the ingress dry for a while
     send_msg_beat(64'hA0, 64'hA1, 64'hA2, 1'b0);
     repeat (6) @(posedge aclk);
@@ -599,7 +616,7 @@ initial begin
     outq.delete(); wrq.delete();
     @(negedge aclk); m_tready = 0;                 // refuse before ANY beat
     incoming(6'd1, 28'd192, TARGET, 1'b1);
-    send_msg_beat({28'b0, 28'd128, OP_WR}, {16'b0, TARGET}, 64'b0, 1'b0);
+    send_msg_beat((HDR_PID | {28'b0, 28'd128, OP_WR}), {16'b0, TARGET}, 64'b0, 1'b0);
     send_msg_beat(64'hE0, 64'hE1, 64'hE2, 1'b0);
     send_msg_beat(64'hF0, 64'hF1, 64'hF2, 1'b1);
     repeat (8) @(posedge aclk);
@@ -621,7 +638,7 @@ initial begin
     req_pulses = 0;
     outq.delete(); wrq.delete();
     incoming(6'd2, 28'd128, STAGING);                 // 2 beats: hdr + 1
-    send_msg_beat({28'b0, 28'd192, OP_WR}, {16'b0, TARGET + 48'h2000}, 64'b0, 1'b0);
+    send_msg_beat((HDR_PID | {28'b0, 28'd192, OP_WR}), {16'b0, TARGET + 48'h2000}, 64'b0, 1'b0);
     send_msg_beat(64'h5100, 64'b0, 64'b0, 1'b0);
     present_pending(6'd2, 28'd64, STAGING + 48'h1000);  // continuation
     send_msg_beat(64'h5101, 64'b0, 64'b0, 1'b0);
@@ -648,13 +665,13 @@ initial begin
     dut_reset();
     drop_pulses = 0; orphan_pulses = 0; outq.delete(); wrq.delete();
     incoming(6'd2, 28'd320, STAGING);        // 5 beats: header + 4 payload
-    send_msg_beat({28'b0, 28'd256, OP_WR}, {16'b0, TARGET + 48'h5000}, 64'b0, 1'b0);
+    send_msg_beat((HDR_PID | {28'b0, 28'd256, OP_WR}), {16'b0, TARGET + 48'h5000}, 64'b0, 1'b0);
     send_msg_beat(64'hAA00, 64'b0, 64'b0, 1'b0);
     send_msg_beat(64'hAA01, 64'b0, 64'b0, 1'b0);
     send_msg_beat(64'hAA02, 64'b0, 64'b0, 1'b0);
     send_msg_beat(64'hAA03, 64'b0, 64'b0, 1'b1);
     // The leak: one more beat, with no request behind it.
-    send_msg_beat({28'b0, 28'd256, OP_WR}, {16'b0, TARGET + 48'h5000}, 64'b0, 1'b0);
+    send_msg_beat((HDR_PID | {28'b0, 28'd256, OP_WR}), {16'b0, TARGET + 48'h5000}, 64'b0, 1'b0);
     wait_quiet(400, "15: unannounced beat");
     dump_wrq("case 15");
     check(outq.size() == 4,
@@ -683,12 +700,12 @@ initial begin
     dut_reset();
     drop_pulses = 0; outq.delete(); wrq.delete();
     incoming(6'd2, 28'd256, STAGING);
-    send_msg_beat({28'b0, 28'd192, OP_WR}, {16'b0, TARGET + 48'h6000}, 64'b0, 1'b0);
+    send_msg_beat((HDR_PID | {28'b0, 28'd192, OP_WR}), {16'b0, TARGET + 48'h6000}, 64'b0, 1'b0);
     send_msg_beat(64'hBB00, 64'b0, 64'b0, 1'b0);
     send_msg_beat(64'hBB01, 64'b0, 64'b0, 1'b0);
     // Q2 is the lost one - it never arrives. The next message follows.
     incoming(6'd2, 28'd128, STAGING);
-    send_msg_beat({28'b0, 28'd64, OP_WR}, {16'b0, TARGET + 48'h7000}, 64'b0, 1'b0);
+    send_msg_beat((HDR_PID | {28'b0, 28'd64, OP_WR}), {16'b0, TARGET + 48'h7000}, 64'b0, 1'b0);
     send_msg_beat(64'hCC00, 64'b0, 64'b0, 1'b1);
     wait_quiet(400, "16: lost beat");
     dump_wrq("case 16");
@@ -699,7 +716,7 @@ initial begin
         check(wrq[0].vaddr == TARGET + 48'h6000,
               "lost beat: the only write is the FIRST message's target");
     if (outq.size() >= 3)
-        check(outq[2].data == {28'b0, 28'd64, OP_WR},
+        check(outq[2].data == (HDR_PID | {28'b0, 28'd64, OP_WR}),
               "lost beat: next header written as payload into previous buffer");
 
     // --- 17. wr_ready backpressure: the request handshake gates the wire ---
@@ -713,7 +730,7 @@ initial begin
     fwd_pulses = 0;
     @(negedge aclk); wr_ready = 0;
     incoming(6'd0, 28'd192);
-    send_msg_beat({28'b0, 28'd128, OP_WR}, {16'b0, TARGET + 48'h800}, 64'b0, 1'b0);
+    send_msg_beat((HDR_PID | {28'b0, 28'd128, OP_WR}), {16'b0, TARGET + 48'h800}, 64'b0, 1'b0);
     send_msg_beat(64'hE0E0_0000, 64'b0, 64'b0, 1'b0);
     send_msg_beat(64'hE0E0_0001, 64'b0, 64'b0, 1'b1);
 

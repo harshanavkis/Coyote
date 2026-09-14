@@ -20,7 +20,7 @@ AXI4L axi_ctrl (.aclk(aclk), .aresetn(aresetn));
 logic                  tbl_commit;
 logic [3:0]            tbl_idx;
 logic                  tbl_valid, tbl_route;
-logic [PID_BITS-1:0]   tbl_pid;
+logic [PID_BITS-1:0]   tbl_pid, tbl_dst_pid;
 logic [VADDR_BITS-1:0] tbl_base;
 logic [LEN_BITS-1:0]   tbl_len;
 
@@ -50,7 +50,7 @@ int commit_pulses = 0;
 loom_ctrl dut (
     .aclk(aclk), .aresetn(aresetn), .axi_ctrl(axi_ctrl),
     .tbl_commit(tbl_commit), .tbl_idx(tbl_idx), .tbl_valid(tbl_valid),
-    .tbl_route(tbl_route), .tbl_pid(tbl_pid), .tbl_base(tbl_base),
+    .tbl_route(tbl_route), .tbl_pid(tbl_pid), .tbl_dst_pid(tbl_dst_pid), .tbl_base(tbl_base),
     .tbl_len(tbl_len),
     .fifo_empty(fifo_empty), .fifo_is_desc(fifo_is_desc),
     .fifo_is_read(fifo_is_read),
@@ -147,12 +147,12 @@ initial begin
     // --- 2. Table programming outputs + commit pulse ---
     axil_write(16'(R_TBL_IDX * 8), 64'd3);
     axil_write(16'(R_TBL_CFG * 8), 64'b11);           // valid | rdma
-    axil_write(16'(R_TBL_PID * 8), 64'd5);
+    axil_write(16'(R_TBL_PID * 8), 64'h0000_0000_0000_0705);   // pid 5, dst pid 7
     axil_write(16'(R_TBL_LEN * 8), 64'h40_0000);
     check(commit_pulses == 0, "commit fired before COMMIT write");
     axil_write(16'(R_TBL_COMMIT * 8), 64'd1);
     check(commit_pulses == 1, "exactly one commit pulse");
-    check(tbl_idx == 4'd3 && tbl_valid && tbl_route && tbl_pid == 6'd5 &&
+    check(tbl_idx == 4'd3 && tbl_valid && tbl_route && tbl_pid == 6'd5 && tbl_dst_pid == 6'd7 &&
           tbl_base == 48'h7f1b_d420_0000 && tbl_len == 28'h40_0000,
           "table programming outputs");
 

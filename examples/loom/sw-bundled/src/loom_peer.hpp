@@ -49,7 +49,7 @@
 namespace loom {
 
 constexpr uint32_t PEER_MAGIC   = 0x4C4F4F4D;   // "LOOM"
-constexpr uint32_t PEER_VERSION = 2;
+constexpr uint32_t PEER_VERSION = 3;
 
 enum class PeerOp : uint32_t {
     RESOLVE = 1,   // handle -> {ctid, va, len}
@@ -70,6 +70,8 @@ struct PeerReq {
     uint64_t staging;  // PONG: the importer's RDMA staging VA
     uint64_t va;       // PONG: the importer's receive buffer VA
     uint64_t len;      // PONG: its length
+    uint32_t ctid;     // PONG: the importer XPU's ctid (the landing pid)
+    uint32_t rsvd;
 };
 
 struct PeerResp {
@@ -90,7 +92,7 @@ public:
     virtual bool resolve(Handle h, Segment &out) = 0;
     // PONG: program this side's engine to write into the far buffer.
     // Default refuses, so a resolver that cannot send stays honest.
-    virtual bool pongSetup(uint64_t, uint64_t, uint64_t) { return false; }
+    virtual bool pongSetup(uint64_t, uint64_t, uint64_t, uint32_t, int &) { return false; }
 };
 
 /**
@@ -187,9 +189,12 @@ private:
                 done_.fetch_add(1);
                 resp.status = 0;
                 break;
-            case PeerOp::PONG:
-                resp.status = resolver_.pongSetup(req.staging, req.va, req.len) ? 0 : -1;
+            case PeerOp::PONG: {
+                int win = 0;
+                resp.status = resolver_.pongSetup(req.staging, req.va, req.len, req.ctid, win) ? 0 : -1;
+                resp.ctid = static_cast<uint32_t>(win);   // the window it got
                 break;
+            }
             default:
                 resp.status = -2;      // unknown op: answer, do not kill conn
                 break;
@@ -237,7 +242,7 @@ public:
     // Cross-host handle resolution; false on refusal or transport error
     bool resolve(Handle h, Segment &out) {
         PeerResp resp{};
-        if (!rpc({static_cast<uint32_t>(PeerOp::RESOLVE), h, 0, 0, 0}, resp)) return false;
+        if (!rpc({static_cast<uint32_t>(PeerOp::RESOLVE), h, 0, 0, 0, 0, 0}, resp)) return false;
         if (resp.status != 0) return false;
         out = {resp.ctid, resp.va, resp.len};
         return true;
@@ -245,15 +250,18 @@ public:
 
     bool done() {
         PeerResp resp{};
-        return rpc({static_cast<uint32_t>(PeerOp::DONE), 0, 0, 0, 0}, resp) &&
+        return rpc({static_cast<uint32_t>(PeerOp::DONE), 0, 0, 0, 0, 0, 0}, resp) &&
                resp.status == 0;
     }
 
-    // Hand the exporter a buffer of ours to write back into (ping-pong)
-    bool pong(uint64_t staging_va, uint64_t buf_va, uint64_t len) {
+    // Hand the exporter a buffer of ours to write back into (ping-pong /
+    // the reverse direction): our staging VA, the buffer, and the ctid of
+    // the XPU that owns it. Returns the far window number, or -1.
+    int pong(uint64_t staging_va, uint64_t buf_va, uint64_t len, uint32_t ctid) {
         PeerResp resp{};
-        return rpc({static_cast<uint32_t>(PeerOp::PONG), 0, staging_va, buf_va, len}, resp) &&
-               resp.status == 0;
+        if (!rpc({static_cast<uint32_t>(PeerOp::PONG), 0, staging_va, buf_va, len, ctid, 0}, resp))
+            return -1;
+        return resp.status == 0 ? int(resp.ctid) : -1;
     }
 
     // Raw request escape hatch (tests: unknown-op survival)

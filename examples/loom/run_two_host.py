@@ -480,6 +480,10 @@ def bench_env(args, gap):
         env += f" LOOM_TX_WINDOW={args.tx_window}"
     if args.pingpong:
         env += " LOOM_BENCH_PINGPONG=1"
+    if args.matrix:
+        env += " LOOM_BENCH_MATRIX=1 LOOM_XPUS=2"
+    elif args.xpus > 1:
+        env += f" LOOM_XPUS={args.xpus}"
     if args.skip_bulk:
         env += " LOOM_SKIP_BULK=1"
     return env
@@ -514,6 +518,13 @@ def summarize(args, gap, result, verdicts=None):
     """One row of the sweep."""
     srv_out, cli_out, srv_n0, srv_n1, cli_n0, cli_n1 = result
     cli_txt, srv_txt = "".join(cli_out), "".join(srv_out)
+    if args.matrix:
+        rows = [l for l in cli_out + srv_out if "matrix" in l and ("PASS" in l or "FAIL" in l)]
+        n_ok = sum("PASS" in l for l in rows); n_bad = sum("FAIL" in l for l in rows)
+        print(f"{BOLD}matrix: {n_ok} landings verified, {n_bad} failed, {verdict(result)}{RESET}")
+        for l in rows:
+            if "FAIL" in l: print("  " + l.rstrip())
+        return
     if args.pingpong:
         # The client prints one row per size; the verdict is the server's
         rows = [l for l in cli_out if re.match(r"^\s*\d+\s+\d+\s+[\d.]+\s+[\d.]+\s+[\d.]+\s+(yes|NO)", l)]
@@ -655,6 +666,15 @@ def main():
                          "lands that; one way = RTT/2 (perf_rdma's method). "
                          "--iters = timed rounds per size; the size and "
                          "window knobs apply as usual")
+    ap.add_argument("--xpus", type=int, default=1,
+                    help="XPUs per host (data cThreads with their own "
+                         "buffers); the QP owner is a separate cThread")
+    ap.add_argument("--matrix", action="store_true",
+                    help="the 2 local + 2 remote XPU exchange test (implies "
+                         "--xpus 2): A1<->A2 and B1<->B2 locally, every "
+                         "A->B pair remotely with the reply, then A1<->B1 "
+                         "and A2<->B2 concurrently; every landing verified "
+                         "on the side it landed on")
     ap.add_argument("--skip-bulk", action="store_true")
     ap.add_argument("--retries", type=int, default=2,
                     help="reflash both cards and retry after a wedge")

@@ -18,23 +18,27 @@ vFPGA. Coyote pids: A=0, B=1 (host 1); C=0 (host 2).
    reachable iff its owner's TLB translates it, the GPU-MMU model). Every
    QP owner additionally allocates a small **staging buffer**, the landing
    zone for inline messages.
-3. **QP setup** (remote bindings only) — the QP must be the *exporter's*,
-   because only its ctid makes its buffers TLB-reachable for incoming
-   writes. Implemented in 6.2a (`sw-bundled/loom_host.cpp`): each side's
-   data cThread calls `initRDMA` (exporter first, importer with the
-   exporter's IP; Coyote's own out-of-band TCP exchanges QPNs and PSNs),
-   and the loomd<->loomd hello (`loom_peer.hpp`) carries the exporter
-   side's staging VA to the importer, which programs it into
-   `RDMA_STAGING_VA` — exactly as NCCL peers exchange transport-buffer
-   addresses at connect/accept. Bring-up scope: one RC connection between
-   the two data cThreads; per-binding QPs are 6.1/6.2b.
+3. **QP setup** (remote bindings only) — one RC connection per host
+   pair, owned by a **dedicated QP-owner cThread** on each host that holds
+   the connection and the staging buffer and never moves data (the "NIC
+   context"); every XPU on the host shares it. Each side's QP owner calls
+   `initRDMA` (exporter first, importer with the exporter's IP; Coyote's
+   own out-of-band TCP exchanges QPNs and PSNs), and the loomd<->loomd
+   hello (`loom_peer.hpp`) carries the far side's staging VA, which is
+   programmed into `RDMA_STAGING_VA` — as NCCL peers exchange
+   transport-buffer addresses at connect/accept. Which XPU an incoming
+   write lands in is not the QP's business: the message header names it
+   (step 4). Per-binding QPs remain 6.1/6.2b.
 4. **Switch programming** (daemon only) — a window-table entry
-   `{route, pid, VA base, len}` per binding, plus the staging CSR. For a
-   remote binding the importer's daemon programs `{rdma, pid = LOCAL
-   QP-owner ctid, base = exporter VA, len}`: the pid selects whose RC
-   connection carries the write, and translation happens at the exporter's
-   TLB (`loom_bundle.hpp`). The staging CSR is per host, so it serves the
-   asymmetric topology only until it moves into the window table (6.1).
+   `{route, pid, dst_pid, VA base, len}` per binding, plus the staging CSR.
+   Local binding: `{local, pid = exporter ctid, base, len}` — the shell TLB
+   translates under that pid (the cross-pid write). Remote binding: the
+   importer's daemon programs `{rdma, pid = LOCAL QP-owner ctid, dst_pid =
+   exporter ctid ON THE FAR HOST, base = exporter VA, len}`: the pid
+   selects whose RC connection carries the write, `dst_pid` travels in the
+   64 B message header and the far `loom_rx` issues its host writes under
+   it, so the far TLB translates in the exporter XPU's address space
+   (`loom_bundle.hpp`). The staging CSR is per host (one QP).
 5. **Handle exchange** (application level) — the exporter passes an opaque
    handle over any channel; the importer resolves it through the control
    plane and receives its window pointer. Cross-host this is the peering
@@ -54,7 +58,7 @@ Concretely:
 | Window (ctrl byte offset) | Entry |
 |---|---|
 | 1 (`0x1000`) | `{local, pid 1, base buf_B, len 4MB}` |
-| 2 (`0x2000`) | `{rdma, qp X (owner pid), base buf_C, len 4MB}` |
+| 2 (`0x2000`) | `{rdma, pid = QP owner, dst_pid 0 (= C), base buf_C, len 4MB}` |
 
 A's pointers: `P_B = ctrl_map + 0x1000`, `P_C = ctrl_map + 0x2000`.
 
@@ -98,17 +102,23 @@ divergence only at the table lookup.
 
 ## Flow 4 — bulk, remote: `copy(P_C + 0x10000, src, 1MB)`
 
-Same pull as Flow 3; the write side is a Loom WRITE message at the staging
-RETH vaddr, len 1 MB + 64. A header beat goes out first —
-`⟨op WRITE · len 1 MB⟩` in lane 0, `buf_C+0x10000` in lane 1 — and the
-payload follows it. The shell fragments the whole thing to PMTU, so it
-arrives at host 2 as 256 packets and 256 `rq_wr`s.
+Same pull as Flow 3 — one `LOCAL_READ` for the whole 1 MB, the
+copy-engine model; its beats land in the engine's 256 KB buffer at
+whatever rate the host delivers. The write side is a Loom WRITE message
+at the staging RETH vaddr: a header beat first — `⟨dst_pid 0 · op WRITE ·
+len 1 MB⟩` in lane 0, `buf_C+0x10000` in lane 1 — then the payload. The
+engine packetises it itself: one RoCE request per PMTU (257 packets), each
+posted only while fewer than `tx_window` packets are unacked by host 2's
+stack (the ACK-clocked window, CSR 66). Beats leave the buffer as packets
+are admitted; the far side's acks open the window again.
 
-loom_rx reads the target **and the length** out of that header and issues a
-single `sq_wr {LOCAL_WRITE, pid 0, buf_C+0x10000, 1MB}`, streaming the
-payload behind it and absorbing the other 255 requests as continuations of
-the message already in flight. Landing it is not optional: per gate G3
-incoming writes reach memory only if user logic issues them.
+At host 2 the packets arrive as 257 `rq_wr`s on the vFPGA's own host
+stream (dest 1). loom_rx reads the target, **the length and the landing
+pid** out of the header and issues one `sq_wr {LOCAL_WRITE, pid 0,
+buf_C+0x10000+k*4KB, 4 KB}` per packet, pipelined eight deep, positioning
+by the header's length — never by the RETH, which names staging. Landing
+it is not optional: per gate G3 incoming writes reach memory only if user
+logic issues them.
 
 The header is what makes that one write possible. Addressing bulk by RETH —
 which is RDMA's own form, and what this did until 2026-08-24 — leaves the
@@ -141,6 +151,21 @@ with Flows 1-4 is inherited from the design — writes are posted, loads
 stall the issuer for the round trip, which is why the fast path stays
 push-only and loads exist as a correctness/debug facility.
 
+## Flow 6 — two XPUs per host
+
+Add D on host 2 (pid 1) and A2 on host 1 (pid 2), each with its own
+buffer. Nothing new is needed on the wire: A2's window onto D carries
+`{rdma, pid = QP owner, dst_pid 1, base buf_D, len}`, so its messages
+reach host 2 on the same QP as everything else and land under pid 1; C's
+and D's replies come back through windows on host 2 onto A's and A2's
+buffers, each with the right `dst_pid`. Locally, A2 -> A is a window
+`{local, pid 0, base buf_A, len}` — the same cross-pid write as Flow 3.
+Both XPUs issue concurrently: the order FIFO interleaves their entries,
+each descriptor carries its issuer's ctid as the source pid, and the
+transmit window is shared per host because it bounds what the far stack
+can absorb regardless of sender. `run_two_host.py --matrix` exercises
+every pair (`sw-bundled/loom_host.cpp`, `run_matrix`/`mx_serve`).
+
 ## Ordering across flows
 
 Stores, descriptors and reads share one arrival-ordered FIFO, so
@@ -167,7 +192,7 @@ acc/cnt deltas; T3 runs read them after homogeneous traffic per class.
 | `P_B`/`P_C` (+offset), on dereference | A's CPU page tables (mmap of ctrl region) | ctrl window + offset |
 | ctrl window + offset | loom_table entry (installed by the daemon) | `{local: (pid, base)}` or `{rdma: qp, base}` |
 | `src` in the descriptor | shell TLB under A's pid, during the pull | A's memory |
-| `base + offset` at the destination | shell TLB under the exporter's pid (locally, or on the remote host via the QP) | exporter's memory |
+| `base + offset` at the destination | shell TLB under the exporter's pid — locally the window's pid, remotely the header's `dst_pid` on the far host | exporter's memory |
 
 Every name is one of the participants' existing VAs: A's pointers going
 in, the exporter's own buffer VA coming out; the wire carries the

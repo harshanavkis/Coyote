@@ -21,7 +21,7 @@ logic                   tbl_commit;
 logic [3:0]             tbl_idx;
 logic                   tbl_valid;
 logic                   tbl_route;
-logic [PID_BITS-1:0]    tbl_pid;
+logic [PID_BITS-1:0]    tbl_pid, tbl_dst_pid;
 logic [VADDR_BITS-1:0]  tbl_base;
 logic [LEN_BITS-1:0]    tbl_len;
 
@@ -34,7 +34,7 @@ logic [63:0]            fifo_payload;
 
 logic [3:0]             lu_idx;
 logic                   lu_valid, lu_route;
-logic [PID_BITS-1:0]    lu_pid;
+logic [PID_BITS-1:0]    lu_pid, lu_dst_pid;
 logic [VADDR_BITS-1:0]  lu_base;
 logic [LEN_BITS-1:0]    lu_len;
 
@@ -64,7 +64,6 @@ logic        rd_resp_valid;
 
 // RDMA staging VA: ctrl -> engine (RETH vaddr for all outgoing messages)
 logic [VADDR_BITS-1:0] rdma_staging_va;
-logic [PID_BITS-1:0]   rx_pid;
 
 // Engine shell-side signals
 req_t eng_rd_req, eng_wr_req;
@@ -174,14 +173,14 @@ end
 loom_ctrl inst_loom_ctrl (
     .aclk(aclk), .aresetn(aresetn), .axi_ctrl(axi_ctrl),
     .tbl_commit(tbl_commit), .tbl_idx(tbl_idx), .tbl_valid(tbl_valid),
-    .tbl_route(tbl_route), .tbl_pid(tbl_pid), .tbl_base(tbl_base),
+    .tbl_route(tbl_route), .tbl_pid(tbl_pid), .tbl_dst_pid(tbl_dst_pid), .tbl_base(tbl_base),
     .tbl_len(tbl_len),
     .fifo_empty(fifo_empty), .fifo_is_desc(fifo_is_desc),
     .fifo_is_read(fifo_is_read),
     .fifo_win(fifo_win), .fifo_off(fifo_off), .fifo_len(fifo_len),
     .fifo_src_pid(fifo_src_pid), .fifo_compl_va(fifo_compl_va),
     .fifo_payload(fifo_payload), .fifo_pop(fifo_pop),
-    .rdma_staging_va(rdma_staging_va), .rx_pid(rx_pid),
+    .rdma_staging_va(rdma_staging_va),
     .pace_num(pace_num), .pace_den(pace_den),
     .tx_window(tx_window), .tx_inflight(tx_inflight),
     .cnt_tx_ack(cnt_tx_ack), .cnt_tx_winfull(cnt_tx_winfull),
@@ -203,10 +202,10 @@ loom_ctrl inst_loom_ctrl (
 loom_table inst_loom_table (
     .aclk(aclk), .aresetn(aresetn),
     .commit(tbl_commit), .prog_idx(tbl_idx), .prog_valid(tbl_valid),
-    .prog_route(tbl_route), .prog_pid(tbl_pid), .prog_base(tbl_base),
+    .prog_route(tbl_route), .prog_pid(tbl_pid), .prog_dst_pid(tbl_dst_pid), .prog_base(tbl_base),
     .prog_len(tbl_len),
     .lu_idx(lu_idx), .lu_valid(lu_valid), .lu_route(lu_route),
-    .lu_pid(lu_pid), .lu_base(lu_base), .lu_len(lu_len)
+    .lu_pid(lu_pid), .lu_dst_pid(lu_dst_pid), .lu_base(lu_base), .lu_len(lu_len)
 );
 
 loom_engine inst_loom_engine (
@@ -219,7 +218,7 @@ loom_engine inst_loom_engine (
     .fifo_compl_va(fifo_compl_va),
     .fifo_payload(fifo_payload), .fifo_pop(fifo_pop),
     .lu_idx(lu_idx), .lu_valid(lu_valid), .lu_route(lu_route),
-    .lu_pid(lu_pid), .lu_base(lu_base), .lu_len(lu_len),
+    .lu_pid(lu_pid), .lu_dst_pid(lu_dst_pid), .lu_base(lu_base), .lu_len(lu_len),
     .rdma_staging_va(rdma_staging_va),
     .rd_req(eng_rd_req), .rd_valid(eng_rd_valid), .rd_ready(sq_rd.ready),
     .wr_req(eng_wr_req), .wr_valid(eng_wr_valid),
@@ -290,7 +289,7 @@ assign rx_cnt_fifo_full = axis_rrsp_recv[0].tvalid && !axis_rrsp_recv[0].tready;
 loom_rx inst_loom_rx (
     .aclk(aclk), .aresetn(aresetn),
     .rq_req(rq_wr.data), .rq_valid(rq_wr.valid), .rq_ready(rq_wr.ready),
-    .rdma_staging_va(rdma_staging_va), .rx_pid(rx_pid),
+    .rdma_staging_va(rdma_staging_va),
     .wr_req(rx_wr_req), .wr_valid(rx_wr_valid),
     .wr_ready(sq_wr.ready && rx_grant),
     .s_tdata(rxf_tdata), .s_tkeep(rxf_tkeep),
