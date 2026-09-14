@@ -176,9 +176,9 @@ logic [27:0]           w_left;       // message bytes after this packet
 // receiver's host-write path stalled ~34% of cycles, essentially all of it
 // mid-packet, and saturated at ~10 GB/s - while perf_rdma's receiver,
 // whose pass-through hands the shell every packet's write as soon as it is
-// announced, takes >= 11.4 on the same host. That ~10 GB/s ceiling is what
-// the sender has to be paced under (loom_engine PACING); raising it is the
-// point of this.
+// announced, takes >= 11.4 on the same host. Raising that ceiling is the
+// point of this; the sender's window (loom_engine) is what keeps a stall
+// here from losing packets.
 //
 // So the requests run AHEAD of the data. A generator posts the packet
 // writes of the current message in order - the same deterministic PMTU

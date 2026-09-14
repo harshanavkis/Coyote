@@ -96,15 +96,13 @@ module loom_ctrl (
     // RDMA staging VA (to loom_engine): RETH vaddr for outgoing messages
     output logic [VADDR_BITS-1:0]       rdma_staging_va,
     output logic [PID_BITS-1:0]         rx_pid,
-    // RDMA chunk size in bytes; 0 disables chunking
-    output logic [27:0]                 chunk_bytes,
     // Egress pacing: payload beats may move at most pace_num/pace_den of
     // cycles on the rdma route; off when either is 0 or num >= den
     output logic [7:0]                  pace_num,
     output logic [7:0]                  pace_den,
     // Transmit window (word 66) and its live state (word 67)
     output logic [7:0]                  tx_window,
-    input  logic [7:0]                  tx_inflight,
+    input  logic [15:0]                 tx_inflight,
     input  logic                        cnt_tx_ack,
     input  logic                        cnt_tx_winfull,
     input  logic                        cnt_tx_reqwait,
@@ -223,11 +221,7 @@ localparam integer R_PULL_DESYNC  = 25;
 localparam integer R_RX_ORPHAN    = 26;
 // Payload beats the host read handed back with a partial keep.
 localparam integer R_TX_PARTIAL   = 27;
-// Chunk size in bytes for RDMA messages, writable from software. 0 disables
-// chunking, which restores the pre-chunking behaviour exactly and is there so
-// the two can be compared on ONE bitstream instead of two. Reset value is the
-// derived safe size, so it works without software touching it.
-localparam integer R_CHUNK        = 28;
+// Word 28 was the rdma chunk size; the engine packetises now. Reads 0.
 // Starved cycles that land INSIDE a wire packet, and the longest such run.
 // cnt_tx_starve counts every starved cycle; these two say whether the gap
 // falls between packets (costs throughput) or inside one (the packetiser has
@@ -258,9 +252,10 @@ localparam integer R_TX_PACE      = 64;
 localparam integer R_TX_PACED     = 65;   // cycles the pacer held
 // Transmit window (loom_engine header). Same line as TX_PACE, for the same
 // reason. [7:0] window: packets posted and not yet acked, 0 = no window.
-// Reset: 8.
+// Reset 16: the smallest window that reaches the pipe's ceiling (11.8 GB/s
+// at ~5.2 us ack RTT) and well under the receiver's ~40-packet buffer.
 localparam integer R_TX_CTL       = 66;
-localparam integer R_TX_STATE     = 67;   // RO [7:0] packets unacked right now
+localparam integer R_TX_STATE     = 67;   // RO [15:0] packets unacked right now
 localparam integer R_TX_ACKS      = 68;   // RO acks received
 localparam integer R_TX_WINFULL   = 69;   // RO cycles a packet waited on the window
 localparam integer R_TX_REQWAIT   = 70;   // RO cycles a packet waited on sq_wr.ready
@@ -352,7 +347,6 @@ logic [63:0] r_tbl_idx, r_tbl_cfg, r_tbl_pid, r_tbl_base, r_tbl_len;
 logic [63:0] r_dma_dst, r_dma_src_va, r_dma_len, r_dma_src_pid, r_dma_compl_va;
 logic [63:0] r_rdma_staging;
 logic [63:0] r_rx_pid;
-logic [63:0] r_chunk;
 logic [63:0] dbg [N_DBG];
 logic [63:0] rx_move, rx_starve, rx_stall, rx_st_head, rx_st_body, rx_req_cnt;
 logic [63:0] rx_stall_run, rx_stall_max;
@@ -384,9 +378,8 @@ always_ff @(posedge aclk) begin
         r_tbl_idx <= 0; r_tbl_cfg <= 0; r_tbl_pid <= 0; r_tbl_base <= 0; r_tbl_len <= 0;
         r_dma_dst <= 0; r_dma_src_va <= 0; r_dma_len <= 0; r_dma_src_pid <= 0;
         r_dma_compl_va <= 0; r_rdma_staging <= 0; r_rx_pid <= 0;
-        r_chunk <= RDMA_N_WR_OUTSTANDING * PMTU_BYTES - 64;
         r_pace  <= 0;
-        r_tx_ctl <= 64'd8;                     // window 8
+        r_tx_ctl <= 64'd16;                    // window 16
     end else if (csr_wr && (&axi_ctrl.wstrb)) begin
         // Full-strobe writes only. Every write software issues is a whole
         // 64-bit word; a beat with partial or no byte enables is not one of
@@ -405,7 +398,6 @@ always_ff @(posedge aclk) begin
             R_DMA_COMPL_VA: r_dma_compl_va <= axi_ctrl.wdata;
             R_RDMA_STAGING: r_rdma_staging <= axi_ctrl.wdata;
             R_RX_PID: r_rx_pid <= axi_ctrl.wdata;
-            R_CHUNK:  r_chunk  <= axi_ctrl.wdata;
             R_TX_PACE: r_pace  <= axi_ctrl.wdata;
             R_TX_CTL:  r_tx_ctl <= axi_ctrl.wdata;
             default: ;
@@ -422,7 +414,6 @@ assign tbl_base   = r_tbl_base[VADDR_BITS-1:0];
 assign tbl_len    = r_tbl_len[LEN_BITS-1:0];
 assign rdma_staging_va = r_rdma_staging[VADDR_BITS-1:0];
 assign rx_pid          = r_rx_pid[PID_BITS-1:0];
-assign chunk_bytes     = r_chunk[27:0];
 assign pace_num        = r_pace[7:0];
 assign pace_den        = r_pace[15:8];
 assign tx_window       = r_tx_ctl[7:0];
@@ -667,10 +658,9 @@ always_ff @(posedge aclk) begin
             R_DMA_COMPL_VA: axi_rdata <= r_dma_compl_va;
             R_RDMA_STAGING: axi_rdata <= r_rdma_staging;
             R_RX_PID:      axi_rdata <= r_rx_pid;
-            R_CHUNK:       axi_rdata <= r_chunk;
             R_TX_PACE:     axi_rdata <= r_pace;
             R_TX_CTL:      axi_rdata <= r_tx_ctl;
-            R_TX_STATE:    axi_rdata <= {56'b0, tx_inflight};
+            R_TX_STATE:    axi_rdata <= {48'b0, tx_inflight};
             R_TX_ACKS:     axi_rdata <= tx_acks;
             R_TX_WINFULL:  axi_rdata <= tx_winfull;
             R_TX_REQWAIT:  axi_rdata <= tx_reqwait;

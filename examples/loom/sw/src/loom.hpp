@@ -84,15 +84,8 @@ constexpr uint32_t RX_ORPHAN     = 0x0D0;   // word 26
 // used to forward that keep onto the wire, which would make the packetiser
 // emit fewer than 64 bytes for the beat and shift everything after it.
 constexpr uint32_t TX_PARTIAL    = 0x0D8;   // word 27
-// RDMA chunk size in bytes (RW). The engine splits a message at this size so
-// it fits the shell's retransmit buffer, and holds itself to one outstanding
-// write. 0 turns chunking off entirely - the pre-chunking behaviour - so both
-// can be compared on ONE bitstream. Resets to RDMA_N_WR_OUTSTANDING *
-// PMTU_BYTES - 64 = 65472, which needs no software at all.
-// The two halves of the retransmit-buffer invariant, both runtime settable
-// so they can be varied without a bitstream:
-//   (writes in flight) x (packets per write) <= the shell's retrans slots
-constexpr uint32_t CHUNK         = 0x0E0;   // word 28: 0 = do not chunk
+// Word 28 was the rdma chunk size; the engine packetises now and the word is
+// unused.
 // Cycles loom_rx refused a beat the shell was offering, in ANY state, and the
 // longest unbroken run of them. RX_STALL above is ST_STREAM-only, so it is
 // blind to the grant wait and the request handshake - exactly where Loom
@@ -120,8 +113,8 @@ constexpr uint32_t RX_PARTIAL    = 0x0B0;   // word 22
 constexpr uint32_t TX_PACE       = 0x200;   // word 64: [7:0] num, [15:8] den; off if 0
 constexpr uint32_t TX_PACED      = 0x208;   // word 65: cycles the pacer held
 // Transmit window (loom_engine.sv header). Same CSR line.
-constexpr uint32_t TX_CTL        = 0x210;   // word 66: [7:0] window (packets unacked), 0 = none
-constexpr uint32_t TX_STATE      = 0x218;   // word 67 RO: [7:0] packets unacked right now
+constexpr uint32_t TX_CTL        = 0x210;   // word 66: [7:0] window (packets unacked), reset 16, 0 = none
+constexpr uint32_t TX_STATE      = 0x218;   // word 67 RO: [15:0] packets unacked right now
 constexpr uint32_t TX_ACKS       = 0x220;   // word 68 RO: packet acks received
 constexpr uint32_t TX_WINFULL    = 0x228;   // word 69 RO: cycles a packet waited on the window
 constexpr uint32_t TX_REQWAIT    = 0x230;   // word 70 RO: cycles a packet waited on sq_wr.ready

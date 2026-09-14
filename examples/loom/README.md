@@ -281,69 +281,19 @@ cd examples/loom
   Unpinned, the source buffer lands on the far node about half the time and
   the pull starves: ~2.3 GB/s instead of ~12.5.
 - `--retries` reflashes and retries after a wedge — never use it when
-  measuring a failure rate. `--settle`, `--credit`, `--skip-bulk`,
+  measuring a failure rate. `--settle`, `--skip-bulk`,
   `--no-flash`, `--out`: see `--help`.
-- `--chunk BYTES --chunk-credit N` delivers the region as a sequence of
-  descriptors of that size with N left unretired. **This is the safe way to
-  move anything large today.** Measured 2026-09-11 on a 4 MB region:
-
-  ```
-  chunk B   GB/s    retrans
-   65472    9.835      0   intact
-   73728   10.180      0   intact
-   81920   10.347      0   intact   <- best clean point
-   90112   10.552    144   CORRUPT
-   98304   10.687    245   CORRUPT
-  262144   11.850    547   CORRUPT
-  ```
-
-  Loss rises monotonically with sustained rate above a knee at
-  ~10.35–10.55 GB/s. `--chunk 81920 --chunk-credit 64` is byte-exact with
-  0 retransmissions at 10.347 GB/s and is the number to quote. Unchunked, a
-  single message is clean up to **1.75 MiB** and corrupt from 1.8125 MiB
-  (`--hw-chunk 0`, every point pinned to `--offset 0x400000`); read that as
-  a practical limit, not a mechanism — the same 4 MB as 4 × 1 MB separate
-  descriptors is corrupt even at `--chunk-credit 1`.
-- `--tx-pace NUM/DEN` — egress pacing (CSR 64, `LOOM_TX_PACE`):
+- `--tx-pace NUM/DEN` — a manual rate cap (CSR 64, `LOOM_TX_PACE`):
   `loom_engine` caps payload beats on the rdma route at NUM of every DEN
-  cycles with a two-beat credit accumulator (a bare `N` means N/(N+1); `0`
-  = off, the reset value). **This is the flow control the link does not
-  have.** The receiver's host-write path saturates (amy: ~63% moving /
-  ~34% stalled, flat as the offered rate rises) and RoCE here has no PFC,
-  no DCQCN and no `prog_full` consumer, so nothing else tells the sender to
-  slow down; above the ceiling the ~3000 beats of RX buffering fill in
-  ~1.7 MB of burst and the CMAC, which has no `tready`, drops before any
-  counter. Measured 2026-09-12 on a 4 MB single message (1-in-N pacer):
-
-  ```
-  cap    push GB/s  rx stall  FIFO full  retrans  lost
-  off      12.66     30875     28594       574     35   CORRUPT
-  75%      11.88     16521     15267       548     15   CORRUPT
-  67%      10.57     32192     28767       115     11   CORRUPT
-  50%       7.95         0         0         0      0   intact
-  ```
-
-  With one completion per message on the receive side (2026-09-13 build)
-  the receiver drains ~10.4 GB/s, and **`--tx-pace 41/64` (10.25 GB/s) is
-  the safe point: 64 MiB as one unchunked message, byte-exact, 0
-  retransmissions, zero receiver stall.** 40/64 is equally clean; 42/64
-  and 44/64 wedge on 64 MiB; 43/64 gets through with the ingress FIFO full
-  for 26k cycles, which is luck, not margin. A setting counts as safe only
-  when 64 MiB survives it with zero stall - 4 MB alone passes at rates
-  that wedge 64 MiB. Sweep on 64 MiB, not 4 MB:
-
-  ```bash
-  for P in 40/64 41/64 42/64 44/64; do
-    ./run_two_host.py --size 67108864 --iters 0 --gap 20 --retries 0 --hw-chunk 0 --tx-pace $P
-  done
-  ```
-
-  The highest clean setting is the receiver's drain ceiling. The client
-  prints `tx pacing: NUM/DEN, pacer held .. cycles (expect ~..)` to prove
-  the knob took; the server prints `ingress FIFO FULL` (CSR 14/15), which
-  is nonzero on every corrupt run and zero on every clean one.
+  cycles with a two-beat credit accumulator (`0` = off, the reset value).
+  Superseded as flow control by `--tx-window` below; kept as an
+  experiment knob. Before the window existed, `41/64` (10.25 GB/s) was the
+  receiver's clean ceiling on 64 MiB and 44/64 wedged it; with the
+  receiver on its own host stream (`dest=1`) the clean ceiling is 11.0.
+  The client prints `tx pacing: NUM/DEN, pacer held .. cycles` to prove the
+  knob took.
 - `--tx-window W` — the transmit window (CSR 66, `LOOM_TX_WINDOW`; reset
-  8, `0` = none). **This replaces the pace constant.** `loom_engine`
+  16, `0` = none). **This is the flow control.** `loom_engine`
   posts one request per PMTU packet with `last=1`, so the shell returns
   one `cq_wr` per packet acked by the far stack, and the engine posts the
   next packet only while fewer than W are unacked. The pull is untouched
@@ -377,16 +327,13 @@ cd examples/loom
   the pull` (CSR 66-71).
 
   ```bash
-  ./run_two_host.py --size 67108864 --iters 20 --gap 20 --retries 0 --hw-chunk 0 --tx-pace 0 --tx-window 32
+  ./run_two_host.py --size 67108864 --iters 20 --gap 20 --retries 0 --tx-window 32
   ```
   **Hardware caveat:** a CSR write to any window-table register (words
   0–5) also clobbers words 4 and 6 of that 64-byte line (see
   `sw-bundled/src/csr_probe.cpp`; simulation does not reproduce it). The
   knob therefore lives at word 64 on an empty line, `loom_ctrl` ignores
   partial-strobe writes, and `loom_host` re-arms it right before the bench.
-- `--hw-chunk BYTES` sets the engine's own chunk size (CSR 28); `0` turns
-  hardware chunking off. Distinct from `--chunk`, which chunks in software.
-  Engine chunking alone does not avoid the loss.
 - The six bisect sizes 1.25 / 1.5 / 1.75 / 1.8125 / 1.875 / 1.9375 MiB are
   appended to `BENCH_SIZES` and fall past `BUF_SIZE` in the packed layout,
   so they are skipped unless run with `--offset`.

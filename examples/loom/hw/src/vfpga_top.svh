@@ -44,7 +44,6 @@ logic cnt_rx_orphan;
 logic cnt_tx_partial;
 // Starvation landing INSIDE a wire packet - see loom_engine.sv
 logic tx_cnt_starve_mid;
-logic [27:0] chunk_bytes;
 // cq_wr IS the engine's ack signal now - one per PACKET. build_sep6 tried
 // to pace on it and wedged because the engine's internally split chunks
 // carried last=0 and so produced no completion at all (71 acks for 65
@@ -54,7 +53,8 @@ logic [27:0] chunk_bytes;
 // remote acks count: local writes (stores, fences, loom_rx's landings on
 // the far side) complete on the same interface with remote clear.
 wire ack_valid = cq_wr.valid && cq_wr.data.remote;
-logic [7:0] tx_window, tx_inflight;
+logic [7:0]  tx_window;
+logic [15:0] tx_inflight;
 logic       cnt_tx_ack, cnt_tx_winfull, cnt_tx_reqwait, cnt_tx_fifo_full;
 
 // Stage cycle counters: engine -> ctrl (RO CSR words 50-63)
@@ -187,7 +187,7 @@ loom_ctrl inst_loom_ctrl (
     .fifo_src_pid(fifo_src_pid), .fifo_compl_va(fifo_compl_va),
     .fifo_payload(fifo_payload), .fifo_pop(fifo_pop),
     .rdma_staging_va(rdma_staging_va), .rx_pid(rx_pid),
-    .chunk_bytes(chunk_bytes), .pace_num(pace_num), .pace_den(pace_den),
+    .pace_num(pace_num), .pace_den(pace_den),
     .tx_window(tx_window), .tx_inflight(tx_inflight),
     .cnt_tx_ack(cnt_tx_ack), .cnt_tx_winfull(cnt_tx_winfull),
     .cnt_tx_reqwait(cnt_tx_reqwait), .cnt_tx_fifo_full(cnt_tx_fifo_full),
@@ -249,7 +249,6 @@ loom_engine inst_loom_engine (
     .cnt_drop(cnt_drop), .cnt_compl(cnt_compl),
     .stage_acc(stage_acc), .stage_cnt(stage_cnt),
     .cnt_pull_desync(cnt_pull_desync), .cnt_tx_partial(cnt_tx_partial),
-    .chunk_bytes(chunk_bytes),
     .cnt_tx_move(tx_cnt_move), .cnt_tx_starve(tx_cnt_starve),
     .cnt_tx_starve_mid(tx_cnt_starve_mid),
     .cnt_tx_stall(tx_cnt_stall),
@@ -263,31 +262,15 @@ loom_engine inst_loom_engine (
 // ---------------------------------------------------------------------------
 // Ingress FIFO in front of loom_rx.
 //
-// This is about PACKET LOSS, not throughput. loom_rx holds no buffer, so its
-// s_tready IS the host write path's readiness, and that backpressure travels
-// upstream into the shell's own 512-beat ingress FIFO (remote_credits_rd.sv
-// inst_recv_cq). Backpressure inside the card cannot reach the wire: RoCE
-// over plain Ethernet has no link-level flow control here, so once the
-// receiving stack has nowhere to put an arriving packet it drops it. A
-// dropped packet is a PSN gap, which the receiver NAKs, which makes the
-// sender retransmit - and every corrupt run has retransmissions while every
-// clean one has none.
-//
-// Hardware at 12.3 GB/s: client sent 895 RoCE packets, server received 875.
-// Twenty lost in flight on a direct point-to-point link, with loom_rx
-// stalled 8.5% of the run. At 2.4 GB/s nothing is lost and nothing is
-// retransmitted.
-//
-// 512 beats is ~2 us at line rate, doubling what the shell already gives.
-// It took the loss between the stack and loom_rx to zero. It did NOT end
-// the loss, because a buffer absorbs JITTER and the deficit is SUSTAINED:
-// the host write saturates at ~10 GB/s (63% moving / 34% stalled, flat as
-// the offered rate rises) while the wire delivers ~12.2, so the whole
-// chain - this FIFO, the shell's 512, the stack, the 2048-beat rx_crossing
-// - fills in ~1.7 MB of burst and the CMAC, which has no tready, drops
-// before any counter. cnt_rx_fifo_full below is the first link of that
-// chain made visible; the pacer in loom_engine is what holds the sender
-// under the ceiling.
+// loom_rx holds no buffer of its own, so its s_tready is the host write
+// path's readiness; this decouples the two by 512 beats (~2 us at line
+// rate). Backpressure inside the card cannot reach the wire - RoCE over
+// plain Ethernet has no link-level flow control here - so once the
+// receiving stack's own buffers (rx_crossing 2048 + incoming 512 beats,
+// ~40 packets) fill, the CMAC drops. What keeps that from happening is
+// the SENDER's window (loom_engine): at most tx_window packets are
+// unacked, so a stall here, however long, backs up at most that many
+// packets into the shell. cnt_rx_fifo_full counts the stall cycles.
 // ---------------------------------------------------------------------------
 logic [511:0] rxf_tdata;
 logic [63:0]  rxf_tkeep;

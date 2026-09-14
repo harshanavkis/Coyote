@@ -96,10 +96,6 @@ loom_table inst_table (
     .lu_pid(lu_pid), .lu_base(lu_base), .lu_len(lu_len)
 );
 
-// The engine reads its chunk size from CSR 28; drive the same value
-// loom_ctrl resets to. Zero here would switch chunking off.
-wire [27:0] chunk_bytes = RDMA_N_WR_OUTSTANDING * PMTU_BYTES - 64;
-
 logic cnt_tx_starve_mid;
 
 // ---- transmit window / ack model ----
@@ -108,7 +104,7 @@ logic cnt_tx_starve_mid;
 logic [7:0] tx_window = 8'd0;      // 0 = no window (most cases don't care)
 int         ACK_DELAY = 20;
 logic       ack_valid;
-logic [7:0] tx_inflight;
+logic [15:0] tx_inflight;
 logic       cnt_tx_ack, cnt_tx_winfull, cnt_tx_reqwait, cnt_tx_fifo_full;
 int         ack_due[$];
 int         cyc = 0;
@@ -127,7 +123,7 @@ end
 
 loom_engine inst_engine (
     .cnt_tx_starve_mid(cnt_tx_starve_mid),
-    .chunk_bytes(chunk_bytes), .pace_num(8'd0), .pace_den(8'd0), .cnt_tx_paced(),
+    .pace_num(8'd0), .pace_den(8'd0), .cnt_tx_paced(),
     .tx_window(tx_window), .ack_valid(ack_valid), .tx_inflight(tx_inflight),
     .cnt_tx_ack(cnt_tx_ack), .cnt_tx_winfull(cnt_tx_winfull),
     .cnt_tx_reqwait(cnt_tx_reqwait), .cnt_tx_fifo_full(cnt_tx_fifo_full),

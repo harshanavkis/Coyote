@@ -470,28 +470,14 @@ def bench_env(args, gap):
     env += f"LOOM_BENCH_ITERS={args.iters}"
     if gap:
         env += f" LOOM_BENCH_GAP_US={gap}"
-    if args.credit:
-        env += f" LOOM_BENCH_CREDIT={args.credit}"
     if args.offset:
         env += f" LOOM_BENCH_OFF={args.offset}"
     if args.frm:
         env += f" LOOM_BENCH_FROM={args.frm}"
-    if args.hw_chunk is not None:
-        env += f" LOOM_CHUNK={args.hw_chunk}"
     if args.tx_pace is not None:
         env += f" LOOM_TX_PACE={args.tx_pace}"
     if args.tx_window is not None:
         env += f" LOOM_TX_WINDOW={args.tx_window}"
-    if args.chunk:
-        env += f" LOOM_BENCH_CHUNK={args.chunk}"
-    if args.chunk_credit is not None:
-        env += f" LOOM_BENCH_CHUNK_CREDIT={args.chunk_credit}"
-    if args.flush_src:
-        env += " LOOM_BENCH_FLUSH_SRC=1"
-    if args.src_skew:
-        env += f" LOOM_BENCH_SRC_SKEW={args.src_skew}"
-    if args.warm:
-        env += f" LOOM_BENCH_WARM={args.warm} LOOM_BENCH_WARM_N={args.warm_n}"
     if args.skip_bulk:
         env += " LOOM_SKIP_BULK=1"
     return env
@@ -622,17 +608,6 @@ def main():
     ap.add_argument("--settle", type=int, default=15,
                     help="seconds to leave the card alone after programming, "
                          "while the PCIe link retrains (default 15)")
-    ap.add_argument("--credit", type=int, default=0,
-                    help="cap unretired descriptors (LOOM_BENCH_CREDIT). "
-                         "0 = uncapped. NOTE: this was added believing "
-                         "outstanding-write count caused the iters=32 wedge. "
-                         "It does not - iters 16 and 20 pass, and iters=32 "
-                         "passes too once paced. That wedge is receiver "
-                         "overrun escalating, the same bug as the corruption. "
-                         "The shell already enforces its own window in "
-                         "rdma_flow.sv and the engine already waits on "
-                         "sq_wr.ready. Kept as a knob; do not read a "
-                         "mechanism into it")
     ap.add_argument("--offset", default=None,
                     help="place the transfer at this byte offset in the "
                          "destination buffer (LOOM_BENCH_OFF; hex ok) "
@@ -644,13 +619,6 @@ def main():
                     help="start the sweep at this size instead of 64 B and "
                          "run everything above it (LOOM_BENCH_FROM). Bisects "
                          "how much of the ramp a large size actually needs")
-    ap.add_argument("--hw-chunk", default=None,
-                    help="set the ENGINE's chunk size in bytes (CSR 28, "
-                         "LOOM_CHUNK). 0 turns hardware chunking off, which "
-                         "is the pre-chunking behaviour - so both can be "
-                         "compared on one bitstream. Defaults to the "
-                         "hardware reset value, 65472. Not --chunk, which "
-                         "chunks in software instead")
     ap.add_argument("--tx-pace", default=None,
                     help="egress pacing as NUM/DEN: payload beats may move "
                          "NUM of every DEN cycles on the rdma route (a bare "
@@ -666,37 +634,9 @@ def main():
                          "and not yet acked (CSR 66, LOOM_TX_WINDOW). The "
                          "engine posts one request per PMTU packet and the "
                          "shell acks each; this bounds how many are in "
-                         "flight to the far stack. Bitstream default 8; the "
-                         "shell caps at 16; 0 = no Loom window")
-    ap.add_argument("--chunk", default=None,
-                    help="deliver the region as descriptors of this size at "
-                         "successive offsets instead of one long message "
-                         "(LOOM_BENCH_CHUNK). Tests whether chunking makes "
-                         "large writes work without fixing the shell")
-    ap.add_argument("--chunk-credit", type=int, default=None,
-                    help="descriptors left unretired while chunking "
-                         "(LOOM_BENCH_CHUNK_CREDIT, default 8). The order "
-                         "FIFO DROPS entries when full and completions are "
-                         "discarded, so an unpaced burst is lost silently")
-    ap.add_argument("--flush-src", action="store_true",
-                    help="evict the payload from the CPU caches before the "
-                         "transfer (LOOM_BENCH_FLUSH_SRC). Tests whether the "
-                         "cold pull is slow because the card's DMA read has "
-                         "to snoop dirty LLC lines the fill just wrote")
-    ap.add_argument("--src-skew", default=None,
-                    help="read the payload from src+SKEW without moving the "
-                         "destination (LOOM_BENCH_SRC_SKEW). Separates a "
-                         "break that follows the RoCE packet from one that "
-                         "follows the source 4 KB page - they coincide at "
-                         "skew 0 and no other run can tell them apart")
-    ap.add_argument("--warm", default=None,
-                    help="send this many bytes as their own descriptor(s) to "
-                         "a scratch offset before the size under test "
-                         "(LOOM_BENCH_WARM, max 64 KB). A lone descriptor of "
-                         "4 MB or more fails while the same size passes "
-                         "inside the sweep; this asks what the ramp provides")
-    ap.add_argument("--warm-n", type=int, default=1,
-                    help="how many warm-up descriptors (LOOM_BENCH_WARM_N)")
+                         "flight to the far stack. Bitstream default 16; 32 "
+                         "is the largest clean setting (the receiver buffers "
+                         "~40 packets above its ack point); 0 = no window")
     ap.add_argument("--skip-bulk", action="store_true")
     ap.add_argument("--retries", type=int, default=2,
                     help="reflash both cards and retry after a wedge")

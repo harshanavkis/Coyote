@@ -139,16 +139,13 @@ loom_table inst_table (
     .lu_pid(lu_pid), .lu_base(lu_base), .lu_len(lu_len)
 );
 
-// CSR 28 still exists for software; the engine ignores it now.
-wire [27:0] chunk_bytes = RDMA_N_WR_OUTSTANDING * PMTU_BYTES - 64;
-
 // Transmit window and its acks. The shell acks every packet request
 // (last=1) once the far stack has taken it; here the ack returns ACK_DELAY
 // cycles after the far side accepts the packet's rq_wr.
 logic [7:0] tx_window = 8'd8;
 int         ACK_DELAY = 64;
 logic       ack_valid;
-logic [7:0] tx_inflight;
+logic [15:0] tx_inflight;
 logic       cnt_tx_ack, cnt_tx_winfull, cnt_tx_reqwait, cnt_tx_fifo_full;
 int         ack_due[$];
 int         cyc = 0;
@@ -179,7 +176,6 @@ end
 loom_engine inst_engine (
     .cnt_tx_starve_mid(cnt_tx_starve_mid),
     .cnt_tx_paced(cnt_tx_paced), .pace_num(pace_num), .pace_den(pace_den),
-    .chunk_bytes(chunk_bytes),
     .tx_window(tx_window), .ack_valid(ack_valid), .tx_inflight(tx_inflight),
     .cnt_tx_ack(cnt_tx_ack), .cnt_tx_winfull(cnt_tx_winfull),
     .cnt_tx_reqwait(cnt_tx_reqwait), .cnt_tx_fifo_full(cnt_tx_fifo_full),

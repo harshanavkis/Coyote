@@ -38,7 +38,6 @@
 #include <cstdlib>
 #include <chrono>
 #include <cstring>
-#include <immintrin.h>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -184,27 +183,17 @@ int bench_iters(uint64_t len) {
     return n ? int(n) : 1;
 }
 
-// Cap on descriptors in flight. loom_engine tracks nothing: vfpga_top ties
-// cq_wr.ready high and discards every completion, so the engine drains the
-// order FIFO as fast as sq_wr is accepted and the number of outstanding
-// RDMA writes is bounded by nothing at all. The shell's budget is
-// RDMA_N_WR_OUTSTANDING = 16. Pacing here in software says whether that is
-// what the large sizes hit: if they come back clean under a cap, the fix is
-// credit tracking in the engine, not bandwidth and not the receive path.
 int bench_gap_us() {
     const char *e = getenv("LOOM_BENCH_GAP_US");
     return e ? atoi(e) : 0;
 }
-int bench_credit() {
-    const char *e = getenv("LOOM_BENCH_CREDIT");
-    return e ? atoi(e) : 0;                  // 0 = unlimited, as today
-}
+// Descriptors the bench leaves unretired at once. loom_ctrl's order FIFO
+// is 64 deep and DROPS a push when full (deliberate: aperture stores stay
+// posted toward the host), so a long --iters burst would lose descriptors
+// silently. Held under the depth; not a knob, not a mechanism - what is in
+// flight on the wire is bounded by the engine's window (LOOM_TX_WINDOW).
+constexpr int BENCH_UNRETIRED = 48;
 constexpr int BENCH_STORES = 256;    // inline messages for the store rate
-
-// Scratch for LOOM_BENCH_WARM: the tail of the buffer, clear of every
-// packed bench offset (40 MB, the last, ends at 173.58 MB).
-constexpr uint64_t WARM_SCRATCH_OFF = 176ULL * 1024 * 1024;
-constexpr uint64_t WARM_SCRATCH_LEN = 16ULL * 1024 * 1024;
 
 // Where each size's last iteration lands, packed nose to tail
 uint64_t bench_offset(int idx) {
@@ -336,7 +325,7 @@ static uint64_t parse_pace(const char *e) {
     return (uint64_t(den) << 8) | num;
 }
 // LOOM_TX_WINDOW=N packets posted and not yet acked (0 = no window). Unset
-// = bitstream default (8). Returns the TX_CTL word.
+// = bitstream default (16). Returns the TX_CTL word.
 static uint64_t tx_ctl_from_env(uint64_t cur) {
     uint64_t v = cur;
     if (const char *e = getenv("LOOM_TX_WINDOW"))
@@ -360,9 +349,8 @@ static void print_pace(uint64_t v, const char *when) {
 
 void run_bench(coyote::cThread &t_ctrl, loom::Xpu &A, int win,
                uint64_t *src, volatile uint64_t *fence) {
-    printf("\n== remote transmit benchmark (<=%d iters/size, <=%lu MB burst, "
-           "credit %d)\n", BENCH_ITERS,
-           (unsigned long) (BENCH_MAX_BURST >> 20), bench_credit());
+    printf("\n== remote transmit benchmark (<=%d iters/size, <=%lu MB burst)\n",
+           BENCH_ITERS, (unsigned long) (BENCH_MAX_BURST >> 20));
     // us/op and GB/s are the TRANSFER alone - the deliberate idle of
     // LOOM_BENCH_GAP_US is excluded, so they answer "how fast does Loom move
     // a message" and are directly comparable to perf_rdma's throughput
@@ -423,118 +411,10 @@ void run_bench(coyote::cThread &t_ctrl, loom::Xpu &A, int win,
         if (from_len && len < from_len) continue;
         if (off + len > BUF_SIZE) continue;   // bisect sizes, packed layout
 
-        // LOOM_BENCH_SRC_SKEW=<bytes> reads the payload from src + skew
-        // instead of src + 0, WITHOUT moving the destination. src is 4 KB
-        // aligned and the message prepends one 64 B header beat, so
-        // "constant at message byte 2768" and "constant at source-page byte
-        // 2704" are the same number and no run so far can tell them apart.
-        // Skewing the source by a non-multiple of 4096 separates them: the
-        // break either follows the packet (the RoCE packetiser) or follows
-        // the source page (the host read path).
-        const uint64_t skew = []{
-            const char *e = getenv("LOOM_BENCH_SRC_SKEW");
-            return e ? (strtoull(e, nullptr, 0) & ~63ULL) : 0ULL;
-        }();
-        uint64_t *const psrc = src + skew / 8;
-
         // Distinct pattern per size so the exporter can tell them apart.
-        // Written AT the skew, so payload word w is still bench_word(i, w)
-        // and the exporter's expectation does not change.
-        for (uint64_t w = 0; w < len / 8; w++) psrc[w] = bench_word(i, w);
-        // LOOM_BENCH_FLUSH_SRC=1 evicts the payload from the CPU caches
-        // before the transfer. The fill above writes it with ordinary
-        // stores, so cold it is DIRTY in the LLC and the card's DMA read
-        // has to snoop it out; warm, a previous descriptor has already
-        // pulled those lines through. That is the one difference between a
-        // cold and a warm pull that is not itself a consequence of the
-        // pull being slow - and the pull being slow at the start is what
-        // starves the packetiser. If flushing makes a cold run clean, the
-        // trigger is dirty-line snooping and it is fixable in software.
-        if (getenv("LOOM_BENCH_FLUSH_SRC")) {
-            auto *p8 = reinterpret_cast<char *>(psrc);
-            for (uint64_t b = 0; b < len; b += 64)
-                _mm_clflush(p8 + b);
-            _mm_mfence();
-            printf("  source flushed from the CPU caches (%lu B)\n",
-                   (unsigned long) len);
-        }
-        if (skew)
-            printf("  source skewed by %lu B: src page offset %lu, "
-                   "message offset %lu\n", (unsigned long) skew,
-                   (unsigned long) (skew % 4096),
-                   (unsigned long) ((skew + 64) % 4096));
-
-        // LOOM_BENCH_WARM=<bytes> sends that many bytes as its own
-        // descriptor(s) to a scratch offset BEFORE the size under test,
-        // LOOM_BENCH_WARM_N=<n> says how many. A lone descriptor of 4 MB or
-        // more fails while the same size passes inside the sweep, so the
-        // question is what the sweep's ramp provides: this asks whether one
-        // small write in front of it is enough, and if not, how many.
-        // Scratch sits ABOVE every bench region (the largest, 40 MB, ends at
-        // 173.58 MB) so a warm-up of any size lands where nothing is
-        // checked.
-        if (const char *we = getenv("LOOM_BENCH_WARM")) {
-            uint64_t wlen = strtoull(we, nullptr, 0) & ~63ULL;
-            if (wlen > WARM_SCRATCH_LEN) wlen = WARM_SCRATCH_LEN;
-            const char *wn = getenv("LOOM_BENCH_WARM_N");
-            const int wcount = wn ? atoi(wn) : 1;
-            int done = 0;
-            for (int k = 0; k < wcount && wlen; k++) {
-                const uint64_t c =
-                    loom::csr_read(t_ctrl, loom::DBG_BASE + 8 * 7);
-                A.copy(win, uint32_t(WARM_SCRATCH_OFF), src, wlen, fence);
-                if (!spin64(fence, c + 1, 5e6)) break;
-                done++;
-            }
-            printf("  primed with %d of %d x %lu B before %lu B\n",
-                   done, wcount, (unsigned long) wlen, (unsigned long) len);
-            fflush(stdout);
-        }
-
-        // LOOM_BENCH_CHUNK=<bytes> delivers the SAME region as a sequence of
-        // descriptors of that size at successive offsets, instead of one
-        // long message. Every size up to 1 MB passes cold and only long
-        // messages fail, so this asks the practical question directly: can
-        // large writes be made to work by chunking, without root-causing
-        // the shell? Unlike --iters, which rewrites one offset N times,
-        // this covers the whole region exactly once.
-        const uint64_t chunk = []{
-            const char *e = getenv("LOOM_BENCH_CHUNK");
-            return e ? (strtoull(e, nullptr, 0) & ~63ULL) : 0ULL;
-        }();
-        if (chunk && chunk < len) {
-            const uint64_t warmc = loom::csr_read(t_ctrl, loom::DBG_BASE + 8 * 7);
-            uint64_t done = 0, n = 0;
-            auto tc0 = std::chrono::steady_clock::now();
-            // Pace against the fence. Nothing else bounds the descriptor
-            // rate: loom_ctrl's order FIFO DROPS an entry when full and
-            // vfpga_top ties cq_wr.ready high, so an unpaced burst of a
-            // thousand descriptors is thrown away silently. LOOM_BENCH_
-            // CHUNK_CREDIT caps how many may be unretired at once.
-            const int ccred = []{
-                const char *e = getenv("LOOM_BENCH_CHUNK_CREDIT");
-                return e ? atoi(e) : 8;
-            }();
-            for (; done < len; done += chunk, n++) {
-                const uint64_t this_len = (len - done < chunk) ? (len - done) : chunk;
-                A.copy(win, uint32_t(off + done), psrc + done / 8,
-                       this_len, fence);
-                if (ccred > 0 && int(n) + 1 > ccred)
-                    spin64_ge(fence, warmc + uint64_t(int(n) + 1 - ccred), 5e6);
-            }
-            const bool okc = spin64(fence, warmc + n, 3e7);
-            const double usc = std::chrono::duration<double, std::micro>(
-                std::chrono::steady_clock::now() - tc0).count();
-            printf("%10lu  %lu chunks of %lu B: %s, %.2f us, %.3f GB/s\n",
-                   (unsigned long) len, (unsigned long) n,
-                   (unsigned long) chunk, okc ? "all fenced" : "NEVER FENCED",
-                   usc, double(len) / (usc * 1e3));
-            fflush(stdout);
-            continue;                       // the region is written; done
-        }
-
+        for (uint64_t w = 0; w < len / 8; w++) src[w] = bench_word(i, w);
         const uint64_t warm = loom::csr_read(t_ctrl, loom::DBG_BASE + 8 * 7);
-        A.copy(win, uint32_t(off), psrc, len, fence);      // warm the path
+        A.copy(win, uint32_t(off), src, len, fence);      // warm the path
         if (!spin64(fence, warm + 1, 5e6)) {
             printf("%10lu   warm-up never fenced - stopping\n",
                    (unsigned long) len);
@@ -550,15 +430,14 @@ void run_bench(coyote::cThread &t_ctrl, loom::Xpu &A, int win,
         loom::StageStats a = loom::read_stage_stats(t_ctrl);
         auto t0 = std::chrono::steady_clock::now();
         const int iters  = bench_iters(len);
-        const int credit = bench_credit();
         const int gap_us = bench_gap_us();
         double idle_us = 0.0;   // deliberate pacing idle, excluded below
         for (int k = 0; k < iters; k++) {
-            A.copy(win, uint32_t(off), psrc, len, fence);
-            if (credit && k + 1 > credit)          // at most `credit` unretired
-                spin64_ge(fence, base + uint64_t(k + 1 - credit), 5e6);
+            A.copy(win, uint32_t(off), src, len, fence);
+            if (k + 1 > BENCH_UNRETIRED)           // stay under the order FIFO
+                spin64_ge(fence, base + uint64_t(k + 1 - BENCH_UNRETIRED), 5e6);
             // Pace against the RECEIVER, which nothing else here does. The
-            // fence is a local posted completion, so with credit 0 the
+            // fence is a local posted completion, so the
             // descriptors go out back to back at whatever rate the engine
             // sustains - 12.3 GB/s on hardware, above the ~11.8 GB/s
             // perf_rdma settles at because ITS benchmark is throttled by
@@ -652,13 +531,6 @@ void run_bench(coyote::cThread &t_ctrl, loom::Xpu &A, int win,
         // receive-path report, which runs on the SERVER - where the engine
         // never streams a bulk descriptor, so it could only ever read zero.
         // The pull is the SENDER's, and this is the sender.
-        // LOOM_CHUNK=<bytes> overrides the engine's chunk size; 0 turns
-        // chunking off. Reported either way so a log says which mode the
-        // run was in - the two are indistinguishable from the output
-        // otherwise, and that is exactly the confusion to avoid.
-        printf("  rdma chunk: %lu B%s\n",
-               (unsigned long) loom::csr_read(t_ctrl, loom::CHUNK),
-               loom::csr_read(t_ctrl, loom::CHUNK) ? "" : "  (CHUNKING OFF)");
         {
             const uint64_t sm  = loom::csr_read(t_ctrl, loom::TX_SMID);
             const uint64_t smx = loom::csr_read(t_ctrl, loom::TX_SMID_MAX);
@@ -698,7 +570,7 @@ void run_bench(coyote::cThread &t_ctrl, loom::Xpu &A, int win,
             const uint64_t rw   = loom::csr_read(t_ctrl, loom::TX_REQWAIT);
             const uint64_t ff   = loom::csr_read(t_ctrl, loom::TX_FIFO_FULL);
             printf("  tx window: %lu packets; %lu unacked at the end\n",
-                   (unsigned long) (ctl & 0xFF), (unsigned long) (st & 0xFF));
+                   (unsigned long) (ctl & 0xFF), (unsigned long) (st & 0xFFFF));
             printf("  tx acks: %lu packets acked; window full %lu cycles; sq_wr wait %lu cycles; "
                    "tx FIFO held the pull %lu cycles\n",
                    (unsigned long) acks, (unsigned long) wf, (unsigned long) rw,
@@ -830,27 +702,16 @@ int run_server(uint16_t qp_port, uint16_t peer_port, const std::string &sock) {
     memset(dst2, 0, BUF_SIZE);
 
     loom::BundledOrchestrator orch(t_ctrl);
-    // The two halves of the invariant, independently settable. Read back and
-    // printed, because a knob that silently did not take is how a whole
-    // experiment gets misread - and both defaults live in the bitstream, so
-    // an unset variable is not the same as a zero.
-    if (const char *e = getenv("LOOM_CHUNK"))
-        loom::csr_write(t_ctrl, loom::CHUNK, strtoull(e, nullptr, 0));
-    // LOOM_TX_PACE=N inserts one idle cycle after every N forwarded payload
-    // beats on the rdma route (wire rate N/(N+1) of the burst rate); 0 = off.
-    // This is the flow control the link does not have: the receiver's host
-    // write saturates at ~10 GB/s and nothing else tells the sender so.
+    // Engine knobs, read back and printed: a knob that silently did not
+    // take is how a whole experiment gets misread, and the defaults live in
+    // the bitstream, so an unset variable is not the same as a zero.
+    // LOOM_TX_WINDOW is the flow control (packets unacked); LOOM_TX_PACE is
+    // an optional manual cap on top, off by default.
     if (const char *e = getenv("LOOM_TX_PACE"))
         loom::csr_write(t_ctrl, loom::TX_PACE, parse_pace(e));
     print_pace(loom::csr_read(t_ctrl, loom::TX_PACE), "at init");
     loom::csr_write(t_ctrl, loom::TX_CTL, tx_ctl_from_env(loom::csr_read(t_ctrl, loom::TX_CTL)));
     print_tx_ctl(loom::csr_read(t_ctrl, loom::TX_CTL), "at init");
-    {
-        const uint64_t cb = loom::csr_read(t_ctrl, loom::CHUNK);
-        printf("engine config: chunk_bytes=%lu (%s)\n",
-               (unsigned long) cb, cb ? "chunked" : "NOT chunked");
-        fflush(stdout);
-    }
     loom::Handle h1 = orch.exportBuf(t_data.getCtid(), dst1, BUF_SIZE);
     loom::Handle h2 = orch.exportBuf(t_data.getCtid(), dst2, BUF_SIZE);
     printf("server: exported handles %u, %u\n", h1, h2);
@@ -1326,27 +1187,16 @@ int run_client(const std::string &ip, uint16_t qp_port, uint16_t peer_port,
 
     // The chunk register lives on the SENDER's engine, so the client needs
     // it too - the server write above only covers the receive side.
-    // The two halves of the invariant, independently settable. Read back and
-    // printed, because a knob that silently did not take is how a whole
-    // experiment gets misread - and both defaults live in the bitstream, so
-    // an unset variable is not the same as a zero.
-    if (const char *e = getenv("LOOM_CHUNK"))
-        loom::csr_write(t_ctrl, loom::CHUNK, strtoull(e, nullptr, 0));
-    // LOOM_TX_PACE=N inserts one idle cycle after every N forwarded payload
-    // beats on the rdma route (wire rate N/(N+1) of the burst rate); 0 = off.
-    // This is the flow control the link does not have: the receiver's host
-    // write saturates at ~10 GB/s and nothing else tells the sender so.
+    // Engine knobs, read back and printed: a knob that silently did not
+    // take is how a whole experiment gets misread, and the defaults live in
+    // the bitstream, so an unset variable is not the same as a zero.
+    // LOOM_TX_WINDOW is the flow control (packets unacked); LOOM_TX_PACE is
+    // an optional manual cap on top, off by default.
     if (const char *e = getenv("LOOM_TX_PACE"))
         loom::csr_write(t_ctrl, loom::TX_PACE, parse_pace(e));
     print_pace(loom::csr_read(t_ctrl, loom::TX_PACE), "at init");
     loom::csr_write(t_ctrl, loom::TX_CTL, tx_ctl_from_env(loom::csr_read(t_ctrl, loom::TX_CTL)));
     print_tx_ctl(loom::csr_read(t_ctrl, loom::TX_CTL), "at init");
-    {
-        const uint64_t cb = loom::csr_read(t_ctrl, loom::CHUNK);
-        printf("engine config: chunk_bytes=%lu (%s)\n",
-               (unsigned long) cb, cb ? "chunked" : "NOT chunked");
-        fflush(stdout);
-    }
 
     auto *src = static_cast<uint64_t *>(A.alloc(BUF_SIZE));
     auto *fence = static_cast<uint64_t *>(A.allocSmall(4096));

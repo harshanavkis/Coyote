@@ -56,8 +56,11 @@ import lynxTypes::*;
  *     one cq_wr per PACKET (req_t.last is what gates the ack; it is not
  *     on the wire);
  *   - a WINDOW: inflight = posted - acked, a packet is posted only while
- *     inflight < tx_window (CSR, <= the shell's 16). The far stack's
- *     acceptance, not a constant, bounds what is in flight;
+ *     inflight < tx_window (CSR 66, reset 16, 0 = none). The far stack's
+ *     acceptance, not a constant, bounds what is in flight. Measured:
+ *     rate = W x PMTU / ack RTT (~5.2 us here) up to the pipe's ceiling,
+ *     and W must stay under the receiver's upstream buffer (~40 packets:
+ *     rx_crossing 2048 + incoming FIFO 512 beats) - 32 holds, 64 drops;
  *   TX_PACE (the fractional pacer) stays as a manual cap, off by default.
  * If the FIFO fills, the pull's tready drops - the only influence Loom has
  * on a streaming source, counted (cnt_tx_fifo_full), never relied on.
@@ -166,14 +169,11 @@ module loom_engine (
     // Nonzero means the pull really does hand back sub-beat data and the
     // wire used to carry it.
     output logic                        cnt_tx_partial,
-    // CSR 28, kept for software compatibility; the engine no longer chunks
-    // a descriptor into messages - it packetises it (see the header).
-    input  logic [27:0]                 chunk_bytes,
     // Transmit window (see the header). tx_window 0 = no window.
     input  logic [7:0]                  tx_window,
     // One pulse per remote-write acknowledgement (cq_wr with remote set)
     input  logic                        ack_valid,
-    output logic [7:0]                  tx_inflight,
+    output logic [15:0]                 tx_inflight,
     output logic                        cnt_tx_ack,
     output logic                        cnt_tx_winfull,  // a packet waited on the window
     output logic                        cnt_tx_reqwait,  // a packet waited on sq_wr.ready
@@ -287,9 +287,7 @@ logic [22:0] l_sbeats;
 // every later packet carries PMTU until the tail. Each request is posted
 // under the window and carries last=1 for its own ack.
 //
-// The old message chunking (CSR 28) is gone: with one request per packet
-// every packet owns one retransmit slot, which is what the chunk size was
-// bounding.
+// With one request per packet every packet owns one retransmit slot.
 // Wire packet in 64 B beats - the shell fragments at PMTU.
 localparam integer PKT_BEATS = PMTU_BYTES / 64;
 // Loom's own transmit buffer, beats. 4096 x 64 B = 256 KB, in URAM.
@@ -302,7 +300,6 @@ wire  [28:0] p_len  = (p_left > PMTU_BYTES) ? 29'(PMTU_BYTES) : p_left;
 wire         p_more = (p_left > PMTU_BYTES);
 // Offset of the next packet inside the message, for the RETH/staging vaddr
 wire  [28:0] p_off  = ({1'b0, l_len} + 29'd64) - p_left;
-wire _unused_chunk = ^chunk_bytes;
 
 function automatic logic [22:0] beats_of(input logic [27:0] len);
     logic [28:0] padded;
@@ -347,15 +344,15 @@ assign cnt_tx_fifo_full = s_tvalid && !s_tready;
 // -------------------------------------------------------------------------
 // Window: packets posted to the stack and not yet acknowledged.
 // -------------------------------------------------------------------------
-logic [7:0] inflight;
-wire        win_ok   = (tx_window == 8'd0) || (inflight < tx_window);
+logic [15:0] inflight;
+wire        win_ok   = (tx_window == 8'd0) || (inflight < {8'd0, tx_window});
 wire        rdma_req = l_route && ((state == ST_WR_REQ) || (state == ST_DMA_WR_REQ));
 logic       wr_valid_i;
 wire        wr_hs    = wr_valid_i && wr_ready;
 always_ff @(posedge aclk) begin
-    if (!aresetn) inflight <= 8'd0;
-    else if (wr_hs && rdma_req && !ack_valid) inflight <= inflight + 8'd1;
-    else if (ack_valid && !(wr_hs && rdma_req) && (inflight != 8'd0)) inflight <= inflight - 8'd1;
+    if (!aresetn) inflight <= 16'd0;
+    else if (wr_hs && rdma_req && !ack_valid) inflight <= inflight + 16'd1;
+    else if (ack_valid && !(wr_hs && rdma_req) && (inflight != 16'd0)) inflight <= inflight - 16'd1;
 end
 assign tx_inflight    = inflight;
 assign cnt_tx_ack     = ack_valid;
@@ -667,36 +664,25 @@ wire stream_local = (state == ST_STREAM) && !l_route;
 wire stream_net   = (state == ST_STREAM) &&  l_route;
 
 // -------------------------------------------------------------------------
-// PACING - the flow control this link does not have.
+// TX_PACE - a manual rate cap, off by default.
 //
-// The receiver's host-write path saturates at ~10 GB/s (amy: 63% moving /
-// 34% stalled, FLAT as the offered rate rises - measured across the chunk
-// sweep, and again with this pacer: rx stall 0 and ingress-FIFO-full 0 at
-// 8 GB/s, 32k and 29k at 10.6). This engine bursts at 64 B/cycle; the wire
-// has no PFC, no DCQCN and no prog_full consumer, so nothing tells the
-// sender to slow down. Above the receiver's ceiling its ~3000 beats of
-// buffering fill in ~1.7 MB, the CMAC (no tready) drops beats before any
-// counter, the PSN gap NAKs, Go-Back-N replays, and the replay lands
-// displaced. Paced under the ceiling, a lone 4 MB message lands byte-exact
-// with 0 retransmissions - the first time in 119 runs (2026-09-12).
+// Flow control is the window above: what is in flight is bounded by the far
+// stack's acks. This is an optional cap on top of it, kept because a fixed
+// fraction of the burst rate is occasionally the right experiment (and it
+// is what held the link together before the window existed: 41/64 =
+// 10.25 GB/s at 250 MHz x 64 B was the receiver's clean ceiling then).
 //
-// RATE ACCUMULATOR, not 1-in-N. The first version held one cycle after
-// every N beats; on hardware that was NOT BINDING for N >= 4, because the
-// hold let the host pull catch up and simply replaced the pull's own ~21%
-// starvation instead of adding to it, and it had no setting between 50%
-// and 67%. This one caps the fraction of cycles a payload beat may move at
-// pace_num/pace_den exactly: every cycle in ST_STREAM earns pace_num
-// units of credit, a beat costs pace_den, credit saturates at two beats so
-// starvation cannot bank more than a two-beat burst. 41/64 is ~10.25 GB/s
-// at 250 MHz x 64 B.
+// RATE ACCUMULATOR, not 1-in-N: every cycle earns pace_num units of
+// credit, a payload beat costs pace_den, credit saturates at two beats so
+// starvation cannot bank more than a two-beat burst. A 1-in-N hold was not
+// binding on hardware for N >= 4, because the hold let the pull catch up.
 //
 // AXI-Stream legality: pace_hold gates BOTH tvalid and the engine's view of
 // tready, and it can only change on a clock edge; a beat that is offered
 // (tvalid high, credit present) stays offered until it moves, because
 // credit only ever DROPS on a move. The header beat is not paced.
 //
-// pace_num/pace_den are CSRs (reset 0 = off) so one bitstream sweeps the
-// rate; the highest clean setting IS the receiver's drain ceiling.
+// pace_num/pace_den are CSRs (reset 0 = off).
 // -------------------------------------------------------------------------
 wire        pace_en   = (pace_num != 8'd0) && (pace_den != 8'd0) && (pace_num < pace_den);
 wire        net_moved = stream_net && f_tvalid && m_net_rdy;
