@@ -46,6 +46,9 @@ user logic and user-space software; the shell and driver stay stock.
 | 6.2b | full deployment topology (per side: loomd + 2 apps); remote reads via shell RDMA READ (T6) | pending |
 | 7a | receiver on its own host stream (`N_STRM_AXI 2`, loom_rx writes dest 1, as perf_rdma's receiver) | done; clean ceiling 10.25 → 11.0 GB/s on 64 MiB |
 | 7b | transmit pacer: one request per PMTU packet under an ACK-clocked window (`--tx-window`), Loom-owned 256 KB tx buffer, pull untouched | done; **11.84 GB/s, 64 MiB x20 x5 runs, 0 retrans** = perf_rdma's number |
+| 7c | ping-pong benchmark (delivery-based, perf_rdma's definition) | done; 7.45 us one way at 64 B, 11.46 GB/s at 64 MiB |
+| 7d | two XPUs per host: dedicated QP-owner cThread, landing pid in the message header (`dst_pid`), `--matrix` test | done; 47/47 landings on hardware (local both hosts, four remote pairs with replies, two pairs concurrently) |
+| 7e | per-XPU completion counts in the fence (the emulated copy engine is the XPU's) | sim-verified, awaiting its bitstream |
 
 **Bitstream: BUILDS on U280** (2026-08-04, Vivado 2023.2 → `cyt_top.bit`).
 u280 must be an HBM device for any `EN_RDMA` build; see
@@ -298,6 +301,37 @@ stores, two engine passes), and delivery at 64 MiB is 11.47 GB/s - ~3%
 under the push number, the per-message fill and drain the fence does not
 see. perf_rdma's throughput method pipelines 32 messages before waiting
 for the echo, so its 11.7 sits between the two.
+
+### The two-XPU matrix test
+
+Two XPUs per host (`LOOM_XPUS=2`: a data cThread and buffer each), the QP
+owned by a separate cThread, one RC connection per host pair. Every pair
+exchanges data and every landing is verified on the side it lands on:
+
+```bash
+./run_two_host.py --matrix --size 67108864 --iters 1 --gap 0 --retries 0 --tx-window 32
+```
+
+Sequence (`run_matrix` on the client, `mx_serve` per server XPU):
+A1 -> A2 and A2 -> A1 locally (1 MiB, the cross-pid write through the
+TLB); B1 -> B2 and B2 -> B1 locally, commanded through a word in B's
+memory and acknowledged back into A1's; A1 -> B1, A2 -> B2, A1 -> B2,
+A2 -> B1 remotely (4 MiB, each answered by the receiver through its own
+reverse window); then A1 <-> B1 and A2 <-> B2 concurrently, eight rounds
+each. What separates the XPUs on the wire is the destination pid the
+sender's window carries in the 64 B header (`TBL_PID[15:8]`); the
+crossed pairs are the ones a wrong pid would break. All signalling is
+peer-written flag words polled in the receiver's own memory. Expected:
+
+```
+matrix: 47 landings verified, 0 failed, intact
+```
+
+Both `loom_host` binaries must be the same version (the peering protocol
+carries the XPU ctid, v3). A fence word is waited on for `>= old + 1`,
+never equality: the count in it is the issuing XPU's own (per source pid
+in the engine), but a fence word only changes when its own descriptor
+completes.
 
 ### 6.2a: the bundled two-host binary (`sw-bundled/`)
 
