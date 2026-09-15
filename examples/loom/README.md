@@ -122,6 +122,36 @@ ENCODE and DECODE are two hand-written layouts in two files: each block TB
 checks its own side against literals it writes itself, so both can agree on
 the same misunderstanding and still pass.
 
+### Out-of-context synthesis (4 minutes, before a 4.5 h build)
+
+`synth_design -mode out_of_context` on one module by itself - no shell,
+no I/O, no place-and-route. It catches what the testbenches cannot (XPM
+inference, latches, elaboration errors Vivado would otherwise report hours
+into the real build), reports the module's cost, and gives a
+post-synthesis timing estimate at 250 MHz. Not a substitute for the full
+build: nothing about the shell integration or routing is checked.
+
+```bash
+cd examples/loom/hw
+./ooc_synth.sh              # loom_engine (default)
+./ooc_synth.sh loom_rx      # or loom_ctrl, loom_table
+```
+
+Needs `build_sim/sim/lynx_pkg.sv` (rendered by `setup_sim.sh`, steps 1-2)
+and Vivado (the script re-execs itself inside `xilinx-shell`). Reports go
+to `build_ooc/<module>/` (`util.rpt`, `timing.rpt`, `vivado.log`); the
+script prints the top-level and one-level-down utilization and the WNS:
+
+```
+| loom_engine  | (top)         | 2852 | ... | 4030 | 0 | 0 | 9 | 0 |
+| inst_tx_fifo | xpm_fifo_axis |   76 | ... |  642 | 0 | 0 | 9 | 0 |
+WNS(ns) 1.089   TNS 0.000   (250 MHz, post-synthesis estimate)
+```
+
+The 9 URAMs are the 256 KB transmit buffer; the 4030 FFs include the 64
+per-XPU completion counters. Run it after any RTL change, before asking
+for a build.
+
 ### Coyote integration sim
 
 Prerequisite: `setup_sim.sh`. The run spawns Vivado/XSIM, so it goes
