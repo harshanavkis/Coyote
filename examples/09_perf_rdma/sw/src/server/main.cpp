@@ -55,11 +55,22 @@ void run_bench(
 
         // For writes, wait until client has written the targer number of messages; then write them back
         if (operation) {
+            // PERF_RDMA_BIDIR=1: write back IMMEDIATELY, without waiting for the
+            // client's writes to land, so both sides transmit at the same time
+            // (a test of the stack under bidirectional traffic; the echoed
+            // payload is then not meaningful and the client does not check it)
+            const bool bidir = getenv("PERF_RDMA_BIDIR") != nullptr;
+            if (bidir)
+                for (int i = 0; i < transfers; i++) {
+                    coyote_thread.invoke(coyote::CoyoteOper::REMOTE_RDMA_WRITE, sg);
+                }
+
             while (coyote_thread.checkCompleted(coyote::CoyoteOper::LOCAL_WRITE) != transfers) {}
 
-            for (int i = 0; i < transfers; i++) {
-                coyote_thread.invoke(coyote::CoyoteOper::REMOTE_RDMA_WRITE, sg);
-            }
+            if (!bidir)
+                for (int i = 0; i < transfers; i++) {
+                    coyote_thread.invoke(coyote::CoyoteOper::REMOTE_RDMA_WRITE, sg);
+                }
         // For reads, the server is completely passive 
         } else { 
 
