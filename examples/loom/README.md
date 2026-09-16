@@ -47,7 +47,8 @@ user logic and user-space software; the shell and driver stay stock.
 | 7a | receiver on its own host stream (`N_STRM_AXI 2`, loom_rx writes dest 1, as perf_rdma's receiver) | done; clean ceiling 10.25 → 11.0 GB/s on 64 MiB |
 | 7b | transmit pacer: one request per PMTU packet under an ACK-clocked window (`--tx-window`), Loom-owned 256 KB tx buffer, pull untouched | done; **11.84 GB/s, 64 MiB x20 x5 runs, 0 retrans** = perf_rdma's number |
 | 7c | ping-pong benchmark (delivery-based, perf_rdma's definition) | done; 7.45 us one way at 64 B, 11.46 GB/s at 64 MiB |
-| 7d | two XPUs per host: dedicated QP-owner cThread, landing pid in the message header (`dst_pid`), `--matrix` test | done; 42/42 landings on hardware (local, four remote pairs with replies, two pairs concurrently) |
+| 7d | two XPUs per host: dedicated QP-owner cThread, landing pid in the message header (`dst_pid`), `--matrix` test | done; 47/47 landings on hardware (local both hosts, four remote pairs with replies, two pairs concurrently) |
+| 7e | bidirectional traffic: per-request `sq_wr` arbitration (the whole-transaction arbiter deadlocked both hosts the moment they pushed at each other), `--bidir` test | done; 64/64 rounds at W=32 and W=16 on hardware (was a wedge in round 1-2 every time), matrix 58/58, push 11.9 GB/s and ping-pong unchanged |
 | 7e | per-XPU completion counts in the fence (the emulated copy engine is the XPU's) | sim-verified, awaiting its bitstream |
 
 **Bitstream: BUILDS on U280** (2026-08-04, Vivado 2023.2 → `cyt_top.bit`).
@@ -135,6 +136,8 @@ build: nothing about the shell integration or routing is checked.
 cd examples/loom/hw
 ./ooc_synth.sh              # loom_engine (default)
 ./ooc_synth.sh loom_rx      # or loom_ctrl, loom_table
+./ooc_synth.sh top          # the whole vFPGA (vfpga_top.svh glue included;
+                            # IP as black boxes from a previous build's stubs)
 ```
 
 Needs `build_sim/sim/lynx_pkg.sv` (rendered by `setup_sim.sh`, steps 1-2)
@@ -346,15 +349,34 @@ Sequence (`run_matrix` on the client, `mx_serve` per server XPU):
 A1 -> A2 and A2 -> A1 locally (1 MiB, the cross-pid write through the
 TLB; the server side runs the same code and is not repeated); A1 -> B1,
 A2 -> B2, A1 -> B2, A2 -> B1 remotely (4 MiB, each answered by the
-receiver through its own reverse window); then A1 <-> B1 and A2 <-> B2
-concurrently, eight rounds each. What separates the XPUs on the wire is the destination pid the
-sender's window carries in the 64 B header (`TBL_PID[15:8]`); the
-crossed pairs are the ones a wrong pid would break. All signalling is
-peer-written flag words polled in the receiver's own memory. Expected:
+receiver through its own reverse window); A1 -> B1 and B1 -> A1
+**bidirectionally** (both push at once, one issuer per engine, eight
+rounds); then A1 <-> B1 and A2 <-> B2 concurrently, eight rounds each
+(both directions and two issuers per engine). What separates the XPUs on
+the wire is the destination pid the sender's window carries in the 64 B
+header (`TBL_PID[15:8]`); the crossed pairs are the ones a wrong pid
+would break. All signalling is peer-written flag words polled in the
+receiver's own memory. Expected:
 
 ```
-matrix: 42 landings verified, 0 failed, intact
+matrix: 58 landings verified, 0 failed, intact
 ```
+
+The bidirectional phase alone, for as many rounds as wanted (two
+landings verified per round):
+
+```bash
+./run_two_host.py --bidir 64 --tx-window 32 --size 67108864 --iters 1 --gap 0 --retries 0
+```
+
+It is what found the deadlock of 2026-09-16: the engine and `loom_rx`
+share the shell's `sq_wr` request channel, and the arbiter granted it for
+whole transactions, so a host pushing a descriptor could not forward the
+packets arriving from the host pushing at it, backpressured the shell's
+receive FSM (which emits and processes acks), and neither engine's window
+ever reopened. Reproduced every time, any window; stock perf_rdma with
+both sides writing at once (`PERF_RDMA_BIDIR=1` on its server) is clean,
+so the stack is not the limit. `sq_wr` is now arbitrated per request.
 
 Both `loom_host` binaries must be the same version (the peering protocol
 carries the XPU ctid, v3). A fence word is waited on for `>= old + 1`,

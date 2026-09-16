@@ -6,12 +6,11 @@
  * sq_wr/axis_host_send, rdma via sq_wr/axis_rreq_send); loom_rx forwards
  * incoming RDMA writes (rq_wr + axis_rrsp_recv) as local writes.
  *
- * The engine and rx share sq_wr; a registered arbiter grants it to one of
- * them for whole transactions (engine priority). The engine is gated by
- * masking its FIFO-empty input rather than by an engine-side grant port.
- * Data goes out on separate host streams: the engine on axis_host_send[0],
- * rx on axis_host_send[1] (wr_req.dest 1), as perf_rdma's receiver does -
- * separate queue, credits and FIFO in the shell for each.
+ * The engine and rx share sq_wr, arbitrated PER REQUEST (rx priority);
+ * neither ever owns it for a whole transaction. Data goes out on separate
+ * host streams: the engine on axis_host_send[0], rx on axis_host_send[1]
+ * (wr_req.dest 1), as perf_rdma's receiver does - separate queue, credits
+ * and FIFO in the shell for each.
  */
 
 // ---------------------------------------------------------------------------
@@ -68,7 +67,9 @@ logic [VADDR_BITS-1:0] rdma_staging_va;
 // Engine shell-side signals
 req_t eng_rd_req, eng_wr_req;
 logic eng_rd_valid, eng_wr_valid;
+/* verilator lint_off UNUSED */
 logic eng_busy;
+/* verilator lint_on UNUSED */
 logic [AXI_DATA_BITS-1:0]   eng_host_tdata, eng_net_tdata;
 logic [AXI_DATA_BITS/8-1:0] eng_host_tkeep, eng_net_tkeep;
 logic eng_host_tvalid, eng_host_tlast, eng_net_tvalid, eng_net_tlast;
@@ -76,7 +77,9 @@ logic eng_host_tvalid, eng_host_tlast, eng_net_tvalid, eng_net_tlast;
 // RX shell-side signals
 req_t rx_wr_req;
 logic rx_wr_valid;
+/* verilator lint_off UNUSED */
 logic rx_req_arb, rx_busy;
+/* verilator lint_on UNUSED */
 logic rx_cnt_move, rx_cnt_starve, rx_cnt_stall;
 // Ingress backpressure in ANY state - see loom_rx.sv
 logic rx_cnt_bp;
@@ -109,63 +112,33 @@ AXI4SR axis_wr_rx (.*);
 axisr_reg inst_reg_wr_rx (.aclk(aclk), .aresetn(aresetn),
                           .s_axis(axis_wr_rx), .m_axis(axis_host_send[1]));
 
-// Arbiter: exclusive, whole-transaction ownership of sq_wr
+// sq_wr: shared by the engine and rx, arbitrated PER REQUEST
 //
-// Why it exists: the engine (stores, DMA writes, fences) and rx
-// (forwarded incoming writes) both need the single sq_wr request channel.
-// The data streams are separate since dest 1 (axis_host_send[0] engine,
-// [1] rx), so only the request channel is shared now; ownership is still
-// granted for WHOLE transactions, which keeps the request/data pairing of
-// each producer trivially in order and costs nothing on the receiver,
-// where the engine is idle during a transfer.
+// Only the request channel is shared: since rx moved to its own host
+// stream (dest 1) each producer's data has its own queue, credits and
+// FIFO in the shell, so the request/data pairing of one producer is
+// unaffected by the other's requests interleaving with its own. The
+// requests are single-cycle handshakes, so the mux below is the whole
+// arbiter: rx when rx has one, else the engine.
 //
-// Why it is registered: a combinational arbiter here closes a loop -
-// the grant would depend on the engine's pop decision, which depends on
-// the (masked) fifo_empty, which would depend on the grant. Registering
-// the decision breaks the loop at the cost of one idle cycle per
-// ownership change, which is negligible against transaction lengths.
+// It used to be whole-transaction ownership (registered, engine
+// priority), on the assumption that "the engine is idle during a
+// transfer" on the receiving host. That is false the moment both hosts
+// push at once, and it DEADLOCKED (2026-09-16, reproduced every time with
+// A1 -> B1 and B1 -> A1 at once, any window): each engine held sq_wr for
+// its whole descriptor, so its rx could not issue the host writes for
+// the incoming packets and backpressured the shell; the shell's receive
+// FSM - which emits acks and processes incoming acks in the same step -
+// stalled behind that; the engine's window never reopened, so it never
+// finished, never released. Per-request arbitration cannot hold anything:
+// rx presents at most one request per packet, the engine at most one per
+// packet or store, and neither producer's valid depends on its ready.
 //
-// How the engine is gated without a grant port: its fifo_empty input is
-// OR-masked with !eng_grant, so outside its grant window the engine
-// simply believes the FIFO is empty and stays in IDLE. rx has an
-// explicit req/grant pair instead, because its trigger (rq_wr.valid)
-// lives outside our modules. Engine priority is a policy choice: local
-// work drains ahead of network ingress; rx work waits (bounded by the
-// FIFO running dry) and cannot be starved indefinitely by design since
-// software's aperture writes are finite.
+// rx has priority because its requests are what keep the shell's receive
+// FSM moving (and with it the acks the engine is waiting for); the engine
+// loses at most one cycle per rx packet. Neither can starve the other.
 // ---------------------------------------------------------------------------
-typedef enum logic [1:0] { ARB_IDLE, ARB_ENG, ARB_RX } arb_t;
-arb_t arb;
-logic rx_started;
-
-wire eng_grant = (arb == ARB_ENG);
-wire rx_grant  = (arb == ARB_RX);
-
-always_ff @(posedge aclk) begin
-    if (!aresetn) begin
-        arb <= ARB_IDLE;
-        rx_started <= 1'b0;
-    end else begin
-        case (arb)
-            ARB_IDLE: begin
-                rx_started <= 1'b0;
-                if (!fifo_empty)      arb <= ARB_ENG;   // engine priority
-                else if (rx_req_arb)  arb <= ARB_RX;
-            end
-            // Engine keeps the path while it has queued work; releasing
-            // requires both an empty FIFO and a finished transaction
-            ARB_ENG:
-                if (fifo_empty && !eng_busy) arb <= ARB_IDLE;
-            // rx_started distinguishes "granted but not yet begun" from
-            // "finished": leave only after busy has risen and fallen
-            ARB_RX: begin
-                if (rx_busy) rx_started <= 1'b1;
-                if (rx_started && !rx_busy) arb <= ARB_IDLE;
-            end
-            default: arb <= ARB_IDLE;
-        endcase
-    end
-end
+wire rx_takes_wr = rx_wr_valid;
 
 // ---------------------------------------------------------------------------
 // Modules
@@ -210,8 +183,7 @@ loom_table inst_loom_table (
 
 loom_engine inst_loom_engine (
     .aclk(aclk), .aresetn(aresetn),
-    // FIFO-empty masked by the arbiter: the engine runs only while granted
-    .fifo_empty(fifo_empty || !eng_grant),
+    .fifo_empty(fifo_empty),
     .fifo_is_desc(fifo_is_desc), .fifo_is_read(fifo_is_read),
     .fifo_win(fifo_win), .fifo_off(fifo_off),
     .fifo_len(fifo_len), .fifo_src_pid(fifo_src_pid),
@@ -222,13 +194,13 @@ loom_engine inst_loom_engine (
     .rdma_staging_va(rdma_staging_va),
     .rd_req(eng_rd_req), .rd_valid(eng_rd_valid), .rd_ready(sq_rd.ready),
     .wr_req(eng_wr_req), .wr_valid(eng_wr_valid),
-    .wr_ready(sq_wr.ready && eng_grant),
+    .wr_ready(sq_wr.ready && !rx_takes_wr),
     .s_tdata(axis_pull.tdata), .s_tkeep(axis_pull.tkeep),
     .s_tvalid(axis_pull.tvalid), .s_tready(axis_pull.tready),
     .s_tlast(axis_pull.tlast),
     .m_host_tdata(eng_host_tdata), .m_host_tkeep(eng_host_tkeep),
     .m_host_tvalid(eng_host_tvalid),
-    .m_host_tready(axis_wr.tready && eng_grant),
+    .m_host_tready(axis_wr.tready),
     .m_host_tlast(eng_host_tlast),
     .m_net_tdata(eng_net_tdata), .m_net_tkeep(eng_net_tkeep),
     .m_net_tvalid(eng_net_tvalid),
@@ -291,13 +263,14 @@ loom_rx inst_loom_rx (
     .rq_req(rq_wr.data), .rq_valid(rq_wr.valid), .rq_ready(rq_wr.ready),
     .rdma_staging_va(rdma_staging_va),
     .wr_req(rx_wr_req), .wr_valid(rx_wr_valid),
-    .wr_ready(sq_wr.ready && rx_grant),
+    .wr_ready(sq_wr.ready),
     .s_tdata(rxf_tdata), .s_tkeep(rxf_tkeep),
     .s_tvalid(rxf_tvalid), .s_tready(rxf_tready),
     .s_tlast(rxf_tlast),
     .m_tdata(rx_tdata), .m_tkeep(rx_tkeep), .m_tvalid(rx_tvalid),
-    .m_tready(axis_wr_rx.tready && rx_grant), .m_tlast(rx_tlast),
-    .req(rx_req_arb), .grant(rx_grant), .busy(rx_busy),
+    .m_tready(axis_wr_rx.tready), .m_tlast(rx_tlast),
+    // always granted: nothing but its own request handshake is shared
+    .req(rx_req_arb), .grant(1'b1), .busy(rx_busy),
     .cnt_rx_move(rx_cnt_move), .cnt_rx_starve(rx_cnt_starve),
     .cnt_rx_stall(rx_cnt_stall), .cnt_rx_bp(rx_cnt_bp), .cnt_rx_req(rx_cnt_req),
     .cnt_rx_fwd(cnt_rx_fwd), .cnt_rx_drop(cnt_rx_drop),
@@ -305,19 +278,18 @@ loom_rx inst_loom_rx (
 );
 
 // ---------------------------------------------------------------------------
-// Shared-path muxes
+// Shared-path mux
 //
-// Data/valid toward the shared resources select on the current grant;
-// the corresponding readys are masked on the way INTO each producer
-// (see the eng/rx instantiations above: `sq_wr.ready && eng_grant` etc.),
-// so an ungranted producer can neither drive nor mistakenly complete a
-// handshake. Resources with a single user need no mux: sq_rd, the pull
+// sq_wr carries rx's request whenever rx has one, else the engine's; the
+// engine's ready is masked on the way in (`sq_wr.ready && !rx_takes_wr`
+// above) so it cannot mistakenly complete a handshake in an rx cycle.
+// Everything else has a single user and needs no mux: sq_rd, the pull
 // stream and axis_host_send[0] belong to the engine, the rdma TX stream
 // to the engine, the rdma RX stream and axis_host_send[1] to loom_rx.
 // ---------------------------------------------------------------------------
 always_comb begin
-    sq_wr.data  = rx_grant ? rx_wr_req  : eng_wr_req;
-    sq_wr.valid = rx_grant ? rx_wr_valid : (eng_wr_valid && eng_grant);
+    sq_wr.data  = rx_takes_wr ? rx_wr_req  : eng_wr_req;
+    sq_wr.valid = rx_wr_valid || eng_wr_valid;
 end
 
 always_comb begin
@@ -329,7 +301,7 @@ always_comb begin
     axis_wr.tdata  = eng_host_tdata;
     axis_wr.tkeep  = eng_host_tkeep;
     axis_wr.tlast  = eng_host_tlast;
-    axis_wr.tvalid = eng_host_tvalid && eng_grant;
+    axis_wr.tvalid = eng_host_tvalid;
     axis_wr.tid    = '0;
 end
 
@@ -337,7 +309,7 @@ always_comb begin
     axis_wr_rx.tdata  = rx_tdata;
     axis_wr_rx.tkeep  = rx_tkeep;
     axis_wr_rx.tlast  = rx_tlast;
-    axis_wr_rx.tvalid = rx_tvalid && rx_grant;
+    axis_wr_rx.tvalid = rx_tvalid;
     axis_wr_rx.tid    = '0;
 end
 

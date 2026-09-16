@@ -482,6 +482,8 @@ def bench_env(args, gap):
         env += " LOOM_BENCH_PINGPONG=1"
     if args.matrix:
         env += " LOOM_BENCH_MATRIX=1 LOOM_XPUS=2"
+        if args.bidir:
+            env += f" LOOM_MATRIX_BIDIR={args.bidir}"
     elif args.xpus > 1:
         env += f" LOOM_XPUS={args.xpus}"
     if args.skip_bulk:
@@ -671,15 +673,23 @@ def main():
                          "buffers); the QP owner is a separate cThread")
     ap.add_argument("--matrix", action="store_true",
                     help="the 2 local + 2 remote XPU exchange test (implies "
-                         "--xpus 2): A1<->A2 and B1<->B2 locally, every "
-                         "A->B pair remotely with the reply, then A1<->B1 "
-                         "and A2<->B2 concurrently; every landing verified "
-                         "on the side it landed on")
+                         "--xpus 2): A1<->A2 locally, every A->B pair "
+                         "remotely with the reply, A1<->B1 bidirectionally "
+                         "(both push at once), then A1<->B1 and A2<->B2 "
+                         "concurrently; every landing verified on the side "
+                         "it landed on")
+    ap.add_argument("--bidir", type=int, default=0, metavar="N",
+                    help="only the bidirectional phase of the matrix, N "
+                         "rounds of A1 -> B1 and B1 -> A1 pushed at once "
+                         "(4 MiB each way, one issuer per engine); implies "
+                         "--matrix")
     ap.add_argument("--skip-bulk", action="store_true")
     ap.add_argument("--retries", type=int, default=2,
                     help="reflash both cards and retry after a wedge")
     ap.add_argument("--out", default=f"{COYOTE}/examples/loom/experiments-log.txt")
     args = ap.parse_args()
+    if args.bidir:
+        args.matrix = True
 
     try:
         gaps = [int(g) for g in args.gap.split(",") if g.strip()]

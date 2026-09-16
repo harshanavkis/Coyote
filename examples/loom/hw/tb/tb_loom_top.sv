@@ -6,11 +6,13 @@ import lynxTypes::*;
  * tb_loom_top — top-level test of the generated wrapper
  * (design_user_logic_c0_0, which includes vfpga_top.svh verbatim).
  *
- * Focus: engine/rx arbitration on the shared sq_wr; the engine lands on
- * axis_host_send[0], rx on axis_host_send[1] (dest 1)
- * path — mutual exclusion (continuous assertion), transaction atomicity
- * under races in both directions, starvation recovery, and a mixed soak
- * with exact counter accounting (completion disabled for clean sums).
+ * Focus: engine/rx arbitration on the shared sq_wr (per request; the
+ * engine lands on axis_host_send[0], rx on axis_host_send[1], dest 1) —
+ * one request on the channel at a time (continuous assertion), both
+ * producers complete under races in both directions, starvation
+ * recovery, a mixed soak with exact counter accounting (completion
+ * disabled for clean sums), and T8: rx served while the engine is held
+ * mid-descriptor by its ack window (the bidirectional deadlock).
  */
 module tb_loom_top;
 
@@ -92,14 +94,24 @@ always @(posedge aclk) begin
 end
 
 // ---- continuous arbitration invariants ----
+// Exactly one producer's request is on sq_wr, and it is that producer's:
+// rx's whenever rx has one, else the engine's; a handshake never
+// completes for a producer that did not present a request.
 always @(posedge aclk) if (aresetn) begin
-    if (inst_dut.eng_grant && inst_dut.rx_grant) begin
+    if (sq_wr.valid && !(inst_dut.rx_wr_valid || inst_dut.eng_wr_valid)) begin
         errors++;
-        $display("FAIL: both grants high");
+        $display("FAIL: sq_wr valid with no producer request");
     end
-    if (inst_dut.inst_loom_engine.busy && inst_dut.inst_loom_rx.busy) begin
-        errors++;
-        $display("FAIL: engine and rx busy simultaneously");
+    if (sq_wr.valid && sq_wr.ready) begin
+        if (inst_dut.rx_wr_valid) begin
+            if (sq_wr.data !== inst_dut.rx_wr_req) begin
+                errors++;
+                $display("FAIL: rx had a request but sq_wr carried something else");
+            end
+        end else if (sq_wr.data !== inst_dut.eng_wr_req) begin
+            errors++;
+            $display("FAIL: engine request handshake carried something else");
+        end
     end
 end
 
@@ -261,19 +273,18 @@ initial begin
     check(host_beats == 1, "T1: one host beat");
     wrq.delete(); host_beats = 0;
 
-    // --- T2: rx arrives while engine mid-DMA -> rx waits ---
+    // --- T2: rx arrives while engine mid-DMA -> both complete, either order ---
     descriptor(4'd1, 28'h100, 28'd192);          // 3 beats; feeder will supply
     rx_pending++;                     // race the rx request in
     wait_quiesce();
-    // order in wrq: DMA write first, rx write after
     check(wrq.size() == 2, "T2: two wr_reqs");
     if (wrq.size() == 2) begin
-        check(wrq[0].vaddr == BASE_B + 48'h100 && wrq[0].len == 192,
-              "T2: DMA wr first");
-        check(wrq[1].vaddr == 48'h7f9e_8860_0000 && wrq[1].pid == 6'd2,
-              "T2: rx wr second");
-        check(wrq[0].dest == 0 && wrq[1].dest == 1,
-              "T2: engine writes dest 0, rx writes dest 1");
+        int e, x;
+        e = (wrq[0].dest == 0) ? 0 : 1; x = 1 - e;
+        check(wrq[e].vaddr == BASE_B + 48'h100 && wrq[e].len == 192 && wrq[e].dest == 0,
+              "T2: DMA write present, dest 0");
+        check(wrq[x].vaddr == 48'h7f9e_8860_0000 && wrq[x].pid == 6'd2 && wrq[x].dest == 1,
+              "T2: rx write present, dest 1");
     end
     check(rx_done == 1, "T2: rx completed");
     wrq.delete(); rdq.delete(); host_beats = 0;
@@ -352,8 +363,8 @@ initial begin
 
     // --- T7: rdma route through the wrapper ---
     // Everything above is local route, so the top-level rdma path - the
-    // engine's net stream out through vfpga_top's muxes while the arbiter
-    // holds the pair - had never carried a beat. On the importer side of
+    // engine's net stream out through vfpga_top's muxes - had never
+    // carried a beat. On the importer side of
     // the two-host setup every window is rdma routed, so this is that
     // host's entire data plane
     begin
@@ -390,6 +401,60 @@ initial begin
               wrq[0].vaddr == STAGING_VA && wrq[0].len == 256 + 64 &&
               wrq[1].strm == STRM_HOST && wrq[1].len == 8,
               "T7: bulk request goes out rdma, fence stays local");
+    end
+
+    // --- T8: bidirectional - rx served while the engine is held mid-descriptor ---
+    // A 20-packet rdma descriptor against the reset window of 16 and no acks
+    // from the mock shell: the engine posts 16 packet requests and stalls on
+    // the window with its transaction open - the state BOTH hosts sit in
+    // during a bidirectional exchange. Incoming writes must still be
+    // forwarded. The old whole-transaction arbiter could not do this, and
+    // on hardware the shell's receive FSM (which emits and processes acks)
+    // stalled behind loom_rx, so the window never reopened: the two-host
+    // deadlock of 2026-09-16. Then the acks arrive and the engine finishes.
+    begin
+        int rx_before, rxb_before, wr_before;
+        rx_before  = rx_done;
+        rxb_before = rx_beats;
+        wrq.delete();
+        descriptor(4'd3, 28'h0, 28'd81920);            // 20 x 4096 on the rdma route
+        wait (inst_dut.tx_inflight == 16'd16);
+        repeat (50) @(posedge aclk);
+        check(inst_dut.inst_loom_engine.busy && inst_dut.tx_inflight == 16'd16,
+              "T8: engine held mid-descriptor by the window");
+        wr_before = wrq.size();
+        rx_pending += 3;
+        wait (rx_done == rx_before + 3);
+        repeat (10) @(posedge aclk);
+        check(inst_dut.inst_loom_engine.busy, "T8: engine still mid-descriptor while rx was served");
+        check(rx_beats == rxb_before + 3, "T8: three rx beats landed on stream 1");
+        check(wrq.size() == wr_before + 3 && wrq[wr_before].dest == 1 &&
+              wrq[wr_before + 1].dest == 1 && wrq[wr_before + 2].dest == 1,
+              "T8: three rx requests went out while the engine's were held");
+        // The far side acks, one per outstanding packet, never ahead of a
+        // request (an ack cannot precede what it acks). T7 left its two
+        // rdma packets unacked, so 2 + 21 acks drain everything.
+        begin
+            int acks = 0;
+            while (acks < 40 && (inst_dut.inst_loom_engine.busy || inst_dut.tx_inflight != 16'd0)) begin
+                wait (inst_dut.tx_inflight != 16'd0);
+                @(negedge aclk);
+                cq_wr.valid = 1; cq_wr.data = '0; cq_wr.data.remote = 1;
+                @(negedge aclk);
+                cq_wr.valid = 0;
+                acks++;
+                repeat (3) @(posedge aclk);
+            end
+            check(acks == 2 + 21, $sformatf("T8: %0d acks drained the window (2 from T7 + 21 packets)", acks));
+        end
+        wait_quiesce();
+        check(!inst_dut.inst_loom_engine.busy, "T8: engine finished once acked");
+        begin
+            int nr = 0;
+            foreach (wrq[k]) if (wrq[k].strm == STRM_RDMA) nr++;
+            check(nr == 21, $sformatf("T8: 21 packet requests for the descriptor, saw %0d", nr));
+        end
+        check(inst_dut.tx_inflight == 16'd0, "T8: nothing left unacked");
     end
 
     if (errors == 0) $display("TB PASS (tb_loom_top)");

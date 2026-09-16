@@ -803,30 +803,39 @@ void run_bench(coyote::cThread &t_ctrl, loom::Xpu &A, int win,
 // Per host: XPU 1 and XPU 2, each on its own cThread with its own buffer,
 // plus the dedicated QP owner. The client XPUs exchange locally (A1<->A2,
 // the cross-pid write through the TLB; the server side is the same code
-// and is not repeated), and every A->B pair remotely (A1->B1, A2->B2,
-// A1->B2, A2->B1, each answered). What makes the remote cases land in the
-// right address space is the destination pid the sender's window carries
-// into the message header - one QP serves all four.
+// and is not repeated), every A->B pair remotely (A1->B1, A2->B2, A1->B2,
+// A2->B1, each answered), then A1<->B1 BIDIRECTIONALLY (both push at
+// once, one issuer per engine), then A1<->B1 and A2<->B2 concurrently
+// (both directions AND two issuers per engine). What makes the remote
+// cases land in the right address space is the destination pid the
+// sender's window carries into the message header - one QP serves all.
 //
-// The fence carries the engine's ONE running completion count (per vFPGA,
-// not per XPU), so a fence word is waited on for >= its old value + 1,
-// never for equality: the other XPU's completions advance the count too.
+// The fence carries the issuing XPU's own completion count (per source pid
+// in the engine); a fence word is waited on for >= its old value + 1.
 //
 // Protocol: the client drives; each server XPU runs a service thread that
 // polls a COMMAND word in its own buffer (the GPU model again):
 //   CMD_REMOTE {seq, from}: verify DATA against pattern(from -> me), copy
 //     it back into the sender's buffer through the window onto it, store
 //     RFLAG = seq there
+//   CMD_BIDIR  {seq, from}: push pattern(me -> from) at the sender NOW (the
+//     sender's own push follows its command by one wire latency, so the
+//     two overlap for nearly the whole transfer), store RFLAG = seq; then
+//     wait for the sender's BFLAG = seq, verify DATA against
+//     pattern(from -> me), store ACK = seq back
 // -------------------------------------------------------------------------
 constexpr uint64_t MX_RFLAG  = 0xF00;   // remote reply landed (seq)      [importer side]
 constexpr uint64_t MX_LFLAG  = 0xF10;   // local copy landed (seq)
 constexpr uint64_t MX_CMD    = 0xF20;   // {code[63:56], from/to[55:48], seq[47:0]}
 constexpr uint64_t MX_LEN    = 0xF28;   // bytes of the command's payload
+constexpr uint64_t MX_ACK    = 0xF30;   // receiver verified the sender's bidir push (seq)
+constexpr uint64_t MX_BFLAG  = 0xF38;   // sender's bidir push fenced (seq)   [server side]
 constexpr uint64_t MX_DATA   = 4ULL << 20;   // remote landing region
 constexpr uint64_t MX_LOCAL  = 8ULL << 20;   // local landing region
-constexpr uint64_t MX_SRC    = 12ULL << 20;  // where a local sender keeps its pattern
+constexpr uint64_t MX_SRC    = 12ULL << 20;  // where a sender keeps its pattern
 constexpr uint64_t MX_BUF    = 16ULL << 20;  // per-XPU buffer for XPU 2
-constexpr uint64_t CMD_REMOTE = 1;
+constexpr uint64_t MX_LEN_R  = 4ULL << 20;   // the remote transfer size
+constexpr uint64_t CMD_REMOTE = 1, CMD_BIDIR = 3;
 
 inline uint64_t mx_cmd(uint64_t code, uint64_t who, uint64_t seq) {
     return (code << 56) | (who << 48) | (seq & 0xFFFF'FFFF'FFFFULL);
@@ -858,6 +867,9 @@ template <class DoneFn>
 void mx_serve(MxServerXpu x, DoneFn done) {
     volatile uint64_t *cmd  = x.buf + MX_CMD / 8;
     volatile uint64_t *lenw = x.buf + MX_LEN / 8;
+    // The bidir source, filled ahead of time: the push has to start the
+    // moment the command lands or it does not overlap the client's
+    for (uint64_t w = 0; w < MX_LEN_R / 8; w++) x.buf[MX_SRC / 8 + w] = mx_word(x.me + 2, x.me, w);
     uint64_t last_cmd = 0;
     while (!done()) {
         bool any = false;
@@ -877,6 +889,19 @@ void mx_serve(MxServerXpu x, DoneFn done) {
                     if (!spin64_ge(x.fence, f + 1, 5e6)) { printf("FAIL: B%d reply never fenced\n", x.me); failures++; }
                     x.xpu->store(x.to_a[who - 1], uint32_t(MX_LEN), len);
                     x.xpu->store(x.to_a[who - 1], uint32_t(MX_RFLAG), seq);
+                } else if (code == CMD_BIDIR) {
+                    if (int(who) != x.me || len > MX_LEN_R) { printf("FAIL: B%d bidir from A%lu, %lu B: unsupported\n", x.me, (unsigned long) who, (unsigned long) len); failures++; continue; }
+                    const uint64_t f = *x.fence;
+                    x.xpu->copy(x.to_a[who - 1], uint32_t(MX_DATA), x.buf + MX_SRC / 8, len, x.fence);
+                    if (!spin64_ge(x.fence, f + 1, 5e6)) { printf("FAIL: matrix bidir: B%d -> A%lu never fenced\n", x.me, (unsigned long) who); failures++; }
+                    x.xpu->store(x.to_a[who - 1], uint32_t(MX_LEN), len);
+                    x.xpu->store(x.to_a[who - 1], uint32_t(MX_RFLAG), seq);
+                    if (!spin64(x.buf + MX_BFLAG / 8, seq, 5e6)) { printf("FAIL: matrix bidir: A%lu -> B%d flag never landed\n", (unsigned long) who, x.me); failures++; continue; }
+                    char what[96];
+                    snprintf(what, sizeof what, "matrix bidir: A%lu -> B%d landed (%lu B, seq %lu)",
+                             (unsigned long) who, x.me, (unsigned long) len, (unsigned long) seq);
+                    mx_check(x.buf + MX_DATA / 8, int(who), x.me + 2, len, what);
+                    x.xpu->store(x.to_a[who - 1], uint32_t(MX_ACK), seq);
                 }
             }
         }
@@ -889,7 +914,40 @@ void mx_serve(MxServerXpu x, DoneFn done) {
 struct MxClientXpu { loom::Xpu *xpu; uint64_t *buf; uint64_t *src; volatile uint64_t *fence; };
 void run_matrix(MxClientXpu A[2], int to_b[2][2], int to_a[2]) {
     uint64_t seq = 0x100;
-    const uint64_t LEN_R = 4ULL << 20, LEN_L = 1ULL << 20;
+    const uint64_t LEN_R = MX_LEN_R, LEN_L = 1ULL << 20;
+    // A_i -> B_i and B_i -> A_i at once. Our command starts B's push; ours
+    // follows it by one wire latency (~8 us against ~370 us of transfer).
+    // One issuer per engine on each side - the two-issuer case is the
+    // concurrent phase.
+    auto bidir = [&](int i, uint64_t len, uint64_t sq, const char *tag) {
+        memset(A[i].buf + MX_DATA / 8, 0, len);
+        const uint64_t f = *A[i].fence;
+        A[i].xpu->store(to_b[i][i], uint32_t(MX_LEN), len);
+        A[i].xpu->store(to_b[i][i], uint32_t(MX_CMD), mx_cmd(CMD_BIDIR, i + 1, sq));
+        A[i].xpu->copy(to_b[i][i], uint32_t(MX_DATA), A[i].src, len, A[i].fence);
+        if (!spin64_ge(A[i].fence, f + 1, 5e6)) { printf("FAIL: %s: A%d -> B%d never fenced\n", tag, i + 1, i + 1); failures++; return; }
+        A[i].xpu->store(to_b[i][i], uint32_t(MX_BFLAG), sq);
+        if (!spin64(A[i].buf + MX_RFLAG / 8, sq, 5e6)) { printf("FAIL: %s: B%d -> A%d never arrived\n", tag, i + 1, i + 1); failures++; return; }
+        char what[96];
+        snprintf(what, sizeof what, "%s: B%d -> A%d landed (%lu B)", tag, i + 1, i + 1, (unsigned long) len);
+        mx_check(A[i].buf + MX_DATA / 8, i + 3, i + 1, len, what);
+        if (!spin64(A[i].buf + MX_ACK / 8, sq, 5e6)) { printf("FAIL: %s: B%d never acked A%d's data\n", tag, i + 1, i + 1); failures++; }
+    };
+    if (const char *e = getenv("LOOM_MATRIX_BIDIR")) {
+        // Only the bidirectional exchange, N rounds
+        const int rounds = atoi(e);
+        printf("\n== matrix bidir only: A1 <-> B1, %d rounds of %lu B each way\n", rounds, (unsigned long) LEN_R);
+        fflush(stdout);
+        for (uint64_t w = 0; w < LEN_R / 8; w++) A[0].src[w] = mx_word(1, 3, w);
+        const int f0 = failures;
+        for (int r = 0; r < rounds; r++) {
+            bidir(0, LEN_R, ++seq, "matrix bidir");
+            if (failures != f0) { printf("matrix bidir: stopping after the first failure (round %d of %d)\n", r + 1, rounds); break; }
+        }
+        printf("== matrix done\n");
+        fflush(stdout);
+        return;
+    }
     printf("\n== matrix: 2 local + 2 remote XPUs\n");
     fflush(stdout);
     auto remote = [&](int i, int j, uint64_t len, uint64_t sq, const char *tag) {
@@ -923,6 +981,9 @@ void run_matrix(MxClientXpu A[2], int to_b[2][2], int to_a[2]) {
     remote(1, 1, LEN_R, ++seq, "matrix: A2 -> B2");
     remote(0, 1, LEN_R, ++seq, "matrix: A1 -> B2");
     remote(1, 0, LEN_R, ++seq, "matrix: A2 -> B1");
+    // --- bidirectional: A1 -> B1 and B1 -> A1 at once, one issuer per engine ---
+    for (uint64_t w = 0; w < LEN_R / 8; w++) A[0].src[w] = mx_word(1, 3, w);
+    for (int r = 0, f0 = failures; r < 8 && failures == f0; r++) bidir(0, LEN_R, ++seq, "matrix bidir");
     // --- concurrent: A1<->B1 and A2<->B2 at once, several rounds ---
     {
         const int rounds = 8;
