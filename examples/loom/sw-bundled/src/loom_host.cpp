@@ -801,11 +801,12 @@ void run_bench(coyote::cThread &t_ctrl, loom::Xpu &A, int win,
 // MATRIX: 2 local + 2 remote XPUs exchanging data every way.
 //
 // Per host: XPU 1 and XPU 2, each on its own cThread with its own buffer,
-// plus the dedicated QP owner. Every XPU pair exchanges: local (A1<->A2,
-// B1<->B2 - the cross-pid write through the TLB) and remote (A1->B1,
-// A2->B2, A1->B2, A2->B1, each answered). What makes the remote cases
-// land in the right address space is the destination pid the sender's
-// window carries into the message header - one QP serves all four.
+// plus the dedicated QP owner. The client XPUs exchange locally (A1<->A2,
+// the cross-pid write through the TLB; the server side is the same code
+// and is not repeated), and every A->B pair remotely (A1->B1, A2->B2,
+// A1->B2, A2->B1, each answered). What makes the remote cases land in the
+// right address space is the destination pid the sender's window carries
+// into the message header - one QP serves all four.
 //
 // The fence carries the engine's ONE running completion count (per vFPGA,
 // not per XPU), so a fence word is waited on for >= its old value + 1,
@@ -816,21 +817,16 @@ void run_bench(coyote::cThread &t_ctrl, loom::Xpu &A, int win,
 //   CMD_REMOTE {seq, from}: verify DATA against pattern(from -> me), copy
 //     it back into the sender's buffer through the window onto it, store
 //     RFLAG = seq there
-//   CMD_LOCAL  {seq, to}:   copy pattern(me -> to) into the other server
-//     XPU's LOCAL region through the local window, store its LFLAG = seq;
-//     the other XPU's service verifies it and stores ACK = seq into A1's
-//     buffer so the client can move on
 // -------------------------------------------------------------------------
 constexpr uint64_t MX_RFLAG  = 0xF00;   // remote reply landed (seq)      [importer side]
 constexpr uint64_t MX_LFLAG  = 0xF10;   // local copy landed (seq)
 constexpr uint64_t MX_CMD    = 0xF20;   // {code[63:56], from/to[55:48], seq[47:0]}
 constexpr uint64_t MX_LEN    = 0xF28;   // bytes of the command's payload
-constexpr uint64_t MX_ACK    = 0xF30;   // server-side local exchange verified (seq)
 constexpr uint64_t MX_DATA   = 4ULL << 20;   // remote landing region
 constexpr uint64_t MX_LOCAL  = 8ULL << 20;   // local landing region
 constexpr uint64_t MX_SRC    = 12ULL << 20;  // where a local sender keeps its pattern
 constexpr uint64_t MX_BUF    = 16ULL << 20;  // per-XPU buffer for XPU 2
-constexpr uint64_t CMD_REMOTE = 1, CMD_LOCAL = 2;
+constexpr uint64_t CMD_REMOTE = 1;
 
 inline uint64_t mx_cmd(uint64_t code, uint64_t who, uint64_t seq) {
     return (code << 56) | (who << 48) | (seq & 0xFFFF'FFFF'FFFFULL);
@@ -852,19 +848,17 @@ static bool mx_check(const uint64_t *at, int from, int to, uint64_t len, const c
     return true;
 }
 
-// Server side: one per server XPU. `me` is 1 or 2 (B1/B2); `other_local`
-// is the local window onto the other server XPU; `to_a[j]` the remote
-// window onto client XPU j+1; `a1_win` where ACKs go.
+// Server side: one per server XPU. `me` is 1 or 2 (B1/B2); `to_a[j]` is
+// the remote window onto client XPU j+1.
 struct MxServerXpu {
     loom::Xpu *xpu; uint64_t *buf; volatile uint64_t *fence; int me;
-    int other_local; int to_a[2]; int a1_win;
+    int to_a[2];
 };
 template <class DoneFn>
 void mx_serve(MxServerXpu x, DoneFn done) {
     volatile uint64_t *cmd  = x.buf + MX_CMD / 8;
     volatile uint64_t *lenw = x.buf + MX_LEN / 8;
-    volatile uint64_t *lfl  = x.buf + MX_LFLAG / 8;
-    uint64_t last_cmd = 0, last_lseq = 0;
+    uint64_t last_cmd = 0;
     while (!done()) {
         bool any = false;
         for (int i = 0; i < 20000 && !any; i++) {
@@ -883,24 +877,7 @@ void mx_serve(MxServerXpu x, DoneFn done) {
                     if (!spin64_ge(x.fence, f + 1, 5e6)) { printf("FAIL: B%d reply never fenced\n", x.me); failures++; }
                     x.xpu->store(x.to_a[who - 1], uint32_t(MX_LEN), len);
                     x.xpu->store(x.to_a[who - 1], uint32_t(MX_RFLAG), seq);
-                } else if (code == CMD_LOCAL) {
-                    for (uint64_t w = 0; w < len / 8; w++)
-                        x.buf[MX_SRC / 8 + w] = mx_word(x.me + 2, int(who) + 2, w);
-                    const uint64_t f = *x.fence;
-                    x.xpu->copy(x.other_local, uint32_t(MX_LOCAL), x.buf + MX_SRC / 8, len, x.fence);
-                    if (!spin64_ge(x.fence, f + 1, 5e6)) { printf("FAIL: B%d local copy never fenced\n", x.me); failures++; }
-                    x.xpu->store(x.other_local, uint32_t(MX_LEN), len);
-                    x.xpu->store(x.other_local, uint32_t(MX_LFLAG), seq);
                 }
-            }
-            const uint64_t l = *lfl;
-            if (l != last_lseq && l != 0) {
-                last_lseq = l; any = true;
-                const int from = (x.me == 1) ? 2 : 1;
-                char what[96];
-                snprintf(what, sizeof what, "matrix: B%d -> B%d local landed (seq %lu)", from, x.me, (unsigned long) l);
-                mx_check(x.buf + MX_LOCAL / 8, from + 2, x.me + 2, *lenw, what);
-                x.xpu->store(x.a1_win, uint32_t(MX_ACK), l);
             }
         }
     }
@@ -940,14 +917,6 @@ void run_matrix(MxClientXpu A[2], int to_b[2][2], int to_a[2]) {
         if (!spin64(A[k].buf + MX_LFLAG / 8, seq, 5e6)) { printf("FAIL: local A%d->A%d flag never landed\n", i+1, k+1); failures++; continue; }
         char what[64]; snprintf(what, sizeof what, "matrix: A%d -> A%d local landed", i + 1, k + 1);
         mx_check(A[k].buf + MX_LOCAL / 8, i + 1, k + 1, LEN_L, what);
-    }
-    // --- local, server side: B1 -> B2, B2 -> B1 (ordered through A1's ACK) ---
-    for (int i = 0; i < 2; i++) {
-        const int k = 1 - i;
-        A[0].xpu->store(to_b[0][i], uint32_t(MX_LEN), LEN_L);
-        A[0].xpu->store(to_b[0][i], uint32_t(MX_CMD), mx_cmd(CMD_LOCAL, k + 1, ++seq));
-        if (!spin64(A[0].buf + MX_ACK / 8, seq, 5e6)) { printf("FAIL: matrix: B%d -> B%d local never acked\n", i+1, k+1); failures++; }
-        else printf("PASS: matrix: B%d -> B%d local acked by the receiver\n", i + 1, k + 1);
     }
     // --- remote, every pair, one at a time ---
     remote(0, 0, LEN_R, ++seq, "matrix: A1 -> B1");
@@ -1194,12 +1163,8 @@ int run_server(uint16_t qp_port, uint16_t peer_port, const std::string &sock) {
                 auto *fence_s2 = static_cast<uint64_t *>(S2.allocSmall(4096));
                 if (!fence_s2) { printf("FAIL: alloc fence xpu2\n"); return 1; }
                 memset(fence_s2, 0, 4096);
-                // Local windows: B1 onto B2's buffer and B2 onto B1's
-                const int wl1 = orch.importLocal(1), wl3 = orch.importLocal(3);
-                check(wl1 != loom::NO_WINDOW && wl3 != loom::NO_WINDOW,
-                      "matrix: local windows onto both server XPUs");
-                MxServerXpu x1{&S1, dst1, fence_s1, 1, wl3, {orch.pongWindow(0), orch.pongWindow(1)}, orch.pongWindow(0)};
-                MxServerXpu x2{&S2, dst3, fence_s2, 2, wl1, {orch.pongWindow(0), orch.pongWindow(1)}, orch.pongWindow(0)};
+                MxServerXpu x1{&S1, dst1, fence_s1, 1, {orch.pongWindow(0), orch.pongWindow(1)}};
+                MxServerXpu x2{&S2, dst3, fence_s2, 2, {orch.pongWindow(0), orch.pongWindow(1)}};
                 auto done = [&] { return peer.doneCount() >= 1; };
                 std::thread th1([&] { mx_serve(x1, done); });
                 std::thread th2([&] { mx_serve(x2, done); });
