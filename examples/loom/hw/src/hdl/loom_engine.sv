@@ -45,6 +45,16 @@ import lynxTypes::*;
  *   remote loads arrive with the two-host phase) still ALWAYS responds:
  *   poison (all-ones) + cnt_drop, so the issuing CPU is never wedged.
  *
+ * WHAT IS THE XPU'S AND WHAT IS LOOM'S. The pull (one LOCAL_READ under the
+ * issuing XPU's pid), the transmit buffer and the fence are the EMULATED
+ * COPY ENGINE of the XPU that issued the descriptor - in a real system
+ * that is the XPU's own engine and semaphore, one per XPU. Everything from
+ * the window lookup on (header, packetising, the ack window, loom_rx) is
+ * Loom, the per-host device every XPU shares. The prototype instantiates
+ * both in this module; the descriptor's src_pid is what keeps the
+ * emulated engines apart (pull TLB context, fence address space, and the
+ * per-pid completion count below).
+ *
  * TRANSMIT PACING (rdma DESC), 2026-09-13. The source is a copy engine
  * that streams: the pull is ONE LOCAL_READ for the whole descriptor and
  * its beats arrive at whatever rate the host side delivers. Loom does not
@@ -355,7 +365,13 @@ assign cnt_tx_ack     = ack_valid;
 assign cnt_tx_winfull = rdma_req && !win_ok;
 assign cnt_tx_reqwait = rdma_req &&  win_ok && !wr_ready;
 
-logic [63:0] compl_cnt;
+// Completion count PER SOURCE PID. The pull and the fence are the emulated
+// copy engine of the XPU that issued the descriptor - in a real system
+// that engine, and its semaphore, are the XPU's own - so each XPU sees only
+// its own completions in its fence words. One shared counter would have
+// let another XPU's completions inflate the value written here (found by
+// the two-XPU matrix, 2026-09-14). Indexed by the descriptor's src_pid.
+logic [31:0] compl_cnt [1 << PID_BITS];
 logic [63:0] rd_data;      // lane-selected read result (or poison)
 logic [2:0]  rd_lane;      // which 8 B lane of the pulled line
 
@@ -384,7 +400,7 @@ wire [VADDR_BITS-1:0] rd_line_va = {rd_addr[VADDR_BITS-1:6], 6'b0};
 always_ff @(posedge aclk) begin
     if (!aresetn) begin
         state <= ST_IDLE;
-        compl_cnt <= 0;
+        for (int i = 0; i < (1 << PID_BITS); i++) compl_cnt[i] <= 0;
         l_is_desc <= 0; l_is_read <= 0; l_off <= 0; l_len <= 0;
         l_src_pid <= 0; l_compl_va <= 0;
         rd_data <= 0; rd_lane <= 0;
@@ -483,7 +499,7 @@ always_ff @(posedge aclk) begin
             ST_CP_REQ:    if (wr_hs) state <= ST_CP_DATA;
             ST_CP_DATA:
                 if (m_host_tready) begin
-                    compl_cnt <= compl_cnt + 1;
+                    compl_cnt[l_src_pid] <= compl_cnt[l_src_pid] + 1;
                     state <= ST_IDLE;
                 end
 
@@ -656,7 +672,7 @@ wire [AXI_DATA_BITS-1:0] msg_write_beat =
 // -------------------------------------------------------------------------
 // Store/completion beat: data LSB-aligned, low 8 bytes valid (gate G2)
 wire [AXI_DATA_BITS-1:0]   beat_data = {{(AXI_DATA_BITS-64){1'b0}},
-                                        (state == ST_CP_DATA) ? (compl_cnt + 1) : l_payload};
+                                        (state == ST_CP_DATA) ? {32'b0, compl_cnt[l_src_pid] + 32'd1} : l_payload};
 wire [AXI_DATA_BITS/8-1:0] beat_keep = {{(AXI_DATA_BITS/8-8){1'b0}}, 8'hFF};
 
 wire stream_local = (state == ST_STREAM) && !l_route;

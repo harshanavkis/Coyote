@@ -151,6 +151,19 @@ with Flows 1-4 is inherited from the design — writes are posted, loads
 stall the issuer for the round trip, which is why the fast path stays
 push-only and loads exist as a correctness/debug facility.
 
+## What is the XPU's and what is Loom's
+
+`loom_engine` instantiates two things. The pull (one `LOCAL_READ` under the
+issuing XPU's pid), the transmit buffer and the fence are the **emulated
+copy engine of the issuing XPU** — in a real system the XPU's own engine
+and semaphore, one per XPU; the fence is a per-XPU completion count
+(indexed by the descriptor's source pid), the hardware-incremented form of
+the per-queue fence seqno a GPU driver keeps, and a waiter spins for
+`>= old + 1`. Everything from the window lookup on — header, packetising,
+the ack window, `loom_rx` — is **Loom**, the per-host device every XPU
+shares. The descriptor's source pid is what keeps the emulated engines
+apart.
+
 ## Flow 6 — two XPUs per host
 
 Add D on host 2 (pid 1) and A2 on host 1 (pid 2), each with its own

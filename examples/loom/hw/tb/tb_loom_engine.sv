@@ -383,7 +383,9 @@ initial begin
               "dma rdma: payload beats follow the header unchanged");
     end
     netq.delete();
-    check(hostq.size() == 1 && hostq[0].data == 64'd2, "dma rdma: completion value 2");
+    // src_pid 0's FIRST completion (case 3's was pid 2's): the count is per
+    // issuing XPU, not per engine
+    check(hostq.size() == 1 && hostq[0].data == 64'd1, "dma rdma: completion value 1 (pid 0's own count)");
     hostq.delete();
 
     // --- 4b. Multi-packet message under a window of 2 ---
@@ -508,7 +510,7 @@ initial begin
     if (hostq.size() == 4) begin
         check(hostq[0].data == 64'hCC00 && hostq[1].data == 64'hCC01,
               "ordering: dma beats first");
-        check(hostq[2].data == 64'd3, "ordering: completion count 3");
+        check(hostq[2].data == 64'd2, "ordering: completion count 2 (pid 2's second)");
         check(hostq[3].data == 64'hF1A6, "ordering: flag beat last");
     end
     hostq.delete();
@@ -766,6 +768,30 @@ initial begin
           $sformatf("tx accounting: local route excluded (%0d/%0d/%0d)",
                     tx_move, tx_starve, tx_stall));
     hostq.delete(); netq.delete(); wrq.delete(); rdq.delete();
+
+    // --- Per-XPU completion counts: two issuers interleaved, each sees
+    //     only its own count in its fence (the emulated copy engine is the
+    //     XPU's; one shared counter let the other XPU inflate it)
+    begin
+        logic [63:0] v2a, v0a, v2b, v0b;
+        hostq.delete(); wrq.delete(); rdq.delete();
+        descriptor(4'd1, 28'h700, {16'b0, SRC_VA}, 28'd64, 6'd2, {16'b0, CPL_VA});
+        fork send_beats(1, 64'hA000); join_none
+        wait_idle(); v2a = hostq[$].data; hostq.delete();
+        descriptor(4'd1, 28'h740, {16'b0, SRC_VA}, 28'd64, 6'd0, {16'b0, CPL_VA});
+        fork send_beats(1, 64'hA100); join_none
+        wait_idle(); v0a = hostq[$].data; hostq.delete();
+        descriptor(4'd1, 28'h780, {16'b0, SRC_VA}, 28'd64, 6'd2, {16'b0, CPL_VA});
+        fork send_beats(1, 64'hA200); join_none
+        wait_idle(); v2b = hostq[$].data; hostq.delete();
+        descriptor(4'd1, 28'h7C0, {16'b0, SRC_VA}, 28'd64, 6'd0, {16'b0, CPL_VA});
+        fork send_beats(1, 64'hA300); join_none
+        wait_idle(); v0b = hostq[$].data; hostq.delete();
+        check(v2b == v2a + 1, $sformatf("per-xpu fence: pid 2 counts only its own (%0d -> %0d)", v2a, v2b));
+        check(v0b == v0a + 1, $sformatf("per-xpu fence: pid 0 counts only its own (%0d -> %0d)", v0a, v0b));
+        check(v2a != v0a, "per-xpu fence: the two XPUs' counts are independent");
+        wrq.delete(); rdq.delete();
+    end
 
     if (errors == 0) $display("TB PASS (tb_loom_engine)");
     else             $display("TB FAIL (tb_loom_engine): %0d errors", errors);
