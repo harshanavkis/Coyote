@@ -229,6 +229,28 @@ def driver_loaded(remote_host=False):
     return bool(sysfs_dir(remote_host))
 
 
+# The identity setup_coyote.sh gives each host's stack. If udev auto-loaded
+# the driver on the PCI rescan and the parameterized reload did not take
+# (insmod "File exists", hidden), the card runs with the driver's DEFAULT ip
+# (0x0b01d4d1): ARP never resolves, nothing is delivered, every wait times
+# out, and the sysfs node looks perfectly healthy. 2026-09-17 cost an hour.
+EXPECT_IP = {"clara": "0a000002", "amy": "0a000001"}
+
+
+def card_ip(remote_host=False):
+    d = sysfs_dir(remote_host)
+    if not d:
+        return ""
+    cmd = f"sudo cat {d}/cyt_attr_ip 2>/dev/null"
+    out = (remote(cmd, check=False) if remote_host else local(cmd, check=False)).stdout
+    m = re.search(r"IP address: ([0-9a-f]+)", out)
+    return m.group(1) if m else ""
+
+
+def identity_ok(host, is_remote):
+    return card_ip(is_remote) == EXPECT_IP[host]
+
+
 def read_nstats(remote_host=False):
     d = sysfs_dir(remote_host)
     if not d:
@@ -322,14 +344,20 @@ def flash(settle, hosts=("amy", "clara")):
             run(f"cd {COYOTE} && sudo bash setup_coyote.sh",
                 check=False, quiet=False)
             st = poll_for(up, is_remote, WAIT_SETUP // SETUP_TRIES)
+            # the node being there is not enough: the driver must be OURS
+            if st and not identity_ok(host, is_remote):
+                print(f"   {host}: driver up with the WRONG identity (ip "
+                      f"{card_ip(is_remote) or '?'}, want {EXPECT_IP[host]}): "
+                      f"udev's auto-load won, running setup again", flush=True)
+                st = None
             if st:
                 break
             print(f"   {host}: setup did not take, running it again",
                   flush=True)
         if not st:
-            die(f"{host}: the driver did not attach after {SETUP_TRIES} "
-                f"setup_coyote.sh runs.\n"
-                f"  card reports: {show(card_state(is_remote))}")
+            die(f"{host}: the driver did not attach with this host's identity "
+                f"after {SETUP_TRIES} setup_coyote.sh runs.\n"
+                f"  card reports: {show(card_state(is_remote))}, ip {card_ip(is_remote) or '?'}")
         print(f"   {host}: card programmed and driver up ({show(st)})",
               flush=True)
 
@@ -343,6 +371,11 @@ def preflight():
         if not card_programmed(is_remote):
             die(f"{host}: card is not running the Coyote shell (expected 10ee:903f). "
                 f"Run with --flash.")
+        if driver_loaded(is_remote) and not identity_ok(host, is_remote):
+            die(f"{host}: the driver is up with the WRONG identity (ip "
+                f"{card_ip(is_remote) or '?'}, want {EXPECT_IP[host]}) - "
+                f"udev's auto-load won over setup_coyote.sh. Reload it: "
+                f"cd {COYOTE} && sudo rmmod coyote_driver && sudo bash setup_coyote.sh")
         if not driver_loaded(is_remote):
             print(f"   {host}: loading driver", flush=True)
             (remote if is_remote else local)(
@@ -488,6 +521,8 @@ def bench_env(args, gap):
             env += " LOOM_BIDIR_NOWARMUP=1"
         if args.local:
             env += f" LOOM_MATRIX_LOCAL={args.local}"
+        if args.storm:
+            env += f" LOOM_STORM_STORES={args.storm}"
     elif args.xpus > 1:
         env += f" LOOM_XPUS={args.xpus}"
     if args.skip_bulk:
@@ -531,7 +566,7 @@ def summarize(args, gap, result, verdicts=None):
         for l in rows:
             if "FAIL" in l: print("  " + l.rstrip())
         for l in cli_out + srv_out:
-            if l.startswith(("bidir timing:", "local timing:", "tx [")) or "warm-up" in l: print("  " + l.rstrip())
+            if l.startswith(("bidir timing:", "local timing:", "storm timing:", "tx [")) or "warm-up" in l: print("  " + l.rstrip())
         return
     if args.pingpong:
         # The client prints one row per size; the verdict is the server's
@@ -698,6 +733,10 @@ def main():
                     help="only N timed rounds of a 4 MiB local copy A1 -> A2 "
                          "on the client (host DMA read + write at once, no "
                          "network); implies --matrix")
+    ap.add_argument("--storm", type=int, default=0, metavar="K",
+                    help="with --bidir: after the timed rounds, N more rounds "
+                         "in which B answers A's 4 MiB push with K 64 B "
+                         "stores instead of a push (packets without bytes)")
     ap.add_argument("--skip-bulk", action="store_true")
     ap.add_argument("--retries", type=int, default=2,
                     help="reflash both cards and retry after a wedge")

@@ -855,7 +855,7 @@ constexpr uint64_t MX_LOCAL  = 8ULL << 20;   // local landing region
 constexpr uint64_t MX_SRC    = 12ULL << 20;  // where a sender keeps its pattern
 constexpr uint64_t MX_BUF    = 16ULL << 20;  // per-XPU buffer for XPU 2
 constexpr uint64_t MX_LEN_R  = 4ULL << 20;   // the remote transfer size
-constexpr uint64_t CMD_REMOTE = 1, CMD_BIDIR = 3;
+constexpr uint64_t CMD_REMOTE = 1, CMD_BIDIR = 3, CMD_STORM = 6;
 
 inline uint64_t mx_cmd(uint64_t code, uint64_t who, uint64_t seq) {
     return (code << 56) | (who << 48) | (seq & 0xFFFF'FFFF'FFFFULL);
@@ -909,6 +909,17 @@ void mx_serve(MxServerXpu x, DoneFn done) {
                     if (!spin64_ge(x.fence, f + 1, 5e6)) { printf("FAIL: B%d reply never fenced\n", x.me); failures++; }
                     x.xpu->store(x.to_a[who - 1], uint32_t(MX_LEN), len);
                     x.xpu->store(x.to_a[who - 1], uint32_t(MX_RFLAG), seq);
+                } else if (code == CMD_STORM) {
+                    // len = how many 64 B stores to fire back-to-back at A
+                    // while A pushes 4 MiB at us: small PACKETS, no bytes.
+                    // Then the usual landing handshake.
+                    for (uint64_t k = 0; k < len; k++) x.xpu->store(x.to_a[who - 1], uint32_t(MX_RFLAG), seq);
+                    if (!spin64(x.buf + MX_BFLAG / 8, seq, 5e6)) { printf("FAIL: matrix storm: A%lu -> B%d flag never landed\n", (unsigned long) who, x.me); failures++; continue; }
+                    x.xpu->store(x.to_a[who - 1], uint32_t(MX_ACK), seq);
+                    char what[96];
+                    snprintf(what, sizeof what, "matrix storm: A%lu -> B%d landed (seq %lu)", (unsigned long) who, x.me, (unsigned long) seq);
+                    mx_check(x.buf + MX_DATA / 8, int(who), x.me + 2, MX_LEN_R, what);
+                    x.xpu->store(x.to_a[who - 1], uint32_t(MX_VFLAG), seq);
                 } else if (code == CMD_BIDIR) {
                     if (int(who) != x.me || len > MX_LEN_R) { printf("FAIL: B%d bidir from A%lu, %lu B: unsupported\n", x.me, (unsigned long) who, (unsigned long) len); failures++; continue; }
                     const uint64_t f = *x.fence;
@@ -1077,6 +1088,34 @@ void run_matrix(MxClientXpu A[2], int to_b[2][2], int to_a[2]) {
             if (failures != f0) { printf("matrix bidir: stopping after the first failure (round %d of %d)\n", r + 1, n_rounds); break; }
         }
         bidir_report(LEN_R);
+        if (const char *k = getenv("LOOM_STORM_STORES")) {
+            // Same rounds, but B answers with K 64 B stores instead of 4 MiB:
+            // does A's push slow down per PACKET B sends (rx cost per
+            // packet) or per BYTE? Fence-clocked: 394 us alone, ~700 us
+            // against a 4 MiB push.
+            const uint64_t K = strtoull(k, nullptr, 0);
+            std::vector<double> t;
+            for (int r = 0; r < n_rounds && failures == f0; r++) {
+                using clk = std::chrono::steady_clock;
+                memset(A[0].buf + MX_DATA / 8, 0, 8);
+                const uint64_t sq = ++seq;
+                const uint64_t f = *A[0].fence;
+                A[0].xpu->store(to_b[0][0], uint32_t(MX_LEN), K);
+                const auto t0 = clk::now();
+                A[0].xpu->store(to_b[0][0], uint32_t(MX_CMD), mx_cmd(CMD_STORM, 1, sq));
+                A[0].xpu->copy(to_b[0][0], uint32_t(MX_DATA), A[0].src, LEN_R, A[0].fence);
+                if (!spin64_ge(A[0].fence, f + 1, 5e6)) { printf("FAIL: storm: A1 -> B1 never fenced\n"); failures++; break; }
+                t.push_back(std::chrono::duration<double, std::micro>(clk::now() - t0).count());
+                A[0].xpu->store(to_b[0][0], uint32_t(MX_BFLAG), sq);
+                if (!spin64(A[0].buf + MX_ACK / 8, sq, 5e6)) { printf("FAIL: storm: B1 never acked\n"); failures++; break; }
+                if (!spin64(A[0].buf + MX_VFLAG / 8, sq, 5e6)) { printf("FAIL: storm: B1 never verified\n"); failures++; break; }
+            }
+            if (!t.empty()) {
+                std::vector<double> v = t; std::sort(v.begin(), v.end());
+                printf("storm timing: A -> B 4 MiB fenced while B fires %lu x 64 B stores: median %.1f  min %.1f  max %.1f us\n",
+                       (unsigned long) K, v[v.size() / 2], v.front(), v.back());
+            }
+        }
         printf("== matrix done\n");
         fflush(stdout);
         return;
