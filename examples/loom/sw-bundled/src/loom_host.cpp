@@ -36,6 +36,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <algorithm>
 #include <chrono>
 #include <cstring>
 #include <memory>
@@ -241,6 +242,24 @@ void dump_counters(coyote::cThread &t, const char *tag) {
         printf(" %s=%lu", name[i],
                (unsigned long) loom::csr_read(t, loom::DBG_BASE + 8 * i));
     printf("\n");
+    fflush(stdout);
+}
+
+// The engine's transmit-side words, for a wedge post-mortem in the matrix
+// modes: is the engine held by its window, by sq_wr, or by its own pull?
+void dump_tx(coyote::cThread &t, const char *tag) {
+    printf("tx [%s]: window %lu, unacked now %lu, acks %lu, window-full %lu cyc, sq_wr-wait %lu cyc, "
+           "tx FIFO held the pull %lu cyc, pull desync %lu, stage: move %lu starve %lu stall %lu\n", tag,
+           (unsigned long) (loom::csr_read(t, loom::TX_CTL) & 0xFF),
+           (unsigned long) (loom::csr_read(t, loom::TX_STATE) & 0xFFFF),
+           (unsigned long) loom::csr_read(t, loom::TX_ACKS),
+           (unsigned long) loom::csr_read(t, loom::TX_WINFULL),
+           (unsigned long) loom::csr_read(t, loom::TX_REQWAIT),
+           (unsigned long) loom::csr_read(t, loom::TX_FIFO_FULL),
+           (unsigned long) loom::csr_read(t, loom::PULL_DESYNC),
+           (unsigned long) loom::csr_read(t, loom::TX_MOVE),
+           (unsigned long) loom::csr_read(t, loom::TX_STARVE),
+           (unsigned long) loom::csr_read(t, loom::TX_STALL));
     fflush(stdout);
 }
 
@@ -830,6 +849,7 @@ constexpr uint64_t MX_CMD    = 0xF20;   // {code[63:56], from/to[55:48], seq[47:
 constexpr uint64_t MX_LEN    = 0xF28;   // bytes of the command's payload
 constexpr uint64_t MX_ACK    = 0xF30;   // receiver verified the sender's bidir push (seq)
 constexpr uint64_t MX_BFLAG  = 0xF38;   // sender's bidir push fenced (seq)   [server side]
+constexpr uint64_t MX_VFLAG  = 0xF40;   // receiver finished verifying the bidir push (seq)
 constexpr uint64_t MX_DATA   = 4ULL << 20;   // remote landing region
 constexpr uint64_t MX_LOCAL  = 8ULL << 20;   // local landing region
 constexpr uint64_t MX_SRC    = 12ULL << 20;  // where a sender keeps its pattern
@@ -897,11 +917,16 @@ void mx_serve(MxServerXpu x, DoneFn done) {
                     x.xpu->store(x.to_a[who - 1], uint32_t(MX_LEN), len);
                     x.xpu->store(x.to_a[who - 1], uint32_t(MX_RFLAG), seq);
                     if (!spin64(x.buf + MX_BFLAG / 8, seq, 5e6)) { printf("FAIL: matrix bidir: A%lu -> B%d flag never landed\n", (unsigned long) who, x.me); failures++; continue; }
+                    // ACK the landing first, verify after: the sender times
+                    // the round up to this ACK, and checking 4 MiB word by
+                    // word takes longer than moving it
+                    x.xpu->store(x.to_a[who - 1], uint32_t(MX_ACK), seq);
                     char what[96];
                     snprintf(what, sizeof what, "matrix bidir: A%lu -> B%d landed (%lu B, seq %lu)",
                              (unsigned long) who, x.me, (unsigned long) len, (unsigned long) seq);
                     mx_check(x.buf + MX_DATA / 8, int(who), x.me + 2, len, what);
-                    x.xpu->store(x.to_a[who - 1], uint32_t(MX_ACK), seq);
+                    // ...and only now may the sender reuse this landing region
+                    x.xpu->store(x.to_a[who - 1], uint32_t(MX_VFLAG), seq);
                 }
             }
         }
@@ -919,31 +944,107 @@ void run_matrix(MxClientXpu A[2], int to_b[2][2], int to_a[2]) {
     // follows it by one wire latency (~8 us against ~370 us of transfer).
     // One issuer per engine on each side - the two-issuer case is the
     // concurrent phase.
-    auto bidir = [&](int i, uint64_t len, uint64_t sq, const char *tag) {
+    // Per-round timing, from the command store: our push fenced (issue,
+    // fence-clocked), the far push landed here (the reply flag), our push
+    // landed there (the ACK, stored before the far side verifies). The
+    // round is the later landing; both directions carry a flag latency or
+    // two of overhead (~8 us each against ~370 us of transfer). Verification
+    // on both sides happens after the last timestamp.
+    struct BidirRound { double fence_us, far_landed_us, own_landed_us; };
+    std::vector<BidirRound> rounds;
+    // sequential = the far push first, ours only after it has landed: the
+    // same buffers and pulls touched, nothing concurrent on either host.
+    // Used as a warm-up to test whether the round-1 host-DMA stall is a
+    // first-touch cost.
+    auto bidir = [&](int i, uint64_t len, uint64_t sq, const char *tag, bool sequential = false) {
+        using clk = std::chrono::steady_clock;
+        auto us = [](clk::time_point a, clk::time_point b) {
+            return std::chrono::duration<double, std::micro>(b - a).count();
+        };
         memset(A[i].buf + MX_DATA / 8, 0, len);
         const uint64_t f = *A[i].fence;
         A[i].xpu->store(to_b[i][i], uint32_t(MX_LEN), len);
+        const auto t0 = clk::now();
         A[i].xpu->store(to_b[i][i], uint32_t(MX_CMD), mx_cmd(CMD_BIDIR, i + 1, sq));
+        if (sequential && !spin64(A[i].buf + MX_RFLAG / 8, sq, 5e6)) { printf("FAIL: %s: B%d -> A%d never arrived (sequential)\n", tag, i + 1, i + 1); failures++; return; }
         A[i].xpu->copy(to_b[i][i], uint32_t(MX_DATA), A[i].src, len, A[i].fence);
         if (!spin64_ge(A[i].fence, f + 1, 5e6)) { printf("FAIL: %s: A%d -> B%d never fenced\n", tag, i + 1, i + 1); failures++; return; }
+        const auto t_fence = clk::now();
         A[i].xpu->store(to_b[i][i], uint32_t(MX_BFLAG), sq);
-        if (!spin64(A[i].buf + MX_RFLAG / 8, sq, 5e6)) { printf("FAIL: %s: B%d -> A%d never arrived\n", tag, i + 1, i + 1); failures++; return; }
+        // The two landings complete in either order; take both timestamps
+        // as each is seen, then verify.
+        clk::time_point t_far{}, t_own{};
+        bool far_ok = false, own_ok = false;
+        volatile uint64_t *rflag = A[i].buf + MX_RFLAG / 8, *ack = A[i].buf + MX_ACK / 8;
+        const auto deadline = clk::now() + std::chrono::seconds(5);
+        while (!(far_ok && own_ok) && clk::now() < deadline) {
+            if (!far_ok && *rflag == sq) { t_far = clk::now(); far_ok = true; }
+            if (!own_ok && *ack == sq)   { t_own = clk::now(); own_ok = true; }
+        }
+        if (!far_ok) { printf("FAIL: %s: B%d -> A%d never arrived\n", tag, i + 1, i + 1); failures++; return; }
+        if (!own_ok) { printf("FAIL: %s: B%d never acked A%d's data\n", tag, i + 1, i + 1); failures++; return; }
+        rounds.push_back({us(t0, t_fence), us(t0, t_far), us(t0, t_own)});
         char what[96];
         snprintf(what, sizeof what, "%s: B%d -> A%d landed (%lu B)", tag, i + 1, i + 1, (unsigned long) len);
         mx_check(A[i].buf + MX_DATA / 8, i + 3, i + 1, len, what);
-        if (!spin64(A[i].buf + MX_ACK / 8, sq, 5e6)) { printf("FAIL: %s: B%d never acked A%d's data\n", tag, i + 1, i + 1); failures++; }
+        // The far side is still checking what we pushed; the next round
+        // overwrites that region, so wait for it (outside the timing)
+        if (!spin64(A[i].buf + MX_VFLAG / 8, sq, 5e6)) { printf("FAIL: %s: B%d never finished verifying A%d's data\n", tag, i + 1, i + 1); failures++; }
+    };
+    auto bidir_report = [&](uint64_t len) {
+        if (rounds.empty()) return;
+        auto med = [&](auto get) {
+            std::vector<double> v; for (auto &r : rounds) v.push_back(get(r));
+            std::sort(v.begin(), v.end()); return v[v.size() / 2];
+        };
+        auto lo = [&](auto get) { double m = 1e30; for (auto &r : rounds) m = std::min(m, get(r)); return m; };
+        auto hi = [&](auto get) { double m = 0;    for (auto &r : rounds) m = std::max(m, get(r)); return m; };
+        auto round_us = [](const BidirRound &r) { return std::max(r.far_landed_us, r.own_landed_us); };
+        const double rm = med(round_us);
+        printf("bidir timing: %zu rounds of %lu B each way, from the command store (us)\n", rounds.size(), (unsigned long) len);
+        printf("bidir timing:   A -> B fenced   median %8.1f  min %8.1f  max %8.1f\n",
+               med([](const BidirRound &r) { return r.fence_us; }), lo([](const BidirRound &r) { return r.fence_us; }), hi([](const BidirRound &r) { return r.fence_us; }));
+        printf("bidir timing:   A -> B landed   median %8.1f  min %8.1f  max %8.1f   (%.2f GB/s)\n",
+               med([](const BidirRound &r) { return r.own_landed_us; }), lo([](const BidirRound &r) { return r.own_landed_us; }), hi([](const BidirRound &r) { return r.own_landed_us; }),
+               len / med([](const BidirRound &r) { return r.own_landed_us; }) / 1e3);
+        printf("bidir timing:   B -> A landed   median %8.1f  min %8.1f  max %8.1f   (%.2f GB/s)\n",
+               med([](const BidirRound &r) { return r.far_landed_us; }), lo([](const BidirRound &r) { return r.far_landed_us; }), hi([](const BidirRound &r) { return r.far_landed_us; }),
+               len / med([](const BidirRound &r) { return r.far_landed_us; }) / 1e3);
+        printf("bidir timing:   round (later landing) median %8.1f  min %8.1f  max %8.1f   -> %.2f GB/s aggregate, both directions\n",
+               rm, lo(round_us), hi(round_us), 2.0 * len / rm / 1e3);
+        for (size_t k = 0; k < rounds.size(); k++)
+            if (round_us(rounds[k]) > 3 * rm)
+                printf("bidir timing:   OUTLIER round %zu: fenced %.1f, far landed %.1f, own landed %.1f us\n",
+                       k + 1, rounds[k].fence_us, rounds[k].far_landed_us, rounds[k].own_landed_us);
+        fflush(stdout);
     };
     if (const char *e = getenv("LOOM_MATRIX_BIDIR")) {
         // Only the bidirectional exchange, N rounds
-        const int rounds = atoi(e);
-        printf("\n== matrix bidir only: A1 <-> B1, %d rounds of %lu B each way\n", rounds, (unsigned long) LEN_R);
+        const int n_rounds = atoi(e);
+        printf("\n== matrix bidir only: A1 <-> B1, %d rounds of %lu B each way\n", n_rounds, (unsigned long) LEN_R);
         fflush(stdout);
         for (uint64_t w = 0; w < LEN_R / 8; w++) A[0].src[w] = mx_word(1, 3, w);
         const int f0 = failures;
-        for (int r = 0; r < rounds; r++) {
-            bidir(0, LEN_R, ++seq, "matrix bidir");
-            if (failures != f0) { printf("matrix bidir: stopping after the first failure (round %d of %d)\n", r + 1, rounds); break; }
+        if (!getenv("LOOM_BIDIR_NOWARMUP")) {
+            // One SEQUENTIAL exchange first (B -> A, then A -> B), not
+            // counted. The first exchange after setup costs ~30 ms on the
+            // server side, whatever its shape (its host DMA and engine do
+            // nothing, then everything completes); paid once per process.
+            // Concurrent with the client's first push, that freeze outlives
+            // the RC retransmit timer and wedged ~1 run in 5 (2026-09-16).
+            // Sequential, it is harmless. LOOM_BIDIR_NOWARMUP=1 reproduces
+            // the stall (the outlier report names the round).
+            bidir(0, LEN_R, ++seq, "matrix bidir warm-up", true);
+            if (failures != f0) { printf("matrix bidir: warm-up failed\n"); }
+            else printf("matrix bidir: warm-up (sequential exchange) done, %.1f us\n",
+                        std::max(rounds.back().far_landed_us, rounds.back().own_landed_us));
+            rounds.clear();
         }
+        for (int r = 0; r < n_rounds && failures == f0; r++) {
+            bidir(0, LEN_R, ++seq, "matrix bidir");
+            if (failures != f0) { printf("matrix bidir: stopping after the first failure (round %d of %d)\n", r + 1, n_rounds); break; }
+        }
+        bidir_report(LEN_R);
         printf("== matrix done\n");
         fflush(stdout);
         return;
@@ -1479,6 +1580,7 @@ int run_server(uint16_t qp_port, uint16_t peer_port, const std::string &sock) {
     }
 
     dump_counters(t_ctrl, "server final");
+    if (matrix_mode()) dump_tx(t_ctrl, "server final");
 
     t_qp.connSync(false);
     peer.stop(); peer_thr.join();
@@ -1612,6 +1714,7 @@ int run_client(const std::string &ip, uint16_t qp_port, uint16_t peer_port,
     }
     check(dropped, "store to released window dropped at source");
     dump_counters(t_ctrl, "client final");
+    if (matrix_mode()) dump_tx(t_ctrl, "client final");
 
     // Re-arm the pacing knob right before the bench. On hardware a write to
     // any table register (TBL_IDX/CFG/LEN/COMMIT - words 0-5) also clobbers

@@ -484,6 +484,8 @@ def bench_env(args, gap):
         env += " LOOM_BENCH_MATRIX=1 LOOM_XPUS=2"
         if args.bidir:
             env += f" LOOM_MATRIX_BIDIR={args.bidir}"
+        if args.bidir_no_warmup:
+            env += " LOOM_BIDIR_NOWARMUP=1"
     elif args.xpus > 1:
         env += f" LOOM_XPUS={args.xpus}"
     if args.skip_bulk:
@@ -526,6 +528,8 @@ def summarize(args, gap, result, verdicts=None):
         print(f"{BOLD}matrix: {n_ok} landings verified, {n_bad} failed, {verdict(result)}{RESET}")
         for l in rows:
             if "FAIL" in l: print("  " + l.rstrip())
+        for l in cli_out + srv_out:
+            if l.startswith("bidir timing:") or l.startswith("tx [") or "warm-up" in l: print("  " + l.rstrip())
         return
     if args.pingpong:
         # The client prints one row per size; the verdict is the server's
@@ -683,6 +687,11 @@ def main():
                          "rounds of A1 -> B1 and B1 -> A1 pushed at once "
                          "(4 MiB each way, one issuer per engine); implies "
                          "--matrix")
+    ap.add_argument("--bidir-no-warmup", action="store_true",
+                    help="with --bidir: skip the sequential warm-up exchange "
+                         "that precedes the timed rounds. Reproduces the "
+                         "first-exchange ~30 ms freeze on the server and the "
+                         "~1-in-5 wedge it causes when concurrent")
     ap.add_argument("--skip-bulk", action="store_true")
     ap.add_argument("--retries", type=int, default=2,
                     help="reflash both cards and retry after a wedge")

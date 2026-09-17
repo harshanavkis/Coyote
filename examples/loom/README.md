@@ -363,11 +363,26 @@ matrix: 58 landings verified, 0 failed, intact
 ```
 
 The bidirectional phase alone, for as many rounds as wanted (two
-landings verified per round):
+landings verified per round), timed per round from the command store:
 
 ```bash
 ./run_two_host.py --bidir 64 --tx-window 32 --size 67108864 --iters 1 --gap 0 --retries 0
 ```
+
+```
+bidir timing:   A -> B landed   median    712.1   (5.89 GB/s)
+bidir timing:   B -> A landed   median    700.8   (5.98 GB/s)
+bidir timing:   round (later landing) median    712.1   -> 11.78 GB/s aggregate, both directions
+```
+
+Both directions share the ~11.8 GB/s a single direction gets; that is
+the shell's per-host ceiling, not Loom's (stock perf_rdma with both
+sides writing at once, `PERF_RDMA_BIDIR=1`, shares ~10.4 GB/s, unevenly).
+The run starts with one sequential exchange that is not counted: the
+first exchange after setup costs ~30 ms on the server side whatever its
+shape, and concurrent with the client's first push that freeze outlives
+the RC retransmit timer and wedged about one run in five.
+`--bidir-no-warmup` reproduces that.
 
 It is what found the deadlock of 2026-09-16: the engine and `loom_rx`
 share the shell's `sq_wr` request channel, and the arbiter granted it for
