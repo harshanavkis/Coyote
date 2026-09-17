@@ -28,6 +28,8 @@
 #include <cstdlib>
 
 // External library for easier parsing of CLI arguments by the executable
+#include <chrono>
+#include <cstdlib>
 #include <boost/program_options.hpp>
 
 // Coyote-specific includes
@@ -62,11 +64,35 @@ double run_bench(
      * In boths cases, that means there will be n_transfers completed writes to local memory (LOCAL_WRITE)
      */
     coyote::CoyoteOper coyote_operation = operation ? coyote::CoyoteOper::REMOTE_RDMA_WRITE : coyote::CoyoteOper::REMOTE_RDMA_READ;
+    const bool bidir = operation && getenv("PERF_RDMA_BIDIR") != nullptr;
     auto bench_fn = [&]() {        
+        const auto t0 = std::chrono::steady_clock::now();
         for (int i = 0; i < transfers; i++) {
             coyote_thread.invoke(coyote_operation, sg);
         }
 
+        if (bidir) {
+            // PERF_RDMA_BIDIR=1: the server writes back without waiting, so
+            // both directions are in flight; time each from the first post
+            bool in_done = false, out_done = false;
+            double t_in = 0, t_out = 0;
+            while (!(in_done && out_done)) {
+                const double now = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
+                if (!in_done  && coyote_thread.checkCompleted(coyote::CoyoteOper::LOCAL_WRITE) >= transfers)       { in_done = true;  t_in = now; }
+                if (!out_done && coyote_thread.checkCompleted(coyote::CoyoteOper::REMOTE_RDMA_WRITE) >= transfers) { out_done = true; t_out = now; }
+                if (now > 3e6) {
+                    std::cout << "bidir client: TIMEOUT after 3 s: LOCAL_WRITE completed " << coyote_thread.checkCompleted(coyote::CoyoteOper::LOCAL_WRITE)
+                              << ", REMOTE_RDMA_WRITE completed " << coyote_thread.checkCompleted(coyote::CoyoteOper::REMOTE_RDMA_WRITE)
+                              << " of " << transfers << std::endl;
+                    break;
+                }
+            }
+            const double bytes = (double) transfers * sg.len;
+            std::cout << "bidir client: " << transfers << " x " << sg.len << " B: incoming landed " << t_in
+                      << " us (" << bytes / t_in / 1e3 << " GB/s), outgoing acked " << t_out
+                      << " us (" << bytes / t_out / 1e3 << " GB/s)" << std::endl;
+            return;
+        }
         while (coyote_thread.checkCompleted(coyote::CoyoteOper::LOCAL_WRITE) != transfers) {}
     };
 
