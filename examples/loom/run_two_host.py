@@ -486,6 +486,8 @@ def bench_env(args, gap):
             env += f" LOOM_MATRIX_BIDIR={args.bidir}"
         if args.bidir_no_warmup:
             env += " LOOM_BIDIR_NOWARMUP=1"
+        if args.local:
+            env += f" LOOM_MATRIX_LOCAL={args.local}"
     elif args.xpus > 1:
         env += f" LOOM_XPUS={args.xpus}"
     if args.skip_bulk:
@@ -529,7 +531,7 @@ def summarize(args, gap, result, verdicts=None):
         for l in rows:
             if "FAIL" in l: print("  " + l.rstrip())
         for l in cli_out + srv_out:
-            if l.startswith("bidir timing:") or l.startswith("tx [") or "warm-up" in l: print("  " + l.rstrip())
+            if l.startswith(("bidir timing:", "local timing:", "tx [")) or "warm-up" in l: print("  " + l.rstrip())
         return
     if args.pingpong:
         # The client prints one row per size; the verdict is the server's
@@ -692,12 +694,16 @@ def main():
                          "that precedes the timed rounds. Reproduces the "
                          "first-exchange ~30 ms freeze on the server and the "
                          "~1-in-5 wedge it causes when concurrent")
+    ap.add_argument("--local", type=int, default=0, metavar="N",
+                    help="only N timed rounds of a 4 MiB local copy A1 -> A2 "
+                         "on the client (host DMA read + write at once, no "
+                         "network); implies --matrix")
     ap.add_argument("--skip-bulk", action="store_true")
     ap.add_argument("--retries", type=int, default=2,
                     help="reflash both cards and retry after a wedge")
     ap.add_argument("--out", default=f"{COYOTE}/examples/loom/experiments-log.txt")
     args = ap.parse_args()
-    if args.bidir:
+    if args.bidir or args.local:
         args.matrix = True
 
     try:

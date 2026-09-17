@@ -1018,6 +1018,38 @@ void run_matrix(MxClientXpu A[2], int to_b[2][2], int to_a[2]) {
                        k + 1, rounds[k].fence_us, rounds[k].far_landed_us, rounds[k].own_landed_us);
         fflush(stdout);
     };
+    if (const char *e = getenv("LOOM_MATRIX_LOCAL")) {
+        // Only local copies, N rounds: A1's engine pulls 4 MiB from host
+        // memory and writes it back into A2's buffer - one host doing a
+        // DMA read and a DMA write at the same time, no network. The
+        // control for the bidirectional rate: the host DMA path does both
+        // at ~9.8 GB/s each (2026-09-17), so it is not what the two
+        // directions share.
+        using clk = std::chrono::steady_clock;
+        const int n_rounds = atoi(e);
+        printf("\n== matrix local only: A1 -> A2, %d rounds of %lu B\n", n_rounds, (unsigned long) LEN_R);
+        fflush(stdout);
+        for (uint64_t w = 0; w < LEN_R / 8; w++) A[0].src[w] = mx_word(1, 2, w);
+        memset(A[1].buf + MX_DATA / 8, 0, LEN_R);
+        std::vector<double> t;
+        for (int r = 0; r < n_rounds + 1; r++) {          // +1: the first is the warm-up
+            const uint64_t f = *A[0].fence;
+            const auto t0 = clk::now();
+            A[0].xpu->copy(to_a[1], uint32_t(MX_DATA), A[0].src, LEN_R, A[0].fence);
+            if (!spin64_ge(A[0].fence, f + 1, 5e6)) { printf("FAIL: local A1 -> A2 round %d never fenced\n", r); failures++; break; }
+            const double us = std::chrono::duration<double, std::micro>(clk::now() - t0).count();
+            if (r == 0) printf("local timing: warm-up round %.1f us\n", us); else t.push_back(us);
+        }
+        if (!t.empty()) {
+            std::vector<double> v = t; std::sort(v.begin(), v.end());
+            printf("local timing: %zu rounds of %lu B: fenced median %.1f  min %.1f  max %.1f us   -> %.2f GB/s (read + write of that many bytes each, on one host)\n",
+                   v.size(), (unsigned long) LEN_R, v[v.size() / 2], v.front(), v.back(), LEN_R / v[v.size() / 2] / 1e3);
+        }
+        mx_check(A[1].buf + MX_DATA / 8, 1, 2, LEN_R, "matrix local: A1 -> A2 landed (last round)");
+        printf("== matrix done\n");
+        fflush(stdout);
+        return;
+    }
     if (const char *e = getenv("LOOM_MATRIX_BIDIR")) {
         // Only the bidirectional exchange, N rounds
         const int n_rounds = atoi(e);
