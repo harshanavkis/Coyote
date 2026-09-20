@@ -566,7 +566,7 @@ def summarize(args, gap, result, verdicts=None):
         for l in rows:
             if "FAIL" in l: print("  " + l.rstrip())
         for l in cli_out + srv_out:
-            if l.startswith(("bidir timing:", "local timing:", "storm timing:", "tx [")) or "warm-up" in l: print("  " + l.rstrip())
+            if l.startswith(("bidir timing:", "local timing:", "storm timing:", "tx [", "rx [")) or "warm-up" in l: print("  " + l.rstrip())
         return
     if args.pingpong:
         # The client prints one row per size; the verdict is the server's

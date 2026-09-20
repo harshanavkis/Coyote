@@ -247,6 +247,24 @@ void dump_counters(coyote::cThread &t, const char *tag) {
 
 // The engine's transmit-side words, for a wedge post-mortem in the matrix
 // modes: is the engine held by its window, by sq_wr, or by its own pull?
+// The receive path's cycle accounting (loom_rx), for the client too: over a
+// run, was its ingress mostly STARVED (the stack delivered nothing) or
+// STALLED (the host write path would not take a beat)?
+void dump_rx(coyote::cThread &t, const char *tag) {
+    const uint64_t mv = loom::csr_read(t, loom::RX_MOVE), sv = loom::csr_read(t, loom::RX_STARVE),
+                   st = loom::csr_read(t, loom::RX_STALL), bp = loom::csr_read(t, loom::RX_BP),
+                   ff = loom::csr_read(t, loom::RX_FIFO_FULL), rq = loom::csr_read(t, loom::RX_REQ),
+                   fw = loom::csr_read(t, loom::DBG_BASE + 8 * 4);
+    const double tot = double(mv + sv + st);
+    printf("rx [%s]: moving %lu, starved %lu, stalled %lu (%.1f%% / %.1f%% / %.1f%%), longest stall %lu, "
+           "backpressure %lu, ingress FIFO full %lu, rq_wr %lu, forwarded %lu\n", tag,
+           (unsigned long) mv, (unsigned long) sv, (unsigned long) st,
+           tot ? 100.0 * mv / tot : 0, tot ? 100.0 * sv / tot : 0, tot ? 100.0 * st / tot : 0,
+           (unsigned long) loom::csr_read(t, loom::RX_STALL_MAX), (unsigned long) bp, (unsigned long) ff,
+           (unsigned long) rq, (unsigned long) fw);
+    fflush(stdout);
+}
+
 void dump_tx(coyote::cThread &t, const char *tag) {
     printf("tx [%s]: window %lu, unacked now %lu, acks %lu, window-full %lu cyc, sq_wr-wait %lu cyc, "
            "tx FIFO held the pull %lu cyc, pull desync %lu, stage: move %lu starve %lu stall %lu\n", tag,
@@ -1784,8 +1802,7 @@ int run_client(const std::string &ip, uint16_t qp_port, uint16_t peer_port,
         if (!dropped) usleep(10000);
     }
     check(dropped, "store to released window dropped at source");
-    dump_counters(t_ctrl, "client final");
-    if (matrix_mode()) dump_tx(t_ctrl, "client final");
+    dump_counters(t_ctrl, "client after the functional tests");
 
     // Re-arm the pacing knob right before the bench. On hardware a write to
     // any table register (TBL_IDX/CFG/LEN/COMMIT - words 0-5) also clobbers
@@ -1835,6 +1852,9 @@ int run_client(const std::string &ip, uint16_t qp_port, uint16_t peer_port,
         int to_b[2][2] = {{w1, w3}, {w1, w3}};
         int to_a[2] = {la1, la2};
         run_matrix(X, to_b, to_a);
+        dump_counters(t_ctrl, "client after the matrix");
+        dump_tx(t_ctrl, "client after the matrix");
+        dump_rx(t_ctrl, "client after the matrix");
     } else if (pingpong_mode()) {
         // Reverse path: our own receive buffer, landing under XPU 1's ctid
         // (the header's dst pid), and amy told where to write and which
