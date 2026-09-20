@@ -95,6 +95,15 @@ delays ACKs, which throttles the other direction's sender.
    this buys nothing unless line 7 is wrong), and ACK coalescing (would
    need loom_engine's window to count PSNs instead of completions).
 
+## Reproducing every line above
+
+README "Running" -> "Reproducing the bidirectional-bandwidth experiments"
+has the exact command and the expected output for each measurement in
+the table, plus the perf_rdma control and how to tell which bitstream a
+card holds. The rest of "Running" covers the environment, the
+testbenches, out-of-context synthesis, building a bitstream, programming
+and the driver, and building the software on both hosts.
+
 ## Tools you have
 
 - `./run_two_host.py` drives both hosts from clara, flashes before every

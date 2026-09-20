@@ -399,6 +399,54 @@ never equality: the count in it is the issuing XPU's own (per source pid
 in the engine), but a fence word only changes when its own descriptor
 completes.
 
+### Reproducing the bidirectional-bandwidth experiments
+
+`HANDOVER-bidir.md` states what is known about the halving; this is the
+command for each of its measurements, all from `examples/loom/` on clara
+with the deployed bitstream (`~/coyote-bitstreams/loom/`, md5 4bb3b847 =
+`hw/build_sep16_arbiter_fixed`) and `loom_host` built from the same
+commit on both hosts. Every run flashes both cards first (~3 min) unless
+`--no-flash`; every run appends both hosts' full logs and the shell's
+network/DMA counters to `experiments-log.txt`. The line to read is the
+bold verdict (`... intact` / `WEDGED`) plus the `timing` lines; the
+per-size `retrans` column and the runner's exit code are not the verdict
+(the matrix modes exit 1 on a cosmetic `NoneType` crash after printing).
+
+| claim | command | expected |
+|---|---|---|
+| one direction 11.8 GB/s | `./run_two_host.py --size 67108864 --iters 20 --gap 20 --retries 0 --tx-window 32` | `11.84-11.90 GB/s`, `whole run: 0 retransmissions` |
+| both directions 5.9 each | `./run_two_host.py --bidir 64 --tx-window 32 --size 67108864 --iters 1 --gap 0 --retries 0` | `128 landings verified`, `round ... median ~713 -> 11.7x GB/s aggregate` |
+| the window is not binding | same with `--tx-window 40` and `48` | same numbers |
+| host DMA is full duplex | `./run_two_host.py --local 64 --size 67108864 --iters 1 --gap 0 --retries 0` | `local timing: ... median ~428 us -> 9.79 GB/s` |
+| cost is per packet | `./run_two_host.py --bidir 16 --storm 2048 --tx-window 32 --size 67108864 --iters 1 --gap 0 --retries 0` (also `--storm 512`, `1024`) | `storm timing: ... median 1258 us` (582 / 808 for 512 / 1024; 394 alone) |
+| where it is paid | the `tx [client after the matrix]` and `rx [client after the matrix]` lines of that run | `sq_wr-wait` ~3.0 M cycles, `backpressure` ~3.4 M, `stalled` ~0.43 M |
+| the first-exchange freeze | `./run_two_host.py --bidir 16 --bidir-no-warmup --tx-window 32 --size 67108864 --iters 1 --gap 0 --retries 0` | `OUTLIER round 1: ... ~30000 us`, or a wedge (~1 in 5) |
+| the stock stack shares the pipe too | see below | `bidir client/server: incoming landed ... 4.1 / 6.3 GB/s` |
+
+The stock-stack control uses `09_perf_rdma` with its own bitstream; the
+server writes back without waiting when `PERF_RDMA_BIDIR=1` is set and
+both sides time their incoming direction (the outgoing completion counter
+never increments on this shell). Build once per host (`sw/build` on
+clara = client, `sw/build_server` on amy = server, both `cmake .. && make`
+inside `nix-shell Coyote/shell.nix`), then:
+
+```bash
+# flash perf_rdma on both cards with the Loom runner's flash routine
+BIT=$HOME/coyote-bitstreams/perf_rdma/hw/bitstreams/cyt_top.bit python3 -c "import run_two_host as r; r.flash(15)"
+# amy, first:
+ssh amy.dos.cit.tum.de 'cd /scratch/harshanavkis/loom-proj/Coyote/examples/09_perf_rdma/sw/build_server && sudo env PERF_RDMA_BIDIR=1 stdbuf -oL ./test -o 1 -x 4194304 -X 4194304 -r 3'
+# clara, once amy listens on 18488:
+cd ../09_perf_rdma && sudo env PERF_RDMA_BIDIR=1 stdbuf -oL sw/build/test -i 131.159.102.20 -o 1 -x 4194304 -X 4194304 -r 3
+```
+
+The next Loom run reflashes the Loom bitstream. Which bitstream a card
+holds is never inferred: `md5sum ~/coyote-bitstreams/loom/hw/bitstreams/cyt_top.bit`
+is what the runner flashes, and `hw/build_*/bitstreams/cyt_top.bit` is
+what a build produced; the RTL a build was made from is under
+`hw/build_*/example_loom_config_0/user_c0_0/hdl/ext/raw/` and
+`.../hdl/vfpga_top.svh` - diff it against `hw/src/` before trusting a
+bitstream (see "Hardware" below for building and programming).
+
 ### 6.2a: the bundled two-host binary (`sw-bundled/`)
 
 One process per host carrying the daemon role (BundledOrchestrator + local
