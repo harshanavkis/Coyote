@@ -21,19 +21,14 @@ if [ ! -f "$LYNX_PKG" ]; then
     exit 1
 fi
 
-TBS="${TBS:-tb_loom_table tb_loom_ctrl tb_loom_engine tb_loom_rx tb_loom_top tb_loom_loopback tb_user_req_mux}"
+TBS="${TBS:-tb_loom_table tb_loom_ctrl tb_loom_engine tb_loom_rx tb_loom_top tb_loom_loopback}"
 SRCS="$LYNX_PKG $AXI_INTF $COYOTE_ROOT/hw/hdl/pkg/lynx_intf.sv \
       ../src/hdl/loom_table.sv ../src/hdl/loom_ctrl.sv \
       ../src/hdl/loom_engine.sv ../src/hdl/loom_rx.sv \
       ./sim_axisr_register_slice_512.sv \
       ./sim_axis_data_fifo_512.sv \
-      ./sim_axis_register_slice_meta.sv \
       $COYOTE_ROOT/hw/hdl/common/regs/axisr_reg.sv \
-      ../build_sim/sim/user_logic_c0_0.sv \
-      $COYOTE_ROOT/hw/hdl/user/mux_init/user_req_mux.sv \
-      $COYOTE_ROOT/hw/hdl/common/queues/queue_meta.sv \
-      $COYOTE_ROOT/hw/hdl/common/queues/fifo.sv \
-      $COYOTE_ROOT/hw/hdl/common/regs/meta_reg.sv"
+      ../build_sim/sim/user_logic_c0_0.sv"
 
 mkdir -p work && cd work
 
@@ -46,7 +41,7 @@ xvlog $GLBL > xvlog_glbl.log 2>&1 || { tail -5 xvlog_glbl.log; echo "COMPILE FAI
 xvlog -sv $(for f in $SRCS; do echo ../$f; done) \
     -i ../../src -i ../$COYOTE_ROOT/hw/hdl/pkg \
     ../tb_loom_table.sv ../tb_loom_ctrl.sv ../tb_loom_engine.sv \
-    ../tb_loom_rx.sv ../tb_loom_top.sv ../tb_loom_loopback.sv ../tb_user_req_mux.sv \
+    ../tb_loom_rx.sv ../tb_loom_top.sv ../tb_loom_loopback.sv \
     > xvlog.log 2>&1 || { tail -30 xvlog.log; echo "COMPILE FAILED"; exit 1; }
 
 fail=0
