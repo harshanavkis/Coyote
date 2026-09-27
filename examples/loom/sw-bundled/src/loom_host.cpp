@@ -1023,12 +1023,28 @@ void run_matrix(MxClientXpu A[2], int to_b[2][2], int to_a[2]) {
     // same buffers and pulls touched, nothing concurrent on either host.
     // Used as a warm-up to test whether the round-1 host-DMA stall is a
     // first-touch cost.
-    auto bidir = [&](int i, uint64_t len, uint64_t sq, const char *tag, bool sequential = false) {
+    // LOOM_BIDIR_LIGHT=1: touch the landing region with the CPU as little as
+    // possible. Normally each round memsets 4 MiB of it and verifies 4 MiB
+    // word by word - 8 MiB of CPU traffic per round on the CLIENT only (the
+    // server neither memsets nor is timed the same way), and every dirty
+    // line makes the landing DMA write do coherency work. The client's engine
+    // is the one starved 63% of the run waiting for its pull, so this asks
+    // how much of that is our own harness rather than the hardware.
+    // Sentinels at both ends still catch a landing that never happened, and
+    // the full check still runs on the last round.
+    const bool light = getenv("LOOM_BIDIR_LIGHT") != nullptr;
+    auto bidir = [&](int i, uint64_t len, uint64_t sq, const char *tag, bool sequential = false,
+                     bool full_check = true) {
         using clk = std::chrono::steady_clock;
         auto us = [](clk::time_point a, clk::time_point b) {
             return std::chrono::duration<double, std::micro>(b - a).count();
         };
-        memset(A[i].buf + MX_DATA / 8, 0, len);
+        if (light) {
+            A[i].buf[MX_DATA / 8] = 0;                       // sentinels only
+            A[i].buf[MX_DATA / 8 + len / 8 - 1] = 0;
+        } else {
+            memset(A[i].buf + MX_DATA / 8, 0, len);
+        }
         const uint64_t f = *A[i].fence;
         A[i].xpu->store(to_b[i][i], uint32_t(MX_LEN), len);
         const auto t0 = clk::now();
@@ -1053,7 +1069,14 @@ void run_matrix(MxClientXpu A[2], int to_b[2][2], int to_a[2]) {
         rounds.push_back({us(t0, t_fence), us(t0, t_far), us(t0, t_own)});
         char what[96];
         snprintf(what, sizeof what, "%s: B%d -> A%d landed (%lu B)", tag, i + 1, i + 1, (unsigned long) len);
-        mx_check(A[i].buf + MX_DATA / 8, i + 3, i + 1, len, what);
+        if (light && !full_check) {
+            // the two words the sentinels zeroed must now hold the pattern
+            const bool ok = A[i].buf[MX_DATA / 8] == mx_word(i + 3, i + 1, 0) &&
+                            A[i].buf[MX_DATA / 8 + len / 8 - 1] == mx_word(i + 3, i + 1, len / 8 - 1);
+            if (!ok) { printf("FAIL: %s: sentinels say the push did not land\n", tag); failures++; }
+        } else {
+            mx_check(A[i].buf + MX_DATA / 8, i + 3, i + 1, len, what);
+        }
         // The far side is still checking what we pushed; the next round
         // overwrites that region, so wait for it (outside the timing)
         if (!spin64(A[i].buf + MX_VFLAG / 8, sq, 5e6)) { printf("FAIL: %s: B%d never finished verifying A%d's data\n", tag, i + 1, i + 1); failures++; }
@@ -1186,7 +1209,7 @@ void run_matrix(MxClientXpu A[2], int to_b[2][2], int to_a[2]) {
             rounds.clear();
         }
         for (int r = 0; r < n_rounds && failures == f0; r++) {
-            bidir(0, LEN_R, ++seq, "matrix bidir");
+            bidir(0, LEN_R, ++seq, "matrix bidir", false, !light || (r == n_rounds - 1));
             if (failures != f0) { printf("matrix bidir: stopping after the first failure (round %d of %d)\n", r + 1, n_rounds); break; }
         }
         bidir_report(LEN_R);

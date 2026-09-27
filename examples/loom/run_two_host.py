@@ -519,6 +519,8 @@ def bench_env(args, gap):
         env += " LOOM_BENCH_MATRIX=1 LOOM_XPUS=2"
         if args.bidir:
             env += f" LOOM_MATRIX_BIDIR={args.bidir}"
+        if args.bidir_light:
+            env += " LOOM_BIDIR_LIGHT=1"
         if args.bidir_no_warmup:
             env += " LOOM_BIDIR_NOWARMUP=1"
         if args.local:
@@ -737,6 +739,13 @@ def main():
                     help="only N timed rounds of a 4 MiB local copy A1 -> A2 "
                          "on the client (host DMA read + write at once, no "
                          "network); implies --matrix")
+    ap.add_argument("--bidir-light", action="store_true",
+                    help="with --bidir: do not memset or verify the 4 MiB "
+                         "landing region every round (sentinels each round, "
+                         "full check on the last). Removes ~8 MiB of CPU "
+                         "memory traffic per round on the client and the "
+                         "dirty cache lines that make each landing DMA write "
+                         "do coherency work")
     ap.add_argument("--rx-chunk", type=int, default=None, metavar="K",
                     help="PMTU packets per host write in loom_rx (CSR 76, "
                          "bitstream default 1 = one write per packet). Fewer, "
