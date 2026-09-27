@@ -107,6 +107,17 @@ module loom_ctrl (
     input  logic                        cnt_tx_winfull,
     input  logic                        cnt_tx_reqwait,
     input  logic                        cnt_tx_fifo_full,
+    // Request-port accounting (words 72-75, see vfpga_top.svh). The engine
+    // and loom_rx share the shell's single sq_wr; these say how long each
+    // waits for ITS OWN downstream path (local writes -> host DMA, rdma
+    // writes -> the RoCE stack) and how long one waits only because the
+    // OTHER type is holding the port. The second is head-of-line blocking,
+    // measured rather than inferred.
+    input  logic                        cnt_wr_wait_local,
+    input  logic                        cnt_wr_wait_rdma,
+    input  logic                        cnt_wr_blk_eng,
+    input  logic                        cnt_wr_blk_rx,
+    output logic [3:0]                  rx_chunk,
 
     // Read response (from loom_engine): completes the held-open AXI read
     input  logic [63:0]                 rd_resp_data,
@@ -237,6 +248,16 @@ localparam integer R_TX_ACKS      = 68;   // RO acks received
 localparam integer R_TX_WINFULL   = 69;   // RO cycles a packet waited on the window
 localparam integer R_TX_REQWAIT   = 70;   // RO cycles a packet waited on sq_wr.ready
 localparam integer R_TX_FIFO_FULL = 71;   // RO cycles the pull was held by our FIFO
+// Request-port accounting, same CSR line's successor (72-75), all RO.
+localparam integer R_WR_WAIT_LOCAL = 72;  // cycles a LOCAL write waited on sq_wr.ready
+localparam integer R_WR_WAIT_RDMA  = 73;  // cycles an RDMA write waited on sq_wr.ready
+localparam integer R_WR_BLK_ENG    = 74;  // cycles the engine had a request while rx held the port
+localparam integer R_WR_BLK_RX     = 75;  // cycles rx had a request while the engine held the port
+// How many PMTU packets one of loom_rx's host writes covers, [3:0], reset 1
+// (= one write per packet, the behaviour up to 2026-09-27). Larger values
+// mean fewer, bigger writes: less DMA overhead per byte and fewer requests
+// through the shell's single sq_wr port.
+localparam integer R_RX_CHUNK      = 76;
 // Ingress FIFO full while the shell had a beat (receiver side), and the
 // longest unbroken run of it. Nonzero here on a corrupt run and zero on the
 // clean control closes the loss chain at the vFPGA boundary.
@@ -329,6 +350,9 @@ logic [63:0] rx_stall_run, rx_stall_max;
 logic [63:0] rx_bp, rx_bp_run, rx_bp_max;
 logic [63:0] r_pace, tx_paced;
 logic [63:0] r_tx_ctl, tx_acks, tx_winfull, tx_reqwait, tx_fifo_full;
+logic [63:0] wr_wait_local, wr_wait_rdma, wr_blk_eng, wr_blk_rx;
+logic [63:0] r_rx_chunk;
+assign rx_chunk = (r_rx_chunk[3:0] == 4'd0) ? 4'd1 : r_rx_chunk[3:0];   // 0 is not a size
 logic [63:0] rx_ff, rx_ff_run, rx_ff_max;
 logic [63:0] pull_desync;
 logic [63:0] rx_orphan;
@@ -352,6 +376,7 @@ always_ff @(posedge aclk) begin
         r_dma_compl_va <= 0; r_rdma_staging <= 0;
         r_pace  <= 0;
         r_tx_ctl <= 64'd16;                    // window 16
+        r_rx_chunk <= 64'd1;                   // one host write per packet
     end else if (csr_wr && (&axi_ctrl.wstrb)) begin
         // Full-strobe writes only. Every write software issues is a whole
         // 64-bit word; a beat with partial or no byte enables is not one of
@@ -371,6 +396,7 @@ always_ff @(posedge aclk) begin
             R_RDMA_STAGING: r_rdma_staging <= axi_ctrl.wdata;
             R_TX_PACE: r_pace  <= axi_ctrl.wdata;
             R_TX_CTL:  r_tx_ctl <= axi_ctrl.wdata;
+            R_RX_CHUNK: r_rx_chunk <= axi_ctrl.wdata;
             default: ;
         endcase
     end
@@ -539,6 +565,7 @@ always_ff @(posedge aclk) begin
         rx_bp <= 0; rx_bp_run <= 0; rx_bp_max <= 0;
         tx_paced <= 0; rx_ff <= 0; rx_ff_run <= 0; rx_ff_max <= 0;
         tx_acks <= 0; tx_winfull <= 0; tx_reqwait <= 0; tx_fifo_full <= 0;
+        wr_wait_local <= 0; wr_wait_rdma <= 0; wr_blk_eng <= 0; wr_blk_rx <= 0;
         pull_desync <= 0;
         rx_orphan <= 0;
     end else begin
@@ -571,6 +598,10 @@ always_ff @(posedge aclk) begin
         if (cnt_tx_ack)       tx_acks      <= tx_acks + 1;
         if (cnt_tx_winfull)   tx_winfull   <= tx_winfull + 1;
         if (cnt_tx_reqwait)   tx_reqwait   <= tx_reqwait + 1;
+        if (cnt_wr_wait_local) wr_wait_local <= wr_wait_local + 1;
+        if (cnt_wr_wait_rdma)  wr_wait_rdma  <= wr_wait_rdma + 1;
+        if (cnt_wr_blk_eng)    wr_blk_eng    <= wr_blk_eng + 1;
+        if (cnt_wr_blk_rx)     wr_blk_rx     <= wr_blk_rx + 1;
         if (cnt_tx_fifo_full) tx_fifo_full <= tx_fifo_full + 1;
         if (cnt_rx_fifo_full) begin
             rx_ff     <= rx_ff + 1;
@@ -619,6 +650,11 @@ always_ff @(posedge aclk) begin
             R_TX_ACKS:     axi_rdata <= tx_acks;
             R_TX_WINFULL:  axi_rdata <= tx_winfull;
             R_TX_REQWAIT:  axi_rdata <= tx_reqwait;
+            R_WR_WAIT_LOCAL: axi_rdata <= wr_wait_local;
+            R_WR_WAIT_RDMA:  axi_rdata <= wr_wait_rdma;
+            R_WR_BLK_ENG:    axi_rdata <= wr_blk_eng;
+            R_WR_BLK_RX:     axi_rdata <= wr_blk_rx;
+            R_RX_CHUNK:      axi_rdata <= {60'b0, rx_chunk};
             R_TX_FIFO_FULL: axi_rdata <= tx_fifo_full;
             default:
                 if (rd_idx >= R_DBG_BASE && rd_idx < R_DBG_BASE + N_DBG)

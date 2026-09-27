@@ -265,6 +265,19 @@ void dump_rx(coyote::cThread &t, const char *tag) {
     fflush(stdout);
 }
 
+// The shared request port: where its time went. See loom.hpp.
+void dump_port(coyote::cThread &t, const char *tag) {
+    const uint64_t wl = loom::csr_read(t, loom::WR_WAIT_LOCAL),
+                   wr = loom::csr_read(t, loom::WR_WAIT_RDMA),
+                   be = loom::csr_read(t, loom::WR_BLK_ENG),
+                   br = loom::csr_read(t, loom::WR_BLK_RX);
+    printf("port [%s]: sq_wr waits - local %lu cyc, rdma %lu cyc; engine blocked by rx %lu cyc; "
+           "rx blocked by engine %lu cyc (must be 0); rx_chunk %lu\n", tag,
+           (unsigned long) wl, (unsigned long) wr, (unsigned long) be, (unsigned long) br,
+           (unsigned long) loom::csr_read(t, loom::RX_CHUNK));
+    fflush(stdout);
+}
+
 void dump_tx(coyote::cThread &t, const char *tag) {
     printf("tx [%s]: window %lu, unacked now %lu, acks %lu, window-full %lu cyc, sq_wr-wait %lu cyc, "
            "tx FIFO held the pull %lu cyc, pull desync %lu, stage: move %lu starve %lu stall %lu\n", tag,
@@ -376,6 +389,19 @@ static uint64_t tx_ctl_from_env(uint64_t cur) {
         v = (v & ~0xFFull) | (strtoul(e, nullptr, 0) & 0xFF);
     return v;
 }
+// loom_rx's host-write granularity (CSR 76), on BOTH hosts: each lands its
+// own incoming packets, so the knob has to be armed on each side.
+static void arm_rx_chunk(coyote::cThread &t, const char *when) {
+    if (const char *e = getenv("LOOM_RX_CHUNK")) {
+        const uint64_t k = strtoull(e, nullptr, 0);
+        loom::csr_write(t, loom::RX_CHUNK, k);
+        const uint64_t got = loom::csr_read(t, loom::RX_CHUNK);
+        printf("engine config: rx_chunk %s: %lu packets per host write%s\n", when,
+               (unsigned long) got, got == k ? "" : " DID NOT TAKE");
+        fflush(stdout);
+    }
+}
+
 static void print_tx_ctl(uint64_t v, const char *when) {
     printf("engine config: tx window %s: %lu packets unacked%s\n",
            when, (unsigned long) (v & 0xFF), (v & 0xFF) ? "" : " (no window)");
@@ -873,7 +899,7 @@ constexpr uint64_t MX_LOCAL  = 8ULL << 20;   // local landing region
 constexpr uint64_t MX_SRC    = 12ULL << 20;  // where a sender keeps its pattern
 constexpr uint64_t MX_BUF    = 16ULL << 20;  // per-XPU buffer for XPU 2
 constexpr uint64_t MX_LEN_R  = 4ULL << 20;   // the remote transfer size
-constexpr uint64_t CMD_REMOTE = 1, CMD_BIDIR = 3, CMD_STORM = 6;
+constexpr uint64_t CMD_REMOTE = 1, CMD_BIDIR = 3, CMD_STORM = 6, CMD_PUSHME = 7;
 
 inline uint64_t mx_cmd(uint64_t code, uint64_t who, uint64_t seq) {
     return (code << 56) | (who << 48) | (seq & 0xFFFF'FFFF'FFFFULL);
@@ -938,6 +964,18 @@ void mx_serve(MxServerXpu x, DoneFn done) {
                     snprintf(what, sizeof what, "matrix storm: A%lu -> B%d landed (seq %lu)", (unsigned long) who, x.me, (unsigned long) seq);
                     mx_check(x.buf + MX_DATA / 8, int(who), x.me + 2, MX_LEN_R, what);
                     x.xpu->store(x.to_a[who - 1], uint32_t(MX_VFLAG), seq);
+                } else if (code == CMD_PUSHME) {
+                    // Push at the sender and nothing else: the sender is busy
+                    // with a LOCAL copy, not with a push of its own. Used by
+                    // --rxlocal to give the sender's vFPGA the same number of
+                    // incoming packets as a bidirectional round while all of
+                    // its OWN requests are local (STRM_HOST) - see the
+                    // head-of-line-blocking question in HANDOVER-bidir.md.
+                    const uint64_t f = *x.fence;
+                    x.xpu->copy(x.to_a[who - 1], uint32_t(MX_DATA), x.buf + MX_SRC / 8, len, x.fence);
+                    if (!spin64_ge(x.fence, f + 1, 5e6)) { printf("FAIL: matrix pushme: B%d -> A%lu never fenced\n", x.me, (unsigned long) who); failures++; }
+                    x.xpu->store(x.to_a[who - 1], uint32_t(MX_LEN), len);
+                    x.xpu->store(x.to_a[who - 1], uint32_t(MX_RFLAG), seq);
                 } else if (code == CMD_BIDIR) {
                     if (int(who) != x.me || len > MX_LEN_R) { printf("FAIL: B%d bidir from A%lu, %lu B: unsupported\n", x.me, (unsigned long) who, (unsigned long) len); failures++; continue; }
                     const uint64_t f = *x.fence;
@@ -1075,6 +1113,52 @@ void run_matrix(MxClientXpu A[2], int to_b[2][2], int to_a[2]) {
                    v.size(), (unsigned long) LEN_R, v[v.size() / 2], v.front(), v.back(), LEN_R / v[v.size() / 2] / 1e3);
         }
         mx_check(A[1].buf + MX_DATA / 8, 1, 2, LEN_R, "matrix local: A1 -> A2 landed (last round)");
+        printf("== matrix done\n");
+        fflush(stdout);
+        return;
+    }
+    if (const char *e = getenv("LOOM_MATRIX_RXLOCAL")) {
+        // A1 copies 4 MiB into A2 (LOCAL route) while B1 pushes 4 MiB into A1
+        // (arriving as local writes out of loom_rx). A's vFPGA therefore
+        // issues only STRM_HOST requests while receiving as many packets as a
+        // bidirectional round - the same load, without a remote request ever
+        // sitting at the head of the shared sq_wr port. If the halving is
+        // head-of-line blocking between the local and remote paths in the
+        // shell's request demux, both directions here stay near full rate; if
+        // both drop to ~5.9 GB/s, that story is wrong.
+        using clk = std::chrono::steady_clock;
+        const int n_rounds = atoi(e);
+        printf("\n== matrix rxlocal: A1 -> A2 local 4 MiB while B1 -> A1 pushes 4 MiB, %d rounds\n", n_rounds);
+        fflush(stdout);
+        for (uint64_t w = 0; w < LEN_R / 8; w++) A[0].src[w] = mx_word(1, 2, w);
+        std::vector<double> t_loc, t_in;
+        const int f0 = failures;
+        for (int r = 0; r < n_rounds + 1 && failures == f0; r++) {   // +1: warm-up, not counted
+            memset(A[0].buf + MX_DATA / 8, 0, LEN_R);
+            memset(A[1].buf + MX_LOCAL / 8, 0, LEN_R);
+            const uint64_t sq = ++seq, f = *A[0].fence;
+            A[0].xpu->store(to_b[0][0], uint32_t(MX_LEN), LEN_R);
+            const auto t0 = clk::now();
+            A[0].xpu->store(to_b[0][0], uint32_t(MX_CMD), mx_cmd(CMD_PUSHME, 1, sq));
+            // ...and now our own 4 MiB, on the local route
+            A[0].xpu->copy(to_a[1], uint32_t(MX_LOCAL), A[0].src, LEN_R, A[0].fence);
+            if (!spin64_ge(A[0].fence, f + 1, 5e6)) { printf("FAIL: rxlocal: A1 -> A2 never fenced\n"); failures++; break; }
+            const double loc = std::chrono::duration<double, std::micro>(clk::now() - t0).count();
+            if (!spin64(A[0].buf + MX_RFLAG / 8, sq, 5e6)) { printf("FAIL: rxlocal: B1 -> A1 never arrived\n"); failures++; break; }
+            const double in = std::chrono::duration<double, std::micro>(clk::now() - t0).count();
+            if (r) { t_loc.push_back(loc); t_in.push_back(in); }
+            mx_check(A[1].buf + MX_LOCAL / 8, 1, 2, LEN_R, "rxlocal: A1 -> A2 local landed");
+            mx_check(A[0].buf + MX_DATA / 8, 3, 1, LEN_R, "rxlocal: B1 -> A1 landed");
+            if (failures != f0) break;
+        }
+        if (!t_loc.empty()) {
+            auto med = [](std::vector<double> v) { std::sort(v.begin(), v.end()); return v[v.size() / 2]; };
+            const double ml = med(t_loc), mi = med(t_in);
+            printf("rxlocal timing: %zu rounds of %lu B each: A1 -> A2 local median %.1f us (%.2f GB/s), "
+                   "B1 -> A1 incoming median %.1f us (%.2f GB/s) -> %.2f GB/s aggregate on A\n",
+                   t_loc.size(), (unsigned long) LEN_R, ml, LEN_R / ml / 1e3, mi, LEN_R / mi / 1e3,
+                   2.0 * LEN_R / std::max(ml, mi) / 1e3);
+        }
         printf("== matrix done\n");
         fflush(stdout);
         return;
@@ -1239,6 +1323,7 @@ int run_server(uint16_t qp_port, uint16_t peer_port, const std::string &sock) {
     print_pace(loom::csr_read(t_ctrl, loom::TX_PACE), "at init");
     loom::csr_write(t_ctrl, loom::TX_CTL, tx_ctl_from_env(loom::csr_read(t_ctrl, loom::TX_CTL)));
     print_tx_ctl(loom::csr_read(t_ctrl, loom::TX_CTL), "at init");
+    arm_rx_chunk(t_ctrl, "at init");
     loom::Handle h1 = orch.exportBuf(t_data.getCtid(), dst1, BUF_SIZE);
     loom::Handle h2 = orch.exportBuf(t_data.getCtid(), dst2, BUF_SIZE);
     printf("server: exported handles %u, %u\n", h1, h2);
@@ -1669,7 +1754,7 @@ int run_server(uint16_t qp_port, uint16_t peer_port, const std::string &sock) {
     }
 
     dump_counters(t_ctrl, "server final");
-    if (matrix_mode()) dump_tx(t_ctrl, "server final");
+    if (matrix_mode()) { dump_tx(t_ctrl, "server final"); dump_port(t_ctrl, "server final"); }
 
     t_qp.connSync(false);
     peer.stop(); peer_thr.join();
@@ -1746,6 +1831,7 @@ int run_client(const std::string &ip, uint16_t qp_port, uint16_t peer_port,
     print_pace(loom::csr_read(t_ctrl, loom::TX_PACE), "at init");
     loom::csr_write(t_ctrl, loom::TX_CTL, tx_ctl_from_env(loom::csr_read(t_ctrl, loom::TX_CTL)));
     print_tx_ctl(loom::csr_read(t_ctrl, loom::TX_CTL), "at init");
+    arm_rx_chunk(t_ctrl, "at init");
 
     auto *src = static_cast<uint64_t *>(A.alloc(BUF_SIZE));
     auto *fence = static_cast<uint64_t *>(A.allocSmall(4096));
@@ -1818,6 +1904,7 @@ int run_client(const std::string &ip, uint16_t qp_port, uint16_t peer_port,
         const uint64_t got = loom::csr_read(t_ctrl, loom::TX_PACE);
         print_pace(got, got == want ? "re-armed before bench" : "re-armed before bench DID NOT TAKE");
     }
+    arm_rx_chunk(t_ctrl, "re-armed before bench");
     {
         const uint64_t want = tx_ctl_from_env(loom::csr_read(t_ctrl, loom::TX_CTL));
         loom::csr_write(t_ctrl, loom::TX_CTL, want);
@@ -1855,6 +1942,7 @@ int run_client(const std::string &ip, uint16_t qp_port, uint16_t peer_port,
         dump_counters(t_ctrl, "client after the matrix");
         dump_tx(t_ctrl, "client after the matrix");
         dump_rx(t_ctrl, "client after the matrix");
+        dump_port(t_ctrl, "client after the matrix");
     } else if (pingpong_mode()) {
         // Reverse path: our own receive buffer, landing under XPU 1's ctid
         // (the header's dst pid), and amy told where to write and which

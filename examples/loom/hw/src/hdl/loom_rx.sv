@@ -56,6 +56,10 @@ module loom_rx (
     /* verilator lint_off UNUSED */
     input  logic [VADDR_BITS-1:0]       rdma_staging_va,
 
+    // How many PMTU packets one host write covers (CSR, 1 = one write per
+    // packet as before; 2/4/8 = fewer, larger writes). See RX_CHUNK below.
+    input  logic [3:0]                  rx_chunk,
+
     // Whose address space incoming writes land in: the QP owner's cThread,
     // fixed for the connection and written by loomd at QP setup
     /* verilator lint_on UNUSED */
@@ -171,7 +175,8 @@ localparam integer     RX_WR_OUTSTANDING = 8;
 logic [VADDR_BITS-1:0] q_va;         // next write to POST
 logic [27:0]           q_left;       // message bytes not yet posted
 logic [3:0]            outstanding;  // posted, data not yet complete
-wire  [27:0]           q_len   = (q_left > PMTU_BYTES[27:0]) ? PMTU_BYTES[27:0] : q_left;
+wire [27:0] chunk_bytes = PMTU_BYTES[27:0] * {24'd0, rx_chunk};
+wire  [27:0]           q_len   = (q_left > chunk_bytes) ? chunk_bytes : q_left;
 wire                   gen_on  = (state == ST_STREAM || state == ST_PKT_WAIT) &&
                                  (q_left != 28'd0) && (outstanding < RX_WR_OUTSTANDING[3:0]);
 wire                   post_now = gen_on && wr_ready;
@@ -272,9 +277,23 @@ wire [22:0]  cred_add  = (rq_valid && rq_ready) ? beats_of(rq_req.len) : 23'd0;
 // would only make a write span a packet boundary - which is what the old
 // single-write-per-message code did for the entire message. Only the
 // one-descriptor-per-packet property depends on it.
-wire [27:0] first_len = (hdr_len > (PMTU_BYTES - 28'd64)) ? (PMTU_BYTES - 28'd64)
+// RX_CHUNK: bytes one host write covers. The shell fragments the wire at
+// PMTU and announces one rq_wr per packet, but nothing says our host writes
+// must match that granularity - only that they are contiguous and sum to the
+// message length. perf_fpga measures the host write path at 12.2 GB/s with
+// 4 KB writes and 13.1-13.3 at 16-64 KB, and every write is also one request
+// through the shell's single sq_wr port, so k packets per write cuts both the
+// DMA overhead and the request rate by k. k = 1 is exactly the old
+// behaviour. It is a CSR rather than a parameter so one bitstream can do the
+// A/B; the reset value is 1.
+//
+// Why not one write for the whole message (the original design): the shell's
+// DMA then had a single long descriptor, could not overlap setup with data,
+// went bursty and lost packets (see the header above). k in the middle keeps
+// the pipeline fed.
+wire [27:0] first_len = (hdr_len > (chunk_bytes - 28'd64)) ? (chunk_bytes - 28'd64)
                                                           : hdr_len;
-wire [27:0] next_len  = (w_left  >  PMTU_BYTES[27:0])     ? PMTU_BYTES[27:0]
+wire [27:0] next_len  = (w_left  >  chunk_bytes)          ? chunk_bytes
                                                           : w_left;
 
 // A header beat waiting on the payload stream is what wants the shared path

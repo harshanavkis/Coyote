@@ -14,6 +14,8 @@ import lynxTypes::*;
  */
 module tb_loom_rx;
 
+logic [3:0] rx_chunk_tb = 4'd1;   // packets per host write (CSR 76); T10 raises it
+
 logic aclk = 0;
 logic aresetn = 0;
 always #2 aclk = ~aclk;
@@ -58,6 +60,7 @@ localparam [63:0] HDR_PID = 64'(RX_PID) << 36;
 localparam [47:0] TARGET  = 48'h7f9e_8860_0000;
 
 loom_rx dut (
+    .rx_chunk(rx_chunk_tb),
     .aclk(aclk), .aresetn(aresetn),
     .rq_req(rq_req), .rq_valid(rq_valid), .rq_ready(rq_ready),
     .rdma_staging_va(STAGING),
@@ -761,6 +764,51 @@ initial begin
           outq[1].data == 64'hE0E0_0001 && outq[1].last,
           "wr_ready release: both payload beats, header stripped");
     outq.delete(); wrq.delete();
+
+    // --- 18. rx_chunk: k PMTU packets per host write (CSR 76).
+    //     One 8192 B message arrives as three wire packets (4096, 4096, 64 -
+    //     the first gives up 64 B to the header). With k = 1 that is three
+    //     host writes, as before; with k = 2 the same bytes land in two.
+    //     Fewer, larger writes cost the host DMA less per byte and, more to
+    //     the point, cost fewer requests through the shell's single sq_wr
+    //     port. What must NOT change: the target addresses are contiguous,
+    //     the lengths sum to the header's, and every payload beat is
+    //     forwarded exactly once.
+    for (int k = 1; k <= 2; k++) begin
+        int unsigned total, beats_fwd;
+        logic [47:0] expect_va;
+        rx_chunk_tb = 4'(k);
+        dut_reset();
+        outq.delete(); wrq.delete();
+        incoming(6'd3, 28'd4096, STAGING);                      // packet 1
+        send_msg_beat((HDR_PID | {28'b0, 28'd8192, OP_WR}), {16'b0, TARGET + 48'h4000}, 64'b0, 1'b0);
+        for (int b = 0; b < 63; b++)
+            send_msg_beat(64'(64'hC000_0000 + b), 64'b0, 64'b0, (b == 62));
+        present_pending(6'd3, 28'd4096, STAGING + 48'h1000);    // packet 2
+        for (int b = 0; b < 64; b++)
+            send_msg_beat(64'(64'hC100_0000 + b), 64'b0, 64'b0, (b == 63));
+        present_pending(6'd3, 28'd64, STAGING + 48'h2000);      // packet 3 (tail)
+        send_msg_beat(64'hC200_0000, 64'b0, 64'b0, 1'b1);
+        wait_quiet(4000, $sformatf("18: 8192 B message at k=%0d", k));
+        dump_wrq($sformatf("case 18, k=%0d", k));
+        check(wrq.size() == (k == 1 ? 3 : 2),
+              $sformatf("chunk k=%0d: %0d host writes, expected %0d",
+                        k, wrq.size(), (k == 1 ? 3 : 2)));
+        total = 0; expect_va = TARGET + 48'h4000;
+        foreach (wrq[i]) begin
+            check(wrq[i].vaddr == {16'b0, expect_va},
+                  $sformatf("chunk k=%0d: write %0d lands at %h (expected %h)",
+                            k, i, wrq[i].vaddr, expect_va));
+            expect_va = expect_va + 48'(wrq[i].len);
+            total = total + wrq[i].len;
+        end
+        check(total == 8192,
+              $sformatf("chunk k=%0d: writes sum to %0d, expected 8192", k, total));
+        beats_fwd = outq.size();
+        check(beats_fwd == 128,
+              $sformatf("chunk k=%0d: %0d payload beats forwarded, expected 128", k, beats_fwd));
+    end
+    rx_chunk_tb = 4'd1;
 
     if (errors == 0) $display("TB PASS (tb_loom_rx)");
     else             $display("TB FAIL (tb_loom_rx): %0d errors", errors);

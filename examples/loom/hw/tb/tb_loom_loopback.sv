@@ -231,6 +231,7 @@ localparam [PID_BITS-1:0] FAR_PID  = 6'd3;         // the exporter XPU's ctid on
 
 logic cnt_rx_bp;   // ingress backpressure, any state
 loom_rx inst_rx (
+    .rx_chunk(4'd1),
     .cnt_rx_bp(cnt_rx_bp),
     .aclk(aclk), .aresetn(aresetn),
     .rq_req(rx_rq_req), .rq_valid(rx_rq_valid), .rq_ready(rx_rq_ready),

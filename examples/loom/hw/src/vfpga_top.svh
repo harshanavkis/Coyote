@@ -38,6 +38,14 @@ logic [VADDR_BITS-1:0]  lu_base;
 logic [LEN_BITS-1:0]    lu_len;
 
 logic cnt_local_wr, cnt_rdma_wr, cnt_rx_fwd, cnt_rx_drop, cnt_drop, cnt_compl;
+// Request-port accounting (CSR words 72-75). Both producers' requests leave
+// through the shell's ONE sq_wr, which the shell demuxes by strm into its
+// host-DMA path and its RoCE path (user_req_mux.sv) with a single register
+// in between - so the request at the head owns the port until ITS path takes
+// it. These four separate "waiting for my own path" from "waiting only
+// because the other type is at the head", which is the head-of-line
+// blocking suspected of halving bidirectional bandwidth.
+logic cnt_wr_wait_local, cnt_wr_wait_rdma, cnt_wr_blk_eng, cnt_wr_blk_rx;
 logic cnt_pull_desync;
 logic cnt_rx_orphan;
 // cq_wr IS the engine's ack signal now - one per PACKET. build_sep6 tried
@@ -135,8 +143,28 @@ axisr_reg inst_reg_wr_rx (.aclk(aclk), .aresetn(aresetn),
 // packet or store, and neither producer's valid depends on its ready.
 //
 // rx has priority because its requests are what keep the shell's receive
-// FSM moving (and with it the acks the engine is waiting for); the engine
-// loses at most one cycle per rx packet. Neither can starve the other.
+// FSM moving (and with it the acks the engine is waiting for).
+//
+// TWO KNOWN DEFECTS HERE, both to be fixed together with the shell's
+// per-branch request queues (2026-09-27), not before - fixing either alone
+// makes bidirectional traffic slower:
+//
+// 1. "the engine loses at most one cycle per rx packet" is false. rx takes
+//    the port whenever it has a request, so under a stream of incoming
+//    packets the engine is preempted again and again: measured 3.0 M cycles
+//    of sq_wr.ready wait in one --storm run. cnt_wr_blk_eng above counts it.
+// 2. The mux switches sq_wr.data from the engine's request to rx's while
+//    sq_wr.valid is already high and ready is low, which an AXI-stream
+//    handshake does not allow (a presented request must stay presented until
+//    it is taken). It works here because the shell samples the payload only
+//    in the cycle it asserts ready, but it is a protocol violation and it is
+//    what makes defect 1 possible.
+//
+// The correct arbiter locks the port to whichever producer it presented
+// until that handshake completes and then alternates. On its own that turns
+// defect 1 into head-of-line blocking (the loser waits out the winner's full
+// path latency, ~84 cycles for a packet on the wire), which is why it waits
+// for the shell fix that decouples the two paths.
 // ---------------------------------------------------------------------------
 wire rx_takes_wr = rx_wr_valid;
 
@@ -158,6 +186,8 @@ loom_ctrl inst_loom_ctrl (
     .tx_window(tx_window), .tx_inflight(tx_inflight),
     .cnt_tx_ack(cnt_tx_ack), .cnt_tx_winfull(cnt_tx_winfull),
     .cnt_tx_reqwait(cnt_tx_reqwait), .cnt_tx_fifo_full(cnt_tx_fifo_full),
+    .cnt_wr_wait_local(cnt_wr_wait_local), .cnt_wr_wait_rdma(cnt_wr_wait_rdma),
+    .cnt_wr_blk_eng(cnt_wr_blk_eng), .cnt_wr_blk_rx(cnt_wr_blk_rx),
     .rd_resp_data(rd_resp_data), .rd_resp_valid(rd_resp_valid),
     .cnt_local_wr(cnt_local_wr), .cnt_rdma_wr(cnt_rdma_wr),
     .cnt_rx_fwd(cnt_rx_fwd), .cnt_rx_drop(cnt_rx_drop),
@@ -291,6 +321,23 @@ always_comb begin
     sq_wr.data  = rx_takes_wr ? rx_wr_req  : eng_wr_req;
     sq_wr.valid = rx_wr_valid || eng_wr_valid;
 end
+
+// What the port is spending its time on. "wait" = the request at the head is
+// presented and the shell has not taken it, split by the path it needs
+// (loom_rx always writes STRM_HOST; the engine writes STRM_RDMA on the rdma
+// route and STRM_HOST for stores, fences and local copies). "blk" = the
+// producer HAS a request and is not the one being presented, so it is
+// waiting on the other producer rather than on its own path - if the halving
+// is head-of-line blocking, blk_eng + blk_rx is where the time goes.
+wire wr_stalled = sq_wr.valid && !sq_wr.ready;
+assign cnt_wr_wait_local = wr_stalled && is_strm_local(sq_wr.data.strm);
+assign cnt_wr_wait_rdma  = wr_stalled && !is_strm_local(sq_wr.data.strm);
+// The engine has a request, rx's is the one presented, and the shell is not
+// taking rx's either: the engine is waiting on the OTHER path's slowness.
+assign cnt_wr_blk_eng    = eng_wr_valid && rx_takes_wr && !sq_wr.ready;
+// Must read 0: rx has priority, so rx is never the one waiting its turn. A
+// nonzero value means the arbiter below does not do what this says.
+assign cnt_wr_blk_rx     = rx_wr_valid && !rx_takes_wr;
 
 always_comb begin
     sq_rd.data  = eng_rd_req;

@@ -511,6 +511,8 @@ def bench_env(args, gap):
         env += f" LOOM_TX_PACE={args.tx_pace}"
     if args.tx_window is not None:
         env += f" LOOM_TX_WINDOW={args.tx_window}"
+    if args.rx_chunk is not None:
+        env += f" LOOM_RX_CHUNK={args.rx_chunk}"
     if args.pingpong:
         env += " LOOM_BENCH_PINGPONG=1"
     if args.matrix:
@@ -521,6 +523,8 @@ def bench_env(args, gap):
             env += " LOOM_BIDIR_NOWARMUP=1"
         if args.local:
             env += f" LOOM_MATRIX_LOCAL={args.local}"
+        if args.rxlocal:
+            env += f" LOOM_MATRIX_RXLOCAL={args.rxlocal}"
         if args.storm:
             env += f" LOOM_STORM_STORES={args.storm}"
     elif args.xpus > 1:
@@ -566,7 +570,7 @@ def summarize(args, gap, result, verdicts=None):
         for l in rows:
             if "FAIL" in l: print("  " + l.rstrip())
         for l in cli_out + srv_out:
-            if l.startswith(("bidir timing:", "local timing:", "storm timing:", "tx [", "rx [")) or "warm-up" in l: print("  " + l.rstrip())
+            if l.startswith(("bidir timing:", "local timing:", "storm timing:", "rxlocal timing:", "tx [", "rx [", "port [")) or "warm-up" in l: print("  " + l.rstrip())
         return
     if args.pingpong:
         # The client prints one row per size; the verdict is the server's
@@ -733,6 +737,19 @@ def main():
                     help="only N timed rounds of a 4 MiB local copy A1 -> A2 "
                          "on the client (host DMA read + write at once, no "
                          "network); implies --matrix")
+    ap.add_argument("--rx-chunk", type=int, default=None, metavar="K",
+                    help="PMTU packets per host write in loom_rx (CSR 76, "
+                         "bitstream default 1 = one write per packet). Fewer, "
+                         "larger writes cost the host DMA less per byte and "
+                         "cost fewer requests through the shell's single "
+                         "sq_wr port; 1/2/4/8 are the useful values")
+    ap.add_argument("--rxlocal", type=int, default=0, metavar="N",
+                    help="N rounds of: A1 copies 4 MiB to A2 on the LOCAL "
+                         "route while B1 pushes 4 MiB at A1. Same incoming "
+                         "packet count as a bidirectional round, but every "
+                         "request A's vFPGA issues is local - the test for "
+                         "head-of-line blocking between the shell's local "
+                         "and remote request paths; implies --matrix")
     ap.add_argument("--storm", type=int, default=0, metavar="K",
                     help="with --bidir: after the timed rounds, N more rounds "
                          "in which B answers A's 4 MiB push with K 64 B "
@@ -742,7 +759,7 @@ def main():
                     help="reflash both cards and retry after a wedge")
     ap.add_argument("--out", default=f"{COYOTE}/examples/loom/experiments-log.txt")
     args = ap.parse_args()
-    if args.bidir or args.local:
+    if args.bidir or args.local or args.rxlocal:
         args.matrix = True
 
     try:

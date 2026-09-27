@@ -101,6 +101,22 @@ constexpr uint32_t TX_ACKS       = 0x220;   // word 68 RO: packet acks received
 constexpr uint32_t TX_WINFULL    = 0x228;   // word 69 RO: cycles a packet waited on the window
 constexpr uint32_t TX_REQWAIT    = 0x230;   // word 70 RO: cycles a packet waited on sq_wr.ready
 constexpr uint32_t TX_FIFO_FULL  = 0x238;   // word 71 RO: cycles the pull was held by the tx FIFO
+// Request-port accounting (words 72-75 RO, vfpga_top.svh). The engine and
+// loom_rx share the shell's ONE sq_wr, which the shell demuxes by strm into
+// its host-DMA path and its RoCE path with a single register in between, so
+// the request at the head owns the port until ITS path takes it. WAIT_* is
+// time a request spent waiting for its own path; BLK_ENG is time the engine
+// had a request while rx's was the one presented AND the shell was not
+// taking that either - head-of-line blocking, measured. BLK_RX must read 0
+// (rx has priority in the arbiter).
+constexpr uint32_t WR_WAIT_LOCAL = 0x240;   // word 72
+constexpr uint32_t WR_WAIT_RDMA  = 0x248;   // word 73
+constexpr uint32_t WR_BLK_ENG    = 0x250;   // word 74
+constexpr uint32_t WR_BLK_RX     = 0x258;   // word 75
+// PMTU packets per host write in loom_rx, [3:0], reset 1 (one write per
+// packet). Larger = fewer, bigger writes: less DMA overhead per byte and
+// fewer requests through the shared port. LOOM_RX_CHUNK / --rx-chunk.
+constexpr uint32_t RX_CHUNK      = 0x260;   // word 76 RW
 constexpr uint32_t RX_FIFO_FULL  = 0x070;   // word 14: ingress FIFO refused a beat
 constexpr uint32_t RX_FIFO_FULL_MAX = 0x078; // word 15: longest run of that
 constexpr uint32_t RX_BP         = 0x0F0;   // word 30
