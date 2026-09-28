@@ -15,8 +15,10 @@ RDMA if it's remote. The endpoint never builds work requests, holds queue
 pairs or polls completions.
 
 **Running that needs two things from hardware:**
-1. **A translation stage on the host interface.** Writes to a decoded
-   address window are treated as transactions and routed, at
+1. **A translation stage where peer transactions enter the device.** In the
+   ToR switch, that's its accelerator-facing ports. On a per-host card (a
+   SmartNIC, or our FPGA), it's the card's PCIe link to the host. Writes to a
+   decoded address window are treated as transactions and routed, at
    per-transaction hardware speed, by bindings the orchestrator owns.
 2. **The right placement.** The element has to sit on the path of every peer
    transaction, local and remote, because that's where the two domains
@@ -207,7 +209,8 @@ translation stage, not the transport.
 
 ## One-paragraph rebuttal
 
-> Loom needs a translation stage on the host interface, one that routes
+> Loom needs a translation stage where peer transactions enter the network
+> element (a switch's accelerator-facing ports, or a card's PCIe link), one that routes
 > writes to a decoded address window by orchestrator-installed bindings, and
 > it needs that stage where the scale-up and scale-out fabrics meet. No
 > shipping device provides both. Fixed-function RDMA NICs implement the verbs
