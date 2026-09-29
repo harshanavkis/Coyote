@@ -28,24 +28,10 @@
 #define _COYOTE_CTHREAD_HPP_
 
 #include <thread>
-#include <chrono>
-#include <string>
-#include <random>
-#include <fstream>
-#include <iostream>
 #include <functional>
-#include <unordered_map> 
+#include <unordered_map>
 
-#include <fcntl.h>
-#include <netdb.h>
-#include <syslog.h>
 #include <unistd.h>
-
-#include <sys/mman.h>
-#include <sys/ioctl.h>
-#include <sys/epoll.h>
-#include <sys/eventfd.h>
-#include <linux/mman.h>
 
 #include <boost/interprocess/sync/named_mutex.hpp>
 
@@ -55,9 +41,18 @@
 #include <immintrin.h>
 #endif
 
+#ifdef EN_ROCM
+#include <hsa.h>
+#include <hip/hip_runtime.h>
+#include <hsa/hsa_ext_amd.h>
+#endif
+
+#ifdef EN_CUDA
+#include <cuda.h>
+#endif
+
 #include <coyote/cDefs.hpp>
 #include <coyote/cOps.hpp>
-#include <coyote/cGpu.hpp>
 
 namespace coyote {
 
@@ -117,6 +112,9 @@ protected:
 
 	/// A map of all the pages that have been allocated and mapped for this thread
 	std::unordered_map<void*, CoyoteAlloc> mapped_pages;
+
+	/// Tracks dmabuf file descriptors for GPU allocations registered via userMap
+	std::unordered_map<void*, int32_t> gpu_dmabuf_fds;
 
 	/** 
 	 * Out-of-band connection file descriptor to a remote node
@@ -206,17 +204,23 @@ protected:
 	~cThread();
 
 	/**
-	 * @brief Maps a buffer to the vFPGAs TLB
+	 * @brief Maps a buffer to the vFPGA's TLB.
+	 * Automatically detects GPU memory (when compiled with EN_ROCM or EN_CUDA) using HIP/CUDA pointer
+	 * query APIs. GPU memory is registered via IOCTL_MAP_DMABUF (the dmabuf is exported internally);
+	 * all other memory uses IOCTL_MAP_USER_MEM. The dmabuf fd is stored internally and released by userUnmap.
 	 *
 	 * @param vaddr Virtual address of the buffer
 	 * @param len Length of the buffer, in bytes
 	 * @param mem_block What memory block to store this memory in; only applicable to Versal devices
 	 *		When -1, the driver picks the first PC with sufficient space
 	 */
-	void userMap(void *vaddr, uint32_t len, int32_t mem_block = -1);
+	void userMap(void *vaddr, uint64_t len, int32_t mem_block = -1);
 
 	/**
-	 * @brief Unmaps a buffer from the the vFPGAs TLB
+	 * @brief Unmaps a buffer from the vFPGA's TLB.
+	 * Automatically detects GPU memory by checking the internal dmabuf fd map populated by userMap.
+	 * GPU memory is deregistered via IOCTL_UNMAP_DMABUF and the exported dmabuf fd is closed;
+	 * all other memory uses IOCTL_UNMAP_USER_MEM.
 	 *
 	 * @param vaddr Virtual address of the buffer
 	 */
@@ -344,8 +348,10 @@ protected:
 	 * @param buffer_size Size of the buffer to be allocated for RDMA operations
 	 * @param port Port number to be used for the out-of-band connection
 	 * @param server_address Optional server address to connect to; if not provided, this cThread acts as the server
+	 * @param mem Optional pre-allocated staging buffer for RDMA operations; if provided (not nullptr),
+	 *            it is used directly and no buffer is allocated internally via getMem
 	 */
-	void* initRDMA(uint32_t buffer_size, uint16_t port, const char* server_address = nullptr);
+	void* initRDMA(uint64_t buffer_size, uint16_t port, const char* server_address = nullptr, void* mem = nullptr);
 	
 	/**
 	 * @brief Opposite of initRDMA; releases the the out-of-band connection which was used to exchange QP
