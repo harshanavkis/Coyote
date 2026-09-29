@@ -50,6 +50,10 @@ inline void program_window(coyote::cThread &t, uint32_t win, bool rdma, uint32_t
     csr_write(t, TBL_LEN,    len);
     csr_write(t, TBL_USTART, ustart);
     csr_write(t, TBL_COMMIT, 1);
+    // The table writes are posted, and they reach the vFPGA on a different
+    // port than data written to the uwin afterwards: read back so the entry
+    // is in place before anything is written through it
+    (void) csr_read(t, TBL_IDX);
 }
 
 inline void release_window(coyote::cThread &t, uint32_t win) {

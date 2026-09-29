@@ -145,6 +145,11 @@ attribute Loom's share.
   cable, at 200G, with RoCE MTU 1024. The other three are clara/amy through
   a switch at 100G.
 - The perf_rdma bitstream's build commit isn't recorded.
+- In `loom-portcnt`, `loom_rx`'s `rx_chunk` input is unconnected
+  (`vfpga_top.svh`) and synthesis tied it to 0, so the receiver lands each
+  message with one host write of its whole length, not one per packet, and
+  the `RX_CHUNK` CSR (word 76) has no effect. The Loom numbers here are in
+  that mode.
 - Means (Loom, perf_rdma) and medians (perftest) are reported as the tools
   give them.
 

@@ -409,6 +409,14 @@ void cThread::unmapUwin() {
     }
 }
 
+void cThread::uwinWrite(uint64_t offset, const void *src, uint64_t len) {
+    if (!uwin || offset + len > uwin_len) {
+        throw std::runtime_error("ERROR: uwinWrite outside the mapped user data window (call mapUwin first)");
+    }
+    memcpy(static_cast<char *>(uwin) + offset, src, len);
+    _mm_sfence();
+}
+
 void cThread::importDmabuf(int dmabuf_fd, void *vaddr, int32_t mem_block) {
     DBG1("cThread: Called importDmabuf, fd " << dmabuf_fd << ", vaddr " << vaddr << ", ctid " << ctid);
     uint64_t tmp[MAX_USER_ARGS];

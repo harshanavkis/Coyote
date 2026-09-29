@@ -177,6 +177,18 @@ can be up to 128 MB (a 64 MiB push fits one binding).
   `/scratch/harshanavkis/loom-proj/Coyote/examples/loom_switch/hw/tb/shell_ctrl_uwin/run.sh`
 - Software:
   `cd /scratch/harshanavkis/loom-proj/Coyote/examples/loom_switch/sw && mkdir -p build && cd build && nix-shell ../../../../shell.nix --run "cmake .. && make -j16"`
+- G2 in Coyote's simulation (the whole vFPGA under `sim/hw/tb_user.sv`,
+  which drives `axi_udata` for `cThread::uwinWrite`; passes, 16 KiB bulk and
+  16 stores). Once: build the software with `-DEN_SIM=ON` in `sw/build_sim`,
+  and create the sim project in `hw/build_sim` with `xilinx-shell -c "make sim"`.
+  Vivado 2023.2's bundled binutils cannot link the DPI library against this
+  host's glibc any more, so that step fails; copy
+  `examples/loom/hw/build_sim/sim/coyote_sim.so` (same source) into
+  `hw/build_sim/sim/` and run
+  `cd /scratch/harshanavkis/loom-proj/Coyote/examples/loom_switch/hw/build_sim && xilinx-shell -c "vivado -mode batch -nojournal -source cr_sim.tcl -notrace"`.
+  Then:
+  `cd /scratch/harshanavkis/loom-proj/Coyote/examples/loom_switch/sw/build_sim && xilinx-shell -c "COYOTE_SIM_DIR=/scratch/harshanavkis/loom-proj/Coyote/examples/loom_switch/hw/build_sim stdbuf -oL ./uwin_probe 16384 16"`
+  (compiles, elaborates and runs; minutes of wall clock)
 - G2 on clara, once the loom_switch bitstream is on the U280 and
   `coyote_driver` has `MMAP_UWIN` (1 MiB bulk, 256 stores):
   `cd /scratch/harshanavkis/loom-proj/Coyote/examples/loom_switch/sw/build && sudo ./uwin_probe 1048576 256`
@@ -186,9 +198,20 @@ can be up to 128 MB (a 64 MiB push fits one binding).
 `examples/loom/hw/src/vfpga_top.svh` connects neither `loom_ctrl`'s
 `rx_chunk` output nor `loom_rx`'s `rx_chunk` input (since `40c7620c`), and
 synthesis does not warn. The CSR (word 76) therefore has no effect on the
-card, and `loom_rx`'s landing size is whatever synthesis makes of an
-undriven input. `loom-portcnt` and `build_sep29_ctrl` both have it.
-`examples/loom` is left as it is here.
+card. `loom-portcnt` and `build_sep29_ctrl` both have it.
+
+What synthesis made of it (read from `loom-portcnt`'s synthesized user
+checkpoint, `build_sep27_port_counters/.../synth_1/design_user_wrapper_0.dcp`):
+`rx_chunk` = 0. The comparators decode to `q_left > 0` and
+`hdr_len > 0xFFFFFC0`, so `chunk_bytes` = 0 and `loom_rx` lands every message
+with ONE host write of its whole length (a 64 MiB push is one 64 MiB write),
+not one per packet. The PERFORMANCE.md numbers were taken in that mode; the
+control build compares like with like.
+
+`loom_switch` differs: the ingress sends only single-packet messages, so the
+far `loom_rx` lands one host write per packet whatever `RX_CHUNK` says. A
+receive-side difference in G5 against `loom-portcnt` has that as a
+candidate cause. `examples/loom` is left as it is.
 
 ## 5. Gates
 

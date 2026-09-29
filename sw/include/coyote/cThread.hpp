@@ -270,6 +270,15 @@ protected:
 	void unmapUwin();
 
 	/**
+	 * @brief Writes len bytes into the user data window at offset, then a
+	 * store fence: on hardware through the mapUwin mapping (map it first),
+	 * in simulation as a write on the vFPGA's axi_udata port. The portable
+	 * way to write the window; whole, aligned 8 B words and full lines are
+	 * what the switch takes.
+	 */
+	void uwinWrite(uint64_t offset, const void *src, uint64_t len);
+
+	/**
 	 * @brief Allocates memory for this cThread and maps it into the vFPGA's TLB
 	 *
 	 * @param alloc CoyoteAlloc object containing the allocation parameters, including size, type (e.g., hugepage, GPU) etc.

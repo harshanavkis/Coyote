@@ -111,6 +111,14 @@ If `do_polling` is asserted, stalls dispatching of the next operator until the `
 +-+-+-+-+-+-+-+-+
 ```
 
+`UWIN_WRITE` (op type 12, projects built with `EN_UWIN`) encodes `uwinWrite(...)`: host writes into the vFPGA's user data window, driven on its `axi_udata` port as the PCIe bridge would, in bursts of at most 256 B that do not cross 4 KB, with byte strobes for the bytes written. `vaddr` is the offset in the window; the `data` field is expected to match `len` in length.
+
+```
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+++++++++++++++
+| offset (long) |   len (long)  | data[len] ...
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+++++++++++++++
+```
+
 ### Scoreboard
 The scoreboard writes back results of control register reads, interrupts, and writes to host memory into a binary output file located at `<build_dir>/sim/output.sock`.
 This binary file works similar to the input file but has the following op codes: `GET_CSR = 0, HOST_WRITE = 1, IRQ = 2, CHECK_COMPLETED = 3, HOST_READ = 4`.

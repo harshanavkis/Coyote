@@ -44,6 +44,9 @@
 {% if cnfg.en_avx %}
 `define EN_AVX
 {% endif %}
+{% if cnfg.en_uwin %}
+`define EN_UWIN
+{% endif %}
 {% if cnfg.en_wb %}
 `define EN_WB
 {% endif %}

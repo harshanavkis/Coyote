@@ -60,7 +60,8 @@ class generator;
         USER_UNMAP,        // cThread.userUnmap
         RDMA_REMOTE_INIT,  // Write data at given position in remote RDMA memory
         RDMA_LOCAL_READ,   // Simulate a RDMA read request coming from remote to the local vFGPA
-        RDMA_LOCAL_WRITE   // Simulate a RDMA write request coming from remote to the local vFGPA
+        RDMA_LOCAL_WRITE,  // Simulate a RDMA write request coming from remote to the local vFGPA
+        UWIN_WRITE         // cThread.uwinWrite: host writes into the vFPGA's user data window
     } op_type_t;
     int op_type_size[] = {
         trs_ctrl::SET_BYTES,
@@ -74,6 +75,7 @@ class generator;
         $bits(longint) / 8,
         $bits(vaddr_size_t) / 8,
         $bits(vaddr_size_t) / 8,
+        $bits(vaddr_size_t) / 8,
         $bits(vaddr_size_t) / 8
     };
 
@@ -83,6 +85,9 @@ class generator;
 
     memory_simulation mem_sim;
     scoreboard scb;
+`ifdef EN_UWIN
+    uwin_simulation uwin_sim;   // set by tb_user
+`endif
 
     string file_name;
     event done;
@@ -266,6 +271,19 @@ class generator;
 `else
                 RDMA_REMOTE_INIT, RDMA_LOCAL_READ, RDMA_LOCAL_WRITE: begin
                     `FATAL(("Project has been setup without RDMA support"))
+                end
+`endif
+`ifdef EN_UWIN
+                UWIN_WRITE: begin
+                    // vaddr is the offset in the uwin
+                    vaddr_size_t trs = data[$bits(vaddr_size_t) - 1:0];
+                    byte write_data[];
+                    read_all_data(fd, trs, write_data);
+                    uwin_sim.write(trs.vaddr, write_data);
+                end
+`else
+                UWIN_WRITE: begin
+                    `FATAL(("Project has been setup without EN_UWIN"))
                 end
 `endif
                 default: begin

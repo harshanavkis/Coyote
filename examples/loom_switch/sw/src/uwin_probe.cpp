@@ -12,7 +12,10 @@
  * become packets, anything the write-combining buffer flushed partially
  * becomes 8 B stores. Both land the same bytes.
  *
- * Needs the loom_switch bitstream (EN_UWIN) and coyote_driver with MMAP_UWIN.
+ * Needs the loom_switch bitstream (EN_UWIN) and coyote_driver with MMAP_UWIN;
+ * or, linked against the simulation library (EN_SIM), COYOTE_SIM_DIR set to
+ * a loom_switch simulation build. Writes go through cThread::uwinWrite, so
+ * the same code drives both.
  */
 #include <chrono>
 #include <cstdio>
@@ -45,6 +48,9 @@ int main(int argc, char **argv) {
         return 2;
     }
 
+    // Simulated time is slow in wall-clock terms
+    const auto patience = getenv("COYOTE_SIM_DIR") ? std::chrono::seconds(1800) : std::chrono::seconds(2);
+
     coyote::cThread t(0, getpid());
     const uint32_t pid = t.getCtid();
 
@@ -59,18 +65,18 @@ int main(int argc, char **argv) {
 
     program_window(t, 1, false, pid, dst, size, 0);
     program_window(t, 2, false, pid, flag, 4096, size);
-    volatile uint64_t *uwin = static_cast<volatile uint64_t *>(t.mapUwin(size + 4096));
+    t.mapUwin(size + 4096);
     volatile uint64_t *vflag = flag;
+    volatile uint64_t *vdst = dst;
     int errors = 0;
 
     // --- 1. bulk, then a flag behind it ---
     IngressCounters c0 = IngressCounters::read(t);
     auto t0 = std::chrono::steady_clock::now();
-    memcpy((void *) uwin, src, size);
-    _mm_sfence();
-    uwin[size / 8] = 1;
-    _mm_sfence();
-    auto deadline = t0 + std::chrono::seconds(2);
+    const uint64_t one = 1;
+    t.uwinWrite(0, src, size);
+    t.uwinWrite(size, &one, 8);
+    auto deadline = t0 + patience;
     while (*vflag != 1 && std::chrono::steady_clock::now() < deadline) _mm_pause();
     auto t1 = std::chrono::steady_clock::now();
     IngressCounters c1 = IngressCounters::read(t);
@@ -98,16 +104,18 @@ int main(int argc, char **argv) {
     c0 = IngressCounters::read(t);
     for (int k = 0; k < n_stores; k++) {
         uint64_t w = (uint64_t(k) * 7919 * 8) % size / 8;
-        uwin[w] = pattern(8 * w) ^ k;
-        _mm_sfence();
+        uint64_t v = pattern(8 * w) ^ k;
+        t.uwinWrite(8 * w, &v, 8);
     }
-    usleep(1000);
+    deadline = std::chrono::steady_clock::now() + patience;
+    do {
+        bad = 0;
+        for (int k = 0; k < n_stores; k++) {
+            uint64_t w = (uint64_t(k) * 7919 * 8) % size / 8;
+            if (vdst[w] != (pattern(8 * w) ^ k)) bad++;
+        }
+    } while (bad && std::chrono::steady_clock::now() < deadline);
     c1 = IngressCounters::read(t);
-    bad = 0;
-    for (int k = 0; k < n_stores; k++) {
-        uint64_t w = (uint64_t(k) * 7919 * 8) % size / 8;
-        if (dst[w] != (pattern(8 * w) ^ k)) bad++;
-    }
     if (bad) {
         printf("FAIL stores: %lu of %d wrong\n", (unsigned long) bad, n_stores);
         errors++;

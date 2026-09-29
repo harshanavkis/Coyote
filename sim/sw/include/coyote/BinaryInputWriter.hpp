@@ -48,7 +48,11 @@ class BinaryInputWriter {
         SLEEP,           // Sleep for a certain duration before processing the next command
         CHECK_COMPLETED, // Return how many requests have been completed for a given CoyoteOper
         CLEAR_COMPLETED, // Clear completed counters
-        USER_UNMAP       // cThread.userUnmap
+        USER_UNMAP,      // cThread.userUnmap
+        RDMA_REMOTE_INIT,  // (Python framework only)
+        RDMA_LOCAL_READ,   // (Python framework only)
+        RDMA_LOCAL_WRITE,  // (Python framework only)
+        UWIN_WRITE       // cThread.uwinWrite: host writes into the vFPGA's user data window
     };
 
     typedef struct __attribute__((packed)) {
@@ -148,6 +152,19 @@ public:
             fflush(fp);
         }
         DEBUG("Wrote writeMem(" << vaddr << ", " << size << ", ...)")
+    }
+
+    void uwinWrite(uint64_t offset, uint64_t size, const void *ptr) {
+        uint8_t op_type = UWIN_WRITE;
+        vaddr_size_t vs = {offset, size};
+        {
+            std::lock_guard<std::mutex> lock(write_mtx);
+            fwrite(&op_type, 1, 1, fp);
+            fwrite(&vs, sizeof(vaddr_size_t), 1, fp);
+            fwrite(ptr, size, 1, fp);
+            fflush(fp);
+        }
+        DEBUG("Wrote uwinWrite(" << offset << ", " << size << ", ...)")
     }
 
     void invoke(uint8_t opcode, uint8_t strm, uint8_t dest, uint64_t vaddr, uint64_t len, uint8_t last) {

@@ -92,7 +92,8 @@ public:
     }
 };
 
-cThread::cThread(int32_t vfid, pid_t hpid, uint32_t device, std::function<void(int)> uisr):
+cThread::cThread(int32_t vfid, pid_t hpid, uint32_t device, std::function<void(int)> uisr,
+                 const std::string &dev_prefix):   // no device file in simulation
   hpid(hpid), vfid(vfid),
   vlock(boost::interprocess::open_or_create, ("vpga_mtx_user_" + std::to_string(std::time(nullptr))).c_str()),
   additional_state(std::make_unique<AdditionalState>()) { // Timestamp for plock to prevent multiple users aquiring the same lock at the same time which does not matter for the simulation, only for hardware
@@ -463,6 +464,30 @@ void cThread::invoke(CoyoteOper oper, rdmaSg sg, bool last) {
 
 void cThread::invoke(CoyoteOper oper, tcpSg sg, bool last) {
     ASSERT("Networking not implemented in simulation target!")
+}
+
+// The user data window has no CPU mapping in simulation: writes go to the
+// simulator as UWIN_WRITE operations (uwinWrite)
+void *cThread::mapUwin(uint64_t len) {
+    uwin = nullptr;
+    uwin_len = len;
+    DEBUG("mapUwin(" << len << "): no CPU mapping in simulation, use uwinWrite")
+    return nullptr;
+}
+
+void cThread::unmapUwin() {
+    uwin = nullptr;
+    uwin_len = 0;
+}
+
+void cThread::uwinWrite(uint64_t offset, const void *src, uint64_t len) {
+    if (offset + len > uwin_len) {
+        throw std::runtime_error("ERROR: uwinWrite outside the mapped user data window (call mapUwin first)");
+    }
+    additional_state->executeUnlessCrash([&] {
+        additional_state->input_writer.uwinWrite(offset, len, src);
+    });
+    DEBUG("uwinWrite(" << offset << ", " << len << ") finished")
 }
 
 uint32_t cThread::checkCompleted(CoyoteOper oper) const {

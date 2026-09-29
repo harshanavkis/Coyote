@@ -38,6 +38,9 @@ import lynxTypes::*;
 `include "ctrl_simulation.svh"
 `include "notify_simulation.svh"
 `include "mem_mock.svh"
+`ifdef EN_UWIN
+`include "uwin_simulation.svh"
+`endif
 `include "generator.svh"
 `include "scoreboard.svh"
 `include "memory_simulation.svh"
@@ -82,6 +85,13 @@ module tb_user;
     AXI4L axi_ctrl(.*);
     c_axil axi_ctrl_drv = new(axi_ctrl);
     ctrl_simulation ctrl_sim;
+
+`ifdef EN_UWIN
+    // User data window (host writes into the vFPGA)
+    AXI4 axi_udata(.aclk(aclk));
+    c_axi4 axi_udata_drv = new(axi_udata);
+    uwin_simulation uwin_sim;
+`endif
 
     // Notify
     metaIntf #(.STYPE(irq_not_t)) notify(.*);
@@ -158,6 +168,9 @@ module tb_user;
     //
     design_user_logic_c0_0 inst_DUT (
         .axi_ctrl(axi_ctrl),
+    `ifdef EN_UWIN
+        .axi_udata(axi_udata),
+    `endif
         .notify(notify),
         .sq_rd(sq_rd),
         .sq_wr(sq_wr),
@@ -362,8 +375,16 @@ module tb_user;
             scb
         );
 
+    `ifdef EN_UWIN
+        uwin_sim = new(axi_udata_drv);
+        gen.uwin_sim = uwin_sim;
+    `endif
+
         // Reset of interfaces
         mem_sim.initialize();
+    `ifdef EN_UWIN
+        uwin_sim.initialize();
+    `endif
 
         ctrl_sim.initialize();
         notify_sim.initialize();
