@@ -228,6 +228,30 @@ protected:
 	void userUnmap(void *vaddr);
 
 	/**
+	 * @brief Exports a region of this vFPGA's BAR as a dma-buf, so a peer
+	 * device (e.g. another FPGA's vFPGA) can import it and write to it
+	 * peer-to-peer. The caller owns the returned fd and closes it when done.
+	 *
+	 * @param region EXPORT_REGION_* (which BAR region)
+	 * @param offset Byte offset into the region, page aligned
+	 * @param len Bytes to export, page aligned
+	 * @return The dma-buf file descriptor
+	 */
+	int exportDmabuf(uint32_t region, uint64_t offset, uint64_t len);
+
+	/**
+	 * @brief Maps a dma-buf exported by another device (e.g. a peer FPGA's BAR
+	 * region) into this vFPGA's MMU at vaddr, so the vFPGA can address it.
+	 * vaddr only has to be unique in this thread's address space; nothing is
+	 * mapped for the CPU.
+	 *
+	 * @param dmabuf_fd The dma-buf file descriptor
+	 * @param vaddr Virtual address the vFPGA will use for it
+	 * @param mem_block Memory block; -1 (host-style mapping) for peer BARs
+	 */
+	void importDmabuf(int dmabuf_fd, void *vaddr, int32_t mem_block = -1);
+
+	/**
 	 * @brief Allocates memory for this cThread and maps it into the vFPGA's TLB
 	 *
 	 * @param alloc CoyoteAlloc object containing the allocation parameters, including size, type (e.g., hugepage, GPU) etc.

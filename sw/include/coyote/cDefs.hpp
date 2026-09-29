@@ -100,6 +100,10 @@ namespace coyote {
 // Retrieves notification value
 #define IOCTL_GET_NOTIFICATION_VALUE        _IOR('F', 19, unsigned long)
 
+// Export a BAR region of this vFPGA as a dma-buf, for a peer device to import
+#define IOCTL_EXPORT_DMABUF                 _IOWR('F', 20, unsigned long)
+#define EXPORT_REGION_CTRL_USER             0   // the vFPGA's AXI-Lite user control region
+
 // Allocate memory for partial reconfiguration
 #define IOCTL_ALLOC_HOST_RECONFIG_MEM       _IOW('P', 1, unsigned long)
 

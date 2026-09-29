@@ -372,6 +372,31 @@ void cThread::munmapFpga() {
 	wback = 0;
 }
 
+int cThread::exportDmabuf(uint32_t region, uint64_t offset, uint64_t len) {
+    DBG1("cThread: Called exportDmabuf, region " << region << ", offset " << offset << ", length " << len);
+    uint64_t tmp[MAX_USER_ARGS];
+    tmp[0] = static_cast<uint64_t>(region);
+    tmp[1] = offset;
+    tmp[2] = len;
+    tmp[3] = 0;
+    if (ioctl(fd, IOCTL_EXPORT_DMABUF, &tmp)) {
+        throw std::runtime_error("ERROR: IOCTL_EXPORT_DMABUF failed");
+    }
+    return static_cast<int>(tmp[3]);
+}
+
+void cThread::importDmabuf(int dmabuf_fd, void *vaddr, int32_t mem_block) {
+    DBG1("cThread: Called importDmabuf, fd " << dmabuf_fd << ", vaddr " << vaddr << ", ctid " << ctid);
+    uint64_t tmp[MAX_USER_ARGS];
+    tmp[0] = static_cast<uint64_t>(dmabuf_fd);
+    tmp[1] = reinterpret_cast<uint64_t>(vaddr);
+    tmp[2] = static_cast<uint64_t>(ctid);
+    tmp[3] = static_cast<uint64_t>(mem_block);
+    if (ioctl(fd, IOCTL_MAP_DMABUF, &tmp)) {
+        throw std::runtime_error("ERROR: IOCTL_MAP_DMABUF failed");
+    }
+}
+
 void cThread::userMap(void *vaddr, uint64_t len, int32_t mem_block) {
     DBG1("cThread: Called userMap to map user buffer, vaddr " << vaddr << ", length " << len << ", memory block " << mem_block << " and ctid " << ctid);
 

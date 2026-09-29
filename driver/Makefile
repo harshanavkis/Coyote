@@ -53,6 +53,7 @@ $(MODNAME)-objs += src/reconfig/reconfig_mem.o
 $(MODNAME)-objs += src/reconfig/reconfig_ops.o
 
 $(MODNAME)-objs += src/vfpga/vfpga_gup.o 
+$(MODNAME)-objs += src/vfpga/vfpga_export.o
 $(MODNAME)-objs += src/vfpga/vfpga_hw.o 
 $(MODNAME)-objs += src/vfpga/vfpga_isr.o 
 $(MODNAME)-objs += src/vfpga/vfpga_ops.o 

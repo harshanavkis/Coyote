@@ -20,6 +20,7 @@
  */
 
 #include "vfpga_ops.h"
+#include "vfpga_export.h"
 
 // Hash map holding the mapping between host process ID (hpid) and Coyote thread IDs (ctid) for each vFPGA device 
 struct hlist_head hpid_ctid_map[MAX_N_REGIONS][1 << (PID_HASH_TABLE_ORDER)];
@@ -340,6 +341,23 @@ long vfpga_dev_ioctl(struct file *file, unsigned int command, unsigned long arg)
 
         // Map (attach) DMA Buffer
         // Args: DMA Buffer file descriptor (fd), virtual address, Coyote thread ID (ctid), target memory block (applicable only to Versal devices)
+        // Export a BAR region of this vFPGA as a dma-buf (for a peer device to import)
+        // Args: region (EXPORT_REGION_*), offset, size; returns the dma-buf fd in arg[3]
+        case IOCTL_EXPORT_DMABUF:
+            ret_val = copy_from_user(&tmp, (unsigned long *) arg, 4 * sizeof(unsigned long));
+            if (ret_val != 0) {
+                pr_warn("user data could not be coppied, return %d\n", ret_val);
+            } else {
+                int fd = vfpga_export_dmabuf(device, (uint32_t) tmp[0], tmp[1], tmp[2]);
+                if (fd < 0) {
+                    ret_val = fd;
+                } else {
+                    tmp[3] = (unsigned long) fd;
+                    ret_val = copy_to_user((unsigned long *) arg, &tmp, 4 * sizeof(unsigned long));
+                }
+            }
+            break;
+
         case IOCTL_MAP_DMABUF:
             #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 2, 0)
                 ret_val = copy_from_user(&tmp, (unsigned long *) arg, 4 * sizeof(unsigned long));
