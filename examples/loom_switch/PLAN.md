@@ -189,9 +189,27 @@ can be up to 128 MB (a 64 MiB push fits one binding).
   Then:
   `cd /scratch/harshanavkis/loom-proj/Coyote/examples/loom_switch/sw/build_sim && xilinx-shell -c "COYOTE_SIM_DIR=/scratch/harshanavkis/loom-proj/Coyote/examples/loom_switch/hw/build_sim stdbuf -oL ./uwin_probe 16384 16"`
   (compiles, elaborates and runs; minutes of wall clock)
-- G2 on clara, once the loom_switch bitstream is on the U280 and
-  `coyote_driver` has `MMAP_UWIN` (1 MiB bulk, 256 stores):
-  `cd /scratch/harshanavkis/loom-proj/Coyote/examples/loom_switch/sw/build && sudo ./uwin_probe 1048576 256`
+- **On hardware (clara, and rose for G4).** Images:
+  `examples/loom_switch/hw/build_sep29_uwin/bitstreams/cyt_top.bit` (U280) and
+  `examples/loom_ce/hw/build_sep29_ce/bitstreams/cyt_top.pdi` (V80), both from
+  `492e2a25`. The drivers come from this tree (`driver/build`,
+  `driver/build_versal`, built with the uwin mmap and export).
+  1. Sync the U280 driver to rose:
+     `rsync -a /scratch/harshanavkis/loom-proj/Coyote/driver/build/ rose.dos.cit.tum.de:/scratch/harshanavkis/loom-proj/Coyote/driver/build/`
+  2. Flash both U280s and load their drivers with each host's IP and MAC
+     (from `examples/loom`, on clara):
+     `cd /scratch/harshanavkis/loom-proj/Coyote/examples/loom && BIT=/scratch/harshanavkis/loom-proj/Coyote/examples/loom_switch/hw/build_sep29_uwin/bitstreams/cyt_top.bit SERVER_HOST=rose.dos.cit.tum.de SERVER_IP=131.159.102.21 SERVER_BDF=c1:00.0 SERVER_FPGA_IP=0a000003 python3 -c "import run_two_host as r; r.flash(15)"`
+  3. Program clara's V80 (never rose's, it is another user's):
+     `cd /scratch/harshanavkis/loom-proj/Coyote && scripts/fpga/program_v80.sh examples/loom_ce/hw/build_sep29_ce/bitstreams/cyt_top.pdi 0000:81:00.0`
+  4. G2 on clara (1 MiB bulk, 256 stores):
+     `cd /scratch/harshanavkis/loom-proj/Coyote/examples/loom_switch/sw/build && sudo ./uwin_probe 1048576 256`
+  5. G4, local half, on clara (1 MiB, 3 copies):
+     `cd /scratch/harshanavkis/loom-proj/Coyote/examples/loom_ce/sw/build && sudo ./ce_local 1048576 3`
+  6. G4: sync the binaries and library to rose, start the server there, then
+     the client on clara:
+     - clara: `rsync -a /scratch/harshanavkis/loom-proj/Coyote/examples/loom_ce/sw/build/ rose.dos.cit.tum.de:/scratch/harshanavkis/loom-proj/Coyote/examples/loom_ce/sw/build/`
+     - rose: `cd /scratch/harshanavkis/loom-proj/Coyote/examples/loom_ce/sw/build && sudo ./ce_remote --server --size 1048576`
+     - clara: `cd /scratch/harshanavkis/loom-proj/Coyote/examples/loom_ce/sw/build && sudo ./ce_remote --client 131.159.102.21 --reps 3`
 
 ## Found on the way: `RX_CHUNK` is not wired in `examples/loom`
 
