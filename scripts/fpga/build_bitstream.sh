@@ -53,7 +53,12 @@ export LD_LIBRARY_PATH=$NCURSES/lib\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH};"
 else
     ENV_SETUP=""
 fi
-ENV_SETUP="$ENV_SETUP export TERM=\${TERM:-xterm}; export PATH=$CMAKE_BIN:\$PATH;"
+# xilinx-shell starts from a clean environment. The CMAC IP (every network
+# build) needs this license; without it the CMAC gets only a Design_Linking
+# license and the bitstream step fails or yields an evaluation core.
+LICENSE=/share/xilinx/Xilinx.lic
+[ -r "$LICENSE" ] || { echo "license file $LICENSE not readable" >&2; exit 1; }
+ENV_SETUP="$ENV_SETUP export LM_LICENSE_FILE=$LICENSE; export TERM=\${TERM:-xterm}; export PATH=$CMAKE_BIN:\$PATH;"
 
 run_xs() { xilinx-shell -c "$ENV_SETUP $1"; }
 
@@ -68,6 +73,7 @@ mkdir -p "$BUILD"
     echo "built:      $(date -Is) on $(hostname)"
     echo "device:     $DEV"
     echo "vivado:     $VIVADO"
+    echo "license:    LM_LICENSE_FILE=$LICENSE"
     echo "hw_dir:     ${HW#$REPO/}"
     echo "cmake args: -DFDEV_NAME=$DEV ${CMAKE_ARGS[*]:-}"
     echo "commit:     $(git -C "$REPO" rev-parse HEAD) ($(git -C "$REPO" branch --show-current))"
