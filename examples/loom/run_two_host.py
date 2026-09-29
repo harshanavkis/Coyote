@@ -55,6 +55,12 @@ BUILD       = f"{COYOTE}/examples/loom/sw-bundled/build"
 # hardcoded path silently reads nothing and the counters look empty.
 SYSFS_GLOB  = "/sys/kernel/coyote_sysfs_*"
 BDF         = os.environ.get("BDF", "e1:00.0")   # the U280 on clara and amy
+# The server's U280 when it is not at the same BDF (rose: c1:00.0).
+SERVER_BDF  = os.environ.get("SERVER_BDF", BDF)
+
+
+def bdf(is_remote):
+    return SERVER_BDF if is_remote else BDF
 # Absolute, because numactl lives in the nix store and is NOT on the PATH that
 # `sudo env ...` gets - neither locally nor over ssh. Same store path on both
 # hosts. This is the same trap as vivado and cmake.
@@ -110,7 +116,7 @@ def card_state(is_remote):
     reliable while clara, probed locally, did not get it. Timing must not
     depend on how a host happens to be reached.
     """
-    d = f"/sys/bus/pci/devices/0000:{BDF}"
+    d = f"/sys/bus/pci/devices/0000:{bdf(is_remote)}"
     cmd = "; ".join([
         f"echo vendor=$(cat {d}/vendor 2>/dev/null)",
         f"echo device=$(cat {d}/device 2>/dev/null)",
@@ -234,7 +240,10 @@ def driver_loaded(remote_host=False):
 # (insmod "File exists", hidden), the card runs with the driver's DEFAULT ip
 # (0x0b01d4d1): ARP never resolves, nothing is delivered, every wait times
 # out, and the sysfs node looks perfectly healthy. 2026-09-17 cost an hour.
-EXPECT_IP = {"clara": "0a000002", "amy": "0a000001"}
+# "amy" is the server's label; SERVER_FPGA_IP for another server (rose:
+# 0a000003, as setup_coyote.sh assigns it).
+EXPECT_IP = {"clara": "0a000002",
+             "amy": os.environ.get("SERVER_FPGA_IP", "0a000001")}
 
 
 def card_ip(remote_host=False):
@@ -286,7 +295,7 @@ def flash(settle, hosts=("amy", "clara")):
         # would remove the wrong subtree, so stop instead.
         st = card_state(is_remote)
         if st.get("vendor") != "0x10ee":
-            die(f"{host}: the U280 is not at 0000:{BDF} (found "
+            die(f"{host}: the U280 is not at 0000:{bdf(is_remote)} (found "
                 f"{st.get('vendor') or 'nothing'}), so it is already off the "
                 f"bus. Recover it with a warm reboot before flashing.\n"
                 f"  card reports: {show(st)}")
@@ -315,7 +324,7 @@ def flash(settle, hosts=("amy", "clara")):
                                  and s.get("width") not in ("", "0", None)),
                       WAIT_TEARDOWN, host)
         back = " (udev re-loaded the driver)" if st.get("sysfs") else ""
-        print(f"   {host}: torn down, endpoint back at {BDF}{back}", flush=True)
+        print(f"   {host}: torn down, endpoint back at {bdf(is_remote)}{back}", flush=True)
 
         # ---- 2/3 program: JTAG, selecting the U280 by PART --------------
         print(f"   {host}: programming over JTAG (vivado, minutes)", flush=True)
@@ -389,7 +398,10 @@ def preflight():
     if not os.access(f"{BUILD}/loom_host", os.X_OK):
         die(f"no loom_host at {BUILD}")
     say("syncing loom_host to amy")
+    # the Coyote library too: loom_host links it from the build dir, and a
+    # server that did not build it itself (rose) otherwise keeps a stale copy
     local(f"rsync -a {BUILD}/loom_host {SERVER_HOST}:{BUILD}/")
+    local(f"rsync -a {BUILD}/coyote/libcoyote.so {SERVER_HOST}:{BUILD}/coyote/")
 
     # A server left by an interrupted run holds port 18488 ("Could not bind a
     # socket") and pushes the ctids up on every attempt. -x matches the
