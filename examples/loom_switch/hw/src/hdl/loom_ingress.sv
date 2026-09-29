@@ -106,7 +106,9 @@ module loom_ingress #(
     output logic                        cnt_pkt_rdma,   // an rdma packet sent (last beat)
     output logic                        cnt_store,      // a store sent
     output logic                        cnt_store_drop, // a beat with a partial 8 B word
-    output logic                        cnt_flush       // a packet closed by the idle timer
+    output logic                        cnt_flush,      // a packet closed by the idle timer
+    output logic                        cnt_win_wait,   // an rdma request waited on the window
+    output logic                        cnt_req_wait    // an rdma request waited on wr_ready
 );
 
 localparam [7:0] MSG_OP_WRITE        = 8'd1;   // keep in sync with loom_rx.sv
@@ -445,7 +447,9 @@ always_comb begin
     end
     wr_valid = (ostate == O_REQ) && (!o.route || win_ok);
 end
-assign rdma_post = wr_valid && wr_ready && o.route;
+assign rdma_post    = wr_valid && wr_ready && o.route;
+assign cnt_win_wait = (ostate == O_REQ) && o.route && !win_ok;
+assign cnt_req_wait = wr_valid && !wr_ready && o.route;
 
 // Header lane 0: {zero, dst_pid, len[27:0], op}; lane 1: target VA; lane 2:
 // a store's data

@@ -1,0 +1,70 @@
+#pragma once
+
+#include <cstdint>
+#include <coyote/cThread.hpp>
+
+/**
+ * The switch's CSR page (hw/src/hdl/loom_ctrl.sv) and window programming.
+ * Word numbers follow examples/loom where the register survives.
+ */
+namespace loom_switch {
+
+// Word indices
+constexpr uint32_t TBL_IDX         = 0;
+constexpr uint32_t TBL_CFG         = 1;    // bit0 valid, bit1 route (0 local, 1 rdma)
+constexpr uint32_t TBL_PID         = 2;    // [5:0] pid (local: destination; rdma: QP owner), [13:8] far pid
+constexpr uint32_t TBL_BASE        = 3;
+constexpr uint32_t TBL_LEN         = 4;
+constexpr uint32_t TBL_COMMIT      = 5;
+constexpr uint32_t TBL_USTART      = 80;   // the window's start in the uwin
+constexpr uint32_t RDMA_STAGING_VA = 16;
+constexpr uint32_t RX_FWD          = 36;
+constexpr uint32_t RX_DROP         = 41;
+constexpr uint32_t CYC             = 48;
+constexpr uint32_t TX_CTL          = 66;
+constexpr uint32_t TX_STATE        = 67;
+constexpr uint32_t TX_ACKS         = 68;
+constexpr uint32_t RX_CHUNK        = 76;
+// Ingress counters, 88-94
+constexpr uint32_t ING_BURSTS      = 88;
+constexpr uint32_t ING_DROPS       = 89;
+constexpr uint32_t ING_PKT_LOCAL   = 90;
+constexpr uint32_t ING_PKT_RDMA    = 91;
+constexpr uint32_t ING_STORES      = 92;
+constexpr uint32_t ING_STORE_DROPS = 93;
+constexpr uint32_t ING_FLUSHES     = 94;
+constexpr int      N_ING           = 7;
+
+inline void csr_write(coyote::cThread &t, uint32_t word, uint64_t val) { t.setCSR(val, word); }
+inline uint64_t csr_read(coyote::cThread &t, uint32_t word) { return t.getCSR(word); }
+
+// One window: uwin bytes [ustart, ustart + len) land at base + offset under
+// pid (local), or go to the far pid's base + offset over pid's QP (rdma)
+inline void program_window(coyote::cThread &t, uint32_t win, bool rdma, uint32_t pid,
+                           const void *base, uint64_t len, uint64_t ustart,
+                           uint32_t dst_pid = 0) {
+    csr_write(t, TBL_IDX,    win);
+    csr_write(t, TBL_CFG,    0b01 | (rdma ? 0b10 : 0b00));
+    csr_write(t, TBL_PID,    (uint64_t(dst_pid & 0x3F) << 8) | (pid & 0x3F));
+    csr_write(t, TBL_BASE,   reinterpret_cast<uint64_t>(base));
+    csr_write(t, TBL_LEN,    len);
+    csr_write(t, TBL_USTART, ustart);
+    csr_write(t, TBL_COMMIT, 1);
+}
+
+inline void release_window(coyote::cThread &t, uint32_t win) {
+    csr_write(t, TBL_IDX,    win);
+    csr_write(t, TBL_CFG,    0);
+    csr_write(t, TBL_COMMIT, 1);
+}
+
+struct IngressCounters {
+    uint64_t v[N_ING];
+    static IngressCounters read(coyote::cThread &t) {
+        IngressCounters c;
+        for (int i = 0; i < N_ING; i++) c.v[i] = csr_read(t, ING_BURSTS + i);
+        return c;
+    }
+};
+
+} // namespace loom_switch

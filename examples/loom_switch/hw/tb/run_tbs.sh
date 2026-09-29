@@ -1,9 +1,6 @@
 #!/usr/bin/env bash
 # Block-level testbench runner (XSIM), as examples/loom/hw/tb/run_tbs.sh.
 # Vivado tools live behind xilinx-shell; the script re-execs itself inside it.
-#
-# Until loom_switch has its own build_sim, lynx_pkg comes from examples/loom's
-# (same shell parameters for everything these blocks use).
 set -u
 cd "$(dirname "$0")"
 
@@ -12,16 +9,26 @@ if ! command -v xvlog >/dev/null 2>&1; then
 fi
 
 COYOTE_ROOT=../../../..
-LYNX_PKG=$COYOTE_ROOT/examples/loom/hw/build_sim/sim/lynx_pkg.sv
-AXI_INTF=$COYOTE_ROOT/hw/hdl/pkg/axi_intf.sv
+LOOM_TB=$COYOTE_ROOT/examples/loom/hw/tb
+LYNX_PKG=../build_sim/sim/lynx_pkg.sv
+USER_LOGIC=../build_sim/sim/user_logic_c0_0.sv
 
 if [ ! -f "$LYNX_PKG" ]; then
-    echo "ERROR: $LYNX_PKG not found; generate it as examples/loom/hw/tb/run_tbs.sh says."
+    echo "ERROR: $LYNX_PKG not found."
+    echo "Generate it once with:"
+    echo "  cd ../ && mkdir -p build_sim && cd build_sim"
+    echo "  xilinx-shell -c \"nix-shell -p cmake --run 'cmake .. -DFDEV_NAME=u280'\""
+    echo "  mkdir -p sim && nix-shell -p 'python3.withPackages(ps: [ps.jinja2])' --run 'python3 write_hdl.py 3 0 0'"
     exit 1
 fi
 
-TBS="${TBS:-tb_loom_ingress}"
-SRCS="$LYNX_PKG $AXI_INTF ../src/hdl/loom_table.sv ../src/hdl/loom_ingress.sv"
+TBS="${TBS:-tb_loom_ingress tb_loom_switch_top}"
+# The shell primitives vfpga_top uses have behavioural stand-ins in
+# examples/loom's tb directory (the register slice and the rx FIFO IPs)
+SRCS="$LYNX_PKG $COYOTE_ROOT/hw/hdl/pkg/axi_intf.sv $COYOTE_ROOT/hw/hdl/pkg/lynx_intf.sv \
+      ../src/hdl/loom_table.sv ../src/hdl/loom_ingress.sv ../src/hdl/loom_ctrl.sv ../src/hdl/loom_rx.sv \
+      $LOOM_TB/sim_axisr_register_slice_512.sv $LOOM_TB/sim_axis_data_fifo_512.sv \
+      $COYOTE_ROOT/hw/hdl/common/regs/axisr_reg.sv $USER_LOGIC"
 
 mkdir -p work && cd work
 
@@ -31,7 +38,8 @@ GLBL=/share/xilinx/Vivado/2023.2/data/verilog/src/glbl.v
 
 echo "== xvlog =="
 xvlog $GLBL > xvlog_glbl.log 2>&1 || { tail -5 xvlog_glbl.log; echo "COMPILE FAILED (glbl)"; exit 1; }
-xvlog -sv $(for f in $SRCS; do echo ../$f; done) ../tb_loom_ingress.sv \
+xvlog -sv $(for f in $SRCS; do echo ../$f; done) -i ../../src -i ../$COYOTE_ROOT/hw/hdl/pkg \
+    ../tb_loom_ingress.sv ../tb_loom_switch_top.sv \
     > xvlog.log 2>&1 || { tail -30 xvlog.log; echo "COMPILE FAILED"; exit 1; }
 
 fail=0

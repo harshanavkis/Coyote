@@ -1,0 +1,373 @@
+import lynxTypes::*;
+
+/**
+ * loom_ctrl (loom_switch)
+ *
+ * AXI4-Lite slave for the switch's CSR page (the vFPGA's user ctrl region).
+ * Control only: every byte of data enters through the uwin (loom_ingress),
+ * so there is no aperture, no order FIFO and no descriptor here. Word
+ * numbers follow examples/loom's loom_ctrl where the register survives, so
+ * the same software writes them.
+ *
+ * CSR map (64-bit word indices; byte offset = idx * 8):
+ *    0 TBL_IDX      (RW) window index to program (1..15)
+ *    1 TBL_CFG      (RW) bit0 = valid, bit1 = route (0 local, 1 rdma)
+ *    2 TBL_PID      (RW) [5:0] local: destination pid; rdma: QP-owner pid.
+ *                        [13:8] rdma: the far exporter's pid (message header)
+ *    3 TBL_BASE     (RW) destination VA base (exporter's own VA)
+ *    4 TBL_LEN      (RW) window length in bytes (bounds)
+ *    5 TBL_COMMIT   (W)  write 1 -> commit the staged entry to table[TBL_IDX]
+ *   80 TBL_USTART   (RW) the window's start in the uwin (bytes); its own
+ *                        64 B line, for the reason given at TX_CTL below
+ *   16 RDMA_STAGING_VA (RW) RETH vaddr of every outgoing rdma message
+ *   14/15 (RO) rx ingress FIFO full while the shell had a beat; longest run
+ *   24 (RO) rx longest stall run          26 (RO) rx orphan beats
+ *   30/31 (RO) rx backpressure; longest run
+ *   36 (RO) rx writes forwarded           41 (RO) rx headers rejected
+ *   42-44 (RO) rx move / starve / stall   47 (RO) rx requests accepted
+ *   48 (RO) free-running cycle counter
+ *   66 TX_CTL (RW) [7:0] ack window: rdma packets posted and not yet acked,
+ *                  0 = none; reset 16
+ *   67 (RO) packets unacked now   68 (RO) acks
+ *   69 (RO) cycles a packet waited on the window
+ *   70 (RO) cycles a packet waited on sq_wr.ready
+ *   72/73 (RO) cycles a local / rdma request waited on sq_wr.ready
+ *   74 (RO) cycles the ingress had a request while loom_rx's was presented
+ *   75 (RO) cycles loom_rx had a request and was not presented (must be 0)
+ *   76 RX_CHUNK (RW) [3:0] PMTU packets per loom_rx host write, reset 1
+ *   88-94 (RO) ingress: 88 bursts, 89 bursts dropped, 90 local packets,
+ *          91 rdma packets, 92 stores, 93 beats with a partial 8 B word,
+ *          94 packets closed by the idle timer
+ * Counters are free-running and never cleared (software takes deltas).
+ */
+module loom_ctrl (
+    input  logic                        aclk,
+    input  logic                        aresetn,
+
+    AXI4L.s                             axi_ctrl,
+
+    // Table programming (to loom_table)
+    output logic                        tbl_commit,
+    output logic [3:0]                  tbl_idx,
+    output logic                        tbl_valid,
+    output logic                        tbl_route,
+    output logic [PID_BITS-1:0]         tbl_pid,
+    output logic [PID_BITS-1:0]         tbl_dst_pid,
+    output logic [VADDR_BITS-1:0]       tbl_base,
+    output logic [LEN_BITS-1:0]         tbl_len,
+    output logic [26:0]                 tbl_ustart,
+
+    output logic [VADDR_BITS-1:0]       rdma_staging_va,
+    output logic [7:0]                  tx_window,
+    output logic [3:0]                  rx_chunk,
+
+    // Ack window state and waits
+    input  logic [15:0]                 tx_inflight,
+    input  logic                        cnt_tx_ack,
+    input  logic                        cnt_tx_winfull,
+    input  logic                        cnt_tx_reqwait,
+
+    // sq_wr accounting
+    input  logic                        cnt_wr_wait_local,
+    input  logic                        cnt_wr_wait_rdma,
+    input  logic                        cnt_wr_blk_ing,
+    input  logic                        cnt_wr_blk_rx,
+
+    // loom_rx
+    input  logic                        cnt_rx_fwd,
+    input  logic                        cnt_rx_drop,
+    input  logic                        cnt_rx_orphan,
+    input  logic                        cnt_rx_move,
+    input  logic                        cnt_rx_starve,
+    input  logic                        cnt_rx_stall,
+    input  logic                        cnt_rx_bp,
+    input  logic                        cnt_rx_req,
+    input  logic                        cnt_rx_fifo_full,
+
+    // loom_ingress
+    input  logic                        cnt_ing_burst,
+    input  logic                        cnt_ing_drop,
+    input  logic                        cnt_ing_pkt_local,
+    input  logic                        cnt_ing_pkt_rdma,
+    input  logic                        cnt_ing_store,
+    input  logic                        cnt_ing_store_drop,
+    input  logic                        cnt_ing_flush
+);
+
+localparam integer ADDR_LSB = $clog2(AXIL_DATA_BITS/8);   // 3
+localparam integer CSR_BITS = 9;                          // 512 words in the CSR page
+
+localparam integer R_TBL_IDX      = 0;
+localparam integer R_TBL_CFG      = 1;
+localparam integer R_TBL_PID      = 2;
+localparam integer R_TBL_BASE     = 3;
+localparam integer R_TBL_LEN      = 4;
+localparam integer R_TBL_COMMIT   = 5;
+localparam integer R_TBL_USTART   = 80;
+localparam integer R_RDMA_STAGING = 16;
+localparam integer R_RX_FIFO_FULL     = 14;
+localparam integer R_RX_FIFO_FULL_MAX = 15;
+localparam integer R_RX_STALL_MAX = 24;
+localparam integer R_RX_ORPHAN    = 26;
+localparam integer R_RX_BP        = 30;
+localparam integer R_RX_BP_MAX    = 31;
+localparam integer R_RX_FWD       = 36;
+localparam integer R_RX_DROP      = 41;
+localparam integer R_RX_MOVE      = 42;
+localparam integer R_RX_STARVE    = 43;
+localparam integer R_RX_STALL     = 44;
+localparam integer R_RX_REQ       = 47;
+localparam integer R_CYC          = 48;
+// Hardware writes to words 0-5 have been seen to clobber words 4 and 6 of
+// the same 64 B line (examples/loom csr_probe.cpp), so a register that must
+// survive table programming sits on a line of its own
+localparam integer R_TX_CTL        = 66;
+localparam integer R_TX_STATE      = 67;
+localparam integer R_TX_ACKS       = 68;
+localparam integer R_TX_WINFULL    = 69;
+localparam integer R_TX_REQWAIT    = 70;
+localparam integer R_WR_WAIT_LOCAL = 72;
+localparam integer R_WR_WAIT_RDMA  = 73;
+localparam integer R_WR_BLK_ING    = 74;
+localparam integer R_WR_BLK_RX     = 75;
+localparam integer R_RX_CHUNK      = 76;
+localparam integer R_ING_BASE      = 88;
+localparam integer N_ING           = 7;
+
+// -------------------------------------------------------------------------
+// AXI4-Lite handshake (single outstanding write and read, as examples/loom)
+// -------------------------------------------------------------------------
+logic [15:0] axi_awaddr, axi_araddr;
+logic        axi_awready, axi_arready, axi_wready, axi_bvalid, axi_rvalid, aw_en;
+logic [1:0]  axi_bresp, axi_rresp;
+logic [AXIL_DATA_BITS-1:0] axi_rdata;
+
+wire ctrl_reg_wren = axi_wready && axi_ctrl.wvalid && axi_awready && axi_ctrl.awvalid;
+wire ctrl_reg_rden = axi_arready && axi_ctrl.arvalid && ~axi_rvalid;
+// Only the CSR page (the region's first 4 KB) has registers
+wire [CSR_BITS-1:0] wr_idx = axi_awaddr[ADDR_LSB +: CSR_BITS];
+wire [CSR_BITS-1:0] rd_idx = axi_araddr[ADDR_LSB +: CSR_BITS];
+wire csr_wr  = ctrl_reg_wren && (axi_awaddr[15:12] == 4'd0);
+wire csr_rd  = (axi_araddr[15:12] == 4'd0);
+
+// -------------------------------------------------------------------------
+// CSRs: stage-then-commit for the table entry. COMMIT fires on the write
+// pulse and needs wstrb[0] && wdata[0], so a write with empty strobes (the
+// padding around a host ctrl write's line) cannot fire it; other registers
+// take full-strobe writes only.
+// -------------------------------------------------------------------------
+logic [63:0] r_tbl_idx, r_tbl_cfg, r_tbl_pid, r_tbl_base, r_tbl_len, r_tbl_ustart;
+logic [63:0] r_rdma_staging, r_tx_ctl, r_rx_chunk;
+
+wire commit_pulse = csr_wr && (wr_idx == R_TBL_COMMIT) && axi_ctrl.wstrb[0] && axi_ctrl.wdata[0];
+
+always_ff @(posedge aclk) begin
+    if (!aresetn) begin
+        r_tbl_idx <= 0; r_tbl_cfg <= 0; r_tbl_pid <= 0; r_tbl_base <= 0; r_tbl_len <= 0;
+        r_tbl_ustart <= 0; r_rdma_staging <= 0;
+        r_tx_ctl   <= 64'd16;
+        r_rx_chunk <= 64'd1;
+    end else if (csr_wr && (&axi_ctrl.wstrb)) begin
+        case (wr_idx)
+            R_TBL_IDX:      r_tbl_idx      <= axi_ctrl.wdata;
+            R_TBL_CFG:      r_tbl_cfg      <= axi_ctrl.wdata;
+            R_TBL_PID:      r_tbl_pid      <= axi_ctrl.wdata;
+            R_TBL_BASE:     r_tbl_base     <= axi_ctrl.wdata;
+            R_TBL_LEN:      r_tbl_len      <= axi_ctrl.wdata;
+            R_TBL_USTART:   r_tbl_ustart   <= axi_ctrl.wdata;
+            R_RDMA_STAGING: r_rdma_staging <= axi_ctrl.wdata;
+            R_TX_CTL:       r_tx_ctl       <= axi_ctrl.wdata;
+            R_RX_CHUNK:     r_rx_chunk     <= axi_ctrl.wdata;
+            default: ;
+        endcase
+    end
+end
+
+assign tbl_commit      = commit_pulse;
+assign tbl_idx         = r_tbl_idx[3:0];
+assign tbl_valid       = r_tbl_cfg[0];
+assign tbl_route       = r_tbl_cfg[1];
+assign tbl_pid         = r_tbl_pid[PID_BITS-1:0];
+assign tbl_dst_pid     = r_tbl_pid[8 +: PID_BITS];
+assign tbl_base        = r_tbl_base[VADDR_BITS-1:0];
+assign tbl_len         = r_tbl_len[LEN_BITS-1:0];
+assign tbl_ustart      = r_tbl_ustart[26:0];
+assign rdma_staging_va = r_rdma_staging[VADDR_BITS-1:0];
+assign tx_window       = r_tx_ctl[7:0];
+assign rx_chunk        = (r_rx_chunk[3:0] == 4'd0) ? 4'd1 : r_rx_chunk[3:0];   // 0 is not a size
+
+// -------------------------------------------------------------------------
+// Counters
+// -------------------------------------------------------------------------
+logic [63:0] cycle_cnt;
+logic [63:0] rx_fwd, rx_drop, rx_orphan, rx_move, rx_starve, rx_stall, rx_req;
+logic [63:0] rx_stall_run, rx_stall_max, rx_bp, rx_bp_run, rx_bp_max, rx_ff, rx_ff_run, rx_ff_max;
+logic [63:0] tx_acks, tx_winfull, tx_reqwait;
+logic [63:0] wr_wait_local, wr_wait_rdma, wr_blk_ing, wr_blk_rx;
+logic [63:0] ing [N_ING];
+wire  [N_ING-1:0] ing_pulse = {cnt_ing_flush, cnt_ing_store_drop, cnt_ing_store, cnt_ing_pkt_rdma,
+                               cnt_ing_pkt_local, cnt_ing_drop, cnt_ing_burst};
+
+always_ff @(posedge aclk) begin
+    if (!aresetn) begin
+        cycle_cnt <= 0;
+        rx_fwd <= 0; rx_drop <= 0; rx_orphan <= 0; rx_move <= 0; rx_starve <= 0; rx_stall <= 0; rx_req <= 0;
+        rx_stall_run <= 0; rx_stall_max <= 0; rx_bp <= 0; rx_bp_run <= 0; rx_bp_max <= 0;
+        rx_ff <= 0; rx_ff_run <= 0; rx_ff_max <= 0;
+        tx_acks <= 0; tx_winfull <= 0; tx_reqwait <= 0;
+        wr_wait_local <= 0; wr_wait_rdma <= 0; wr_blk_ing <= 0; wr_blk_rx <= 0;
+        for (int i = 0; i < N_ING; i++) ing[i] <= 0;
+    end else begin
+        cycle_cnt <= cycle_cnt + 1;
+        if (cnt_rx_fwd)    rx_fwd    <= rx_fwd + 1;
+        if (cnt_rx_drop)   rx_drop   <= rx_drop + 1;
+        if (cnt_rx_orphan) rx_orphan <= rx_orphan + 1;
+        if (cnt_rx_move)   rx_move   <= rx_move + 1;
+        if (cnt_rx_starve) rx_starve <= rx_starve + 1;
+        if (cnt_rx_stall)  rx_stall  <= rx_stall + 1;
+        if (cnt_rx_req)    rx_req    <= rx_req + 1;
+        if (cnt_rx_stall) begin
+            rx_stall_run <= rx_stall_run + 1;
+            if (rx_stall_run + 1 > rx_stall_max) rx_stall_max <= rx_stall_run + 1;
+        end else rx_stall_run <= 0;
+        if (cnt_rx_bp) begin
+            rx_bp     <= rx_bp + 1;
+            rx_bp_run <= rx_bp_run + 1;
+            if (rx_bp_run + 1 > rx_bp_max) rx_bp_max <= rx_bp_run + 1;
+        end else rx_bp_run <= 0;
+        if (cnt_rx_fifo_full) begin
+            rx_ff     <= rx_ff + 1;
+            rx_ff_run <= rx_ff_run + 1;
+            if (rx_ff_run + 1 > rx_ff_max) rx_ff_max <= rx_ff_run + 1;
+        end else rx_ff_run <= 0;
+        if (cnt_tx_ack)        tx_acks       <= tx_acks + 1;
+        if (cnt_tx_winfull)    tx_winfull    <= tx_winfull + 1;
+        if (cnt_tx_reqwait)    tx_reqwait    <= tx_reqwait + 1;
+        if (cnt_wr_wait_local) wr_wait_local <= wr_wait_local + 1;
+        if (cnt_wr_wait_rdma)  wr_wait_rdma  <= wr_wait_rdma + 1;
+        if (cnt_wr_blk_ing)    wr_blk_ing    <= wr_blk_ing + 1;
+        if (cnt_wr_blk_rx)     wr_blk_rx     <= wr_blk_rx + 1;
+        for (int i = 0; i < N_ING; i++) if (ing_pulse[i]) ing[i] <= ing[i] + 1;
+    end
+end
+
+// -------------------------------------------------------------------------
+// Read data
+// -------------------------------------------------------------------------
+always_ff @(posedge aclk) begin
+    if (!aresetn) axi_rdata <= 0;
+    else if (ctrl_reg_rden) begin
+        axi_rdata <= 0;
+        if (csr_rd) case (rd_idx)
+            R_TBL_IDX:          axi_rdata <= r_tbl_idx;
+            R_TBL_CFG:          axi_rdata <= r_tbl_cfg;
+            R_TBL_PID:          axi_rdata <= r_tbl_pid;
+            R_TBL_BASE:         axi_rdata <= r_tbl_base;
+            R_TBL_LEN:          axi_rdata <= r_tbl_len;
+            R_TBL_USTART:       axi_rdata <= r_tbl_ustart;
+            R_RDMA_STAGING:     axi_rdata <= r_rdma_staging;
+            R_RX_FIFO_FULL:     axi_rdata <= rx_ff;
+            R_RX_FIFO_FULL_MAX: axi_rdata <= rx_ff_max;
+            R_RX_STALL_MAX:     axi_rdata <= rx_stall_max;
+            R_RX_ORPHAN:        axi_rdata <= rx_orphan;
+            R_RX_BP:            axi_rdata <= rx_bp;
+            R_RX_BP_MAX:        axi_rdata <= rx_bp_max;
+            R_RX_FWD:           axi_rdata <= rx_fwd;
+            R_RX_DROP:          axi_rdata <= rx_drop;
+            R_RX_MOVE:          axi_rdata <= rx_move;
+            R_RX_STARVE:        axi_rdata <= rx_starve;
+            R_RX_STALL:         axi_rdata <= rx_stall;
+            R_RX_REQ:           axi_rdata <= rx_req;
+            R_CYC:              axi_rdata <= cycle_cnt;
+            R_TX_CTL:           axi_rdata <= r_tx_ctl;
+            R_TX_STATE:         axi_rdata <= {48'b0, tx_inflight};
+            R_TX_ACKS:          axi_rdata <= tx_acks;
+            R_TX_WINFULL:       axi_rdata <= tx_winfull;
+            R_TX_REQWAIT:       axi_rdata <= tx_reqwait;
+            R_WR_WAIT_LOCAL:    axi_rdata <= wr_wait_local;
+            R_WR_WAIT_RDMA:     axi_rdata <= wr_wait_rdma;
+            R_WR_BLK_ING:       axi_rdata <= wr_blk_ing;
+            R_WR_BLK_RX:        axi_rdata <= wr_blk_rx;
+            R_RX_CHUNK:         axi_rdata <= {60'b0, rx_chunk};
+            default:
+                if (rd_idx >= R_ING_BASE && rd_idx < R_ING_BASE + N_ING)
+                    axi_rdata <= ing[rd_idx - R_ING_BASE];
+        endcase
+    end
+end
+
+// -------------------------------------------------------------------------
+// Standard AXI4-Lite control (Coyote boilerplate)
+// -------------------------------------------------------------------------
+assign axi_ctrl.awready = axi_awready;
+assign axi_ctrl.arready = axi_arready;
+assign axi_ctrl.bresp   = axi_bresp;
+assign axi_ctrl.bvalid  = axi_bvalid;
+assign axi_ctrl.wready  = axi_wready;
+assign axi_ctrl.rdata   = axi_rdata;
+assign axi_ctrl.rresp   = axi_rresp;
+assign axi_ctrl.rvalid  = axi_rvalid;
+
+always_ff @(posedge aclk) begin
+    if (!aresetn) begin
+        axi_awready <= 1'b0; axi_awaddr <= 0; aw_en <= 1'b1;
+    end else begin
+        if (~axi_awready && axi_ctrl.awvalid && axi_ctrl.wvalid && aw_en) begin
+            axi_awready <= 1'b1; aw_en <= 1'b0;
+            axi_awaddr  <= axi_ctrl.awaddr[15:0];
+        end else if (axi_ctrl.bready && axi_bvalid) begin
+            aw_en <= 1'b1; axi_awready <= 1'b0;
+        end else begin
+            axi_awready <= 1'b0;
+        end
+    end
+end
+
+always_ff @(posedge aclk) begin
+    if (!aresetn) begin
+        axi_arready <= 1'b0; axi_araddr <= 0;
+    end else begin
+        if (~axi_arready && axi_ctrl.arvalid) begin
+            axi_arready <= 1'b1; axi_araddr <= axi_ctrl.araddr[15:0];
+        end else begin
+            axi_arready <= 1'b0;
+        end
+    end
+end
+
+always_ff @(posedge aclk) begin
+    if (!aresetn) begin
+        axi_bvalid <= 0; axi_bresp <= 2'b0;
+    end else begin
+        if (axi_awready && axi_ctrl.awvalid && ~axi_bvalid && axi_wready && axi_ctrl.wvalid) begin
+            axi_bvalid <= 1'b1; axi_bresp <= 2'b0;
+        end else if (axi_ctrl.bready && axi_bvalid) begin
+            axi_bvalid <= 1'b0;
+        end
+    end
+end
+
+always_ff @(posedge aclk) begin
+    if (!aresetn) begin
+        axi_wready <= 1'b0;
+    end else begin
+        if (~axi_wready && axi_ctrl.wvalid && axi_ctrl.awvalid && aw_en)
+            axi_wready <= 1'b1;
+        else
+            axi_wready <= 1'b0;
+    end
+end
+
+always_ff @(posedge aclk) begin
+    if (!aresetn) begin
+        axi_rvalid <= 0; axi_rresp <= 0;
+    end else begin
+        if (axi_arready && axi_ctrl.arvalid && ~axi_rvalid) begin
+            axi_rvalid <= 1'b1; axi_rresp <= 2'b0;
+        end else if (axi_rvalid && axi_ctrl.rready) begin
+            axi_rvalid <= 1'b0;
+        end
+    end
+end
+
+endmodule

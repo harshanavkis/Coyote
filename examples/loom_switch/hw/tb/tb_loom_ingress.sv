@@ -85,7 +85,7 @@ loom_ingress #(.UWIN_BITS(UWIN_BITS), .FLUSH_CYCLES(FLUSH)) dut (
     .m_net_tlast(m_net_tlast),
     .cnt_burst(cnt_burst), .cnt_drop(cnt_drop), .cnt_pkt_local(cnt_pkt_local),
     .cnt_pkt_rdma(cnt_pkt_rdma), .cnt_store(cnt_store), .cnt_store_drop(cnt_store_drop),
-    .cnt_flush(cnt_flush)
+    .cnt_flush(cnt_flush), .cnt_win_wait(), .cnt_req_wait()
 );
 
 int errors = 0;

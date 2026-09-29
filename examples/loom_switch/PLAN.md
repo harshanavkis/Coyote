@@ -98,10 +98,14 @@ can be up to 128 MB (a 64 MiB push fits one binding).
 
 ## 3. RTL
 
-- **`loom_switch` (U280):** `vfpga_top` = `loom_ctrl` (the CSR page only:
-  table programming including each window's `ustart`, staging VA, ack
-  window, counters), `loom_table`, `loom_ingress` and `loom_rx`. `sq_wr` is
-  shared per request by the ingress and `loom_rx`, nothing else.
+- **`loom_switch` (U280, done: `hw/src/vfpga_top.svh`, `hw/CMakeLists.txt`):**
+  `vfpga_top` = `loom_ctrl` (the CSR page only: table programming including
+  each window's `ustart` at word 80, staging VA, ack window, `RX_CHUNK`,
+  counters; ingress counters at words 88-94), `loom_table`, `loom_ingress`
+  and `loom_rx` (copied unchanged from `examples/loom`). `sq_wr` is shared
+  per request by the ingress and `loom_rx`, nothing else; the arbiter and
+  its two known defects are carried over as they are. `RX_CHUNK` is wired
+  to `loom_rx` here (in `examples/loom` it is not, see below).
   - **`loom_table`** (the switch's copy): each entry gains `ustart`, its
     range in the uwin being `[ustart, ustart + len)`; a second lookup port
     matches an address against the ranges (lowest index wins).
@@ -149,10 +153,42 @@ can be up to 128 MB (a 64 MiB push fits one binding).
   Back-to-back bursts are taken at one beat per cycle. Run:
   `examples/loom_switch/hw/tb/run_tbs.sh` (uses `examples/loom`'s
   `build_sim/sim/lynx_pkg.sv` until this app has its own).
-- `tb_loom_switch_top`: ingress + `loom_rx` sharing `sq_wr`.
+- `tb_loom_switch_top` (passes): the generated wrapper with the TB as the
+  shell. Table programming and readback; bulk and stores through the uwin
+  on both routes, exact; the ack window holding rdma packets until acks
+  return; `loom_rx` landings, and `RX_CHUNK` 1 vs 2 changing a two-packet
+  message from two host writes to one; the ingress and `loom_rx` racing for
+  `sq_wr` under backpressure with the arbitration invariants checked every
+  cycle; the counters. Under `sq_wr` backpressure the shell interface's own
+  stability assertion catches the arbiter's known defect 2 (a presented
+  request replaced by `loom_rx`'s); it is switched off for that test only,
+  and the test checks that no request is lost.
 - `tb_loom_ce`: descriptor → `sq_rd`/`sq_wr` sequence, stream forwarding,
   fence.
-- Same style and runner as `examples/loom/hw/tb/` (`run_tbs.sh`).
+- Same style as `examples/loom/hw/tb/`. `hw/tb/run_tbs.sh` runs both block
+  TBs against this app's own generated package and wrapper (`hw/build_sim`,
+  generated once as the script says).
+
+## Running
+
+- Block TBs (any host with Vivado):
+  `/scratch/harshanavkis/loom-proj/Coyote/examples/loom_switch/hw/tb/run_tbs.sh`
+- The shell window's block design:
+  `/scratch/harshanavkis/loom-proj/Coyote/examples/loom_switch/hw/tb/shell_ctrl_uwin/run.sh`
+- Software:
+  `cd /scratch/harshanavkis/loom-proj/Coyote/examples/loom_switch/sw && mkdir -p build && cd build && nix-shell ../../../../shell.nix --run "cmake .. && make -j16"`
+- G2 on clara, once the loom_switch bitstream is on the U280 and
+  `coyote_driver` has `MMAP_UWIN` (1 MiB bulk, 256 stores):
+  `cd /scratch/harshanavkis/loom-proj/Coyote/examples/loom_switch/sw/build && sudo ./uwin_probe 1048576 256`
+
+## Found on the way: `RX_CHUNK` is not wired in `examples/loom`
+
+`examples/loom/hw/src/vfpga_top.svh` connects neither `loom_ctrl`'s
+`rx_chunk` output nor `loom_rx`'s `rx_chunk` input (since `40c7620c`), and
+synthesis does not warn. The CSR (word 76) therefore has no effect on the
+card, and `loom_rx`'s landing size is whatever synthesis makes of an
+undriven input. `loom-portcnt` and `build_sep29_ctrl` both have it.
+`examples/loom` is left as it is here.
 
 ## 5. Gates
 
