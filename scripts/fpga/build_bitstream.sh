@@ -58,7 +58,7 @@ fi
 # warning is expected with or without it (link training, unused).
 LICENSE=/share/xilinx/Xilinx.lic
 [ -r "$LICENSE" ] || { echo "license file $LICENSE not readable" >&2; exit 1; }
-ENV_SETUP="$ENV_SETUP export LM_LICENSE_FILE=$LICENSE; export TERM=\${TERM:-xterm}; export PATH=$CMAKE_BIN:\$PATH;"
+ENV_SETUP="$ENV_SETUP export LM_LICENSE_FILE=$LICENSE; export XILINX_JOBS=256; export TERM=\${TERM:-xterm}; export PATH=$CMAKE_BIN:\$PATH;"
 
 run_xs() { xilinx-shell -c "$ENV_SETUP $1"; }
 
@@ -74,6 +74,7 @@ mkdir -p "$BUILD"
     echo "device:     $DEV"
     echo "vivado:     $VIVADO"
     echo "license:    LM_LICENSE_FILE=$LICENSE"
+    echo "jobs:       XILINX_JOBS=256"
     echo "hw_dir:     ${HW#$REPO/}"
     echo "cmake args: -DFDEV_NAME=$DEV ${CMAKE_ARGS[*]:-}"
     echo "commit:     $(git -C "$REPO" rev-parse HEAD) ($(git -C "$REPO" branch --show-current))"

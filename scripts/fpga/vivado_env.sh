@@ -35,7 +35,7 @@ source /share/xilinx/2025.1/Vitis/.settings64-Vitis.sh >/dev/null 2>&1; \
 export XILINX_LOCAL_USER_DATA=no; \
 export LD_LIBRARY_PATH=$ncurses/lib\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH};"
     fi
-    echo "$env export LM_LICENSE_FILE=$VIVADO_LICENSE; export TERM=\${TERM:-xterm};"
+    echo "$env export LM_LICENSE_FILE=$VIVADO_LICENSE; export XILINX_JOBS=256; export TERM=\${TERM:-xterm};"
 }
 
 # Default PCIe addresses of the cards, per host
