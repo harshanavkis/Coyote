@@ -127,7 +127,7 @@ public:
 	 *		Only important for systems with multiple FPGA cards
 	 *		e.g., reconfiguring 2nd FPGA in a system would mean device = 1
 	 */
-	cRcnfg(unsigned int device = 0);
+	cRcnfg(unsigned int device = 0, const std::string &dev_prefix = "coyote_fpga");
 
 	/// Default destructor; free up dynamically allocated bitstream_t memory, remove mutex etc.
 	~cRcnfg();

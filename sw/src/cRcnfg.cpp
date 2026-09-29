@@ -29,12 +29,12 @@
 namespace coyote {
 std::atomic<uint32_t> cRcnfg::crid_gen; 
 
-cRcnfg::cRcnfg(unsigned int device): mlock(boost::interprocess::open_or_create, "reconfig_mtx") {
+cRcnfg::cRcnfg(unsigned int device, const std::string &dev_prefix): mlock(boost::interprocess::open_or_create, ("reconfig_mtx_" + dev_prefix).c_str()) {
 	DBG2("cRcnfg: Constructor called");
 
 	// Issue driver call to obtain the file descriptor for this (physical) FPGA
 	// In the driver, an instance of reconfig_dev is opened, ready for memory mapping and reconfiguration
-	std::string dev_name = "/dev/coyote_fpga_" + std::to_string(device) + "_reconfig";
+	std::string dev_name = "/dev/" + dev_prefix + "_" + std::to_string(device) + "_reconfig";
 	reconfig_dev_fd = open(dev_name.c_str(), O_RDWR | O_SYNC);
 	if (reconfig_dev_fd == -1)
 		throw std::runtime_error("ERROR: cRcnfg instance could not be obtained");

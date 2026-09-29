@@ -103,14 +103,15 @@ int eventHandler(int fd, int efd, int terminate_efd, std::function<void(int)> ui
 
 static unsigned seed = std::chrono::system_clock::now().time_since_epoch().count();
 
-cThread::cThread(int32_t vfid, pid_t hpid, uint32_t device, std::function<void(int)> uisr):
+cThread::cThread(int32_t vfid, pid_t hpid, uint32_t device, std::function<void(int)> uisr,
+                 const std::string &dev_prefix):
   hpid(hpid), vfid(vfid),
-  vlock(boost::interprocess::open_or_create, ("mutex_dev_" + std::to_string(device) + "_vfpa_" + std::to_string(vfid)).c_str()),
+  vlock(boost::interprocess::open_or_create, ("mutex_" + dev_prefix + "_" + std::to_string(device) + "_vfpa_" + std::to_string(vfid)).c_str()),
   additional_state(nullptr) {
 	DBG1("cThread: opening vFPGA " << vfid << ", hpid " << hpid);
 
 	// Open char device with the name specified in the driver
-	std::string region = "/dev/coyote_fpga_" + std::to_string(device) + "_v" + std::to_string(vfid);
+	std::string region = "/dev/" + dev_prefix + "_" + std::to_string(device) + "_v" + std::to_string(vfid);
     this->fd = open(region.c_str(), O_RDWR | O_SYNC); 
 	if (fd == -1) { 
         throw std::runtime_error("ERROR: cThread instance could not be obtained, vfid: " + std::to_string(vfid)); 

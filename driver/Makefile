@@ -22,42 +22,52 @@
 # Target platform: ultrascale_plus for u55c, u250, u280 or versal for v80
 TARGET_PLATFORM ?= ultrascale_plus
 
-# Target output name
-obj-m := coyote_driver.o
+# Target output name: a Versal build is a separate module (coyote_driver_versal)
+# so that both can be loaded in one host
+ifeq ($(TARGET_PLATFORM), versal)
+MODNAME := coyote_driver_versal
+else
+MODNAME := coyote_driver
+endif
+obj-m := $(MODNAME).o
 
 # Pre-requisites that need to be compiled for the Coyote driver
-coyote_driver-objs := src/coyote_driver.o 
-coyote_driver-objs += src/coyote_setup.o 
-coyote_driver-objs += src/coyote_sysfs.o 
+$(MODNAME)-objs := src/coyote_driver.o 
+$(MODNAME)-objs += src/coyote_setup.o 
+$(MODNAME)-objs += src/coyote_sysfs.o 
 
 ifeq ($(TARGET_PLATFORM), versal)
-coyote_driver-objs += src/platform/pci_qdma.o
+$(MODNAME)-objs += src/platform/pci_qdma.o
 ccflags-y += -DPLATFORM_VERSAL
 else ifeq ($(TARGET_PLATFORM), ultrascale_plus)
-coyote_driver-objs += src/platform/pci_xdma.o
+$(MODNAME)-objs += src/platform/pci_xdma.o
 ccflags-y += -DPLATFORM_ULTRASCALE_PLUS
 else
 $(error "Unsupported TARGET_PLATFORM specified. Supported options are: ultrascale_plus, versal")
 endif
-coyote_driver-objs += src/platform/pci_util.o
+$(MODNAME)-objs += src/platform/pci_util.o
 
-coyote_driver-objs += src/reconfig/reconfig_hw.o 
-coyote_driver-objs += src/reconfig/reconfig_isr.o
-coyote_driver-objs += src/reconfig/reconfig_mem.o
-coyote_driver-objs += src/reconfig/reconfig_ops.o
+$(MODNAME)-objs += src/reconfig/reconfig_hw.o 
+$(MODNAME)-objs += src/reconfig/reconfig_isr.o
+$(MODNAME)-objs += src/reconfig/reconfig_mem.o
+$(MODNAME)-objs += src/reconfig/reconfig_ops.o
 
-coyote_driver-objs += src/vfpga/vfpga_gup.o 
-coyote_driver-objs += src/vfpga/vfpga_hw.o 
-coyote_driver-objs += src/vfpga/vfpga_isr.o 
-coyote_driver-objs += src/vfpga/vfpga_ops.o 
-coyote_driver-objs += src/vfpga/vfpga_uisr.o 
+$(MODNAME)-objs += src/vfpga/vfpga_gup.o 
+$(MODNAME)-objs += src/vfpga/vfpga_hw.o 
+$(MODNAME)-objs += src/vfpga/vfpga_isr.o 
+$(MODNAME)-objs += src/vfpga/vfpga_ops.o 
+$(MODNAME)-objs += src/vfpga/vfpga_uisr.o 
 
 # Location of the Linux kernel header files, we will be building within the context of the kernel's Makefile (the flag -C sets the context)
 # This gives us access to all the Linux kernel functionality, typically implemented in <linux/*.h> and <asm/*.h>
 #KERNELDIR ?= /nix/store/83wasx6wh3idjgkdjmk7b1w2w1v620gb-linux-6.9-dev/lib/modules/6.9.0-rc7/build
 KERNELDIR ?= /home/harshanavkis/doctor-cluster-config/result-dev/lib/modules/$(shell uname -r)/build
 
+ifeq ($(TARGET_PLATFORM), versal)
+BUILD_DIR := $(shell pwd)/build_versal
+else
 BUILD_DIR := $(shell pwd)/build
+endif
 ccflags-y += -std=gnu11 -Wno-declaration-after-statement -I$(src)/include -I$(src)/include/reconfig -I$(src)/include/vfpga -I$(src)/include/platform
 
 # To avoid polluting the source files with a bunch of build (*.o, *.mod etc.) files, the source files are temporarily copied to the build folder for compilation
@@ -70,4 +80,4 @@ all:
 	rm -rf $(BUILD_DIR)/src $(BUILD_DIR)/include $(BUILD_DIR)/Makefile
 
 clean:
-	rm -rf build
+	rm -rf build build_versal

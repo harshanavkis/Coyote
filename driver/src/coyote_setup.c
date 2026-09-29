@@ -285,7 +285,7 @@ static struct kobj_type cyt_kobj_type = {
 int create_sysfs_entry(struct bus_driver_data *data) {
     int ret_val = 0;
     char sysfs_name[MAX_CHAR_FDEV];
-    sprintf(sysfs_name, "coyote_sysfs_%d", data->dev_id);
+    sprintf(sysfs_name, COYOTE_SYSFS_NAME "_%d", data->dev_id);
     
     dbg_info("creating sysfs entry...\n");
 
