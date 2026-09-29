@@ -329,6 +329,15 @@ window 32:
   67108864     32    11697.22     5848.61   11.474
 ```
 
+Against rose instead of amy (rose's U280 is at `c1:00.0`, FPGA IP
+10.0.0.3; `setup_coyote.sh` already knows rose). The repo must exist at the
+same path on rose, and loom_host's nix libraries must be realized there:
+
+```bash
+SERVER_HOST=rose.dos.cit.tum.de SERVER_IP=131.159.102.21 SERVER_BDF=c1:00.0 SERVER_FPGA_IP=0a000003 \
+  ./run_two_host.py --size 67108864 --iters 20 --gap 20 --retries 0 --tx-window 32
+```
+
 Three variants (2026-09-28/29; results in `PERFORMANCE.md`):
 
 ```bash
