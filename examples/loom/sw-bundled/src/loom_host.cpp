@@ -194,7 +194,12 @@ int bench_gap_us() {
 // silently. Held under the depth; not a knob, not a mechanism - what is in
 // flight on the wire is bounded by the engine's window (LOOM_TX_WINDOW).
 constexpr int BENCH_UNRETIRED = 48;
-constexpr int BENCH_STORES = 256;    // inline messages for the store rate
+// Inline messages for the store rate. LOOM_BENCH_STORES overrides; at most
+// 64 (the order FIFO depth) are guaranteed to be accepted back to back.
+int bench_stores() {
+    const char *e = getenv("LOOM_BENCH_STORES");
+    return e ? atoi(e) : 256;
+}
 
 // Where each size's last iteration lands, packed nose to tail
 uint64_t bench_offset(int idx) {
@@ -447,6 +452,14 @@ constexpr uint64_t PP_FLAG_OFF = 0xF00;              // flag word, both sides
 constexpr uint64_t PP_LEN_OFF  = 0xF08;              // length word, both sides
 constexpr uint64_t PP_DATA_OFF = 64ULL * 1024 * 1024; // payload, both sides
 constexpr uint64_t PP_MAGIC    = 0x5049'4E47'0000'0000ULL;   // "PING" | k
+// Set in the LEN word: the payload travelled as aperture stores at window
+// offsets 0.., and the pong must answer the same way.
+constexpr uint64_t PP_STORES   = 1ULL << 63;
+// DMA-only ping-pong (LOOM_PP_DMAFLAG=1): no aperture stores at all. The
+// payload ENDS at PP_END_OFF on both sides; its last two words are LEN and
+// FLAG, so the flag lands with the data, in the same copy, last - as
+// perftest polls the last bytes of its buffer.
+constexpr uint64_t PP_END_OFF  = PP_DATA_OFF + 64ULL * 1024 * 1024;
 
 // Server side: answer every ping until the client's DONE arrives.
 template <class DoneFn>
@@ -457,6 +470,24 @@ void serve_pong(loom::Xpu &S, int win, uint64_t *buf,
     uint64_t k = 0, served = 0, bytes = 0;
     printf("server: ping-pong service on window %d\n", win);
     fflush(stdout);
+    if (getenv("LOOM_PP_DMAFLAG")) {
+        volatile uint64_t *tflag = buf + PP_END_OFF / 8 - 1;
+        volatile uint64_t *tlen  = buf + PP_END_OFF / 8 - 2;
+        while (!done()) {
+            bool got = false;
+            for (int i = 0; i < 20000 && !got; i++)
+                if (*tflag == (PP_MAGIC | (k + 1))) got = true;
+            if (!got) continue;
+            k++;
+            const uint64_t len = *tlen, off = PP_END_OFF - len;
+            S.copy(win, uint32_t(off), buf + off / 8, len, fence);
+            served++; bytes += len;
+        }
+        printf("server: DMA ping-pong served %lu rounds, %lu bytes each way\n",
+               (unsigned long) served, (unsigned long) bytes);
+        fflush(stdout);
+        return;
+    }
     while (!done()) {
         // poll the flag, checking for DONE every ~1 ms of spinning
         bool got = false;
@@ -465,6 +496,16 @@ void serve_pong(loom::Xpu &S, int win, uint64_t *buf,
         if (!got) continue;
         k++;
         const uint64_t len = *lenw;
+        if (len & PP_STORES) {
+            // store ping-pong: answer with stores from the landed copy
+            const uint64_t n = (len & ~PP_STORES) / 8;
+            for (uint64_t w = 0; w < n; w++)
+                S.store(win, uint32_t(w * 8), buf[w]);
+            S.store(win, uint32_t(PP_LEN_OFF), len);
+            S.store(win, uint32_t(PP_FLAG_OFF), PP_MAGIC | k);
+            served++; bytes += n * 8;
+            continue;
+        }
         const uint64_t c = *fence;
         S.copy(win, uint32_t(PP_DATA_OFF), buf + PP_DATA_OFF / 8, len, fence);
         if (!spin64(fence, c + 1, 5e6)) {
@@ -545,6 +586,113 @@ void run_pingpong(loom::Xpu &A, int win, uint64_t *src, uint64_t *pong,
         if (!ok || !same) { printf("ping-pong: stopping at this size\n"); break; }
     }
     usleep(500000);      // let RC retransmit timers fire before sampling
+    printf("whole run: %ld retransmissions, %ld PSN drops (this side)\n",
+           net_stat("Retrans cnt") - rt0, net_stat("PSN drop cnt") - pd0);
+    fflush(stdout);
+}
+
+// DMA-only ping-pong: each way is ONE copy() whose last word is the flag.
+void run_pingpong_dmaflag(loom::Xpu &A, int win, uint64_t *src, uint64_t *pong,
+                          volatile uint64_t *fence) {
+    const uint64_t e = PP_END_OFF / 8;
+    uint64_t k = 0;
+    const long rt0 = net_stat("Retrans cnt"), pd0 = net_stat("PSN drop cnt");
+    printf("\n== DMA ping-pong (one copy() each way, flag in the payload's last "
+           "word, no aperture stores; one way = RTT/2)\n");
+    printf("%10s %6s %12s %12s %10s %8s\n",
+           "bytes", "rounds", "rtt_us", "one_way_us", "GB/s", "landed");
+    fflush(stdout);
+    for (size_t i = 0; i < sizeof(BENCH_SIZES) / sizeof(BENCH_SIZES[0]); i++) {
+        const uint64_t len = BENCH_SIZES[i], off = PP_END_OFF - len;
+        if (len < 16 || len > PP_END_OFF - PP_DATA_OFF) continue;
+        for (uint64_t w = 0; w < len / 8 - 2; w++) src[off / 8 + w] = bench_word(i, w);
+        src[e - 2] = len;
+        memset(pong + off / 8, 0, len);
+        const int rounds = bench_iters(len) > 0 ? bench_iters(len) : 1;
+        bool ok = true;
+        double total_us = 0.0;
+        for (int r = 0; r <= rounds && ok; r++) {     // round 0 = warm-up
+            k++;
+            src[e - 1] = PP_MAGIC | k;
+            auto t0 = std::chrono::steady_clock::now();
+            A.copy(win, uint32_t(off), src + off / 8, len, fence);
+            if (!spin64(pong + e - 1, PP_MAGIC | k, 5e6)) {
+                printf("%10lu   round %d: pong never arrived\n", (unsigned long) len, r);
+                ok = false;
+                break;
+            }
+            const double us = std::chrono::duration<double, std::micro>(
+                std::chrono::steady_clock::now() - t0).count();
+            if (r > 0) total_us += us;
+        }
+        bool same = ok && pong[e - 2] == len;
+        for (uint64_t w = 0; same && w < len / 8 - 2; w++)
+            if (pong[off / 8 + w] != bench_word(i, w)) same = false;
+        if (ok) {
+            const double rtt = total_us / rounds;
+            printf("%10lu %6d %12.2f %12.2f %10.3f %8s\n",
+                   (unsigned long) len, rounds, rtt, rtt / 2,
+                   double(len) / (rtt / 2 * 1e3), same ? "yes" : "NO");
+        }
+        fflush(stdout);
+        if (!ok || !same) { printf("DMA ping-pong: stopping at this size\n"); break; }
+    }
+    usleep(500000);
+    printf("whole run: %ld retransmissions, %ld PSN drops (this side)\n",
+           net_stat("Retrans cnt") - rt0, net_stat("PSN drop cnt") - pd0);
+    fflush(stdout);
+}
+
+// STORE ping-pong (LOOM_PP_STORES=1): the payload is written as 8 B
+// aperture stores - a CPU memcpy onto the peer pointer, every access
+// uncached - then LEN and FLAG, all through the same order FIFO and RC
+// connection, so the flag lands last. The data sits below the flag/length
+// words, so at most PP_FLAG_OFF bytes (3840) fit in one 4 KB window.
+void run_store_pingpong(loom::Xpu &A, int win, uint64_t *pong) {
+    static const uint64_t SIZES[] = {8, 64, 128, 256, 512, 1024, 2048, 3840};
+    volatile uint64_t *pflag = pong + PP_FLAG_OFF / 8;
+    uint64_t k = 0;
+    const long rt0 = net_stat("Retrans cnt"), pd0 = net_stat("PSN drop cnt");
+    printf("\n== store ping-pong (payload as 8 B aperture stores, then LEN, "
+           "FLAG; amy answers the same way; one way = RTT/2)\n");
+    printf("%10s %7s %6s %12s %12s %14s %8s\n", "bytes", "stores", "rounds",
+           "rtt_us", "one_way_us", "per_store_us", "landed");
+    fflush(stdout);
+    for (size_t i = 0; i < sizeof(SIZES) / sizeof(SIZES[0]); i++) {
+        const uint64_t len = SIZES[i], n = len / 8;
+        memset(pong, 0, len);
+        const int rounds = bench_iters(len) > 0 ? bench_iters(len) : 1;
+        bool ok = true;
+        double total_us = 0.0;
+        for (int r = 0; r <= rounds && ok; r++) {     // round 0 = warm-up
+            k++;
+            auto t0 = std::chrono::steady_clock::now();
+            for (uint64_t w = 0; w < n; w++)
+                A.store(win, uint32_t(w * 8), bench_word(i, w));
+            A.store(win, uint32_t(PP_LEN_OFF), len | PP_STORES);
+            A.store(win, uint32_t(PP_FLAG_OFF), PP_MAGIC | k);
+            if (!spin64(pflag, PP_MAGIC | k, 5e6)) {
+                printf("%10lu   round %d: pong never arrived\n", (unsigned long) len, r);
+                ok = false;
+                break;
+            }
+            const double us = std::chrono::duration<double, std::micro>(
+                std::chrono::steady_clock::now() - t0).count();
+            if (r > 0) total_us += us;
+        }
+        bool same = ok;
+        for (uint64_t w = 0; same && w < n; w++)
+            if (pong[w] != bench_word(i, w)) same = false;
+        if (ok) {
+            const double rtt = total_us / rounds;
+            printf("%10lu %7lu %6d %12.2f %12.2f %14.3f %8s\n",
+                   (unsigned long) len, (unsigned long) n, rounds, rtt, rtt / 2,
+                   rtt / 2 / double(n + 2), same ? "yes" : "NO");
+        }
+        fflush(stdout);
+        if (!ok || !same) { printf("store ping-pong: stopping at this size\n"); break; }
+    }
+    usleep(500000);
     printf("whole run: %ld retransmissions, %ld PSN drops (this side)\n",
            net_stat("Retrans cnt") - rt0, net_stat("PSN drop cnt") - pd0);
     fflush(stdout);
@@ -797,6 +945,7 @@ void run_bench(coyote::cThread &t_ctrl, loom::Xpu &A, int win,
         // every store below targets the same offset; only dbg[6] shows it.
         const uint64_t ovf0 = loom::csr_read(t_ctrl, loom::DBG_BASE + 8 * 6);
         loom::StageStats a = loom::read_stage_stats(t_ctrl);
+        const int BENCH_STORES = bench_stores();
         auto t0 = std::chrono::steady_clock::now();
         for (int k = 0; k < BENCH_STORES; k++)
             A.store(win, 0x100, 0x5709'0000'0000'0000ULL | uint64_t(k));
@@ -1976,7 +2125,9 @@ int run_client(const std::string &ip, uint16_t qp_port, uint16_t peer_port,
         check(peer.pong(reinterpret_cast<uint64_t>(staging_local),
                         reinterpret_cast<uint64_t>(pong), BUF_SIZE, t_data.getCtid()) > 0,
               "server accepted the PONG window");
-        run_pingpong(A, w1, src, pong, fence);
+        if (getenv("LOOM_PP_DMAFLAG")) run_pingpong_dmaflag(A, w1, src, pong, fence);
+        else if (getenv("LOOM_PP_STORES")) run_store_pingpong(A, w1, pong);
+        else run_pingpong(A, w1, src, pong, fence);
     } else if (bench_mode())
         run_bench(t_ctrl, A, w1, src, fence);
 

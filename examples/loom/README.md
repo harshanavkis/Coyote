@@ -329,6 +329,21 @@ window 32:
   67108864     32    11697.22     5848.61   11.474
 ```
 
+Three variants (2026-09-28/29; results in `PERFORMANCE.md`):
+
+```bash
+# DMA only: one copy() each way, the flag is the payload's LAST word (as
+# perftest polls its buffer) - no aperture stores at all. The comparable
+# number against perftest / perf_rdma.
+./run_two_host.py --pingpong-dma --size 0 --iters 32 --gap 0 --retries 0 --tx-window 32
+# Stores only: the payload as 8 B aperture stores (a CPU memcpy onto the
+# peer pointer), 8 B..3840 B; beyond ~1 KiB the 64-deep order FIFO drops.
+./run_two_host.py --store-pingpong --size 0 --iters 32 --gap 0 --retries 0 --tx-window 32
+# Push bench plus K back-to-back 8 B remote stores (host-side rate,
+# t-encap cyc/op, FIFO drops); stores are off unless --stores is given.
+./run_two_host.py --size 4096 --iters 1 --gap 0 --retries 0 --tx-window 32 --stores 64
+```
+
 So the fixed cost is ~7.5 us one way (two software polls, two aperture
 stores, two engine passes), and delivery at 64 MiB is 11.47 GB/s - ~3%
 under the push number, the per-message fill and drain the fence does not

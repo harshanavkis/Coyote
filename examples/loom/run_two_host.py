@@ -497,7 +497,8 @@ def bench_env(args, gap):
     # size 0 means "every size in BENCH_SIZES": the bench sweeps its whole
     # list when LOOM_BENCH_ONLY is unset. It stops at the first size that
     # retransmits, since later rows would measure RC recovery instead.
-    env = "LOOM_BENCH=1 LOOM_BENCH_NO_STORES=1 "
+    env = "LOOM_BENCH=1 "
+    env += f"LOOM_BENCH_STORES={args.stores} " if args.stores else "LOOM_BENCH_NO_STORES=1 "
     if str(args.size) != "0":
         env += f"LOOM_BENCH_ONLY={args.size} "
     env += f"LOOM_BENCH_ITERS={args.iters}"
@@ -515,6 +516,10 @@ def bench_env(args, gap):
         env += f" LOOM_RX_CHUNK={args.rx_chunk}"
     if args.pingpong:
         env += " LOOM_BENCH_PINGPONG=1"
+        if args.store_pingpong:
+            env += " LOOM_PP_STORES=1"
+        if args.pingpong_dma:
+            env += " LOOM_PP_DMAFLAG=1"
     if args.matrix:
         env += " LOOM_BENCH_MATRIX=1 LOOM_XPUS=2"
         if args.bidir:
@@ -763,11 +768,25 @@ def main():
                     help="with --bidir: after the timed rounds, N more rounds "
                          "in which B answers A's 4 MiB push with K 64 B "
                          "stores instead of a push (packets without bytes)")
+    ap.add_argument("--pingpong-dma", action="store_true",
+                    help="ping-pong with NO aperture stores: one copy() each "
+                         "way, the flag is the payload's last word (as "
+                         "perftest polls); implies --pingpong")
+    ap.add_argument("--store-pingpong", action="store_true",
+                    help="ping-pong whose payload is 8 B aperture stores "
+                         "(a CPU memcpy onto the peer pointer), 8 B..3840 B; "
+                         "implies --pingpong")
+    ap.add_argument("--stores", type=int, default=0, metavar="K",
+                    help="push bench: after the sizes, K back-to-back 8 B "
+                         "remote stores (t-encap cyc/op, us/op, FIFO drops); "
+                         "off by default. The order FIFO is 64 deep")
     ap.add_argument("--skip-bulk", action="store_true")
     ap.add_argument("--retries", type=int, default=2,
                     help="reflash both cards and retry after a wedge")
     ap.add_argument("--out", default=f"{COYOTE}/examples/loom/experiments-log.txt")
     args = ap.parse_args()
+    if args.store_pingpong or args.pingpong_dma:
+        args.pingpong = True
     if args.bidir or args.local or args.rxlocal:
         args.matrix = True
 
