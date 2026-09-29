@@ -53,9 +53,9 @@ export LD_LIBRARY_PATH=$NCURSES/lib\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH};"
 else
     ENV_SETUP=""
 fi
-# xilinx-shell starts from a clean environment. The CMAC IP (every network
-# build) needs this license; without it the CMAC gets only a Design_Linking
-# license and the bitstream step fails or yields an evaluation core.
+# xilinx-shell starts from a clean environment; the CMAC IP (every network
+# build) needs this license. The "cmac_an_lt ... Design_Linking license"
+# warning is expected with or without it (link training, unused).
 LICENSE=/share/xilinx/Xilinx.lic
 [ -r "$LICENSE" ] || { echo "license file $LICENSE not readable" >&2; exit 1; }
 ENV_SETUP="$ENV_SETUP export LM_LICENSE_FILE=$LICENSE; export TERM=\${TERM:-xterm}; export PATH=$CMAKE_BIN:\$PATH;"
