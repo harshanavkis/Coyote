@@ -620,6 +620,17 @@ of `loom_rx`.
 
 ### Hardware
 
+**Bitstream, reproducibly:** `scripts/fpga/build_bitstream.sh <device> <hw_dir> <build_name> [--fg] [cmake args]`
+picks the Vivado version for the device (U280/U55C/U250: 2023.2, whose
+static checkpoints are Vivado 2022.1 files; V80: 2025.1, with the
+environment 2025.1 needs inside xilinx-shell), configures, runs `make project
+&& make bitgen` in tmux session `bit_<build_name>`, and writes
+`BUILD_INFO.txt` (commit, network submodule, device, Vivado, cmake args,
+dirty files) next to the bitstream. E.g.
+`scripts/fpga/build_bitstream.sh u280 examples/loom/hw build_sep29_ctrl` and
+`scripts/fpga/build_bitstream.sh v80 examples/07_perf_fpga/hw build_v80`.
+The manual recipe below is what it automates.
+
 **Bitstream** (hours; tmux). U280 needs the HBM shell — with `EN_RDMA` on
 a DDR-configured u280 the DDR4 MIG and the dangling HBM clock both claim
 the board's single 100 MHz reference (BJ43/BJ44) and `opt_design` dies with
