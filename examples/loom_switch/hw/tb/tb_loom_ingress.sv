@@ -14,7 +14,9 @@ import lynxTypes::*;
  * Covers: aligned packets on both routes, a run that starts mid-packet,
  * back-to-back bursts over several packets, alternating windows, an offset
  * gap in one window, drops (past the window's end, unmapped, misaligned,
- * invalid entry), a 64 MiB window, backpressure everywhere, and reads.
+ * invalid entry), a 64 MiB window, 8 B stores (lone, several in one beat,
+ * inside a run, a flag behind bulk, partial words dropped), backpressure
+ * everywhere, and reads.
  */
 module tb_loom_ingress;
 
@@ -53,7 +55,7 @@ logic [AXI_DATA_BITS-1:0]   m_host_tdata, m_net_tdata;
 logic [AXI_DATA_BITS/8-1:0] m_host_tkeep, m_net_tkeep;
 logic m_host_tvalid, m_host_tready, m_host_tlast;
 logic m_net_tvalid, m_net_tready, m_net_tlast;
-logic cnt_burst, cnt_drop, cnt_pkt_local, cnt_pkt_rdma, cnt_flush;
+logic cnt_burst, cnt_drop, cnt_pkt_local, cnt_pkt_rdma, cnt_store, cnt_store_drop, cnt_flush;
 
 loom_table #(.UWIN_BITS(UWIN_BITS)) inst_table (
     .aclk(aclk), .aresetn(aresetn),
@@ -82,7 +84,8 @@ loom_ingress #(.UWIN_BITS(UWIN_BITS), .FLUSH_CYCLES(FLUSH)) dut (
     .m_net_tvalid(m_net_tvalid), .m_net_tready(m_net_tready),
     .m_net_tlast(m_net_tlast),
     .cnt_burst(cnt_burst), .cnt_drop(cnt_drop), .cnt_pkt_local(cnt_pkt_local),
-    .cnt_pkt_rdma(cnt_pkt_rdma), .cnt_flush(cnt_flush)
+    .cnt_pkt_rdma(cnt_pkt_rdma), .cnt_store(cnt_store), .cnt_store_drop(cnt_store_drop),
+    .cnt_flush(cnt_flush)
 );
 
 int errors = 0;
@@ -124,12 +127,15 @@ endfunction
 // Bursts and the reference packetiser
 // ---------------------------------------------------------------------------
 typedef struct {
-    longint uaddr;      // uwin address
-    int     beats;
-    bit     gap_after;  // idle past the flush timer after this burst
+    longint      uaddr;      // uwin address
+    int          beats;
+    bit          gap_after;  // idle past the flush timer after this burst
+    logic [63:0] strb [64];  // per beat
 } burst_t;
 
 typedef struct {
+    bit                    store;   // an 8 B store; else a packet
+    logic [63:0]           data;    // the store's word
     bit                    route;
     logic [PID_BITS-1:0]   pid, dst_pid;
     logic [VADDR_BITS-1:0] va;
@@ -139,7 +145,7 @@ typedef struct {
 
 burst_t bursts [$];
 pkt_t   exp_pkts [$];
-int     exp_drops;
+int     exp_drops, exp_store_drops;
 
 // Which window holds a burst, and whether it is taken (the RTL's rule)
 function automatic int win_of(input burst_t b, output longint off);
@@ -159,6 +165,8 @@ task automatic model();
     pkt_t   p;
     exp_pkts.delete();
     exp_drops = 0;
+    exp_store_drops = 0;
+    p.store = 0; p.data = 0;
     foreach (bursts[k]) begin
         longint off;
         int wi = win_of(bursts[k], off);
@@ -166,6 +174,25 @@ task automatic model();
         for (int j = 0; j < bursts[k].beats; j++) begin
             longint o = off + 64*j;
             int cap = W[wi].route ? PKT_BEATS-1 : PKT_BEATS;
+            logic [63:0] sb = bursts[k].strb[j];
+            if (sb != '1) begin
+                // stores: close the open packet, then one per whole word
+                bit bad = 0;
+                if (open) begin exp_pkts.push_back(p); open = 0; end
+                for (int l = 0; l < 8; l++) begin
+                    if (sb[8*l +: 8] == 8'hFF) begin
+                        pkt_t st;
+                        logic [AXI_DATA_BITS-1:0] line = pat(W[wi].ustart + o);
+                        st.store = 1; st.route = W[wi].route; st.pid = W[wi].pid;
+                        st.dst_pid = W[wi].dst_pid; st.va = W[wi].base + o + 8*l;
+                        st.uaddr = W[wi].ustart + o; st.beats = 0;
+                        st.data = line[64*l +: 64];
+                        exp_pkts.push_back(st);
+                    end else if (sb[8*l +: 8] != 8'h00) bad = 1;
+                end
+                exp_store_drops += bad;
+                continue;
+            end
             if (open && p_win == wi && p_next == o) begin
                 p.beats++;
             end else begin
@@ -219,6 +246,7 @@ always begin
         for (int j = 0; j < bursts[k].beats; j++) begin
             if (bp) repeat ($urandom_range(0, 1) ? 0 : $urandom_range(1, 3)) @(posedge aclk);
             axi.wdata  <= pat(bursts[k].uaddr + 64*j);
+            axi.wstrb  <= bursts[k].strb[j];
             axi.wlast  <= (j == bursts[k].beats - 1);
             axi.wvalid <= 1;
             do @(posedge aclk); while (!axi.wready);
@@ -244,8 +272,10 @@ end
 // ---------------------------------------------------------------------------
 req_t reqs [$];
 logic [AXI_DATA_BITS-1:0] host_beats [$], net_beats [$];
+logic [AXI_DATA_BITS/8-1:0] host_keep [$];
 bit   host_last [$], net_last [$];
 int   n_burst = 0, n_drop = 0, n_pkt_local = 0, n_pkt_rdma = 0, n_post = 0;
+int   n_store = 0, n_store_drop = 0;
 // Input rate: W beats taken between the first and the last
 longint cyc = 0, w_first = -1, w_last = 0, w_beats = 0;
 always @(posedge aclk) cyc++;
@@ -261,7 +291,7 @@ always @(posedge aclk) if (aresetn) begin
     if (wr_valid && wr_ready) reqs.push_back(wr_req);
     if (m_host_tvalid && m_host_tready) begin
         host_beats.push_back(m_host_tdata); host_last.push_back(m_host_tlast);
-        `CHECK(m_host_tkeep == '1, "host tkeep not full")
+        host_keep.push_back(m_host_tkeep);
     end
     if (m_net_tvalid && m_net_tready) begin
         net_beats.push_back(m_net_tdata); net_last.push_back(m_net_tlast);
@@ -272,6 +302,8 @@ always @(posedge aclk) if (aresetn) begin
     n_pkt_local += cnt_pkt_local;
     n_pkt_rdma  += cnt_pkt_rdma;
     n_post      += rdma_post;
+    n_store     += cnt_store;
+    n_store_drop += cnt_store_drop;
     if (axi.wvalid && axi.wready) begin
         if (w_first < 0) w_first = cyc;
         w_last = cyc;
@@ -284,11 +316,12 @@ end
 // Run one test: send, wait for everything to drain, compare
 // ---------------------------------------------------------------------------
 task automatic run(input string name);
-    int n_local = 0, n_rdma = 0, n_bursts;
+    int n_local = 0, n_rdma = 0, n_st = 0, n_st_rdma = 0, n_bursts;
     int e0 = errors;
     reqs.delete(); host_beats.delete(); net_beats.delete();
-    host_last.delete(); net_last.delete();
+    host_last.delete(); net_last.delete(); host_keep.delete();
     n_burst = 0; n_drop = 0; n_pkt_local = 0; n_pkt_rdma = 0; n_post = 0; b_seen = 0;
+    n_store = 0; n_store_drop = 0;
     w_first = -1; w_beats = 0;
     salt = $urandom();
     model();
@@ -310,10 +343,31 @@ task automatic run(input string name);
         if (i >= reqs.size()) break;
         r = reqs[i];
         `CHECK(r.pid == e.pid && r.last == 1'b1, $sformatf("%s pkt %0d: pid %0d last %0d", name, i, r.pid, r.last))
-        if (e.route) begin
+        if (e.store && e.route) begin
             logic [AXI_DATA_BITS-1:0] h;
             `CHECK(r.opcode == RC_RDMA_WRITE_ONLY && r.strm == STRM_RDMA && r.mode == 1'b1 &&
-                   r.rdma && r.remote && r.dest == 1 && r.vaddr == STAGING &&
+                   r.dest == 0 && r.vaddr == STAGING && r.len == 64,
+                   $sformatf("%s pkt %0d: rdma store request op %0h len %0d", name, i, r.opcode, r.len))
+            h = net_beats.pop_front();
+            `CHECK(net_last.pop_front(), $sformatf("%s pkt %0d: no tlast on the inline message", name, i))
+            `CHECK(h[63:0] == {{(28-PID_BITS){1'b0}}, e.dst_pid, 28'd8, 8'd2} && h[127:64] == 64'(e.va) &&
+                   h[191:128] == e.data && h[AXI_DATA_BITS-1:192] == '0,
+                   $sformatf("%s pkt %0d: inline message %h %h %h, expected va %h data %h",
+                             name, i, h[191:128], h[127:64], h[63:0], e.va, e.data))
+            n_st++; n_st_rdma++;
+        end else if (e.store) begin
+            logic [AXI_DATA_BITS-1:0] d;
+            `CHECK(r.opcode == LOCAL_WRITE && r.strm == STRM_HOST && r.dest == 0 &&
+                   r.vaddr == e.va && r.len == 8,
+                   $sformatf("%s pkt %0d: local store request va %h len %0d, expected va %h", name, i, r.vaddr, r.len, e.va))
+            d = host_beats.pop_front();
+            `CHECK(d[63:0] == e.data && host_keep.pop_front() == 64'hFF && host_last.pop_front(),
+                   $sformatf("%s pkt %0d: local store beat %h, expected %h", name, i, d[63:0], e.data))
+            n_st++;
+        end else if (e.route) begin
+            logic [AXI_DATA_BITS-1:0] h;
+            `CHECK(r.opcode == RC_RDMA_WRITE_ONLY && r.strm == STRM_RDMA && r.mode == 1'b1 &&
+                   r.rdma && r.remote && r.dest == 0 && r.vaddr == STAGING &&
                    r.len == LEN_BITS'(64 + 64*e.beats),
                    $sformatf("%s pkt %0d: rdma request op %0h strm %0d dest %0d va %h len %0d, expected len %0d",
                              name, i, r.opcode, r.strm, r.dest, r.vaddr, r.len, 64 + 64*e.beats))
@@ -328,13 +382,14 @@ task automatic run(input string name);
             end
             n_rdma++;
         end else begin
-            `CHECK(r.opcode == LOCAL_WRITE && r.strm == STRM_HOST && r.dest == 2 &&
+            `CHECK(r.opcode == LOCAL_WRITE && r.strm == STRM_HOST && r.dest == 0 &&
                    r.vaddr == e.va && r.len == LEN_BITS'(64*e.beats),
                    $sformatf("%s pkt %0d: local request va %h len %0d, expected va %h len %0d",
                              name, i, r.vaddr, r.len, e.va, 64*e.beats))
             for (int j = 0; j < e.beats; j++) begin
                 `CHECK(host_beats.pop_front() == pat(e.uaddr + 64*j), $sformatf("%s pkt %0d: payload beat %0d", name, i, j))
                 `CHECK(host_last.pop_front() == (j == e.beats - 1), $sformatf("%s pkt %0d: tlast at beat %0d", name, i, j))
+                `CHECK(host_keep.pop_front() == '1, $sformatf("%s pkt %0d: tkeep at beat %0d", name, i, j))
             end
             n_local++;
         end
@@ -343,10 +398,13 @@ task automatic run(input string name);
            $sformatf("%s: %0d host / %0d net beats left over", name, host_beats.size(), net_beats.size()))
     `CHECK(n_drop == exp_drops && n_burst == n_bursts - exp_drops,
            $sformatf("%s: %0d bursts %0d drops, expected %0d / %0d", name, n_burst, n_drop, n_bursts - exp_drops, exp_drops))
-    `CHECK(n_pkt_local == n_local && n_pkt_rdma == n_rdma && n_post == n_rdma,
+    `CHECK(n_pkt_local == n_local && n_pkt_rdma == n_rdma && n_post == n_rdma + n_st_rdma,
            $sformatf("%s: counters local %0d rdma %0d post %0d", name, n_pkt_local, n_pkt_rdma, n_post))
-    $display("%s %s: %0d bursts, %0d local + %0d rdma packets, %0d drops, input %0d beats in %0d cycles",
-             (errors == e0) ? "ok  " : "FAIL", name, n_bursts, n_local, n_rdma, exp_drops,
+    `CHECK(n_store == n_st && n_store_drop == exp_store_drops,
+           $sformatf("%s: counters store %0d store_drop %0d, expected %0d / %0d",
+                     name, n_store, n_store_drop, n_st, exp_store_drops))
+    $display("%s %s: %0d bursts, %0d local + %0d rdma packets, %0d stores, %0d drops, input %0d beats in %0d cycles",
+             (errors == e0) ? "ok  " : "FAIL", name, n_bursts, n_local, n_rdma, n_st, exp_drops,
              w_beats, w_last - w_first + 1);
     bursts.delete();
 endtask
@@ -354,7 +412,19 @@ endtask
 function automatic void add(input longint uaddr, input int beats, input bit gap = 0);
     burst_t b;
     b.uaddr = uaddr; b.beats = beats; b.gap_after = gap;
+    for (int j = 0; j < 64; j++) b.strb[j] = '1;
     bursts.push_back(b);
+endfunction
+
+// One beat with these strobes (a set of 8 B stores)
+function automatic void add_st(input longint uaddr, input logic [63:0] strb, input bit gap = 0);
+    add(uaddr, 1, gap);
+    bursts[bursts.size()-1].strb[0] = strb;
+endfunction
+
+// 8 B word w's strobes
+function automatic logic [63:0] word(input int w);
+    return 64'hFF << (8*w);
 endfunction
 
 // Bursts of `per` beats covering `total` beats from uaddr
@@ -409,6 +479,29 @@ task automatic suite(input string tag);
     add(W5 + 64'h400_0000 - 256, 4);
     add(W5 + 64'h400_0000 - 128, 4);
     run({tag, "64 MiB window"});
+
+    // stores: lone words on both routes, several in one beat, an empty beat,
+    // a partial word next to a whole one
+    add_st(W1 + 64'h2000, word(3));
+    add_st(W2 + 64'h2000, word(7));
+    add_st(W1 + 64'h2040, word(0) | word(2) | word(5));
+    add_st(W2 + 64'h2040, word(1) | word(6));
+    add_st(W1 + 64'h2080, 64'h0);
+    add_st(W1 + 64'h20C0, 64'h0F << 8 | word(4));
+    add_st(W2 + 64'h20C0, 64'h01);
+    run({tag, "stores"});
+
+    // a flag behind bulk, on each route; a store inside a run closes the
+    // packet before it; a whole line after a run joins its packet
+    add_run(W2 + 64'h4000, 64, 4);
+    add_st(W2 + 64'h8000, word(0));
+    add_run(W1 + 64'h4000, 16, 4);
+    add_st(W1 + 64'h8000, word(0));
+    add(W1 + 64'hA000, 3);
+    bursts[bursts.size()-1].strb[1] = word(7);
+    add(W1 + 64'hB000, 4);
+    add(W1 + 64'hB100, 1);
+    run({tag, "flag behind bulk"});
 endtask
 
 initial begin

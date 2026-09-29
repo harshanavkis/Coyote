@@ -3,46 +3,57 @@ import lynxTypes::*;
 /**
  * loom_ingress
  *
- * AXI4 write slave on the ingress window (uwin). A producer - the V80 copy
- * engine, peer-to-peer over PCIe - writes to an address, and the address
+ * AXI4 write slave on the ingress window (uwin), Loom's one data path. A
+ * producer - the V80 copy engine peer-to-peer over PCIe, or the host CPU
+ * through a write-combining mapping - writes to an address, and the address
  * names the destination: the table's uwin ranges map it to a binding and an
- * offset in it. Loom turns the write stream into packets:
+ * offset in it. Loom turns the write stream into packets and stores:
  *
- *   local: sq_wr {LOCAL_WRITE, STRM_HOST, dest HOST_DEST, pid, base+off, len}
- *          + the payload beats on its own host stream
- *   rdma:  one single-packet Loom message: sq_wr {RC_RDMA_WRITE_ONLY, RAW,
- *          STRM_RDMA, dest NET_DEST, pid = QP owner, vaddr = staging,
+ *   packet, local: sq_wr {LOCAL_WRITE, STRM_HOST, dest HOST_DEST, pid,
+ *          base+off, len} + the payload beats on the host stream
+ *   packet, rdma: one single-packet Loom message: sq_wr {RC_RDMA_WRITE_ONLY,
+ *          RAW, STRM_RDMA, dest NET_DEST, pid = QP owner, vaddr = staging,
  *          64 + len} + the header beat {op WRITE, len, dst_pid, base+off}
  *          + the payload beats, which is exactly what loom_engine's bulk
  *          path sends for a message that fits one packet, so the far
  *          loom_rx lands it unchanged
+ *   store, local: sq_wr {LOCAL_WRITE, 8 B} + one beat, data in lane 0
+ *   store, rdma: the 64 B inline message loom_engine sends for a store:
+ *          {lane0 = op WRITE_INLINE, len 8, dst_pid; lane1 = base+off;
+ *          lane2 = data}, which loom_rx lands as the exact 8 B write
  *
- * PACKETS. Writes arrive as bursts of PCIe-payload size (a few beats each).
- * Consecutive beats that continue the same binding at the next offset are
- * gathered into one packet, up to PMTU on the wire (header included, so 63
- * payload beats on rdma, 64 on local). A packet closes when it is full, when
- * the next beat does not continue it (another window or offset), or when no
- * beat has been presented for FLUSH_CYCLES. Both the request and the rdma
- * header state the length, so a packet is stored before it is forwarded;
- * the data FIFO holds several, so the next one gathers while the last one
- * leaves.
+ * PACKETS. Full beats (all 64 strobes) that continue the same binding at the
+ * next offset are gathered into one packet, up to PMTU on the wire (header
+ * included, so 63 payload beats on rdma, 64 on local). A packet closes when
+ * it is full, when the next beat does not continue it (another window or
+ * offset, or a store), or when no beat has been presented for FLUSH_CYCLES.
+ * Both the request and the rdma header state the length, so a packet is
+ * stored before it is forwarded; the data FIFO holds several, so the next
+ * one gathers while the last one leaves.
  *
- * ORDER. One data FIFO and one packet queue: packets leave in the order
- * their beats arrived, across bindings.
+ * STORES. A beat that is not full is a set of 8 B stores: every aligned 8 B
+ * word whose strobes are all set is one store, in lane order, one per cycle.
+ * A word with only some of its strobes set is dropped and counted
+ * (cnt_store_drop, once per beat); words with none are nothing. A CPU
+ * write-combining buffer that fills a whole line hands over a full beat,
+ * which joins packets like bulk.
  *
- * CONTRACT. Bursts are 64 B-aligned, full-width, full-strobe INCR bursts
- * (loom_ce only emits those; wstrb is not looked at). A burst with no
- * window, a misaligned address or an end past the window's length is
- * accepted, discarded and counted (cnt_drop). B is answered once the
- * burst's last beat is in the FIFO. Reads are answered with zeros.
+ * ORDER. One queue for packets and stores: they leave in the order their
+ * beats arrived, across bindings, so a flag stored after data stays behind
+ * it.
  *
- * WINDOW. rdma packets are posted only while win_ok (the shared ack window
- * in vfpga_top); rdma_post pulses on each so the window can count them.
+ * CONTRACT. Bursts are 64 B-aligned INCR bursts (awsize is not looked at).
+ * A burst with no window, a misaligned address or an end past the window's
+ * length is accepted, discarded and counted (cnt_drop). B is answered once
+ * the burst's last beat is taken. Reads are answered with zeros.
+ *
+ * WINDOW. rdma packets and stores are posted only while win_ok (the ack
+ * window); rdma_post pulses on each so the window can count them.
  */
 module loom_ingress #(
     parameter integer UWIN_BITS    = 27,
-    parameter integer HOST_DEST    = 2,
-    parameter integer NET_DEST     = 1,
+    parameter integer HOST_DEST    = 0,
+    parameter integer NET_DEST     = 0,
     parameter integer FLUSH_CYCLES = 16,
     parameter integer FIFO_BEATS   = 256
 ) (
@@ -65,12 +76,12 @@ module loom_ingress #(
     // RDMA staging VA (RETH vaddr of every outgoing message)
     input  logic [VADDR_BITS-1:0]       rdma_staging_va,
 
-    // sq_wr (shared in vfpga_top)
+    // sq_wr (shared with loom_rx in vfpga_top)
     output req_t                        wr_req,
     output logic                        wr_valid,
     input  logic                        wr_ready,
 
-    // Shared ack window
+    // Ack window
     input  logic                        win_ok,
     output logic                        rdma_post,
 
@@ -89,14 +100,17 @@ module loom_ingress #(
     output logic                        m_net_tlast,
 
     // Counter pulses
-    output logic                        cnt_burst,     // a burst accepted into a packet
-    output logic                        cnt_drop,      // a burst discarded
-    output logic                        cnt_pkt_local, // a local packet sent (last beat)
-    output logic                        cnt_pkt_rdma,  // an rdma packet sent (last beat)
-    output logic                        cnt_flush      // a packet closed by the idle timer
+    output logic                        cnt_burst,      // a burst accepted
+    output logic                        cnt_drop,       // a burst discarded
+    output logic                        cnt_pkt_local,  // a local packet sent (last beat)
+    output logic                        cnt_pkt_rdma,   // an rdma packet sent (last beat)
+    output logic                        cnt_store,      // a store sent
+    output logic                        cnt_store_drop, // a beat with a partial 8 B word
+    output logic                        cnt_flush       // a packet closed by the idle timer
 );
 
-localparam [7:0] MSG_OP_WRITE = 8'd1;   // keep in sync with loom_rx.sv
+localparam [7:0] MSG_OP_WRITE        = 8'd1;   // keep in sync with loom_rx.sv
+localparam [7:0] MSG_OP_WRITE_INLINE = 8'd2;
 localparam integer PKT_BEATS  = PMTU_BYTES / 64;
 localparam integer BEAT_W     = $clog2(PKT_BEATS + 1);
 
@@ -128,7 +142,7 @@ assign ua_addr = aw_addr;
 // latched when it took the slot.
 // ---------------------------------------------------------------------------
 logic                  b_act;             // a burst is loaded
-logic                  b_ok;              // its beats go into packets
+logic                  b_ok;              // its beats are taken, not discarded
 logic [3:0]            b_idx;
 logic                  b_route;
 logic [PID_BITS-1:0]   b_pid, b_dst_pid;
@@ -144,16 +158,45 @@ wire aw_ok = ua_hit && (aw_addr[5:0] == 6'b0) && (aw_end <= {1'b0, ua_len});
 logic   bq_valid;
 logic [AXI_ID_BITS-1:0] bq_id;
 
-// Packet queue and data FIFO room
+// Queue and data FIFO room
 logic   pq_full;
 logic   df_ready;
+logic   pk_open;
 
-wire w_in    = axi_udata.wvalid && b_act;
-// A good beat may close a packet, so it needs room in both; the last beat of
-// a burst also needs the B register
-wire w_room  = (!b_ok || (df_ready && !pq_full)) &&
-               (!axi_udata.wlast || !bq_valid || axi_udata.bready);
-assign axi_udata.wready = b_act && w_room;
+wire w_in   = axi_udata.wvalid && b_act;
+wire b_room = !axi_udata.wlast || !bq_valid || axi_udata.bready;
+
+// The beat presented: full, or a set of stores
+wire w_full = &axi_udata.wstrb;
+logic [7:0] wd_all, wd_bad;               // per 8 B word: all strobes / some
+always_comb
+    for (int l = 0; l < 8; l++) begin
+        wd_all[l] = &axi_udata.wstrb[8*l +: 8];
+        wd_bad[l] = |axi_udata.wstrb[8*l +: 8] && !wd_all[l];
+    end
+
+// Stores of a partial beat go out one word per cycle; st_done holds the words
+// of the presented beat already queued
+logic [7:0] st_done;
+wire  [7:0] st_rem  = wd_all & ~st_done;
+wire  [7:0] st_one  = st_rem & (~st_rem + 8'd1);    // lowest remaining word
+logic [2:0] st_lane;
+always_comb begin
+    st_lane = 3'd0;
+    for (int l = 7; l >= 0; l--) if (st_rem[l]) st_lane = 3'(l);
+end
+wire part       = w_in && b_ok && !w_full;
+// A partial beat first closes an open packet (so it cannot pass it), then
+// queues its words, and is taken with its last one (or at once if it has none)
+wire part_close = part && pk_open;
+wire part_store = part && !pk_open && (st_rem != 8'd0);
+wire part_last  = (st_rem & ~st_one) == 8'd0;
+wire part_take  = part && !pk_open && (!part_store || !pq_full) && part_last;
+
+wire full_ok    = df_ready && !pq_full;
+
+assign axi_udata.wready = b_act && b_room &&
+                          (!b_ok || (w_full ? full_ok : part_take));
 wire w_hs    = axi_udata.wvalid && axi_udata.wready;
 wire w_end   = w_hs && axi_udata.wlast;
 
@@ -181,8 +224,15 @@ always_ff @(posedge aclk) begin
     end
 end
 
-assign cnt_burst = aw_take && aw_ok;
-assign cnt_drop  = aw_take && !aw_ok;
+always_ff @(posedge aclk) begin
+    if (!aresetn)                       st_done <= '0;
+    else if (w_hs)                      st_done <= '0;
+    else if (part_store && !pq_full)    st_done <= st_done | st_one;
+end
+
+assign cnt_burst      = aw_take && aw_ok;
+assign cnt_drop       = aw_take && !aw_ok;
+assign cnt_store_drop = w_hs && b_ok && !w_full && (wd_bad != 8'd0);
 
 always_ff @(posedge aclk) begin
     if (!aresetn) bq_valid <= 1'b0;
@@ -198,7 +248,6 @@ assign axi_udata.bresp  = 2'b00;
 // ---------------------------------------------------------------------------
 // Packet gathering
 // ---------------------------------------------------------------------------
-logic                  pk_open;
 logic [3:0]            pk_idx;
 logic                  pk_route;
 logic [PID_BITS-1:0]   pk_pid, pk_dst_pid;
@@ -207,34 +256,46 @@ logic [LEN_BITS-1:0]   pk_next;           // binding offset the next beat must h
 logic [BEAT_W-1:0]     pk_beats;
 logic [$clog2(FLUSH_CYCLES+1)-1:0] idle;
 
-wire good_beat = w_hs && b_ok;
+wire good_beat = w_hs && b_ok && w_full;
 wire cont      = pk_open && (pk_idx == b_idx) && (pk_next == b_off);
 wire [BEAT_W-1:0] cap_cur = pk_route ? BEAT_W'(PKT_BEATS-1) : BEAT_W'(PKT_BEATS);
 wire flush     = pk_open && !w_in && !pq_full && (idle >= FLUSH_CYCLES - 1);
 
-// At most one packet closes per cycle: the open one when a beat does not
-// continue it, or when the beat fills it, or on the idle timer (only in
-// cycles with no beat)
-logic                  pq_push;
-logic                  pq_route_i;
-logic [PID_BITS-1:0]   pq_pid_i, pq_dst_pid_i;
-logic [VADDR_BITS-1:0] pq_va_i;
-logic [BEAT_W-1:0]     pq_beats_i;
+// Queue entries: a packet (its beats are in the data FIFO) or a store
+typedef struct packed {
+    logic                  store;
+    logic                  route;
+    logic [PID_BITS-1:0]   pid;
+    logic [PID_BITS-1:0]   dst_pid;
+    logic [VADDR_BITS-1:0] va;
+    logic [BEAT_W-1:0]     beats;
+    logic [63:0]           data;
+} pkt_t;
+
+// At most one entry is queued per cycle: the open packet when a full beat
+// does not continue it, when a beat fills it, when a partial beat arrives, or
+// on the idle timer (only in cycles with no beat); or one store
+logic pq_push;
+pkt_t pq_in;
 
 always_comb begin
-    pq_push      = 1'b0;
-    pq_route_i   = pk_route;
-    pq_pid_i     = pk_pid;
-    pq_dst_pid_i = pk_dst_pid;
-    pq_va_i      = pk_va;
-    pq_beats_i   = pk_beats;
+    pq_push = 1'b0;
+    pq_in   = '{store: 1'b0, route: pk_route, pid: pk_pid, dst_pid: pk_dst_pid,
+                va: pk_va, beats: pk_beats, data: 64'd0};
     if (good_beat) begin
         if (pk_open && !cont) begin
             pq_push = 1'b1;                           // close the open one
         end else if (cont && (pk_beats + 1'b1 == cap_cur)) begin
-            pq_push    = 1'b1;                        // this beat fills it
-            pq_beats_i = pk_beats + 1'b1;
+            pq_push     = 1'b1;                       // this beat fills it
+            pq_in.beats = pk_beats + 1'b1;
         end
+    end else if (part_close) begin
+        pq_push = !pq_full;
+    end else if (part_store) begin
+        pq_push = !pq_full;
+        pq_in   = '{store: 1'b1, route: b_route, pid: b_pid, dst_pid: b_dst_pid,
+                    va: b_base + VADDR_BITS'(b_off) + VADDR_BITS'({st_lane, 3'b0}),
+                    beats: '0, data: axi_udata.wdata[64*st_lane +: 64]};
     end else if (flush) begin
         pq_push = 1'b1;
     end
@@ -262,7 +323,7 @@ always_ff @(posedge aclk) begin
                 pk_next    <= b_off + LEN_BITS'(64);
                 pk_beats   <= BEAT_W'(1);
             end
-        end else if (flush) begin
+        end else if ((part_close && !pq_full) || flush) begin
             pk_open <= 1'b0;
         end
     end
@@ -271,16 +332,9 @@ end
 assign cnt_flush = flush;
 
 // ---------------------------------------------------------------------------
-// Packet queue: closed packets waiting to be sent
+// Queue: closed packets and stores waiting to be sent
 // ---------------------------------------------------------------------------
 localparam integer PQ_DEPTH = 8;
-typedef struct packed {
-    logic                  route;
-    logic [PID_BITS-1:0]   pid;
-    logic [PID_BITS-1:0]   dst_pid;
-    logic [VADDR_BITS-1:0] va;
-    logic [BEAT_W-1:0]     beats;
-} pkt_t;
 
 pkt_t pq_mem [PQ_DEPTH];
 logic [$clog2(PQ_DEPTH):0] pq_wp, pq_rp;
@@ -296,8 +350,7 @@ always_ff @(posedge aclk) begin
         pq_rp <= '0;
     end else begin
         if (pq_push) begin
-            pq_mem[pq_wp[$clog2(PQ_DEPTH)-1:0]] <= '{route: pq_route_i, pid: pq_pid_i,
-                dst_pid: pq_dst_pid_i, va: pq_va_i, beats: pq_beats_i};
+            pq_mem[pq_wp[$clog2(PQ_DEPTH)-1:0]] <= pq_in;
             pq_wp <= pq_wp + 1'b1;
         end
         if (pq_pop) pq_rp <= pq_rp + 1'b1;
@@ -332,9 +385,10 @@ xpm_fifo_axis #(
 );
 
 // ---------------------------------------------------------------------------
-// Send: request, rdma header, payload
+// Send: request, then the rdma header (a store's whole message), then the
+// payload (a local store's one beat)
 // ---------------------------------------------------------------------------
-typedef enum logic [1:0] { O_IDLE, O_REQ, O_HDR, O_DATA } ostate_t;
+typedef enum logic [2:0] { O_IDLE, O_REQ, O_HDR, O_DATA, O_STORE } ostate_t;
 ostate_t ostate;
 pkt_t    o;
 logic [BEAT_W-1:0] o_left;
@@ -353,9 +407,10 @@ always_ff @(posedge aclk) begin
         end
         O_REQ: if (wr_valid && wr_ready) begin
             o_left <= o.beats;
-            ostate <= o.route ? O_HDR : O_DATA;
+            ostate <= o.route ? O_HDR : (o.store ? O_STORE : O_DATA);
         end
-        O_HDR: if (m_net_tready) ostate <= O_DATA;
+        O_HDR:   if (m_net_tready) ostate <= o.store ? O_IDLE : O_DATA;
+        O_STORE: if (m_host_tready) ostate <= O_IDLE;
         O_DATA: if (o_beat) begin
             o_left <= o_left - 1'b1;
             if (o_last) ostate <= O_IDLE;
@@ -364,7 +419,7 @@ always_ff @(posedge aclk) begin
     endcase
 end
 
-wire [LEN_BITS-1:0] o_bytes = LEN_BITS'(o.beats) << 6;
+wire [LEN_BITS-1:0] o_bytes = o.store ? LEN_BITS'(8) : (LEN_BITS'(o.beats) << 6);
 
 always_comb begin
     wr_req      = '0;
@@ -379,7 +434,8 @@ always_comb begin
         wr_req.actv   = 1'b1;
         wr_req.dest   = NET_DEST;
         wr_req.vaddr  = rdma_staging_va;
-        wr_req.len    = o_bytes + LEN_BITS'(64);
+        // header beat + payload; a store is its header beat alone
+        wr_req.len    = o.store ? LEN_BITS'(64) : o_bytes + LEN_BITS'(64);
     end else begin
         wr_req.opcode = LOCAL_WRITE;
         wr_req.strm   = STRM_HOST;
@@ -391,26 +447,31 @@ always_comb begin
 end
 assign rdma_post = wr_valid && wr_ready && o.route;
 
-// Header lane 0: {zero, dst_pid, len[27:0], op}; lane 1: target VA
-wire [63:0] hdr_q0 = {{(28-PID_BITS){1'b0}}, o.dst_pid, o_bytes, MSG_OP_WRITE};
+// Header lane 0: {zero, dst_pid, len[27:0], op}; lane 1: target VA; lane 2:
+// a store's data
+wire [63:0] hdr_q0 = {{(28-PID_BITS){1'b0}}, o.dst_pid, o_bytes,
+                      o.store ? MSG_OP_WRITE_INLINE : MSG_OP_WRITE};
 wire [63:0] hdr_q1 = {{(64-VADDR_BITS){1'b0}}, o.va};
+wire [63:0] hdr_q2 = o.store ? o.data : 64'd0;
 
 assign df_tready = (ostate == O_DATA) && o_rdy;
 
 always_comb begin
-    m_host_tdata  = df_tdata;
-    m_host_tkeep  = '1;
-    m_host_tlast  = o_last;
-    m_host_tvalid = (ostate == O_DATA) && !o.route && df_tvalid;
+    m_host_tdata  = (ostate == O_STORE) ? {{(AXI_DATA_BITS-64){1'b0}}, o.data} : df_tdata;
+    m_host_tkeep  = (ostate == O_STORE) ? {{(AXI_DATA_BITS/8-8){1'b0}}, 8'hFF} : '1;
+    m_host_tlast  = (ostate == O_STORE) || o_last;
+    m_host_tvalid = (ostate == O_STORE) || ((ostate == O_DATA) && !o.route && df_tvalid);
 
-    m_net_tdata   = (ostate == O_HDR) ? {{(AXI_DATA_BITS-128){1'b0}}, hdr_q1, hdr_q0} : df_tdata;
+    m_net_tdata   = (ostate == O_HDR) ? {{(AXI_DATA_BITS-192){1'b0}}, hdr_q2, hdr_q1, hdr_q0} : df_tdata;
     m_net_tkeep   = '1;
-    m_net_tlast   = (ostate == O_DATA) && o_last;
+    m_net_tlast   = ((ostate == O_HDR) && o.store) || ((ostate == O_DATA) && o_last);
     m_net_tvalid  = (ostate == O_HDR) || ((ostate == O_DATA) && o.route && df_tvalid);
 end
 
 assign cnt_pkt_local = o_beat && o_last && !o.route;
 assign cnt_pkt_rdma  = o_beat && o_last &&  o.route;
+assign cnt_store     = ((ostate == O_HDR) && o.store && m_net_tready) ||
+                       ((ostate == O_STORE) && m_host_tready);
 
 // ---------------------------------------------------------------------------
 // Reads: zeros, one beat per requested beat
