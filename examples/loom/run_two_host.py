@@ -812,6 +812,9 @@ def main():
     preflight()
 
     rows = []
+    # Ping-pong and matrix modes print their own report and have no rate row;
+    # their outcome is the verdict of each run
+    own_report_ok = []
     for i, gap in enumerate(gaps, 1):
         say(f"sweep point {i}/{len(gaps)}: gap={gap}us")
         # TEARDOWN -> FLASH -> SETUP ON BOTH HOSTS BEFORE EVERY POINT.
@@ -831,6 +834,9 @@ def main():
             flash(args.settle)
         result, verdicts = run_gap(args, gap)
         row = summarize(args, gap, result, verdicts)
+        if row is None:
+            own_report_ok.append(all(v == "intact" for v in verdicts))
+            continue
         rows.append(row)
         extra = ("  [attempts: " + ", ".join(row["attempts"]) + "]"
                  if len(row["attempts"]) > 1 else "")
@@ -843,6 +849,10 @@ def main():
         if row["payload"] != "intact" and i < len(gaps):
             say("reflashing to clear the wedge before the next point")
             recover(args.settle)
+
+    if not rows:
+        print(f"\nfull log: {args.out}")
+        return 0 if own_report_ok and all(own_report_ok) else 1
 
     # ------------------------------------------------------------- summary
     say("sweep summary")

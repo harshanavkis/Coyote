@@ -197,8 +197,11 @@ can be up to 128 MB (a 64 MiB push fits one binding).
   1. Sync the U280 driver to rose:
      `rsync -a /scratch/harshanavkis/loom-proj/Coyote/driver/build/ rose.dos.cit.tum.de:/scratch/harshanavkis/loom-proj/Coyote/driver/build/`
   2. Flash both U280s and load their drivers with each host's IP and MAC
-     (from `examples/loom`, on clara):
-     `cd /scratch/harshanavkis/loom-proj/Coyote/examples/loom && BIT=/scratch/harshanavkis/loom-proj/Coyote/examples/loom_switch/hw/build_sep29_uwin/bitstreams/cyt_top.bit SERVER_HOST=rose.dos.cit.tum.de SERVER_IP=131.159.102.21 SERVER_BDF=c1:00.0 SERVER_FPGA_IP=0a000003 python3 -c "import run_two_host as r; r.flash(15)"`
+     (from `examples/loom`, on clara). Each host programs from its own view
+     of `BIT`, and `/scratch` is per host, so the image goes to the shared
+     home first:
+     `mkdir -p ~/coyote-bitstreams/loom-switch-sep29/hw/bitstreams && cp /scratch/harshanavkis/loom-proj/Coyote/examples/loom_switch/hw/build_sep29_uwin/bitstreams/cyt_top.bit /scratch/harshanavkis/loom-proj/Coyote/examples/loom_switch/hw/build_sep29_uwin/bitstreams/cyt_top.ltx ~/coyote-bitstreams/loom-switch-sep29/hw/bitstreams/`
+     `cd /scratch/harshanavkis/loom-proj/Coyote/examples/loom && BIT=/home/harshanavkis/coyote-bitstreams/loom-switch-sep29/hw/bitstreams/cyt_top.bit SERVER_HOST=rose.dos.cit.tum.de SERVER_IP=131.159.102.21 SERVER_BDF=c1:00.0 SERVER_FPGA_IP=0a000003 python3 -c "import run_two_host as r; r.flash(15)"`
   3. Program clara's V80 (never rose's, it is another user's):
      `cd /scratch/harshanavkis/loom-proj/Coyote && scripts/fpga/program_v80.sh examples/loom_ce/hw/build_sep29_ce/bitstreams/cyt_top.pdi 0000:81:00.0`
   4. G2 on clara (1 MiB bulk, 256 stores):

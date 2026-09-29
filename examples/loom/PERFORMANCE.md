@@ -1,6 +1,7 @@
 # Performance: Loom vs perf_rdma vs ConnectX-7 vs E810
 
-Measured 2026-09-28/29. All four systems use RDMA WRITE over one QP. The
+Measured 2026-09-28/29 (Loom re-measured 2026-09-29 on the control build
+below). All four systems use RDMA WRITE over one QP. The
 Loom numbers in the comparison tables use **only the copy-engine (DMA)
 path**, with no aperture stores. The store path is reported separately at
 the end.
@@ -9,7 +10,7 @@ the end.
 
 | System | Hosts | Device | Link | NUMA | Software |
 |---|---|---|---|---|---|
-| **Loom** | clara ↔ amy | Alveo U280, Coyote shell, `loom-portcnt` bitstream (md5 `36de2752`, HEAD RTL = `40c7620c`) | 100G through the FS N8550-32C switch (flow control on the FPGA ports) | 1 (card) | `loom_host` @ `88853322`, ACK window 32 |
+| **Loom** | clara ↔ amy | Alveo U280, Coyote shell merged with upstream (network stack `1197a9d`), `loom-ctrl-sep29` bitstream (md5 `a13d05d1`, built from `446dff77`: Loom RTL as at `40c7620c`, Vivado 2023.2) | 100G through the FS N8550-32C switch (flow control on the FPGA ports) | 1 (card) | `loom_host` (source as at `88853322`) built against this tree, ACK window 32 |
 | **perf_rdma** | clara ↔ amy | same U280s, `perf_rdma` bitstream (md5 `3894367a`; build commit not recorded) | same | 1 | stock `examples/09_perf_rdma` (unmodified, built from this tree at `20f5f14d`) |
 | **E810** | clara ↔ amy | Intel E810-C, irdma, RoCE v2 | 100G through the same switch (flow control on ports 1/0/7-8 since 2026-09-28), MTU 9000 (RoCE 4096) | 0 (NIC) | perftest 26.07.7, rdma-core 62.0 |
 | **ConnectX-7** | jamie ↔ ian | ConnectX-7, fw 28.44.1036, RoCE v2 | **200G direct cable**, MTU 1500 (RoCE 1024) | 0 / 1 (NIC) | perftest 26.07.7, rdma-core 62.0 |
@@ -21,15 +22,15 @@ run verified the landed bytes.
 
 | Size | Loom (DMA) | perf_rdma | ConnectX-7 | E810 |
 |---|---|---|---|---|
-| 64 B | 6.42 | 5.45 | 1.12 | 5.53 |
-| 256 B | 6.38 | 5.58 | 1.65 | 6.24 |
-| 1 KiB | 6.71 | 5.74 | 1.78 | 6.63 |
-| 4 KiB | 7.31 | 6.68 | 1.95 | 7.49 |
-| 16 KiB | 8.67 | 7.74 | 2.46 | 9.48 |
-| 64 KiB | 12.45 | 11.81 | 4.63 | 17.21 |
-| 256 KiB | 29.40 | 28.69 | 13.11 | 47.70 |
-| 1 MiB | 97.76 | 98.77 | 47.12 | 171.01 |
-| 4 MiB | 375.33 | 373.63 | 183.04 | 654.84 |
+| 64 B | 6.41 | 5.45 | 1.12 | 5.53 |
+| 256 B | 6.57 | 5.58 | 1.65 | 6.24 |
+| 1 KiB | 6.73 | 5.74 | 1.78 | 6.63 |
+| 4 KiB | 7.69 | 6.68 | 1.95 | 7.49 |
+| 16 KiB | 8.59 | 7.74 | 2.46 | 9.48 |
+| 64 KiB | 12.83 | 11.81 | 4.63 | 17.21 |
+| 256 KiB | 29.89 | 28.69 | 13.11 | 47.70 |
+| 1 MiB | 98.11 | 98.77 | 47.12 | 171.01 |
+| 4 MiB | 379.31 | 373.63 | 183.04 | 654.84 |
 
 - **Loom vs perf_rdma:** on the same cards and stack, Loom adds about
   1 µs at small sizes (the engine pulls the source, then sends it). The two
@@ -43,13 +44,13 @@ run verified the landed bytes.
 
 | Size | Loom (push) | perf_rdma | ConnectX-7, 1 QP | E810, 1 QP |
 |---|---|---|---|---|
-| 64 B | 0.037 | 0.101 | 0.339 | 0.220 |
-| 256 B | 0.145 | 0.450 | 1.354 | 0.904 |
-| 1 KiB | 0.600 | 1.727 | 5.43 | 3.55 |
-| 4 KiB | 2.16 | 5.76 | 20.59 | 6.86 |
-| 16 KiB | 5.75 | 9.44 | 23.10 | 6.30 |
-| 64 KiB | 9.89 | 10.54 | 23.14 | 6.22 |
-| 256 KiB | 11.75 | 11.25 | 23.14 | 6.19 |
+| 64 B | 0.034 | 0.101 | 0.339 | 0.220 |
+| 256 B | 0.136 | 0.450 | 1.354 | 0.904 |
+| 1 KiB | 0.543 | 1.727 | 5.43 | 3.55 |
+| 4 KiB | 2.12 | 5.76 | 20.59 | 6.86 |
+| 16 KiB | 5.72 | 9.44 | 23.10 | 6.30 |
+| 64 KiB | 9.92 | 10.54 | 23.14 | 6.22 |
+| 256 KiB | 11.70 | 11.25 | 23.14 | 6.19 |
 | 1 MiB | 11.87 | 11.41 | 23.15 | 6.21 |
 | 4 MiB | 11.90 | 11.48 | 23.15 | 6.21 |
 
@@ -59,7 +60,7 @@ run verified the landed bytes.
   per QP; with 2 QPs it reaches 11.6 GB/s, and with 4 it reaches 12.3.
 - **Small sizes** measure the host's cost of *starting* transfers, not the
   network. A Loom `copy()` is six uncached control-register writes (about
-  1.75 µs each at 64 B), a perf_rdma `invoke` is fewer, and a verbs post is
+  1.9 µs per `copy()` at 64 B), a perf_rdma `invoke` is fewer, and a verbs post is
   cheaper still. The three methods also time different things (see
   Methodology).
 
@@ -67,7 +68,7 @@ run verified the landed bytes.
 
 | System | One-way | Both ways at once |
 |---|---|---|
-| Loom | 11.8 | 5.9 + 5.9 (halves) |
+| Loom (`loom-portcnt`, not re-measured) | 11.8 | 5.9 + 5.9 (halves) |
 | perf_rdma | 11.3–11.7 | 5.22 incoming (halves; lossy at 32 × 4 MiB) |
 | ConnectX-7 | 24.5 (wire) | 24.5 + 24.5 |
 | E810 | 6.33 (1 QP) | 6.0 + 6.3 |
@@ -145,11 +146,16 @@ attribute Loom's share.
   cable, at 200G, with RoCE MTU 1024. The other three are clara/amy through
   a switch at 100G.
 - The perf_rdma bitstream's build commit isn't recorded.
-- In `loom-portcnt`, `loom_rx`'s `rx_chunk` input is unconnected
-  (`vfpga_top.svh`) and synthesis tied it to 0, so the receiver lands each
-  message with one host write of its whole length, not one per packet, and
-  the `RX_CHUNK` CSR (word 76) has no effect. The Loom numbers here are in
-  that mode.
+- In both Loom bitstreams (`loom-portcnt` and `loom-ctrl-sep29`),
+  `loom_rx`'s `rx_chunk` input is unconnected (`vfpga_top.svh`) and
+  synthesis tied it to 0, so the receiver lands each message with one host
+  write of its whole length, not one per packet, and the `RX_CHUNK` CSR
+  (word 76) has no effect. The Loom numbers here are in that mode.
+- `loom-ctrl-sep29` misses timing by 30 ps (WNS −0.030 ns, in the RoCE
+  stack's `mac_ip_encode`, not in Loom). It measured the same as the earlier
+  `loom-portcnt` (timing met, stack before the upstream merge) within a few
+  percent, both ways, on all three Loom runs; clara was also running two
+  Vivado builds during the re-measurement.
 - Means (Loom, perf_rdma) and medians (perftest) are reported as the tools
   give them.
 
@@ -160,23 +166,25 @@ A CPU memcpy onto the peer pointer, sent as uncached 8 B aperture stores
 
 | Bytes | Stores | One way |
 |---|---|---|
-| 8 | 1 | 4.78 µs |
-| 64 | 8 | 7.34 µs |
-| 128 | 16 | 10.66 µs |
-| 256 | 32 | 17.05 µs |
-| 512 | 64 | 30.09 µs |
-| 1024 | 128 | 56.43 µs |
+| 8 | 1 | 4.70 µs |
+| 64 | 8 | 7.47 µs |
+| 128 | 16 | 11.00 µs |
+| 256 | 32 | 17.27 µs |
+| 512 | 64 | 30.27 µs |
+| 1024 | 128 | 60.32 µs |
 | 2048 | 256 | fails: the 64-deep order FIFO drops stores |
 
-- **Per store:** about 0.41 µs each after the first, set by the host's
+- **Per store:** about 0.44 µs each after the first, set by the host's
   uncached write path. The engine itself takes 2 cycles (8 ns) per store.
-- **64 back-to-back stores** (`--stores 64`): 0.39 µs per store on the host,
-  with none dropped.
+- **64 back-to-back stores** (`--stores 64`, `loom-portcnt`, not
+  re-measured): 0.39 µs per store on the host, with none dropped.
 
 ## Reproducing
 
-**Loom** (from `examples/loom`, `BIT=` pointing at the `loom-portcnt`
-bitstream):
+**Loom** (from `examples/loom`, with
+`BIT=/home/harshanavkis/coyote-bitstreams/loom-ctrl-sep29/hw/bitstreams/cyt_top.bit`;
+the image must be on the shared home, since each host programs from its own
+view of the path):
 
 ```bash
 ./run_two_host.py --pingpong-dma --size 0 --iters 32 --gap 0 --retries 0 --tx-window 32
