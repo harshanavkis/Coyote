@@ -78,17 +78,23 @@ can be up to 128 MB (a 64 MiB push fits one binding).
   they did; holes and past-the-uwin addresses get DECERR; uwin reads come
   back; back-to-back 256 B writes cross at one beat per cycle.
 
-## 2. Driver (U280) and user library
+## 2. Driver (U280) and user library (done, untested on hardware)
 
-- **mmap:** a new `MMAP_UWIN` offset in `vfpga_ops.c` mapping the region
-  write-combining, so the host CPU can also write it (gate G2).
-- **dma-buf exporter:** an ioctl that exports the region as a dma-buf, so the
-  V80's driver can import it through its existing path (`vfpga_gup.c`, as in
-  `06_gpu_p2p`). The exporter returns an sg_table holding the BAR's bus
-  address (`dma_map_resource` in the importer's attach).
-- **User library:** `cThread` maps the window (`getUwin()`) and exports its
-  fd (`exportUwin()`). On the V80 side, an existing-style import maps the fd
-  at a virtual address.
+- **Addresses:** the driver's region offsets are relative to
+  `bar_phys_addr[BAR_SHELL_CONFIG]`, the bypass BAR, and equal the block
+  design's AXI addresses, so vFPGA *i*'s uwin is at
+  `+ VFPGA_UWIN_OFFS (0x0800_0000) + i * uwin_size`, `uwin_size` being the
+  same power-of-two share `cr_ctrl.tcl` gives it (`coyote_setup.c`).
+- **mmap:** `MMAP_UWIN` (page offset 4) maps up to `uwin_size` bytes
+  write-combining (`vfpga_ops.c`); it is refused if the BAR is too small to
+  hold the uwin. Nothing tells the driver whether the shell was built with
+  `EN_UWIN`: on one that was not, writes are dropped with DECERR, and reads
+  must not be issued.
+- **dma-buf:** `EXPORT_REGION_UWIN` (1) in `vfpga_export.c`: the G1 exporter,
+  whose importer maps the BAR range with `dma_map_resource`.
+- **User library:** `cThread::mapUwin(len)` / `unmapUwin()` (unmapped with
+  the thread); `exportDmabuf(EXPORT_REGION_UWIN, off, len)` for the V80, which
+  imports it with `importDmabuf(fd, vaddr)` as in G1.
 
 ## 3. RTL
 

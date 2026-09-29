@@ -103,6 +103,7 @@ namespace coyote {
 // Export a BAR region of this vFPGA as a dma-buf, for a peer device to import
 #define IOCTL_EXPORT_DMABUF                 _IOWR('F', 20, unsigned long)
 #define EXPORT_REGION_CTRL_USER             0   // the vFPGA's AXI-Lite user control region
+#define EXPORT_REGION_UWIN                  1   // the vFPGA's user data window (EN_UWIN shells)
 
 // Allocate memory for partial reconfiguration
 #define IOCTL_ALLOC_HOST_RECONFIG_MEM       _IOW('P', 1, unsigned long)
@@ -274,6 +275,7 @@ constexpr unsigned long const MMAP_WB = 0x0 << PAGE_SHIFT;
 constexpr unsigned long const MMAP_CNFG = 0x1 << PAGE_SHIFT;
 constexpr unsigned long const MMAP_CNFG_AVX = 0x2 << PAGE_SHIFT;
 constexpr unsigned long const MMAP_CTRL = 0x3 << PAGE_SHIFT;
+constexpr unsigned long const MMAP_UWIN = 0x4 << PAGE_SHIFT;
 constexpr unsigned long const MMAP_RECONFIG = 0x100 << PAGE_SHIFT;
 
 // Writeback region constants; there are deidcated writebacks for reads, writes, remote reads and remote writes

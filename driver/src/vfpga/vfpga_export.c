@@ -104,6 +104,10 @@ int vfpga_export_dmabuf(struct vfpga_dev *device, uint32_t region, uint64_t offs
             base = device->vfpga_cnfg_phys_addr + VFPGA_CTRL_USER_OFFS;
             region_size = VFPGA_CTRL_USER_SIZE;
             break;
+        case EXPORT_REGION_UWIN:
+            base = device->uwin_phys_addr;
+            region_size = device->uwin_size;
+            break;
         default:
             pr_warn("coyote export: unknown region %u\n", region);
             return -EINVAL;

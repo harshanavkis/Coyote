@@ -110,6 +110,10 @@ protected:
 	/// Pointer to writeback region, if enabled
 	volatile uint32_t *wback = { 0 };
 
+	/// User data window (EN_UWIN shells), write-combining; mapped by mapUwin
+	void *uwin = nullptr;
+	uint64_t uwin_len = 0;
+
 	/// A map of all the pages that have been allocated and mapped for this thread
 	std::unordered_map<void*, CoyoteAlloc> mapped_pages;
 
@@ -250,6 +254,20 @@ protected:
 	 * @param mem_block Memory block; -1 (host-style mapping) for peer BARs
 	 */
 	void importDmabuf(int dmabuf_fd, void *vaddr, int32_t mem_block = -1);
+
+	/**
+	 * @brief Maps the first len bytes of this vFPGA's user data window (shells
+	 * built with EN_UWIN) write-combining. Stores into it are writes into the
+	 * vFPGA's axi_udata port; order them with a store fence where it matters.
+	 * Unmapped by unmapUwin or when the thread is destroyed.
+	 *
+	 * @param len Bytes to map, page aligned, at most the window's size
+	 * @return The mapping
+	 */
+	void *mapUwin(uint64_t len);
+
+	/// Unmaps the user data window, if mapped
+	void unmapUwin();
 
 	/**
 	 * @brief Allocates memory for this cThread and maps it into the vFPGA's TLB

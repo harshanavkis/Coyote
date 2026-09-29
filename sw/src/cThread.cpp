@@ -337,6 +337,8 @@ void cThread::mmapFpga() {
 void cThread::munmapFpga() {
 	DBG1("cThread: Called munmapFpga");
 
+	unmapUwin();
+
 	// Config
     #ifdef EN_AVX
 	if (fcnfg.en_avx) {
@@ -383,6 +385,28 @@ int cThread::exportDmabuf(uint32_t region, uint64_t offset, uint64_t len) {
         throw std::runtime_error("ERROR: IOCTL_EXPORT_DMABUF failed");
     }
     return static_cast<int>(tmp[3]);
+}
+
+void *cThread::mapUwin(uint64_t len) {
+    DBG1("cThread: Called mapUwin, length " << len);
+    unmapUwin();
+    void *p = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_SHARED, fd, MMAP_UWIN);
+    if (p == MAP_FAILED) {
+        throw std::runtime_error("ERROR: uwin mmap failed");
+    }
+    uwin = p;
+    uwin_len = len;
+    return uwin;
+}
+
+void cThread::unmapUwin() {
+    if (uwin) {
+        if (munmap(uwin, uwin_len) != 0) {
+            throw std::runtime_error("ERROR: uwin munmap failed");
+        }
+        uwin = nullptr;
+        uwin_len = 0;
+    }
 }
 
 void cThread::importDmabuf(int dmabuf_fd, void *vaddr, int32_t mem_block) {

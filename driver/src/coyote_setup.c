@@ -392,6 +392,13 @@ int setup_vfpga_devices(struct bus_driver_data *data) {
         // Set physical address of control registers (AVX + non-AVX)
         data->vfpga_dev[i].vfpga_cnfg_phys_addr = data->bar_phys_addr[BAR_SHELL_CONFIG] + VFPGA_CTRL_OFFS + i * VFPGA_CTRL_SIZE;
         data->vfpga_dev[i].vfpga_cnfg_avx_phys_addr = data->bar_phys_addr[BAR_SHELL_CONFIG] + VFPGA_CTRL_CNFG_AVX_OFFS + i * VFPGA_CTRL_CNFG_AVX_SIZE;
+
+        // User data window, as cr_ctrl.tcl splits it: power-of-two shares
+        data->vfpga_dev[i].uwin_size = VFPGA_UWIN_TOTAL;
+        while (data->vfpga_dev[i].uwin_size * data->n_fpga_reg > VFPGA_UWIN_TOTAL) {
+            data->vfpga_dev[i].uwin_size /= 2;
+        }
+        data->vfpga_dev[i].uwin_phys_addr = data->bar_phys_addr[BAR_SHELL_CONFIG] + VFPGA_UWIN_OFFS + i * data->vfpga_dev[i].uwin_size;
         
         // Memory map the control registers for MMU and shell configuration
         data->vfpga_dev[i].fpga_lTlb = ioremap(data->vfpga_dev[i].vfpga_cnfg_phys_addr + VFPGA_CTRL_LTLB_OFFS, VFPGA_CTRL_LTLB_SIZE);

@@ -675,6 +675,36 @@ int vfpga_dev_mmap(struct file *file, struct vm_area_struct *vma) {
         }
     }
 
+    // Memory map the user data window (EN_UWIN shells), write-combining: the
+    // CPU's stores are data, and full lines leave as one PCIe write
+    if (vma->vm_pgoff == MMAP_UWIN) {
+        unsigned long len = vma->vm_end - vma->vm_start;
+        if (len > device->uwin_size ||
+            VFPGA_UWIN_OFFS + VFPGA_UWIN_TOTAL > device->bd_data->bar_len[BAR_SHELL_CONFIG]) {
+            pr_warn("uwin mmap of %lu bytes refused: window %llu bytes, BAR %llu bytes\n",
+                    len, device->uwin_size, (u64) device->bd_data->bar_len[BAR_SHELL_CONFIG]);
+            return -EINVAL;
+        }
+        dbg_info(
+            "fpga dev. %d, memory mapping user data window at %llx of size %lx\n",
+            device->id, device->uwin_phys_addr, len
+        );
+        vma->vm_page_prot = pgprot_writecombine(vma->vm_page_prot);
+        int ret_val = remap_pfn_range(
+            vma,
+            vma->vm_start,
+            device->uwin_phys_addr >> PAGE_SHIFT,
+            len,
+            vma->vm_page_prot
+        );
+        if (ret_val) {
+            pr_warn("remap_pfn_range failed for user data window, ret_val: %d\n", ret_val);
+            return -EIO;
+        } else {
+            return 0;
+        }
+    }
+
     // Memory map writeback region
     if (vma->vm_pgoff == MMAP_WB) {
         dbg_info(

@@ -304,6 +304,11 @@ extern bool en_hmm;
 #define VFPGA_CTRL_CNFG_AVX_SIZE 256 * 1024
 #define VFPGA_CTRL_CNFG_AVX_OFFS 0x1000000
 
+// User data window (uwin; shells built with EN_UWIN): 128 MB of the bypass BAR
+// from this offset, split equally (in power-of-two sizes) between the vFPGAs
+#define VFPGA_UWIN_OFFS 0x8000000
+#define VFPGA_UWIN_TOTAL 0x8000000
+
 /*
  * Various values that can be written to the above control registers
  * These values can be used to clear an interrupt, mark a page fault as completed etc.
@@ -402,6 +407,7 @@ extern bool en_hmm;
 #define MMAP_CNFG 0x1
 #define MMAP_CNFG_AVX 0x2
 #define MMAP_CTRL 0x3
+#define MMAP_UWIN 0x4
 #define MMAP_RECONFIG 0x100
 
 // vFPGA IOCTL calls; see vfpga_ops.c for more details
@@ -428,6 +434,7 @@ extern bool en_hmm;
 
 // Regions IOCTL_EXPORT_DMABUF can export (a BAR range of this card)
 #define EXPORT_REGION_CTRL_USER 0   // the vFPGA's AXI-Lite user control region
+#define EXPORT_REGION_UWIN 1        // the vFPGA's user data window (EN_UWIN shells)
 
 // Reconfiguration IOCTL calls; see reconfig_ops.c for more details
 #define IOCTL_ALLOC_HOST_RECONFIG_MEM _IOW('P', 1, unsigned long)
@@ -978,6 +985,10 @@ struct vfpga_dev {
 
     /// Physical address of the AVX control region (vfpga_cnfg_regs) in the vFPGA 
     uint64_t vfpga_cnfg_avx_phys_addr;
+
+    /// Physical address and size of the vFPGA's user data window (EN_UWIN shells)
+    uint64_t uwin_phys_addr;
+    uint64_t uwin_size;
 
     /// Virtual address of the writeback region
     uint32_t *wb_addr_virt;
