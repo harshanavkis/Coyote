@@ -217,6 +217,11 @@ set(EN_STATS 1 CACHE STRING "Enable driver sysfs statistics")
 # Enable AVX (for host CPUs which include AVX), enabling faste data transfer
 set(EN_AVX 1 CACHE STRING "AVX environment")
 
+# User data window (uwin): a 512-bit AXI4 port into each vFPGA, at bypass-BAR
+# offset 0x0800_0000 (128 MB, split equally between regions); writes only,
+# reads return whatever the vFPGA answers. UltraScale+ only, no EN_UCLK.
+set(EN_UWIN 0 CACHE STRING "User data window")
+
 # Enable writeback, for polling completions from the host CPU --- best NOT to change
 set(EN_WB 1 CACHE STRING "Enable writeback")
 
@@ -731,6 +736,19 @@ macro(validation_checks_hw)
         if(EN_NET)
             set(POL_INV 1)
         endif()
+        endif()
+
+        ##
+        ## User data window
+        ##
+
+        if(EN_UWIN)
+            if(NOT FPGA_ARCH STREQUAL "ultrascale_plus")
+                message(FATAL_ERROR "EN_UWIN is only supported on UltraScale+ devices.")
+            endif()
+            if(EN_UCLK)
+                message(FATAL_ERROR "EN_UWIN does not support EN_UCLK (no AXI4 clock crossing on the uwin path).")
+            endif()
         endif()
 
         ##

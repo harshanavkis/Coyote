@@ -57,6 +57,49 @@ module design_user_wrapper_{{ c_reg }} (
     (* io_buffer_type = "none" *) input  logic[(AXIL_DATA_BITS/8)-1:0]        axi_ctrl_wstrb,
     (* io_buffer_type = "none" *) input  logic                                axi_ctrl_wvalid,
 
+{% if cnfg.en_uwin %}
+    // AXI4 USER DATA WINDOW
+    (* io_buffer_type = "none" *) input  logic[AXI_ID_BITS-1:0]                   axi_udata_arid,
+    (* io_buffer_type = "none" *) input  logic[AXI_ADDR_BITS-1:0]                 axi_udata_araddr,
+    (* io_buffer_type = "none" *) input  logic[1:0]                               axi_udata_arburst,
+    (* io_buffer_type = "none" *) input  logic[3:0]                               axi_udata_arcache,
+    (* io_buffer_type = "none" *) input  logic[7:0]                               axi_udata_arlen,
+    (* io_buffer_type = "none" *) input  logic[0:0]                               axi_udata_arlock,
+    (* io_buffer_type = "none" *) input  logic[2:0]                               axi_udata_arprot,
+    (* io_buffer_type = "none" *) input  logic[3:0]                               axi_udata_arqos,
+    (* io_buffer_type = "none" *) input  logic[3:0]                               axi_udata_arregion,
+    (* io_buffer_type = "none" *) input  logic[2:0]                               axi_udata_arsize,
+    (* io_buffer_type = "none" *) input  logic                                    axi_udata_arvalid,
+    (* io_buffer_type = "none" *) output logic                                    axi_udata_arready,
+    (* io_buffer_type = "none" *) input  logic[AXI_ID_BITS-1:0]                   axi_udata_awid,
+    (* io_buffer_type = "none" *) input  logic[AXI_ADDR_BITS-1:0]                 axi_udata_awaddr,
+    (* io_buffer_type = "none" *) input  logic[1:0]                               axi_udata_awburst,
+    (* io_buffer_type = "none" *) input  logic[3:0]                               axi_udata_awcache,
+    (* io_buffer_type = "none" *) input  logic[7:0]                               axi_udata_awlen,
+    (* io_buffer_type = "none" *) input  logic[0:0]                               axi_udata_awlock,
+    (* io_buffer_type = "none" *) input  logic[2:0]                               axi_udata_awprot,
+    (* io_buffer_type = "none" *) input  logic[3:0]                               axi_udata_awqos,
+    (* io_buffer_type = "none" *) input  logic[3:0]                               axi_udata_awregion,
+    (* io_buffer_type = "none" *) input  logic[2:0]                               axi_udata_awsize,
+    (* io_buffer_type = "none" *) input  logic                                    axi_udata_awvalid,
+    (* io_buffer_type = "none" *) output logic                                    axi_udata_awready,
+    (* io_buffer_type = "none" *) input  logic[AXI_DATA_BITS-1:0]                 axi_udata_wdata,
+    (* io_buffer_type = "none" *) input  logic[AXI_DATA_BITS/8-1:0]               axi_udata_wstrb,
+    (* io_buffer_type = "none" *) input  logic                                    axi_udata_wlast,
+    (* io_buffer_type = "none" *) input  logic                                    axi_udata_wvalid,
+    (* io_buffer_type = "none" *) output logic                                    axi_udata_wready,
+    (* io_buffer_type = "none" *) output logic[AXI_ID_BITS-1:0]                   axi_udata_bid,
+    (* io_buffer_type = "none" *) output logic[1:0]                               axi_udata_bresp,
+    (* io_buffer_type = "none" *) output logic                                    axi_udata_bvalid,
+    (* io_buffer_type = "none" *) input  logic                                    axi_udata_bready,
+    (* io_buffer_type = "none" *) output logic[AXI_ID_BITS-1:0]                   axi_udata_rid,
+    (* io_buffer_type = "none" *) output logic[AXI_DATA_BITS-1:0]                 axi_udata_rdata,
+    (* io_buffer_type = "none" *) output logic[1:0]                               axi_udata_rresp,
+    (* io_buffer_type = "none" *) output logic                                    axi_udata_rlast,
+    (* io_buffer_type = "none" *) output logic                                    axi_udata_rvalid,
+    (* io_buffer_type = "none" *) input  logic                                    axi_udata_rready,
+
+{% endif %}
     // NOTIFY
     (* io_buffer_type = "none" *) output logic                                notify_valid,
     (* io_buffer_type = "none" *) input  logic                                notify_ready,
@@ -287,6 +330,51 @@ module design_user_wrapper_{{ c_reg }} (
     assign axi_ctrl_rvalid                      = axi_ctrl_user.rvalid;
     assign axi_ctrl_wready                      = axi_ctrl_user.wready;
 
+{% if cnfg.en_uwin %}
+    // AXI4 user data window
+    AXI4 axi_udata_user(.*);
+
+    assign axi_udata_user.araddr    = axi_udata_araddr;
+    assign axi_udata_user.arburst   = axi_udata_arburst;
+    assign axi_udata_user.arcache   = axi_udata_arcache;
+    assign axi_udata_user.arlen     = axi_udata_arlen;
+    assign axi_udata_user.arlock    = axi_udata_arlock;
+    assign axi_udata_user.arprot    = axi_udata_arprot;
+    assign axi_udata_user.arqos     = axi_udata_arqos;
+    assign axi_udata_user.arregion  = axi_udata_arregion;
+    assign axi_udata_user.arsize    = axi_udata_arsize;
+    assign axi_udata_user.arvalid   = axi_udata_arvalid;
+    assign axi_udata_arready   = axi_udata_user.arready;
+    assign axi_udata_user.awaddr    = axi_udata_awaddr;
+    assign axi_udata_user.awburst   = axi_udata_awburst;
+    assign axi_udata_user.awcache   = axi_udata_awcache;
+    assign axi_udata_user.awlen     = axi_udata_awlen;
+    assign axi_udata_user.awlock    = axi_udata_awlock;
+    assign axi_udata_user.awprot    = axi_udata_awprot;
+    assign axi_udata_user.awqos     = axi_udata_awqos;
+    assign axi_udata_user.awregion  = axi_udata_awregion;
+    assign axi_udata_user.awsize    = axi_udata_awsize;
+    assign axi_udata_user.awvalid   = axi_udata_awvalid;
+    assign axi_udata_awready   = axi_udata_user.awready;
+    assign axi_udata_user.wdata     = axi_udata_wdata;
+    assign axi_udata_user.wstrb     = axi_udata_wstrb;
+    assign axi_udata_user.wlast     = axi_udata_wlast;
+    assign axi_udata_user.wvalid    = axi_udata_wvalid;
+    assign axi_udata_wready    = axi_udata_user.wready;
+    assign axi_udata_bresp     = axi_udata_user.bresp;
+    assign axi_udata_bvalid    = axi_udata_user.bvalid;
+    assign axi_udata_user.bready    = axi_udata_bready;
+    assign axi_udata_rdata     = axi_udata_user.rdata;
+    assign axi_udata_rresp     = axi_udata_user.rresp;
+    assign axi_udata_rlast     = axi_udata_user.rlast;
+    assign axi_udata_rvalid    = axi_udata_user.rvalid;
+    assign axi_udata_user.rready    = axi_udata_rready;
+    assign axi_udata_user.arid      = axi_udata_arid;
+    assign axi_udata_user.awid      = axi_udata_awid;
+    assign axi_udata_bid            = axi_udata_user.bid;
+    assign axi_udata_rid            = axi_udata_user.rid;
+
+{% endif %}
     // Notify
     metaIntf #(.STYPE(irq_not_t)) notify (.*);
     metaIntf #(.STYPE(irq_not_t)) notify_int (.*);
@@ -1079,6 +1167,9 @@ module design_user_wrapper_{{ c_reg }} (
 
     design_user_logic_c{{ c_cnfg }}_{{ c_reg }} inst_user_c{{ c_cnfg }}_{{ c_reg }} (
 	    .axi_ctrl(axi_ctrl_user),
+    {% if cnfg.en_uwin %}
+        .axi_udata(axi_udata_user),
+    {% endif %}
         .notify(notify),
         .sq_rd(user_sq_rd_int),
         .sq_wr(user_sq_wr_int),

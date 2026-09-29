@@ -420,6 +420,9 @@ module shell_top (
     AXI4L axi_cnfg ();
     AXI4L axi_ctrl [N_REGIONS] ();
     AXI4 #(.AXI4_DATA_BITS(AVX_DATA_BITS)) axim_ctrl [N_REGIONS] ();
+{% if cnfg.en_uwin %}
+    AXI4 axim_udata [N_REGIONS] ();
+{% endif %}
     
     {% if cnfg.fpga_arch == 'versal' and not cnfg.en_pr %}
     AXI4 #(.AXI4_DATA_BITS(128), .AXI4_ADDR_BITS(64), .AXI4_ID_BITS(2)) s_axi_debug_hub ();
@@ -445,6 +448,9 @@ module shell_top (
         .axi_main(s_axi_main),
         .axi_cnfg(axi_cnfg),
         .axi_ctrl(axi_ctrl),
+{% if cnfg.en_uwin %}
+        .axim_udata(axim_udata),
+{% endif %}
         .axim_ctrl(axim_ctrl) 
     );
 
@@ -1481,6 +1487,9 @@ module shell_top (
         .s_axi_ctrl(axi_ctrl[0+:{{ cnfg.n_reg }}]),
 {% if cnfg.en_avx %}
         .s_axim_ctrl(axim_ctrl[0+:{{ cnfg.n_reg }}]),
+{% endif %}
+{% if cnfg.en_uwin %}
+        .s_axim_udata(axim_udata[0+:{{ cnfg.n_reg }}]),
 {% endif %}
 {% if cnfg.en_mem %}
         .m_axi_ddr(axi_mem[{{ cnfg.n_net_chan }}+:{{ (1+cnfg.n_reg*cnfg.n_card_axi) }}]),

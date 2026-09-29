@@ -47,13 +47,25 @@ equally (`128 MB / N_REGIONS` each). Windows are not fixed slices of it:
 each table entry holds its own range in the uwin (see RTL), so one binding
 can be up to 128 MB (a 64 MiB push fits one binding).
 
-- **Config flag:** a new `EN_UWIN` (default 0), so no existing example changes.
-- **Templates to change:** `cr_ctrl.tcl` (port and address segment),
-  `shell_top` / `dynamic_top` / `user_wrapper` / `user_logic` (route the port
-  to `vfpga_top` as `axi_udata`), `FindCoyoteHW.cmake` (the flag).
+- **Config flag (done):** `EN_UWIN` (default 0; UltraScale+ only, not with
+  `EN_UCLK`). With it off, every generated file is identical to before.
+- **Path (done):** `cr_ctrl.tcl` adds `axim_udata_<i>` (512-bit AXI4, 6-bit
+  IDs) as interconnect masters after the control ports, and their address
+  segments. `shell_ctrl` → `shell_top` → `dynamic_top` (two register slices
+  and the decoupler, all on aclk) → `user_wrapper` → `user_logic`, where
+  `vfpga_top` sees it as `axi_udata`.
+- **IDs:** the uwin port carries the host's AXI IDs (the AVX port has none:
+  its width converter drops them). The vFPGA must answer B and R with the ID
+  it was given, or the interconnect's response routing wedges; `loom_ingress`
+  echoes them.
 - **Writes:** reach the vFPGA as AXI4 bursts. The payload is posted, so the
   B channel must be answered promptly.
-- **Reads:** answered with zeros, since Loom has no remote reads (6.2b).
+- **Test (passes):** `hw/tb/shell_ctrl_uwin/run.sh` (`run.sh 2` for two
+  regions) builds `design_ctrl` from `cr_ctrl.tcl` in Vivado 2023.2 and
+  simulates it: uwin bursts arrive whole with their IDs, up to the uwin's
+  last byte; shell config, `axi_ctrl` and `axim_ctrl` still decode where
+  they did; holes and past-the-uwin addresses get DECERR; uwin reads come
+  back; back-to-back 256 B writes cross at one beat per cycle.
 
 ## 2. Driver (U280) and user library
 

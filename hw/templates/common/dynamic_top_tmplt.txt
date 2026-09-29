@@ -42,6 +42,11 @@ module design_dynamic_top #(
     AXI4.s                                      s_axim_ctrl [N_REGIONS],
         
 {% endif %}
+{% if cnfg.en_uwin %}
+    // AXI4 user data window
+    AXI4.s                                      s_axim_udata [N_REGIONS],
+
+{% endif %}
 {% if cnfg.en_mem %}
     // AXI4 DDR 
     AXI4.m									    m_axi_ddr [1+N_REGIONS*N_CARD_AXI],
@@ -972,6 +977,21 @@ module design_dynamic_top #(
 {% endif %}
     end	
 
+{% if cnfg.en_uwin %}
+    // User data window: two slices, then the decoupler (EN_UWIN excludes
+    // EN_UCLK, so the whole path is on aclk)
+    AXI4 axim_udata_s0 [N_REGIONS] ();
+    AXI4 axim_udata_s1 [N_REGIONS] ();
+    AXI4 axim_udata_ul [N_REGIONS] ();
+
+    for(genvar i = 0; i < N_REGIONS; i++) begin
+        axi_reg_array #(.N_STAGES(N_REG_DYN_HOST_S0)) (.aclk(aclk), .aresetn(aresetn), .s_axi(s_axim_udata[i]), .m_axi(axim_udata_s0[i]));
+        axi_reg_array #(.N_STAGES(N_REG_DYN_HOST_S1)) (.aclk(aclk), .aresetn(aresetn), .s_axi(axim_udata_s0[i]), .m_axi(axim_udata_s1[i]));
+    end
+
+    axi_decoupler (.decouple(decouple_uclk), .s_axi(axim_udata_s1), .m_axi(axim_udata_ul));
+
+{% endif %}
 	// Decoupling 
 	// ----------------------------------------------------------------------
 	AXI4L axi_ctrl_user_ul [N_REGIONS] ();
@@ -1102,6 +1122,49 @@ module design_dynamic_top #(
         .axi_ctrl_wstrb                 (axi_ctrl_user_ul[{{ i }}].wstrb),
         .axi_ctrl_wvalid                (axi_ctrl_user_ul[{{ i }}].wvalid),
 
+{% if cnfg.en_uwin %}
+        // AXI4 USER DATA WINDOW
+        .axi_udata_araddr                (axim_udata_ul[{{ i }}].araddr),
+        .axi_udata_arid                  (axim_udata_ul[{{ i }}].arid),
+        .axi_udata_awid                  (axim_udata_ul[{{ i }}].awid),
+        .axi_udata_bid                   (axim_udata_ul[{{ i }}].bid),
+        .axi_udata_rid                   (axim_udata_ul[{{ i }}].rid),
+        .axi_udata_arburst               (axim_udata_ul[{{ i }}].arburst),
+        .axi_udata_arcache               (axim_udata_ul[{{ i }}].arcache),
+        .axi_udata_arlen                 (axim_udata_ul[{{ i }}].arlen),
+        .axi_udata_arlock                (axim_udata_ul[{{ i }}].arlock),
+        .axi_udata_arprot                (axim_udata_ul[{{ i }}].arprot),
+        .axi_udata_arqos                 (axim_udata_ul[{{ i }}].arqos),
+        .axi_udata_arregion              (axim_udata_ul[{{ i }}].arregion),
+        .axi_udata_arsize                (axim_udata_ul[{{ i }}].arsize),
+        .axi_udata_arvalid               (axim_udata_ul[{{ i }}].arvalid),
+        .axi_udata_arready               (axim_udata_ul[{{ i }}].arready),
+        .axi_udata_awaddr                (axim_udata_ul[{{ i }}].awaddr),
+        .axi_udata_awburst               (axim_udata_ul[{{ i }}].awburst),
+        .axi_udata_awcache               (axim_udata_ul[{{ i }}].awcache),
+        .axi_udata_awlen                 (axim_udata_ul[{{ i }}].awlen),
+        .axi_udata_awlock                (axim_udata_ul[{{ i }}].awlock),
+        .axi_udata_awprot                (axim_udata_ul[{{ i }}].awprot),
+        .axi_udata_awqos                 (axim_udata_ul[{{ i }}].awqos),
+        .axi_udata_awregion              (axim_udata_ul[{{ i }}].awregion),
+        .axi_udata_awsize                (axim_udata_ul[{{ i }}].awsize),
+        .axi_udata_awvalid               (axim_udata_ul[{{ i }}].awvalid),
+        .axi_udata_awready               (axim_udata_ul[{{ i }}].awready),
+        .axi_udata_wdata                 (axim_udata_ul[{{ i }}].wdata),
+        .axi_udata_wstrb                 (axim_udata_ul[{{ i }}].wstrb),
+        .axi_udata_wlast                 (axim_udata_ul[{{ i }}].wlast),
+        .axi_udata_wvalid                (axim_udata_ul[{{ i }}].wvalid),
+        .axi_udata_wready                (axim_udata_ul[{{ i }}].wready),
+        .axi_udata_bresp                 (axim_udata_ul[{{ i }}].bresp),
+        .axi_udata_bvalid                (axim_udata_ul[{{ i }}].bvalid),
+        .axi_udata_bready                (axim_udata_ul[{{ i }}].bready),
+        .axi_udata_rdata                 (axim_udata_ul[{{ i }}].rdata),
+        .axi_udata_rresp                 (axim_udata_ul[{{ i }}].rresp),
+        .axi_udata_rlast                 (axim_udata_ul[{{ i }}].rlast),
+        .axi_udata_rvalid                (axim_udata_ul[{{ i }}].rvalid),
+        .axi_udata_rready                (axim_udata_ul[{{ i }}].rready),
+
+{% endif %}
         // NOTIFY
         .notify_valid                   (notify_ul[{{ i }}].valid),
         .notify_ready                   (notify_ul[{{ i }}].ready),
