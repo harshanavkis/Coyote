@@ -87,8 +87,9 @@ else
     SESSION=bit_$NAME
     # The session re-enters xilinx-shell with the same environment
     printf '%s\n' "$ENV_SETUP $STEPS" > "$BUILD/.build_cmd.sh"
-    tmux new-session -d -s "$SESSION" "xilinx-shell -c 'bash $BUILD/.build_cmd.sh' > $BUILD/bitgen.log 2>&1"
-    echo "started tmux session $SESSION"
+    # tee: the log file AND the tmux window (tmux attach -t $SESSION)
+    tmux new-session -d -s "$SESSION" "xilinx-shell -c 'bash $BUILD/.build_cmd.sh' 2>&1 | tee $BUILD/bitgen.log"
+    echo "started tmux session $SESSION (tmux attach -t $SESSION; detach with Ctrl-b d)"
     echo "  log:  $BUILD/bitgen.log"
     echo "  info: $BUILD/BUILD_INFO.txt"
 fi
