@@ -182,7 +182,7 @@ int main(int argc, char **argv) {
         // as the landing's one store, after which every card write completes
         const uint64_t *got = dst, *gfence = fence;
         if (land) {
-            (void) L->settle(size, before + 1, std::chrono::milliseconds(500));
+            (void) L->wait(size, before + 1);
         } else {
             while (*vfence != before + 1 && std::chrono::steady_clock::now() - t0 < std::chrono::seconds(5))
                 _mm_pause();

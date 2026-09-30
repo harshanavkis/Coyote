@@ -180,12 +180,10 @@ int run_server(uint16_t port, uint64_t size, bool land) {
         auto t0 = std::chrono::steady_clock::now();
         Verdict v{};
         if (land) {
-            // one fence store per copy so far, then every card write complete
-            // never read the V80 while the U280 writes into it: a fixed settle,
-            // then sync and check in host memory (wait_us is the settle, not
-            // the landing time; the client's CE cycles give the rate)
-            (void) L->settle(size, an.fence, std::chrono::milliseconds(500));
+            // the fence, read through the V80's window, then the data synced back
+            (void) L->wait(size, an.fence);
             v.wait_us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
+            L->pull();
             vdst = L->buf;
             v.fence = L->buf[size / 8];
         } else {
