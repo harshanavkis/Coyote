@@ -213,6 +213,11 @@ can be up to 128 MB (a 64 MiB push fits one binding).
      - clara: `rsync -a /scratch/harshanavkis/loom-proj/Coyote/examples/loom_ce/sw/build/ rose.dos.cit.tum.de:/scratch/harshanavkis/loom-proj/Coyote/examples/loom_ce/sw/build/`
      - rose: `cd /scratch/harshanavkis/loom-proj/Coyote/examples/loom_ce/sw/build && sudo ./ce_remote --server --size 1048576`
      - clara: `cd /scratch/harshanavkis/loom-proj/Coyote/examples/loom_ce/sw/build && sudo ./ce_remote --client 131.159.102.21 --reps 3`
+  7. The V80's write bandwidth, to host memory and peer-to-peer into the
+     uwin, on clara. It needs example 07 on the V80 instead of `loom_ce`
+     (step 3 puts `loom_ce` back):
+     `cd /scratch/harshanavkis/loom-proj/Coyote && scripts/fpga/program_v80.sh examples/07_perf_fpga/hw/build_v80/bitstreams/cyt_top.pdi 0000:81:00.0`
+     `cd /scratch/harshanavkis/loom-proj/Coyote/examples/loom_ce/sw/build && sudo ./p2p_bw`
 
 ## Found on the way: `RX_CHUNK` is not wired in `examples/loom`
 
