@@ -16,6 +16,12 @@ import lynxTypes::*;
  * base is always the exporter's own VA; len is the segment bounds.
  * Programmed only through the CSR page (loom_ctrl). Overlapping uwin ranges
  * are the daemon's to avoid; the lowest index wins.
+ *
+ * The uwin lookup is two register stages, each advanced by its enable
+ * (ua_ce1 takes ua_addr, ua_ce2 takes stage 1): stage 1 compares ua_addr
+ * with every window's range (its end, ustart + len, is kept from commit),
+ * stage 2 picks the lowest hit and its entry. A commit while a lookup is in
+ * flight may give that lookup the old entry.
  */
 module loom_table #(
     parameter integer UWIN_BITS = 27
@@ -43,8 +49,10 @@ module loom_table #(
     output logic [VADDR_BITS-1:0]   lu_base,
     output logic [LEN_BITS-1:0]     lu_len,
 
-    // Ingress lookup by uwin address (combinational): the window whose range
-    // holds ua_addr, and ua_addr's offset inside it
+    // Ingress lookup by uwin address (two stages): the window whose range
+    // holds ua_addr, its start and its end
+    input  logic                    ua_ce1,
+    input  logic                    ua_ce2,
     input  logic [UWIN_BITS-1:0]    ua_addr,
     output logic                    ua_hit,
     output logic [3:0]              ua_idx,
@@ -52,11 +60,12 @@ module loom_table #(
     output logic [PID_BITS-1:0]     ua_pid,
     output logic [PID_BITS-1:0]     ua_dst_pid,
     output logic [VADDR_BITS-1:0]   ua_base,
-    output logic [LEN_BITS-1:0]     ua_len,
-    output logic [LEN_BITS-1:0]     ua_off
+    output logic [UWIN_BITS-1:0]    ua_ustart,
+    output logic [LEN_BITS:0]       ua_end        // ustart + len
 );
 
-localparam integer N_WIN = 16;
+localparam integer N_WIN    = 16;
+localparam integer END_BITS = LEN_BITS + 1;
 
 logic                  e_valid [N_WIN];
 logic                  e_route [N_WIN];
@@ -65,6 +74,7 @@ logic [PID_BITS-1:0]   e_dpid  [N_WIN];
 logic [VADDR_BITS-1:0] e_base  [N_WIN];
 logic [LEN_BITS-1:0]   e_len   [N_WIN];
 logic [UWIN_BITS-1:0]  e_ustart[N_WIN];
+logic [END_BITS-1:0]   e_end   [N_WIN];
 
 always_ff @(posedge aclk) begin
     if (!aresetn) begin
@@ -77,6 +87,7 @@ always_ff @(posedge aclk) begin
         e_base[prog_idx]   <= prog_base;
         e_len[prog_idx]    <= prog_len;
         e_ustart[prog_idx] <= prog_ustart;
+        e_end[prog_idx]    <= END_BITS'(prog_ustart) + END_BITS'(prog_len);
     end
 end
 
@@ -87,26 +98,29 @@ assign lu_dst_pid = e_dpid[lu_idx];
 assign lu_base    = e_base[lu_idx];
 assign lu_len     = e_len[lu_idx];
 
-// Range match: 15 comparators, lowest index wins
-logic [LEN_BITS-1:0] rel [N_WIN];
+// Stage 1: one range compare per window
+logic [N_WIN-1:0] s1_hit;
+always_ff @(posedge aclk) if (ua_ce1)
+    for (int i = 0; i < N_WIN; i++)
+        s1_hit[i] <= (i != 0) && e_valid[i] && (ua_addr >= e_ustart[i]) &&
+                     (END_BITS'(ua_addr) < e_end[i]);
+
+// Stage 2: the lowest hit and its entry
+logic [3:0] s1_idx;
 always_comb begin
-    ua_hit = 1'b0;
-    ua_idx = 4'd0;
-    for (int i = N_WIN-1; i >= 1; i--) begin
-        rel[i] = LEN_BITS'(ua_addr - e_ustart[i]);
-        if (e_valid[i] && (ua_addr >= e_ustart[i]) && (rel[i] < e_len[i])) begin
-            ua_hit = 1'b1;
-            ua_idx = 4'(i);
-        end
-    end
-    rel[0] = '0;
+    s1_idx = 4'd0;
+    for (int i = N_WIN-1; i >= 1; i--) if (s1_hit[i]) s1_idx = 4'(i);
 end
 
-assign ua_route   = e_route[ua_idx];
-assign ua_pid     = e_pid[ua_idx];
-assign ua_dst_pid = e_dpid[ua_idx];
-assign ua_base    = e_base[ua_idx];
-assign ua_len     = e_len[ua_idx];
-assign ua_off     = rel[ua_idx];
+always_ff @(posedge aclk) if (ua_ce2) begin
+    ua_hit     <= |s1_hit;
+    ua_idx     <= s1_idx;
+    ua_route   <= e_route[s1_idx];
+    ua_pid     <= e_pid[s1_idx];
+    ua_dst_pid <= e_dpid[s1_idx];
+    ua_base    <= e_base[s1_idx];
+    ua_ustart  <= e_ustart[s1_idx];
+    ua_end     <= e_end[s1_idx];
+end
 
 endmodule

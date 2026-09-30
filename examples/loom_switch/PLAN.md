@@ -101,14 +101,16 @@ can be up to 128 MB (a 64 MiB push fits one binding).
 - **`loom_switch` (U280, done: `hw/src/vfpga_top.svh`, `hw/CMakeLists.txt`):**
   `vfpga_top` = `loom_ctrl` (the CSR page only: table programming including
   each window's `ustart` at word 80, staging VA, ack window, `RX_CHUNK`,
-  counters; ingress counters at words 88-94), `loom_table`, `loom_ingress`
+  counters; ingress counters at words 88-94, its debug counters at 95-108),
+  `loom_table`, `loom_ingress`
   and `loom_rx` (copied unchanged from `examples/loom`). `sq_wr` is shared
   per request by the ingress and `loom_rx`, nothing else; the arbiter and
   its two known defects are carried over as they are. `RX_CHUNK` is wired
   to `loom_rx` here (in `examples/loom` it is not, see below).
   - **`loom_table`** (the switch's copy): each entry gains `ustart`, its
     range in the uwin being `[ustart, ustart + len)`; a second lookup port
-    matches an address against the ranges (lowest index wins).
+    matches an address against the ranges (lowest index wins), in two
+    register stages.
   - **`loom_ingress`** (done, `hw/src/hdl/loom_ingress.sv`): AXI4 write
     slave, 512-bit.
     - **Packets:** consecutive beats continuing one binding at the next
@@ -129,9 +131,19 @@ can be up to 128 MB (a 64 MiB push fits one binding).
       dropped and counted.
     - **Order:** one data FIFO and one packet queue, so packets leave in
       arrival order across bindings.
-    - **Contract:** 64 B-aligned INCR bursts. A burst with no window, a
-      misaligned address or an end past its window is discarded and
-      counted. B once the last beat is in the FIFO. Reads return zeros.
+    - **Contract:** INCR bursts of full-width beats. The address is rounded
+      down to 64 B and the strobes say which bytes are written, so a Zen 3
+      host's 32 B half-line flushes and 8 B stores at their own address are
+      stores. A burst with no window or whose lines end past its window is
+      discarded and counted. B once the last beat is in the FIFO. Reads
+      return zeros.
+    - **Lookup:** three register stages (the table's two, then offset and
+      bounds) that advance whenever the next has room, so bursts follow
+      each other with no gap, at one a cycle for 1-beat bursts.
+    - **Debug counters (words 95-108):** output backpressure, the data
+      FIFO empty while sending, cycles a W beat waited by reason, drops by
+      reason, bursts by size, misaligned bursts. `uwin_probe` prints them
+      all, `p2p_bw` those of each landed run.
   - **Streams:** the ingress is the only sender: host stream 0 and RDMA
     stream 0; `loom_rx` lands on host stream 1 (`N_STRM_AXI 2`,
     `N_RDMA_AXI 1`). The ack window counts only the ingress's posts.
@@ -148,7 +160,10 @@ can be up to 128 MB (a 64 MiB push fits one binding).
   bursts over several packets, alternating windows, offset and idle gaps,
   drops, a 64 MiB window, 8 B stores (lone words on both routes, several in
   one beat, an empty beat, partial words dropped, a store inside a run, a
-  flag behind bulk), reads; then all of it again under random
+  flag behind bulk), writes starting inside a line (32 B halves, 8 B stores
+  at their own address, a burst from line+32), 1-beat bursts at one a cycle,
+  the debug counters (each W wait under exactly one reason, every cycle),
+  reads; then all of it again under random
   backpressure on `sq_wr`, the window, both send streams, B, and W bubbles.
   Back-to-back bursts are taken at one beat per cycle. Run:
   `examples/loom_switch/hw/tb/run_tbs.sh` (uses `examples/loom`'s

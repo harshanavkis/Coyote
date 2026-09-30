@@ -98,7 +98,8 @@ int main() {
                (unsigned long) (c1.v[1] - c0.v[1]),
                (unsigned long) (c2.v[0] - c1.v[0]), (unsigned long) pk,
                (unsigned long) (wl1 - wl0), pk ? double(wl1 - wl0) / pk : 0.0);
-        (void) cyc0; (void) cyc1;
+        printf("    p2p+ ingress debug over %lu cycles:\n", (unsigned long) (cyc1 - cyc0));
+        loom_switch::print_ingress_delta(c1, c2, loom_switch::I_DBG, loom_switch::N_ING - loom_switch::I_DBG);
     }
     loom_switch::release_window(u280, 1);
     return 0;

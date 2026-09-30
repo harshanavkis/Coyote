@@ -38,9 +38,20 @@ import lynxTypes::*;
  *   88-94 (RO) ingress: 88 bursts, 89 bursts dropped, 90 local packets,
  *          91 rdma packets, 92 stores, 93 beats with a partial 8 B word,
  *          94 packets closed by the idle timer
- * Counters are free-running and never cleared (software takes deltas).
+ *   95-108 (RO) ingress debug (loom_ingress cnt_dbg, bit = word - 95):
+ *          95/96 cycles the host / net output was valid and not ready,
+ *          97 cycles sending a packet with the data FIFO empty,
+ *          98-102 cycles a W beat waited: 98 no burst looked up yet, 99 B slot
+ *          busy, 100 data FIFO full, 101 queue full, 102 a partial beat
+ *          still sending its stores; 103/104 bursts dropped for no window /
+ *          past the window's end; 105-107 bursts of 1, 2-4, more than 4
+ *          beats; 108 bursts at a non-64 B-aligned address
+ * Counters are free-running and never cleared (software takes deltas). The
+ * ingress pulses are registered once before they count.
  */
-module loom_ctrl (
+module loom_ctrl #(
+    parameter integer N_DBG = 14
+) (
     input  logic                        aclk,
     input  logic                        aresetn,
 
@@ -91,7 +102,8 @@ module loom_ctrl (
     input  logic                        cnt_ing_pkt_rdma,
     input  logic                        cnt_ing_store,
     input  logic                        cnt_ing_store_drop,
-    input  logic                        cnt_ing_flush
+    input  logic                        cnt_ing_flush,
+    input  logic [N_DBG-1:0]            cnt_ing_dbg
 );
 
 localparam integer ADDR_LSB = $clog2(AXIL_DATA_BITS/8);   // 3
@@ -133,6 +145,7 @@ localparam integer R_WR_BLK_RX     = 75;
 localparam integer R_RX_CHUNK      = 76;
 localparam integer R_ING_BASE      = 88;
 localparam integer N_ING           = 7;
+localparam integer R_DBG_BASE      = 95;
 
 // -------------------------------------------------------------------------
 // AXI4-Lite handshake (single outstanding write and read, as examples/loom)
@@ -205,8 +218,19 @@ logic [63:0] rx_stall_run, rx_stall_max, rx_bp, rx_bp_run, rx_bp_max, rx_ff, rx_
 logic [63:0] tx_acks, tx_winfull, tx_reqwait;
 logic [63:0] wr_wait_local, wr_wait_rdma, wr_blk_ing, wr_blk_rx;
 logic [63:0] ing [N_ING];
-wire  [N_ING-1:0] ing_pulse = {cnt_ing_flush, cnt_ing_store_drop, cnt_ing_store, cnt_ing_pkt_rdma,
-                               cnt_ing_pkt_local, cnt_ing_drop, cnt_ing_burst};
+logic [63:0] dbg [N_DBG];
+logic [N_ING-1:0] ing_pulse;
+logic [N_DBG-1:0] dbg_pulse;
+always_ff @(posedge aclk) begin
+    if (!aresetn) begin
+        ing_pulse <= '0;
+        dbg_pulse <= '0;
+    end else begin
+        ing_pulse <= {cnt_ing_flush, cnt_ing_store_drop, cnt_ing_store, cnt_ing_pkt_rdma,
+                      cnt_ing_pkt_local, cnt_ing_drop, cnt_ing_burst};
+        dbg_pulse <= cnt_ing_dbg;
+    end
+end
 
 always_ff @(posedge aclk) begin
     if (!aresetn) begin
@@ -217,6 +241,7 @@ always_ff @(posedge aclk) begin
         tx_acks <= 0; tx_winfull <= 0; tx_reqwait <= 0;
         wr_wait_local <= 0; wr_wait_rdma <= 0; wr_blk_ing <= 0; wr_blk_rx <= 0;
         for (int i = 0; i < N_ING; i++) ing[i] <= 0;
+        for (int i = 0; i < N_DBG; i++) dbg[i] <= 0;
     end else begin
         cycle_cnt <= cycle_cnt + 1;
         if (cnt_rx_fwd)    rx_fwd    <= rx_fwd + 1;
@@ -248,6 +273,7 @@ always_ff @(posedge aclk) begin
         if (cnt_wr_blk_ing)    wr_blk_ing    <= wr_blk_ing + 1;
         if (cnt_wr_blk_rx)     wr_blk_rx     <= wr_blk_rx + 1;
         for (int i = 0; i < N_ING; i++) if (ing_pulse[i]) ing[i] <= ing[i] + 1;
+        for (int i = 0; i < N_DBG; i++) if (dbg_pulse[i]) dbg[i] <= dbg[i] + 1;
     end
 end
 
@@ -292,6 +318,8 @@ always_ff @(posedge aclk) begin
             default:
                 if (rd_idx >= R_ING_BASE && rd_idx < R_ING_BASE + N_ING)
                     axi_rdata <= ing[rd_idx - R_ING_BASE];
+                else if (rd_idx >= R_DBG_BASE && rd_idx < R_DBG_BASE + N_DBG)
+                    axi_rdata <= dbg[rd_idx - R_DBG_BASE];
         endcase
     end
 end

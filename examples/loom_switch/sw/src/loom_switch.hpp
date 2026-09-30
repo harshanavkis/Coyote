@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <cstdio>
 #include <coyote/cThread.hpp>
 
 /**
@@ -35,7 +36,7 @@ constexpr uint32_t RX_BP           = 30;   // loom_rx refused a beat the FIFO of
 constexpr uint32_t RX_MOVE         = 42;   // loom_rx forwarded a beat
 constexpr uint32_t RX_STARVE       = 43;   // loom_rx had nothing to forward
 constexpr uint32_t RX_STALL        = 44;   // loom_rx had a beat, the host write was not ready
-// Ingress counters, 88-94
+// Ingress counters, 88-94, then its debug counters, 95-108 (loom_ctrl.sv)
 constexpr uint32_t ING_BURSTS      = 88;
 constexpr uint32_t ING_DROPS       = 89;
 constexpr uint32_t ING_PKT_LOCAL   = 90;
@@ -43,7 +44,17 @@ constexpr uint32_t ING_PKT_RDMA    = 91;
 constexpr uint32_t ING_STORES      = 92;
 constexpr uint32_t ING_STORE_DROPS = 93;
 constexpr uint32_t ING_FLUSHES     = 94;
-constexpr int      N_ING           = 7;
+constexpr uint32_t ING_DBG         = 95;
+constexpr int      N_ING           = 21;
+constexpr int      I_DBG           = ING_DBG - ING_BURSTS;   // first debug counter in IngressCounters
+
+inline const char *const ING_NAMES[N_ING] = {
+    "bursts", "bursts dropped", "local packets", "rdma packets",
+    "stores", "partial words", "idle flushes",
+    "host out bp", "net out bp", "send fifo empty",
+    "W wait: no aw", "W wait: B slot", "W wait: fifo", "W wait: queue", "W wait: stores",
+    "drop: no window", "drop: past end",
+    "bursts 1 beat", "bursts 2-4", "bursts >4", "misaligned"};
 
 inline void csr_write(coyote::cThread &t, uint32_t word, uint64_t val) { t.setCSR(val, word); }
 inline uint64_t csr_read(coyote::cThread &t, uint32_t word) { return t.getCSR(word); }
@@ -80,5 +91,13 @@ struct IngressCounters {
         return c;
     }
 };
+
+// Counters [first, first + n) that moved from a to b, as "name delta" pairs
+inline void print_ingress_delta(const IngressCounters &a, const IngressCounters &b,
+                                int first = 0, int n = N_ING) {
+    for (int i = first; i < first + n; i++)
+        if (b.v[i] != a.v[i])
+            printf("    %-17s %lu\n", ING_NAMES[i], (unsigned long) (b.v[i] - a.v[i]));
+}
 
 } // namespace loom_switch

@@ -37,7 +37,9 @@ logic                   ua_hit, ua_route;
 logic [3:0]             ua_idx;
 logic [PID_BITS-1:0]    ua_pid, ua_dst_pid;
 logic [VADDR_BITS-1:0]  ua_base;
-logic [LEN_BITS-1:0]    ua_len, ua_off;
+logic [26:0]            ua_ustart;
+logic [LEN_BITS:0]      ua_end;
+logic                   ua_ce1, ua_ce2;
 
 // ---------------------------------------------------------------------------
 // Ack window: rdma packets and stores posted by the ingress and not yet
@@ -68,6 +70,7 @@ logic ing_host_tvalid, ing_host_tlast, ing_net_tvalid, ing_net_tlast, rx_tvalid,
 
 logic cnt_ing_burst, cnt_ing_drop, cnt_ing_pkt_local, cnt_ing_pkt_rdma;
 logic cnt_ing_store, cnt_ing_store_drop, cnt_ing_flush, cnt_ing_win_wait, cnt_ing_req_wait;
+logic [13:0] cnt_ing_dbg;
 logic cnt_rx_fwd, cnt_rx_drop, cnt_rx_orphan, rx_cnt_move, rx_cnt_starve, rx_cnt_stall;
 logic rx_cnt_bp, rx_cnt_req, rx_cnt_fifo_full;
 logic cnt_wr_wait_local, cnt_wr_wait_rdma, cnt_wr_blk_ing, cnt_wr_blk_rx;
@@ -105,7 +108,7 @@ loom_ctrl inst_loom_ctrl (
     .cnt_ing_burst(cnt_ing_burst), .cnt_ing_drop(cnt_ing_drop),
     .cnt_ing_pkt_local(cnt_ing_pkt_local), .cnt_ing_pkt_rdma(cnt_ing_pkt_rdma),
     .cnt_ing_store(cnt_ing_store), .cnt_ing_store_drop(cnt_ing_store_drop),
-    .cnt_ing_flush(cnt_ing_flush)
+    .cnt_ing_flush(cnt_ing_flush), .cnt_ing_dbg(cnt_ing_dbg)
 );
 
 loom_table inst_loom_table (
@@ -115,16 +118,18 @@ loom_table inst_loom_table (
     .prog_base(tbl_base), .prog_len(tbl_len), .prog_ustart(tbl_ustart),
     // no aperture: the index lookup is unused
     .lu_idx(4'd0), .lu_valid(), .lu_route(), .lu_pid(), .lu_dst_pid(), .lu_base(), .lu_len(),
+    .ua_ce1(ua_ce1), .ua_ce2(ua_ce2),
     .ua_addr(ua_addr), .ua_hit(ua_hit), .ua_idx(ua_idx), .ua_route(ua_route),
     .ua_pid(ua_pid), .ua_dst_pid(ua_dst_pid), .ua_base(ua_base),
-    .ua_len(ua_len), .ua_off(ua_off)
+    .ua_ustart(ua_ustart), .ua_end(ua_end)
 );
 
 loom_ingress #(.HOST_DEST(0), .NET_DEST(0)) inst_loom_ingress (
     .aclk(aclk), .aresetn(aresetn), .axi_udata(axi_udata),
+    .ua_ce1(ua_ce1), .ua_ce2(ua_ce2),
     .ua_addr(ua_addr), .ua_hit(ua_hit), .ua_route(ua_route), .ua_pid(ua_pid),
-    .ua_dst_pid(ua_dst_pid), .ua_base(ua_base), .ua_len(ua_len),
-    .ua_off(ua_off), .ua_idx(ua_idx),
+    .ua_dst_pid(ua_dst_pid), .ua_base(ua_base), .ua_ustart(ua_ustart),
+    .ua_end(ua_end), .ua_idx(ua_idx),
     .rdma_staging_va(rdma_staging_va),
     .wr_req(ing_wr_req), .wr_valid(ing_wr_valid),
     .wr_ready(sq_wr.ready && !rx_takes_wr),
@@ -139,7 +144,8 @@ loom_ingress #(.HOST_DEST(0), .NET_DEST(0)) inst_loom_ingress (
     .cnt_pkt_local(cnt_ing_pkt_local), .cnt_pkt_rdma(cnt_ing_pkt_rdma),
     .cnt_store(cnt_ing_store), .cnt_store_drop(cnt_ing_store_drop),
     .cnt_flush(cnt_ing_flush),
-    .cnt_win_wait(cnt_ing_win_wait), .cnt_req_wait(cnt_ing_req_wait)
+    .cnt_win_wait(cnt_ing_win_wait), .cnt_req_wait(cnt_ing_req_wait),
+    .cnt_dbg(cnt_ing_dbg)
 );
 
 // ---------------------------------------------------------------------------

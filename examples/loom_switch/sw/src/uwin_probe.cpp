@@ -29,13 +29,9 @@
 
 using namespace loom_switch;
 
-static const char *ING_NAMES[N_ING] = {
-    "bursts", "bursts dropped", "local packets", "rdma packets",
-    "stores", "partial words", "idle flushes"};
-
 static void print_delta(const IngressCounters &a, const IngressCounters &b) {
     for (int i = 0; i < N_ING; i++)
-        printf("    %-15s %lu\n", ING_NAMES[i], (unsigned long) (b.v[i] - a.v[i]));
+        printf("    %-17s %lu\n", ING_NAMES[i], (unsigned long) (b.v[i] - a.v[i]));
 }
 
 static uint64_t pattern(uint64_t off) { return 0x10AD000000000000ULL ^ (off * 0x9E3779B97F4A7C15ULL); }

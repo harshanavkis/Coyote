@@ -42,16 +42,32 @@ import lynxTypes::*;
  * beats arrived, across bindings, so a flag stored after data stays behind
  * it.
  *
- * CONTRACT. Bursts are 64 B-aligned INCR bursts (awsize is not looked at).
- * A burst with no window, a misaligned address or an end past the window's
- * length is accepted, discarded and counted (cnt_drop). B is answered once
+ * CONTRACT. Bursts are INCR bursts of full-width beats (awsize is not
+ * looked at). The address is rounded down to 64 B and the strobes say which
+ * bytes are written, so a write that starts inside a line - a CPU's 32 B
+ * half-line flush at line+32, a lone 8 B store at its own address - is a
+ * partial first beat, i.e. stores. Window starts and lengths are 64 B
+ * multiples. A burst with no window, or whose lines end past the window's
+ * length, is accepted, discarded and counted (cnt_drop). B is answered once
  * the burst's last beat is taken. Reads are answered with zeros.
+ *
+ * LOOKUP. AW goes through three register stages (the table's two, then the
+ * offset and bounds), each advancing whenever the next has room, so up to
+ * three bursts are looked up ahead of the one being written and bursts
+ * follow each other with no gap, at one a cycle for 1-beat bursts.
  *
  * WINDOW. rdma packets and stores are posted only while win_ok (the ack
  * window); rdma_post pulses on each so the window can count them.
  */
 module loom_ingress #(
     parameter integer UWIN_BITS    = 27,
+    // cnt_dbg bits: 0/1 host/net output valid and not ready; 2 sending a
+    // packet with the data FIFO empty; 3-7 a W beat presented and not taken,
+    // by reason: 3 no burst looked up yet, 4 the B slot busy, 5 data FIFO
+    // full, 6 queue full, 7 a partial beat still sending its stores; 8/9 a
+    // burst dropped for no window / past the window's end; 10-12 bursts of
+    // 1, 2-4, more than 4 beats; 13 a burst whose address is not 64 B-aligned
+    parameter integer N_DBG        = 14,
     parameter integer HOST_DEST    = 0,
     parameter integer NET_DEST     = 0,
     parameter integer FLUSH_CYCLES = 16,
@@ -62,15 +78,17 @@ module loom_ingress #(
 
     AXI4.s                              axi_udata,
 
-    // Table lookup by uwin address (loom_table ua_* port)
+    // Table lookup by uwin address (loom_table ua_* port, two stages)
+    output logic                        ua_ce1,
+    output logic                        ua_ce2,
     output logic [UWIN_BITS-1:0]        ua_addr,
     input  logic                        ua_hit,
     input  logic                        ua_route,
     input  logic [PID_BITS-1:0]         ua_pid,
     input  logic [PID_BITS-1:0]         ua_dst_pid,
     input  logic [VADDR_BITS-1:0]       ua_base,
-    input  logic [LEN_BITS-1:0]         ua_len,
-    input  logic [LEN_BITS-1:0]         ua_off,
+    input  logic [UWIN_BITS-1:0]        ua_ustart,
+    input  logic [LEN_BITS:0]           ua_end,
     input  logic [3:0]                  ua_idx,
 
     // RDMA staging VA (RETH vaddr of every outgoing message)
@@ -108,7 +126,8 @@ module loom_ingress #(
     output logic                        cnt_store_drop, // a beat with a partial 8 B word
     output logic                        cnt_flush,      // a packet closed by the idle timer
     output logic                        cnt_win_wait,   // an rdma request waited on the window
-    output logic                        cnt_req_wait    // an rdma request waited on wr_ready
+    output logic                        cnt_req_wait,   // an rdma request waited on wr_ready
+    output logic [N_DBG-1:0]            cnt_dbg         // debug pulses, listed at N_DBG
 );
 
 localparam [7:0] MSG_OP_WRITE        = 8'd1;   // keep in sync with loom_rx.sv
@@ -117,31 +136,80 @@ localparam integer PKT_BEATS  = PMTU_BYTES / 64;
 localparam integer BEAT_W     = $clog2(PKT_BEATS + 1);
 
 // ---------------------------------------------------------------------------
-// AW: one slot ahead of the burst being written, so the next burst's lookup
-// is ready when the current one ends and bursts follow with no gap.
+// AW lookup: s1 takes the address (the table compares it), s2 has the table's
+// pick, s3 the offset and the bounds. Each stage advances when the next has
+// room; the burst stage takes s3 (aw_take).
 // ---------------------------------------------------------------------------
-logic                  aw_full;
-logic [UWIN_BITS-1:0]  aw_addr;
-logic [7:0]            aw_len;
-logic [AXI_ID_BITS-1:0] aw_id;
-logic                  aw_take;           // the burst stage takes the slot
+logic                   aw_take;          // the burst stage takes s3
 
-assign axi_udata.awready = !aw_full || aw_take;
+logic                   s1_v, s2_v, s3_v;
+logic [UWIN_BITS-1:0]   s1_addr, s2_addr;
+logic [UWIN_BITS:0]     s1_aend, s2_aend; // end of the burst's lines
+logic [7:0]             s1_len, s2_len, s3_len;
+logic [AXI_ID_BITS-1:0] s1_id, s2_id, s3_id;
+logic                   s1_mis, s2_mis, s3_mis;
+logic                   s3_hit, s3_ok, s3_route;
+logic [3:0]             s3_idx;
+logic [PID_BITS-1:0]    s3_pid, s3_dst_pid;
+logic [VADDR_BITS-1:0]  s3_base;
+logic [LEN_BITS-1:0]    s3_off;
+
+wire s3_en = !s3_v || aw_take;
+wire s2_en = !s2_v || s3_en;
+wire s1_en = !s1_v || s2_en;
+
+assign axi_udata.awready = s1_en;
+wire aw_hs = axi_udata.awvalid && s1_en;
+wire [UWIN_BITS-1:0] aw_line = {axi_udata.awaddr[UWIN_BITS-1:6], 6'b0};
+
+assign ua_ce1  = s1_en;
+assign ua_ce2  = s2_en;
+assign ua_addr = aw_line;
+
 always_ff @(posedge aclk) begin
-    if (!aresetn) aw_full <= 1'b0;
-    else if (axi_udata.awvalid && axi_udata.awready) begin
-        aw_full <= 1'b1;
-        aw_addr <= axi_udata.awaddr[UWIN_BITS-1:0];
-        aw_len  <= axi_udata.awlen;
-        aw_id   <= axi_udata.awid;
-    end else if (aw_take) aw_full <= 1'b0;
+    if (!aresetn) begin
+        s1_v <= 1'b0;
+        s2_v <= 1'b0;
+        s3_v <= 1'b0;
+    end else begin
+        if (s1_en) s1_v <= aw_hs;
+        if (s2_en) s2_v <= s1_v;
+        if (s3_en) s3_v <= s2_v;
+    end
 end
 
-assign ua_addr = aw_addr;
+always_ff @(posedge aclk) begin
+    if (s1_en) begin
+        s1_addr <= aw_line;
+        s1_aend <= {1'b0, aw_line} + {{(UWIN_BITS-14){1'b0}}, axi_udata.awlen, 6'b0} + (UWIN_BITS+1)'(64);
+        s1_len  <= axi_udata.awlen;
+        s1_id   <= axi_udata.awid;
+        s1_mis  <= axi_udata.awaddr[5:0] != 6'b0;
+    end
+    if (s2_en) begin
+        s2_addr <= s1_addr;
+        s2_aend <= s1_aend;
+        s2_len  <= s1_len;
+        s2_id   <= s1_id;
+        s2_mis  <= s1_mis;
+    end
+    if (s3_en) begin
+        s3_hit     <= ua_hit;
+        s3_ok      <= ua_hit && ((LEN_BITS+1)'(s2_aend) <= ua_end);
+        s3_idx     <= ua_idx;
+        s3_route   <= ua_route;
+        s3_pid     <= ua_pid;
+        s3_dst_pid <= ua_dst_pid;
+        s3_base    <= ua_base;
+        s3_off     <= LEN_BITS'(s2_addr - ua_ustart);
+        s3_len     <= s2_len;
+        s3_id      <= s2_id;
+        s3_mis     <= s2_mis;
+    end
+end
 
 // ---------------------------------------------------------------------------
-// Burst stage: the burst whose beats are being accepted, with its table hit
-// latched when it took the slot.
+// Burst stage: the burst whose beats are being accepted
 // ---------------------------------------------------------------------------
 logic                  b_act;             // a burst is loaded
 logic                  b_ok;              // its beats are taken, not discarded
@@ -151,10 +219,6 @@ logic [PID_BITS-1:0]   b_pid, b_dst_pid;
 logic [VADDR_BITS-1:0] b_base;
 logic [LEN_BITS-1:0]   b_off;             // binding offset of the next beat
 logic [AXI_ID_BITS-1:0] b_id;
-
-// End of the slot's burst inside its window
-wire [LEN_BITS:0] aw_end = {1'b0, ua_off} + {{(LEN_BITS-13){1'b0}}, aw_len, 6'b0} + (LEN_BITS+1)'(64);
-wire aw_ok = ua_hit && (aw_addr[5:0] == 6'b0) && (aw_end <= {1'b0, ua_len});
 
 // B: one response register
 logic   bq_valid;
@@ -202,7 +266,7 @@ assign axi_udata.wready = b_act && b_room &&
 wire w_hs    = axi_udata.wvalid && axi_udata.wready;
 wire w_end   = w_hs && axi_udata.wlast;
 
-assign aw_take = aw_full && (!b_act || w_end);
+assign aw_take = s3_v && (!b_act || w_end);
 
 always_ff @(posedge aclk) begin
     if (!aresetn) begin
@@ -211,14 +275,14 @@ always_ff @(posedge aclk) begin
     end else begin
         if (aw_take) begin
             b_act     <= 1'b1;
-            b_ok      <= aw_ok;
-            b_idx     <= ua_idx;
-            b_route   <= ua_route;
-            b_pid     <= ua_pid;
-            b_dst_pid <= ua_dst_pid;
-            b_base    <= ua_base;
-            b_off     <= ua_off;
-            b_id      <= aw_id;
+            b_ok      <= s3_ok;
+            b_idx     <= s3_idx;
+            b_route   <= s3_route;
+            b_pid     <= s3_pid;
+            b_dst_pid <= s3_dst_pid;
+            b_base    <= s3_base;
+            b_off     <= s3_off;
+            b_id      <= s3_id;
         end else if (w_end) begin
             b_act <= 1'b0;
         end
@@ -232,8 +296,8 @@ always_ff @(posedge aclk) begin
     else if (part_store && !pq_full)    st_done <= st_done | st_one;
 end
 
-assign cnt_burst      = aw_take && aw_ok;
-assign cnt_drop       = aw_take && !aw_ok;
+assign cnt_burst      = aw_take && s3_ok;
+assign cnt_drop       = aw_take && !s3_ok;
 assign cnt_store_drop = w_hs && b_ok && !w_full && (wd_bad != 8'd0);
 
 always_ff @(posedge aclk) begin
@@ -476,6 +540,27 @@ assign cnt_pkt_local = o_beat && o_last && !o.route;
 assign cnt_pkt_rdma  = o_beat && o_last &&  o.route;
 assign cnt_store     = ((ostate == O_HDR) && o.store && m_net_tready) ||
                        ((ostate == O_STORE) && m_host_tready);
+
+// ---------------------------------------------------------------------------
+// Debug pulses (bit meanings at N_DBG)
+// ---------------------------------------------------------------------------
+wire w_wait = axi_udata.wvalid && !axi_udata.wready;
+wire w_taking = w_wait && b_act && b_room && b_ok;
+
+assign cnt_dbg[0]  = m_host_tvalid && !m_host_tready;
+assign cnt_dbg[1]  = m_net_tvalid && !m_net_tready;
+assign cnt_dbg[2]  = (ostate == O_DATA) && !df_tvalid;
+assign cnt_dbg[3]  = w_wait && !b_act;
+assign cnt_dbg[4]  = w_wait && b_act && !b_room;
+assign cnt_dbg[5]  = w_taking && w_full && !df_ready;
+assign cnt_dbg[6]  = w_taking && pq_full && (df_ready || !w_full);
+assign cnt_dbg[7]  = w_taking && !w_full && !pq_full;
+assign cnt_dbg[8]  = aw_take && !s3_hit;
+assign cnt_dbg[9]  = aw_take && s3_hit && !s3_ok;
+assign cnt_dbg[10] = aw_take && (s3_len == 8'd0);
+assign cnt_dbg[11] = aw_take && (s3_len != 8'd0) && (s3_len < 8'd4);
+assign cnt_dbg[12] = aw_take && (s3_len >= 8'd4);
+assign cnt_dbg[13] = aw_take && s3_mis;
 
 // ---------------------------------------------------------------------------
 // Reads: zeros, one beat per requested beat
