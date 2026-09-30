@@ -36,7 +36,13 @@
  * writes into the U280, for measuring what that load does to the U280's
  * other traffic (e.g. loom_rx landings from the far host).
  *
- * Usage: ce_local [--land-v80 | --discard SECONDS] [bytes (multiple of 4 KiB, at most 64 MiB)] [copies]
+ * With --self the U280 is not involved: the V80 imports its OWN exported
+ * window, so loom_ce copies HBM out over PCIe and back into its window (HBM)
+ * through the root complex. It measures the V80's receive path (and the
+ * self-loop, a local P2P path) without the U280 in front of it; the host
+ * checks the fence and every byte as for --land-v80.
+ *
+ * Usage: ce_local [--land-v80 | --self | --discard SECONDS] [bytes (multiple of 4 KiB, at most 64 MiB)] [copies]
  */
 #include <sys/mman.h>
 #include <unistd.h>
@@ -83,9 +89,10 @@ uint64_t pattern(uint64_t off, int rep) { return 0xCE00000000000000ULL ^ (off * 
 }  // namespace
 
 int main(int argc, char **argv) {
-    bool land = false;
+    bool land = false, self = false;
     double discard_s = 0;
     if (argc > 1 && strcmp(argv[1], "--land-v80") == 0) { land = true; argv++; argc--; }
+    else if (argc > 1 && strcmp(argv[1], "--self") == 0) { self = true; argv++; argc--; }
     else if (argc > 2 && strcmp(argv[1], "--discard") == 0) { discard_s = atof(argv[2]); argv += 2; argc -= 2; }
     const uint64_t size = (argc > 1) ? strtoull(argv[1], nullptr, 0) : (1ULL << 20);
     const int reps      = (argc > 2) ? atoi(argv[2]) : 1;
@@ -124,6 +131,49 @@ int main(int argc, char **argv) {
                (unsigned long) copies, (unsigned long) size, s, copies * size / s / 1e9,
                (unsigned long) (c1.v[1] - c0.v[1]));
         return 0;
+    }
+
+    if (self) {
+        land_v80::Landing L(v80, size + 4096);
+        void *sva = loom_switch::reserve_va(size + 4096);
+        v80.importDmabuf(L.export_fd(), sva);
+        printf("V80 uwin [0, %lu) imported into its own MMU at %p, landing at card VA %p\n",
+               (unsigned long) (size + 4096), sva, (void *) L.buf);
+        uint64_t *src = static_cast<uint64_t *>(v80.getMem({coyote::CoyoteAllocType::HPF, size}));
+        int errors = 0;
+        for (int r = 0; r < reps; r++) {
+            for (uint64_t i = 0; i < size / 8; i++) src[i] = pattern(8 * i, r);
+            v80.invoke(coyote::CoyoteOper::LOCAL_OFFLOAD, coyote::syncSg{src, size});
+            L.clear();
+            const uint64_t before = v80.getCSR(COPIES);
+            const V80Counters k0 = V80Counters::read(v80);
+            const land_v80::Counters u0 = land_v80::Counters::read(L.win);
+            v80.setCSR(reinterpret_cast<uint64_t>(src), SRC_VA);
+            v80.setCSR(reinterpret_cast<uint64_t>(sva), DST_VA);
+            v80.setCSR(size, LEN);
+            v80.setCSR(v80.getCtid(), PID);
+            v80.setCSR(reinterpret_cast<uint64_t>(sva) + size, FENCE_VA);
+            const auto t0 = std::chrono::steady_clock::now();
+            v80.setCSR(1, START);
+            const bool landed = L.wait(size, before + 1);
+            const auto t1 = std::chrono::steady_clock::now();
+            const land_v80::Counters u1 = land_v80::Counters::read(L.win);
+            const V80Counters k1 = V80Counters::read(v80);
+            L.pull();
+            uint64_t bad = 0;
+            for (uint64_t i = 0; i < size / 8; i++) bad += (L.buf[i] != pattern(8 * i, r));
+            const double us = std::chrono::duration<double, std::micro>(t1 - t0).count();
+            const bool ok = landed && L.buf[size / 8] == before + 1 && !bad;
+            errors += !ok;
+            printf("%s copy %d: %lu bytes, fence %s after %.1f us (%.2f GB/s), %lu of %lu words wrong; CE %lu cycles (%.2f GB/s)\n",
+                   ok ? "ok  " : "FAIL", r, (unsigned long) size, landed ? "seen" : "NOT seen", us, size / us / 1e3,
+                   (unsigned long) bad, (unsigned long) (size / 8), (unsigned long) v80.getCSR(CYCLES),
+                   size / (v80.getCSR(CYCLES) * 4e-9) / 1e9);
+            print_v80_delta(k0, k1);
+            u1.print(u0);
+        }
+        printf(errors ? "SELF FAIL\n" : "SELF PASS\n");
+        return errors ? 1 : 0;
     }
 
     // Destination and fence: host buffers of the U280's, or (--land-v80) the
