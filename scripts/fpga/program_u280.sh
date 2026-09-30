@@ -32,7 +32,8 @@ case $IMG in *.bit) ;; *) echo "$IMG is not a .bit" >&2; exit 1 ;; esac
 echo "== U280 at $BDF: $IMG"
 
 # 1. driver out, card off the bus
-if lsmod | grep -q '^coyote_driver '; then
+# grep -q under pipefail: lsmod dies of SIGPIPE and the test reads false
+if lsmod | grep '^coyote_driver ' >/dev/null; then
     echo "   unloading coyote_driver"
     sudo rmmod coyote_driver
 fi

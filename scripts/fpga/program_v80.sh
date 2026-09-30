@@ -33,7 +33,8 @@ case $IMG in *.pdi) ;; *) echo "$IMG is not a .pdi (V80 images are PDIs)" >&2; e
 echo "== V80 at $BDF: $IMG"
 
 # 1. driver out, card off the bus
-if lsmod | grep -q '^coyote_driver_versal '; then
+# grep -q under pipefail: lsmod dies of SIGPIPE and the test reads false
+if lsmod | grep '^coyote_driver_versal ' >/dev/null; then
     echo "   unloading coyote_driver_versal"
     sudo rmmod coyote_driver_versal
 fi
