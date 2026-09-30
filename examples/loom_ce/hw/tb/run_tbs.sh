@@ -22,33 +22,27 @@ if [ ! -f "$LYNX_PKG" ]; then
     exit 1
 fi
 
-TBS="${TBS:-tb_loom_ce}"
+TBS="${TBS:-tb_loom_ce tb_uwin_hbm}"
 # axisr_reg's register slice has a behavioural stand-in in examples/loom's tb
 SRCS="$LYNX_PKG $COYOTE_ROOT/hw/hdl/pkg/axi_intf.sv $COYOTE_ROOT/hw/hdl/pkg/lynx_intf.sv \
-      ../src/hdl/loom_ce_ctrl.sv ../src/hdl/loom_ce.sv ../src/hdl/loom_ingress.sv \
+      ../src/hdl/loom_ce_ctrl.sv ../src/hdl/loom_ce.sv \
       $LOOM_TB/sim_axisr_register_slice_512.sv \
-      $COYOTE_ROOT/hw/hdl/common/regs/axisr_reg.sv $USER_LOGIC"
-
-# loom_ingress is examples/loom_switch's, copied (the build takes an app's
-# sources from its own src/hdl): the copies must not drift apart
-cmp -s ../src/hdl/loom_ingress.sv $COYOTE_ROOT/examples/loom_switch/hw/src/hdl/loom_ingress.sv \
-    || { echo "ERROR: src/hdl/loom_ingress.sv differs from examples/loom_switch's"; exit 1; }
+      $COYOTE_ROOT/hw/hdl/common/regs/axisr_reg.sv $USER_LOGIC \
+      $COYOTE_ROOT/hw/hdl/common/regs/axi_reg_array.sv $COYOTE_ROOT/hw/hdl/common/queues/fifo.sv \
+      $COYOTE_ROOT/hw/hdl/common/queues/queue_meta.sv $COYOTE_ROOT/hw/hdl/stripe/axi_stripe_rd.sv \
+      $COYOTE_ROOT/hw/hdl/stripe/axi_stripe_wr.sv $COYOTE_ROOT/hw/hdl/stripe/axi_stripe.sv \
+      $COYOTE_ROOT/hw/hdl/common/uwin/uwin_hbm.sv"
 
 mkdir -p work && cd work
 
-# The landing's data FIFO is an XPM primitive: xelab links it from the
-# precompiled xpm library, which needs glbl
-GLBL=/share/xilinx/Vivado/2023.2/data/verilog/src/glbl.v
-
 echo "== xvlog =="
-xvlog $GLBL > xvlog_glbl.log 2>&1 || { tail -5 xvlog_glbl.log; echo "COMPILE FAILED (glbl)"; exit 1; }
 xvlog -sv $(for f in $SRCS; do echo ../$f; done) -i ../../src -i ../$COYOTE_ROOT/hw/hdl/pkg \
-    ../tb_loom_ce.sv > xvlog.log 2>&1 || { grep -E 'ERROR' xvlog.log | head -20; echo "COMPILE FAILED"; exit 1; }
+    ../tb_loom_ce.sv ../tb_uwin_hbm.sv > xvlog.log 2>&1 || { grep -E 'ERROR' xvlog.log | head -20; echo "COMPILE FAILED"; exit 1; }
 
 fail=0
 for tb in $TBS; do
     echo "== $tb =="
-    xelab -debug typical -L xpm "$tb" glbl -s "${tb}_sim" > "xelab_${tb}.log" 2>&1 \
+    xelab -debug typical "$tb" -s "${tb}_sim" > "xelab_${tb}.log" 2>&1 \
         || { grep -E 'ERROR' "xelab_${tb}.log" | head -20; echo "ELAB FAILED: $tb"; fail=1; continue; }
     xsim -R "${tb}_sim" > "xsim_${tb}.log" 2>&1
     if grep -q "TB PASS ($tb)" "xsim_${tb}.log"; then

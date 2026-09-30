@@ -18,36 +18,14 @@ import lynxTypes::*;
  *   8 BUSY     (RO) a copy is in flight
  *   9 COPIES   (RO) copies finished (the fence count)
  *  10 CYCLES   (RO) cycles from START to the data write's completion, last copy
- *
- * The landing window (the receive side: the U280's loom_rx writes into this
- * vFPGA's uwin peer-to-peer, and loom_ingress lands it in card memory):
- *  16 LAND_BASE (RW) card VA that uwin offset 0 lands at, 64 B-aligned
- *  17 LAND_LEN  (RW) window length in bytes, a multiple of 64; 0 = closed
- *                    (every write is dropped)
- *  18 LAND_PID  (RW) the cThread (ctid) whose address space LAND_BASE is in
- *  24 LAND_REQS    (RO) card writes posted (packets and 8 B stores)
- *  25 LAND_DONE    (RO) card writes completed
- *  26 LAND_BURSTS  (RO) uwin bursts taken
- *  27 LAND_DROPS   (RO) uwin bursts dropped (outside the window)
- *  28 LAND_STORES  (RO) 8 B stores posted
- *  29 LAND_PARTIAL (RO) beats with a partial 8 B word (not landed)
- *  32-45 (RO) the landing's loom_ingress debug counters (cnt_dbg, bit =
- *             word - 32; the order of examples/loom_switch's words 95-108):
- *             32 card out valid and not ready, 33 unused (net), 34 sending
- *             with the data FIFO empty, 35-39 W beat waits (no burst looked
- *             up, B slot, data FIFO, queue, stores), 40/41 drops (no window,
- *             past the end), 42-44 bursts of 1 / 2-4 / >4 beats, 45 bursts
- *             at a non-64 B-aligned address
- *  48 CE_OUT_BP   (RO) cycles the copy's write stream was valid and not ready
- *                      (the peer-to-peer writes into the U280 held back)
- *  49 CE_IN_WAIT  (RO) cycles the copy waited for card data (HBM read)
- *  50 WR_WAIT     (RO) cycles a request waited on sq_wr (either producer)
- * Counters are free-running; software takes deltas. LAND_DONE == LAND_REQS
- * means everything that entered the window is in card memory.
+ *  48 CE_OUT_BP  (RO) cycles the copy's write stream was valid and not ready
+ *                     (the peer-to-peer writes into the U280 held back)
+ *  49 CE_IN_WAIT (RO) cycles the copy waited for card data (HBM read)
+ *  50 WR_WAIT    (RO) cycles a write request waited on sq_wr
+ * The counters are free-running (software takes deltas); the pulses are
+ * registered once before they count.
  */
-module loom_ce_ctrl #(
-    parameter integer N_DBG = 14
-) (
+module loom_ce_ctrl (
     input  logic                        aclk,
     input  logic                        aresetn,
 
@@ -64,16 +42,6 @@ module loom_ce_ctrl #(
     input  logic [31:0]                 copies,
     input  logic [63:0]                 cycles,
 
-    output logic [VADDR_BITS-1:0]       land_base,
-    output logic [LEN_BITS-1:0]         land_len,
-    output logic [PID_BITS-1:0]         land_pid,
-    input  logic                        cnt_land_req,
-    input  logic                        cnt_land_done,
-    input  logic                        cnt_land_burst,
-    input  logic                        cnt_land_drop,
-    input  logic                        cnt_land_store,
-    input  logic                        cnt_land_partial,
-    input  logic [N_DBG-1:0]            cnt_land_dbg,
     input  logic                        cnt_ce_out_bp,
     input  logic                        cnt_ce_in_wait,
     input  logic                        cnt_wr_wait
@@ -91,14 +59,8 @@ localparam integer R_FENCE_VA = 5;
 localparam integer R_BUSY     = 8;
 localparam integer R_COPIES   = 9;
 localparam integer R_CYCLES   = 10;
-localparam integer R_LAND_BASE = 16;
-localparam integer R_LAND_LEN  = 17;
-localparam integer R_LAND_PID  = 18;
-localparam integer R_LAND_CNT  = 24;   // 24-29, in the order of cnt_land below
-localparam integer N_LAND_CNT  = 6;
-localparam integer R_LAND_DBG  = 32;   // 32-45
-localparam integer R_PERF      = 48;   // 48-50, in the order of perf_pulse below
-localparam integer N_PERF      = 3;
+localparam integer R_PERF     = 48;   // 48-50, in the order of perf_pulse below
+localparam integer N_PERF     = 3;
 
 logic [15:0] axi_awaddr, axi_araddr;
 logic        axi_awready, axi_arready, axi_wready, axi_bvalid, axi_rvalid, aw_en;
@@ -114,13 +76,11 @@ wire [CSR_BITS-1:0] rd_idx = axi_araddr[ADDR_LSB +: CSR_BITS];
 // empty-strobe writes around a host ctrl write's line cannot fire it; the
 // other registers take full-strobe writes only (as examples/loom)
 logic [63:0] r_src, r_dst, r_len, r_pid, r_fence;
-logic [63:0] r_land_base, r_land_len, r_land_pid;
 assign start = ctrl_reg_wren && (wr_idx == R_START) && axi_ctrl.wstrb[0] && axi_ctrl.wdata[0];
 
 always_ff @(posedge aclk) begin
     if (!aresetn) begin
         r_src <= 0; r_dst <= 0; r_len <= 0; r_pid <= 0; r_fence <= 0;
-        r_land_base <= 0; r_land_len <= 0; r_land_pid <= 0;
     end else if (ctrl_reg_wren && (&axi_ctrl.wstrb)) begin
         case (wr_idx)
             R_SRC_VA:   r_src   <= axi_ctrl.wdata;
@@ -128,9 +88,6 @@ always_ff @(posedge aclk) begin
             R_LEN:      r_len   <= axi_ctrl.wdata;
             R_PID:      r_pid   <= axi_ctrl.wdata;
             R_FENCE_VA: r_fence <= axi_ctrl.wdata;
-            R_LAND_BASE: r_land_base <= axi_ctrl.wdata;
-            R_LAND_LEN:  r_land_len  <= axi_ctrl.wdata;
-            R_LAND_PID:  r_land_pid  <= axi_ctrl.wdata;
             default: ;
         endcase
     end
@@ -141,33 +98,16 @@ assign dst_va   = r_dst[VADDR_BITS-1:0];
 assign len      = r_len[LEN_BITS-1:0];
 assign pid      = r_pid[PID_BITS-1:0];
 assign fence_va = r_fence[VADDR_BITS-1:0];
-assign land_base = r_land_base[VADDR_BITS-1:0];
-assign land_len  = r_land_len[LEN_BITS-1:0];
-assign land_pid  = r_land_pid[PID_BITS-1:0];
 
-// Landing, landing-debug and copy counters, the pulses registered once
-logic [63:0] land_cnt [N_LAND_CNT];
-logic [63:0] dbg_cnt  [N_DBG];
-logic [63:0] perf_cnt [N_PERF];
-logic [N_LAND_CNT-1:0] land_pulse;
-logic [N_DBG-1:0]      dbg_pulse;
-logic [N_PERF-1:0]     perf_pulse;
+logic [63:0]       perf_cnt [N_PERF];
+logic [N_PERF-1:0] perf_pulse;
 always_ff @(posedge aclk) begin
     if (!aresetn) begin
-        land_pulse <= '0;
-        dbg_pulse  <= '0;
         perf_pulse <= '0;
-        for (int i = 0; i < N_LAND_CNT; i++) land_cnt[i] <= 0;
-        for (int i = 0; i < N_DBG; i++)      dbg_cnt[i]  <= 0;
-        for (int i = 0; i < N_PERF; i++)     perf_cnt[i] <= 0;
+        for (int i = 0; i < N_PERF; i++) perf_cnt[i] <= 0;
     end else begin
-        land_pulse <= {cnt_land_partial, cnt_land_store, cnt_land_drop,
-                       cnt_land_burst, cnt_land_done, cnt_land_req};
-        dbg_pulse  <= cnt_land_dbg;
         perf_pulse <= {cnt_wr_wait, cnt_ce_in_wait, cnt_ce_out_bp};
-        for (int i = 0; i < N_LAND_CNT; i++) if (land_pulse[i]) land_cnt[i] <= land_cnt[i] + 1;
-        for (int i = 0; i < N_DBG; i++)      if (dbg_pulse[i])  dbg_cnt[i]  <= dbg_cnt[i] + 1;
-        for (int i = 0; i < N_PERF; i++)     if (perf_pulse[i]) perf_cnt[i] <= perf_cnt[i] + 1;
+        for (int i = 0; i < N_PERF; i++) if (perf_pulse[i]) perf_cnt[i] <= perf_cnt[i] + 1;
     end
 end
 
@@ -183,15 +123,8 @@ always_ff @(posedge aclk) begin
             R_BUSY:     axi_rdata <= {63'b0, busy};
             R_COPIES:   axi_rdata <= {32'b0, copies};
             R_CYCLES:   axi_rdata <= cycles;
-            R_LAND_BASE: axi_rdata <= r_land_base;
-            R_LAND_LEN:  axi_rdata <= r_land_len;
-            R_LAND_PID:  axi_rdata <= r_land_pid;
             default:
-                if (rd_idx >= R_LAND_CNT && rd_idx < R_LAND_CNT + N_LAND_CNT)
-                    axi_rdata <= land_cnt[rd_idx - R_LAND_CNT];
-                else if (rd_idx >= R_LAND_DBG && rd_idx < R_LAND_DBG + N_DBG)
-                    axi_rdata <= dbg_cnt[rd_idx - R_LAND_DBG];
-                else if (rd_idx >= R_PERF && rd_idx < R_PERF + N_PERF)
+                if (rd_idx >= R_PERF && rd_idx < R_PERF + N_PERF)
                     axi_rdata <= perf_cnt[rd_idx - R_PERF];
                 else
                     axi_rdata <= 0;
