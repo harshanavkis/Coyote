@@ -38,7 +38,7 @@ import lynxTypes::*;
 module design_user_logic_c{{ c_cnfg }}_{{ c_reg }} (
     // AXI4L CONTROL
     AXI4L.s                     axi_ctrl,
-{% if cnfg.en_uwin %}
+{% if cnfg.en_uwin and not cnfg.en_uwin_hbm %}
 
     // AXI4 USER DATA WINDOW
     AXI4.s                      axi_udata,

@@ -223,6 +223,13 @@ set(EN_AVX 1 CACHE STRING "AVX environment")
 # reads return whatever the vFPGA answers. No EN_UCLK.
 set(EN_UWIN 0 CACHE STRING "User data window")
 
+# User data window into HBM (Versal, with EN_UWIN): the window does not go to
+# the vFPGA but through its own HBM channel straight into card memory, uwin
+# offset x at HBM (card) physical address UWIN_HBM_BASE + x - the last HBM
+# block, which the driver keeps out of its allocator. A peer writing into
+# the exported window writes into HBM, like into a GPU's BAR.
+set(EN_UWIN_HBM 0 CACHE STRING "User data window into HBM")
+
 # Enable writeback, for polling completions from the host CPU --- best NOT to change
 set(EN_WB 1 CACHE STRING "Enable writeback")
 
@@ -672,6 +679,10 @@ macro(validation_checks_hw)
         if(EN_MEM)
             MATH(EXPR N_MEM_CHAN "${N_REGIONS} * ${N_CARD_AXI} + 1 + ${N_MEM_CHAN}")
         endif()
+        if(EN_UWIN_HBM)
+            # the window's own HBM channel, after the vFPGA card channels
+            MATH(EXPR N_MEM_CHAN "${N_MEM_CHAN} + 1")
+        endif()
         if(EN_TCP OR EN_RDMA)
             MATH(EXPR N_MEM_CHAN "${N_NET_CHAN} + ${N_MEM_CHAN}")
         endif()
@@ -742,6 +753,18 @@ macro(validation_checks_hw)
         ##
         ## User data window
         ##
+
+        if(EN_UWIN_HBM)
+            if(NOT EN_UWIN OR NOT FPGA_ARCH STREQUAL "versal" OR NOT EN_MEM)
+                message(FATAL_ERROR "EN_UWIN_HBM needs EN_UWIN, EN_MEM and a Versal device.")
+            endif()
+            if(NOT N_REGIONS EQUAL 1)
+                message(FATAL_ERROR "EN_UWIN_HBM supports one vFPGA region (the window has one HBM channel).")
+            endif()
+            if(EN_TCP OR EN_RDMA)
+                message(FATAL_ERROR "EN_UWIN_HBM does not support networking on the same card (the HBM channels assume no network channels).")
+            endif()
+        endif()
 
         if(EN_UWIN)
             if(EN_UCLK)

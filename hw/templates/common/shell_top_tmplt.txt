@@ -1492,7 +1492,7 @@ module shell_top (
         .s_axim_udata(axim_udata[0+:{{ cnfg.n_reg }}]),
 {% endif %}
 {% if cnfg.en_mem %}
-        .m_axi_ddr(axi_mem[{{ cnfg.n_net_chan }}+:{{ (1+cnfg.n_reg*cnfg.n_card_axi) }}]),
+        .m_axi_ddr(axi_mem[{{ cnfg.n_net_chan }}+:{{ (1+cnfg.n_reg*cnfg.n_card_axi+(cnfg.en_uwin_hbm or 0)) }}]),
 {% endif %}
 {% if cnfg.en_strm %}
         .m_host_dma_rd_req(dma_rd_req[{{ cnfg.strm_chan }}]),

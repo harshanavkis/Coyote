@@ -47,6 +47,9 @@
 {% if cnfg.en_uwin %}
 `define EN_UWIN
 {% endif %}
+{% if cnfg.en_uwin_hbm %}
+`define EN_UWIN_HBM
+{% endif %}
 {% if cnfg.en_wb %}
 `define EN_WB
 {% endif %}
@@ -381,6 +384,11 @@ package lynxTypes;
     localparam integer N_DDR_CHAN_BITS = clog2s({{ cnfg.n_ddr_chan }});
     localparam integer N_MEM_CHAN = {{ cnfg.n_mem_chan }};
     localparam integer N_MEM_CHAN_BITS = clog2s({{ cnfg.n_mem_chan }});
+{% if cnfg.en_uwin_hbm %}
+    // EN_UWIN_HBM: uwin offset x lands at card physical address UWIN_HBM_BASE + x,
+    // the last HBM block (driver: UWIN_HBM_BASE in coyote_defs.h, must match)
+    localparam logic [63:0] UWIN_HBM_BASE = 64'h47_E000_0000;
+{% endif %}
     localparam integer N_STRIPE_CHAN = {{ cnfg.n_stripe_chan }};
     localparam integer N_STRIPE_CHAN_BITS = clog2s({{ cnfg.n_stripe_chan }});
     localparam integer STRIPE_FRAG_SIZE = {{ cnfg.stripe_frag_size }};

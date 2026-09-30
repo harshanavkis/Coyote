@@ -98,6 +98,7 @@ set cfg(en_shell_pblock)        ${EN_SHELL_PBLOCK}
 set cfg(n_outs)                 ${N_OUTSTANDING}
 set cfg(en_avx)                 ${EN_AVX}
 set cfg(en_uwin)                ${EN_UWIN}
+set cfg(en_uwin_hbm)            ${EN_UWIN_HBM}
 set cfg(en_wb)                  ${EN_WB}
 set cfg(en_rdma)                ${EN_RDMA}
 set cfg(en_tcp)                 ${EN_TCP}   

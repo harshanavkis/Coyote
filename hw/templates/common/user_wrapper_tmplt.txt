@@ -57,7 +57,7 @@ module design_user_wrapper_{{ c_reg }} (
     (* io_buffer_type = "none" *) input  logic[(AXIL_DATA_BITS/8)-1:0]        axi_ctrl_wstrb,
     (* io_buffer_type = "none" *) input  logic                                axi_ctrl_wvalid,
 
-{% if cnfg.en_uwin %}
+{% if cnfg.en_uwin and not cnfg.en_uwin_hbm %}
     // AXI4 USER DATA WINDOW
     (* io_buffer_type = "none" *) input  logic[AXI_ID_BITS-1:0]                   axi_udata_arid,
     (* io_buffer_type = "none" *) input  logic[AXI_ADDR_BITS-1:0]                 axi_udata_araddr,
@@ -330,7 +330,7 @@ module design_user_wrapper_{{ c_reg }} (
     assign axi_ctrl_rvalid                      = axi_ctrl_user.rvalid;
     assign axi_ctrl_wready                      = axi_ctrl_user.wready;
 
-{% if cnfg.en_uwin %}
+{% if cnfg.en_uwin and not cnfg.en_uwin_hbm %}
     // AXI4 user data window
     AXI4 axi_udata_user(.*);
 
@@ -1167,7 +1167,7 @@ module design_user_wrapper_{{ c_reg }} (
 
     design_user_logic_c{{ c_cnfg }}_{{ c_reg }} inst_user_c{{ c_cnfg }}_{{ c_reg }} (
 	    .axi_ctrl(axi_ctrl_user),
-    {% if cnfg.en_uwin %}
+    {% if cnfg.en_uwin and not cnfg.en_uwin_hbm %}
         .axi_udata(axi_udata_user),
     {% endif %}
         .notify(notify),
