@@ -15,6 +15,19 @@ import lynxTypes::*;
  * rewrites last), but this window answers the shell's interconnect, which
  * needs AXI's rlast. So rlast is made here: each accepted read's length is
  * queued (in order: one ID), and rlast is raised on its last beat.
+ *
+ * COUNTERS: where a peer's writes into the window spend their cycles. A read
+ * of the window's last 4 KiB page returns them instead of HBM (the read still
+ * goes to HBM, for its beats; only the data is replaced): 64-bit word i at
+ * page offset 8*i, free-running, the reader takes deltas.
+ *   0 cycles            6 B responses
+ *   1 AW bursts         7 B stalled (bvalid, !bready)
+ *   2 W beats           8 cycles with a write outstanding (AW taken, no B yet)
+ *   3 W stalled         9 sum of writes outstanding over cycles
+ *     (wvalid, !wready: memory side slow)       (/ bursts = mean AW-to-B cycles)
+ *   4 W starved         10 most writes outstanding at once
+ *     (beats announced by AW, !wvalid: PCIe side slow)
+ *   5 AW stalled        11 W beats with a partial strobe
  */
 module uwin_hbm #(
     parameter integer          UWIN_BITS = 27,
@@ -39,8 +52,12 @@ assign m_axi.arprot   = s_axi.arprot;
 assign m_axi.arqos    = s_axi.arqos;
 assign m_axi.arregion = s_axi.arregion;
 assign m_axi.arsize   = s_axi.arsize;
-// a read is accepted only with room to remember its length
+// a read is accepted only with room to remember its length (and whether it
+// reads the counter page, from which line)
+localparam integer N_CTR = 12;
 logic [7:0] rq_len [N_RD];
+logic       rq_ctr [N_RD];
+logic [5:0] rq_line [N_RD];
 logic [$clog2(N_RD):0] rq_wp, rq_rp;
 wire rq_full  = (rq_wp - rq_rp) == ($clog2(N_RD)+1)'(N_RD);
 logic [7:0] r_beat;
@@ -74,9 +91,51 @@ assign s_axi.bresp    = m_axi.bresp;
 assign s_axi.bvalid   = m_axi.bvalid;
 assign m_axi.bready   = s_axi.bready;
 
-assign s_axi.rdata    = m_axi.rdata;
+// Counters
+logic [63:0] ctr [N_CTR];
+logic signed [15:0] w_owed;          // beats announced by AW, not yet on W
+logic [15:0]        wr_out;          // AW taken, B not yet
+wire aw_hs = s_axi.awvalid && s_axi.awready;
+wire w_hs  = s_axi.wvalid && s_axi.wready;
+wire b_hs  = s_axi.bvalid && s_axi.bready;
+
+always_ff @(posedge aclk) begin
+    if (!aresetn) begin
+        for (int i = 0; i < N_CTR; i++) ctr[i] <= '0;
+        w_owed <= '0;
+        wr_out <= '0;
+    end else begin
+        w_owed <= w_owed + (aw_hs ? 16'(s_axi.awlen) + 16'sd1 : 16'sd0) - (w_hs ? 16'sd1 : 16'sd0);
+        wr_out <= wr_out + (aw_hs ? 16'd1 : 16'd0) - (b_hs ? 16'd1 : 16'd0);
+        ctr[0]  <= ctr[0] + 1;
+        ctr[1]  <= ctr[1] + aw_hs;
+        ctr[2]  <= ctr[2] + w_hs;
+        ctr[3]  <= ctr[3] + (s_axi.wvalid && !s_axi.wready);
+        ctr[4]  <= ctr[4] + ((w_owed > 0) && !s_axi.wvalid);
+        ctr[5]  <= ctr[5] + (s_axi.awvalid && !s_axi.awready);
+        ctr[6]  <= ctr[6] + b_hs;
+        ctr[7]  <= ctr[7] + (s_axi.bvalid && !s_axi.bready);
+        ctr[8]  <= ctr[8] + (wr_out != 0);
+        ctr[9]  <= ctr[9] + wr_out;
+        if (64'(wr_out) > ctr[10]) ctr[10] <= 64'(wr_out);
+        ctr[11] <= ctr[11] + (w_hs && (s_axi.wstrb != '1));
+    end
+end
+
+// A counter-page read's beat: line rq_line + r_beat, eight counters per line
+wire [$clog2(N_RD)-1:0] rp = rq_rp[$clog2(N_RD)-1:0];
+wire [5:0] r_line = rq_line[rp] + r_beat[5:0];
+logic [AXI_DATA_BITS-1:0] ctr_data;
+always_comb begin
+    ctr_data = '0;
+    for (int j = 0; j < AXI_DATA_BITS/64; j++)
+        if (8*r_line + j < N_CTR) ctr_data[64*j +: 64] = ctr[8*r_line + j];
+end
+wire ar_ctr = (s_axi.araddr[UWIN_BITS-1:12] == '1);
+
+assign s_axi.rdata    = rq_ctr[rp] ? ctr_data : m_axi.rdata;
 assign s_axi.rid      = m_axi.rid;
-wire  r_last = (r_beat == rq_len[rq_rp[$clog2(N_RD)-1:0]]);
+wire  r_last = (r_beat == rq_len[rp]);
 assign s_axi.rlast    = r_last;
 
 always_ff @(posedge aclk) begin
@@ -86,7 +145,9 @@ always_ff @(posedge aclk) begin
         r_beat <= '0;
     end else begin
         if (s_axi.arvalid && s_axi.arready) begin
-            rq_len[rq_wp[$clog2(N_RD)-1:0]] <= s_axi.arlen;
+            rq_len[rq_wp[$clog2(N_RD)-1:0]]  <= s_axi.arlen;
+            rq_ctr[rq_wp[$clog2(N_RD)-1:0]]  <= ar_ctr;
+            rq_line[rq_wp[$clog2(N_RD)-1:0]] <= s_axi.araddr[11:6];
             rq_wp <= rq_wp + 1'b1;
         end
         if (m_axi.rvalid && s_axi.rready) begin

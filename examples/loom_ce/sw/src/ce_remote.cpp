@@ -45,7 +45,7 @@
  * the client its waits on the window and on sq_wr, the server loom_rx's
  * moving / starved / stalled cycles; the client also its U280 ingress's
  * debug counters and its copy engine's (V80 words 48-50), a V80-landing
- * server the landing's (24-29, 32-45).
+ * server the V80 window's (uwin_hbm, read through the window's last page).
  */
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -177,12 +177,15 @@ int run_server(uint16_t port, uint64_t size, bool land) {
     Announce an;
     while (read_full(c, &an, sizeof(an)) && an.rep != ~0ULL) {
         const Counters k0 = Counters::read(t_qp);
+        land_v80::Counters u0{}, u1{};
+        if (land) u0 = land_v80::Counters::read(L->win);
         auto t0 = std::chrono::steady_clock::now();
         Verdict v{};
         if (land) {
             // the fence, read through the V80's window, then the data synced back
             (void) L->wait(size, an.fence);
             v.wait_us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
+            u1 = land_v80::Counters::read(L->win);
             L->pull();
             vdst = L->buf;
             v.fence = L->buf[size / 8];
@@ -204,6 +207,7 @@ int run_server(uint16_t port, uint64_t size, bool land) {
         printf("     loom_rx over %lu cycles: %lu moving, %lu starved (nothing arrived), %lu stalled (host write not ready), rx FIFO full %lu\n",
                (unsigned long) k1.d(k0, C_CYC), (unsigned long) k1.d(k0, C_RX_MOVE), (unsigned long) k1.d(k0, C_RX_STARVE),
                (unsigned long) k1.d(k0, C_RX_STALL), (unsigned long) k1.d(k0, C_RX_FF));
+        if (land) u1.print(u0);
         errors += (v.bad != 0);
         copies++;
         // the next copy must write every byte again

@@ -266,6 +266,50 @@ initial begin
     `CHECK(aw_expect.size() == 0, "uwin_hbm: expected write addresses not all seen")
     $display("ok   T4 the window's last line; uwin_hbm addresses exact");
 
+    // --- T5: the counters, read through the window's last page. T1-T4 wrote
+    //     64 x 4-beat bursts + 33 single beats (17 with a partial strobe) + 1,
+    //     one at a time (so never more than one outstanding)
+    begin
+        logic [63:0] c [16];
+        int got = 0;
+        @(negedge aclk); win_in.araddr = BAR + UWIN_SIZE - 4096; win_in.arlen = 1; win_in.arvalid = 1;
+        do @(posedge aclk); while (!win_in.arready);
+        @(negedge aclk); win_in.arvalid = 0;
+        while (got < 2) begin
+            @(posedge aclk);
+            if (win_in.rvalid && win_in.rready) begin
+                for (int j = 0; j < 8; j++) c[8*got + j] = win_in.rdata[64*j +: 64];
+                `CHECK(win_in.rlast == (got == 1), "T5: rlast")
+                got++;
+            end
+        end
+        `CHECK(c[0] > 0,     $sformatf("T5: cycles %0d", c[0]))
+        `CHECK(c[1] == 98,   $sformatf("T5: AW bursts %0d, want 98", c[1]))
+        `CHECK(c[2] == 290,  $sformatf("T5: W beats %0d, want 290", c[2]))
+        `CHECK(c[3] > 0,     $sformatf("T5: W stalled %0d (the memory model drops wready)", c[3]))
+        `CHECK(c[6] == 98,   $sformatf("T5: B %0d, want 98", c[6]))
+        `CHECK(c[8] > 0 && c[9] == c[8], $sformatf("T5: outstanding cycles %0d, sum %0d", c[8], c[9]))
+        `CHECK(c[10] == 1,   $sformatf("T5: max outstanding %0d, want 1", c[10]))
+        `CHECK(c[11] == 17,  $sformatf("T5: partial beats %0d, want 17", c[11]))
+        for (int i = 12; i < 16; i++) `CHECK(c[i] == 0, $sformatf("T5: word %0d = %0d, want 0", i, c[i]))
+        // a single beat at the second line: words 8-11, then zeros
+        got = 0;
+        @(negedge aclk); win_in.araddr = BAR + UWIN_SIZE - 4096 + 64; win_in.arlen = 0; win_in.arvalid = 1;
+        do @(posedge aclk); while (!win_in.arready);
+        @(negedge aclk); win_in.arvalid = 0;
+        while (!got) begin
+            @(posedge aclk);
+            if (win_in.rvalid && win_in.rready) begin
+                `CHECK(win_in.rdata[64*2 +: 64] == 1 && win_in.rdata[64*3 +: 64] == 17 && win_in.rdata[64*4 +: 64] == 0 && win_in.rlast,
+                       "T5: second line read alone")
+                got = 1;
+            end
+        end
+    end
+    // reads elsewhere still return HBM
+    rd_check("T5 HBM", 1, BAR + 64'h4_0000, UWIN_HBM_BASE + 64'h4_0000, 4, 4);
+    $display("ok   T5 counters through the window's last page; other reads still HBM");
+
     if (errors == 0) $display("TB PASS (tb_uwin_hbm)");
     else             $display("TB FAIL (tb_uwin_hbm): %0d errors", errors);
     $finish;
