@@ -217,9 +217,10 @@ set(EN_STATS 1 CACHE STRING "Enable driver sysfs statistics")
 # Enable AVX (for host CPUs which include AVX), enabling faste data transfer
 set(EN_AVX 1 CACHE STRING "AVX environment")
 
-# User data window (uwin): a 512-bit AXI4 port into each vFPGA, at bypass-BAR
-# offset 0x0800_0000 (128 MB, split equally between regions); writes only,
-# reads return whatever the vFPGA answers. UltraScale+ only, no EN_UCLK.
+# User data window (uwin): a 512-bit AXI4 port into each vFPGA, at offset
+# 0x0800_0000 of the BAR that carries the shell registers (the U280's bypass
+# BAR, the V80's BAR4; 128 MB, split equally between regions); writes only,
+# reads return whatever the vFPGA answers. No EN_UCLK.
 set(EN_UWIN 0 CACHE STRING "User data window")
 
 # Enable writeback, for polling completions from the host CPU --- best NOT to change
@@ -743,9 +744,6 @@ macro(validation_checks_hw)
         ##
 
         if(EN_UWIN)
-            if(NOT FPGA_ARCH STREQUAL "ultrascale_plus")
-                message(FATAL_ERROR "EN_UWIN is only supported on UltraScale+ devices.")
-            endif()
             if(EN_UCLK)
                 message(FATAL_ERROR "EN_UWIN does not support EN_UCLK (no AXI4 clock crossing on the uwin path).")
             endif()

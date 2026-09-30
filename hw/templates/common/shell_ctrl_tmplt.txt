@@ -200,34 +200,46 @@ design_ctrl inst_design_ctrl (
     .axim_udata_{{ i }}_araddr(axim_udata[{{ i }}].araddr),
     .axim_udata_{{ i }}_arburst(axim_udata[{{ i }}].arburst),
     .axim_udata_{{ i }}_arcache(axim_udata[{{ i }}].arcache),
+    {% if cnfg.fpga_arch == 'ultrascale_plus' %}
     .axim_udata_{{ i }}_arid(axim_udata[{{ i }}].arid),
+    {% endif %}
     .axim_udata_{{ i }}_arlen(axim_udata[{{ i }}].arlen),
     .axim_udata_{{ i }}_arlock(axim_udata[{{ i }}].arlock),
     .axim_udata_{{ i }}_arprot(axim_udata[{{ i }}].arprot),
     .axim_udata_{{ i }}_arqos(axim_udata[{{ i }}].arqos),
     .axim_udata_{{ i }}_arready(axim_udata[{{ i }}].arready),
+    {% if cnfg.fpga_arch == 'ultrascale_plus' %}
     .axim_udata_{{ i }}_arregion(axim_udata[{{ i }}].arregion),
+    {% endif %}
     .axim_udata_{{ i }}_arsize(axim_udata[{{ i }}].arsize),
     .axim_udata_{{ i }}_arvalid(axim_udata[{{ i }}].arvalid),
     .axim_udata_{{ i }}_awaddr(axim_udata[{{ i }}].awaddr),
     .axim_udata_{{ i }}_awburst(axim_udata[{{ i }}].awburst),
     .axim_udata_{{ i }}_awcache(axim_udata[{{ i }}].awcache),
+    {% if cnfg.fpga_arch == 'ultrascale_plus' %}
     .axim_udata_{{ i }}_awid(axim_udata[{{ i }}].awid),
+    {% endif %}
     .axim_udata_{{ i }}_awlen(axim_udata[{{ i }}].awlen),
     .axim_udata_{{ i }}_awlock(axim_udata[{{ i }}].awlock),
     .axim_udata_{{ i }}_awprot(axim_udata[{{ i }}].awprot),
     .axim_udata_{{ i }}_awqos(axim_udata[{{ i }}].awqos),
     .axim_udata_{{ i }}_awready(axim_udata[{{ i }}].awready),
+    {% if cnfg.fpga_arch == 'ultrascale_plus' %}
     .axim_udata_{{ i }}_awregion(axim_udata[{{ i }}].awregion),
+    {% endif %}
     .axim_udata_{{ i }}_awsize(axim_udata[{{ i }}].awsize),
     .axim_udata_{{ i }}_awvalid(axim_udata[{{ i }}].awvalid),
+    {% if cnfg.fpga_arch == 'ultrascale_plus' %}
     .axim_udata_{{ i }}_bid(axim_udata[{{ i }}].bid),
+    {% endif %}
     .axim_udata_{{ i }}_bready(axim_udata[{{ i }}].bready),
     .axim_udata_{{ i }}_bresp(axim_udata[{{ i }}].bresp),
     .axim_udata_{{ i }}_bvalid(axim_udata[{{ i }}].bvalid),
     .axim_udata_{{ i }}_rdata(axim_udata[{{ i }}].rdata),
     .axim_udata_{{ i }}_rlast(axim_udata[{{ i }}].rlast),
+    {% if cnfg.fpga_arch == 'ultrascale_plus' %}
     .axim_udata_{{ i }}_rid(axim_udata[{{ i }}].rid),
+    {% endif %}
     .axim_udata_{{ i }}_rready(axim_udata[{{ i }}].rready),
     .axim_udata_{{ i }}_rresp(axim_udata[{{ i }}].rresp),
     .axim_udata_{{ i }}_rvalid(axim_udata[{{ i }}].rvalid),
@@ -290,5 +302,16 @@ design_ctrl inst_design_ctrl (
     .lckresetn(lckresetn),
     .sys_reset(sys_reset)
 );
+{% if cnfg.en_uwin and cnfg.fpga_arch == 'versal' %}
+
+// The SmartConnect's uwin ports carry no IDs or regions either: the vFPGA
+// sees ID 0 and region 0, and the IDs it echoes are not used
+for (genvar i = 0; i < N_REGIONS; i++) begin
+    assign axim_udata[i].awid     = '0;
+    assign axim_udata[i].arid     = '0;
+    assign axim_udata[i].awregion = '0;
+    assign axim_udata[i].arregion = '0;
+end
+{% endif %}
 
 endmodule

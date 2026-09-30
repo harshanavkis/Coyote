@@ -147,6 +147,31 @@ proc cr_bd_design_ctrl { parentCell } {
     }
   }
 
+  # User data window (uwin): 512-bit AXI4 into each vFPGA
+  if {$cnfg(en_uwin) eq 1} {
+    for {set i 0}  {$i < $cnfg(n_reg)} {incr i} {
+      set cmd "set axim_udata_$i \[ create_bd_intf_port -mode Master -vlnv xilinx.com:interface:aximm_rtl:1.0 axim_udata_$i ]
+              set_property -dict \[ list \
+                CONFIG.ADDR_WIDTH {64} \
+                CONFIG.DATA_WIDTH {512} \
+                CONFIG.HAS_BRESP {1} \
+                CONFIG.HAS_BURST {1} \
+                CONFIG.HAS_CACHE {1} \
+                CONFIG.HAS_LOCK {1} \
+                CONFIG.HAS_PROT {1} \
+                CONFIG.HAS_QOS {0} \
+                CONFIG.HAS_REGION {0} \
+                CONFIG.HAS_RRESP {1} \
+                CONFIG.HAS_WSTRB {1} \
+                CONFIG.NUM_READ_OUTSTANDING {8} \
+                CONFIG.NUM_WRITE_OUTSTANDING {8} \
+                CONFIG.PROTOCOL {AXI4} \
+                CONFIG.READ_WRITE_MODE {READ_WRITE} \
+              ] \$axim_udata_$i"
+      eval $cmd
+    }
+  }
+
 ########################################################################################################
 # Create ports
 ########################################################################################################
@@ -184,6 +209,11 @@ proc cr_bd_design_ctrl { parentCell } {
             if {$cnfg(en_avx) eq 1} {
                 for {set i 0}  {$i < $cnfg(n_reg)} {incr i} {
                     append cmd ":axim_ctrl_$i"
+                }
+            }
+            if {$cnfg(en_uwin) eq 1} {
+                for {set i 0}  {$i < $cnfg(n_reg)} {incr i} {
+                    append cmd ":axim_udata_$i"
                 }
             }
             append cmd "} \
@@ -225,6 +255,11 @@ proc cr_bd_design_ctrl { parentCell } {
     set ic0_mi [expr {2*$cnfg(n_reg) + 1}]
   } else {
     set ic0_mi [expr {$cnfg(n_reg) + 1}]
+  }
+  # The uwin ports follow the control ports
+  set ic0_udata $ic0_mi
+  if {$cnfg(en_uwin) eq 1} {
+    set ic0_mi [expr {$ic0_mi + $cnfg(n_reg)}]
   }
 
   set axi_interconnect_0 [ create_bd_cell -type ip -vlnv xilinx.com:ip:smartconnect:1.0 axi_interconnect_0 ]
@@ -284,6 +319,15 @@ proc cr_bd_design_ctrl { parentCell } {
     }
   }
 
+  # User data window
+  if {$cnfg(en_uwin) eq 1} {
+    for {set i 0}  {$i < $cnfg(n_reg)} {incr i} {
+      set j [expr {$ic0_udata + $i}]
+      set cmd [format "connect_bd_intf_net -intf_net axi_interconnect_0_M%02d_AXI \[get_bd_intf_ports axim_udata_%d] \[get_bd_intf_pins axi_interconnect_0/M%02d_AXI]" $j $i $j]
+      eval $cmd
+    }
+  }
+
   if {$cnfg(en_pr) eq 0} {
     connect_bd_intf_net [get_bd_intf_ports axi_debug_hub] [get_bd_intf_pins axi_dbg_hub_0/S_AXI]
   }
@@ -333,6 +377,19 @@ proc cr_bd_design_ctrl { parentCell } {
   } else {
     for {set i 0}  {$i < $cnfg(n_reg)} {incr i} {
       set cmd [format "create_bd_addr_seg -range 0x00040000 -offset 0x000%02x0000 \[get_bd_addr_spaces /axi_main] \[get_bd_addr_segs axi_ctrl_$i/Reg] SEG_axi_ctrl_$i\_Reg" [expr {0x10 + $i * 4}]]
+      eval $cmd
+    }
+  }
+
+  # User data window: 0x0800_0000..0x0FFF_FFFF of BAR4, split equally
+  # (power-of-two ranges, as address segments must be) between the regions
+  if {$cnfg(en_uwin) eq 1} {
+    set uwin_range 0x08000000
+    for {set n 1} {$n < $cnfg(n_reg)} {set n [expr {$n * 2}]} {
+      set uwin_range [expr {$uwin_range / 2}]
+    }
+    for {set i 0}  {$i < $cnfg(n_reg)} {incr i} {
+      set cmd [format "create_bd_addr_seg -range 0x%08x -offset 0x%08x \[get_bd_addr_spaces /axi_main] \[get_bd_addr_segs axim_udata_$i/Reg] SEG_axim_udata_$i\_Reg" $uwin_range [expr {0x08000000 + $i * $uwin_range}]]
       eval $cmd
     }
   }
