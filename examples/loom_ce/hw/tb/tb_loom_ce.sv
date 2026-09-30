@@ -12,7 +12,11 @@ import lynxTypes::*;
  * count can end a copy. Covers: a copy with a fence and one without, the
  * exact requests, data and fence value; START while busy ignored; a 64 KiB
  * copy under random backpressure on every channel; CSR readback; the cycle
- * counter stopping at the data write's completion.
+ * counter stopping at the data write's completion. The landing window: uwin
+ * bursts become card writes at LAND_BASE + offset (a packet, 32 B half
+ * lines and an 8 B store as 8 B writes), writes outside it dropped, the
+ * landing counters; then a copy and a landing at once under backpressure,
+ * sharing sq_wr, each exact on its own stream.
  */
 module tb_loom_ce;
 
@@ -30,9 +34,10 @@ AXI4SR axis_host_recv [N_STRM_AXI] (.*);
 AXI4SR axis_host_send [N_STRM_AXI] (.*);
 AXI4SR axis_card_recv [N_CARD_AXI] (.*);
 AXI4SR axis_card_send [N_CARD_AXI] (.*);
+AXI4 #(.AXI4_ADDR_BITS(64)) axi_udata (.aclk(aclk));
 
 design_user_logic_c0_0 inst_dut (
-    .axi_ctrl(axi_ctrl), .notify(notify),
+    .axi_ctrl(axi_ctrl), .notify(notify), .axi_udata(axi_udata),
     .sq_rd(sq_rd), .sq_wr(sq_wr), .cq_rd(cq_rd), .cq_wr(cq_wr),
     .axis_host_recv(axis_host_recv), .axis_host_send(axis_host_send),
     .axis_card_recv(axis_card_recv), .axis_card_send(axis_card_send),
@@ -40,6 +45,12 @@ design_user_logic_c0_0 inst_dut (
 );
 
 int errors = 0;
+
+// The landing window every landing test uses
+localparam logic [47:0] LAND_BASE = 48'h7a00_0000_0000;
+localparam int          LAND_PID  = 5;
+localparam logic [63:0] LO32 = 64'h0000_0000_FFFF_FFFF;
+localparam logic [63:0] HI32 = 64'hFFFF_FFFF_0000_0000;
 `define CHECK(c, msg) if (!(c)) begin errors++; $display("FAIL [%0t] %s", $time, msg); end
 
 function automatic logic [AXI_DATA_BITS-1:0] pat(input longint va);
@@ -57,7 +68,6 @@ initial begin
     cq_rd.valid = 0; cq_rd.data = '0;
     axis_host_recv[0].tvalid = 0; axis_host_recv[0].tdata = '0; axis_host_recv[0].tkeep = '0;
     axis_host_recv[0].tlast = 0; axis_host_recv[0].tid = '0;
-    axis_card_send[0].tready = 1;
     axis_card_recv[0].tvalid = 0; axis_card_recv[0].tdata = '0; axis_card_recv[0].tkeep = '0;
     axis_card_recv[0].tlast = 0; axis_card_recv[0].tid = '0;
     notify.ready = 1;
@@ -67,6 +77,7 @@ always @(posedge aclk) begin
     sq_rd.ready              <= bp ? ($urandom_range(0, 2) != 0) : 1'b1;
     sq_wr.ready              <= bp ? ($urandom_range(0, 2) != 0) : 1'b1;
     axis_host_send[0].tready <= bp ? ($urandom_range(0, 2) != 0) : 1'b1;
+    axis_card_send[0].tready <= bp ? ($urandom_range(0, 2) != 0) : 1'b1;
 end
 
 // Card reads: each accepted sq_rd is answered with its beats, in 1 KB
@@ -94,20 +105,30 @@ initial forever begin
     end
 end
 
-// Writes: requests and beats captured; a write completes (cq_wr) a few
+// Writes: requests and beats captured by stream (host: the copy engine,
+// card: the landing); a write completes (cq_wr, with its stream) a few
 // cycles after its last beat
-req_t wr_seen [$], wr_open [$];
-logic [AXI_DATA_BITS-1:0]   h_d [$];
-logic [AXI_DATA_BITS/8-1:0] h_k [$];
-bit                         h_l [$];
+req_t wr_seen [$], land_seen [$];
+logic [AXI_DATA_BITS-1:0]   h_d [$], c_d [$];
+logic [AXI_DATA_BITS/8-1:0] h_k [$], c_k [$];
+bit                         h_l [$], c_l [$];
+logic [STRM_BITS-1:0]       cq_q [$];
 int                         cq_owed = 0, cq_delay = 0;
 
 always @(posedge aclk) if (aresetn) begin
-    if (sq_wr.valid && sq_wr.ready) begin wr_seen.push_back(sq_wr.data); wr_open.push_back(sq_wr.data); end
+    if (sq_wr.valid && sq_wr.ready) begin
+        if (sq_wr.data.strm == STRM_CARD) land_seen.push_back(sq_wr.data);
+        else                              wr_seen.push_back(sq_wr.data);
+    end
     if (axis_host_send[0].tvalid && axis_host_send[0].tready) begin
         h_d.push_back(axis_host_send[0].tdata); h_k.push_back(axis_host_send[0].tkeep);
         h_l.push_back(axis_host_send[0].tlast);
-        if (axis_host_send[0].tlast) begin void'(wr_open.pop_front()); cq_owed++; end
+        if (axis_host_send[0].tlast) begin cq_q.push_back(STRM_HOST); cq_owed++; end
+    end
+    if (axis_card_send[0].tvalid && axis_card_send[0].tready) begin
+        c_d.push_back(axis_card_send[0].tdata); c_k.push_back(axis_card_send[0].tkeep);
+        c_l.push_back(axis_card_send[0].tlast);
+        if (axis_card_send[0].tlast) begin cq_q.push_back(STRM_CARD); cq_owed++; end
     end
 end
 always @(posedge aclk) begin
@@ -115,12 +136,88 @@ always @(posedge aclk) begin
     cq_wr.data  <= '0;
     if (cq_owed > 0) begin
         if (cq_delay == 20) begin
-            cq_wr.valid <= 1'b1;
+            cq_wr.valid     <= 1'b1;
+            cq_wr.data.strm <= cq_q.pop_front();
             cq_owed--;
             cq_delay = 0;
         end else cq_delay++;
     end
 end
+
+// ---------------------------------------------------------------------------
+// uwin master: one burst at a time (AW, its beats, B)
+// ---------------------------------------------------------------------------
+function automatic logic [AXI_DATA_BITS-1:0] lpat(input longint off);
+    logic [AXI_DATA_BITS-1:0] d;
+    for (int l = 0; l < 8; l++) d[64*l +: 64] = {32'hA1A0_0000 + 32'(l), 32'(off)};
+    return d;
+endfunction
+
+initial begin
+    axi_udata.awvalid = 0; axi_udata.wvalid = 0; axi_udata.arvalid = 0;
+    axi_udata.bready = 1; axi_udata.rready = 1;
+    axi_udata.awburst = 2'b01; axi_udata.awsize = 3'd6; axi_udata.awcache = 0; axi_udata.awlock = 0;
+    axi_udata.awprot = 0; axi_udata.awqos = 0; axi_udata.awregion = 0; axi_udata.awid = 0;
+    axi_udata.arburst = 2'b01; axi_udata.arsize = 3'd6; axi_udata.arcache = 0; axi_udata.arlock = 0;
+    axi_udata.arprot = 0; axi_udata.arqos = 0; axi_udata.arregion = 0; axi_udata.arid = 0;
+    axi_udata.araddr = 0; axi_udata.arlen = 0;
+    axi_udata.wstrb = '1; axi_udata.wlast = 0; axi_udata.wdata = 0; axi_udata.awaddr = 0; axi_udata.awlen = 0;
+end
+
+// A burst of `beats` from uwin offset `off` (its first line off rounded
+// down to 64 B), the first beat with strobes strb0
+task automatic uwin_wr(input longint off, input int beats, input logic [63:0] strb0 = '1);
+    longint line = off & ~64'd63;
+    @(negedge aclk);
+    axi_udata.awaddr = 64'h0800_0000 + off; axi_udata.awlen = 8'(beats - 1); axi_udata.awvalid = 1;
+    do @(posedge aclk); while (!axi_udata.awready);
+    @(negedge aclk);
+    axi_udata.awvalid = 0;
+    for (int j = 0; j < beats; j++) begin
+        if (bp) while ($urandom_range(0, 2) == 0) @(negedge aclk);
+        axi_udata.wdata = lpat(line + 64*j); axi_udata.wstrb = (j == 0) ? strb0 : '1;
+        axi_udata.wlast = (j == beats - 1); axi_udata.wvalid = 1;
+        do @(posedge aclk); while (!axi_udata.wready);
+        @(negedge aclk);
+        axi_udata.wvalid = 0;
+    end
+    while (!axi_udata.bvalid) @(posedge aclk);
+    @(negedge aclk);
+endtask
+
+// The next landing packet: its request, then its beats on the card stream
+task automatic expect_land_pkt(input string name, input longint off, input int beats);
+    req_t r;
+    `CHECK(land_seen.size() != 0, {name, ": no landing request"})
+    if (land_seen.size() == 0) return;
+    r = land_seen.pop_front();
+    `CHECK(r.opcode == LOCAL_WRITE && r.strm == STRM_CARD && r.dest == 0 && r.pid == LAND_PID &&
+           r.vaddr == LAND_BASE + off && r.len == LEN_BITS'(64*beats) && r.last,
+           $sformatf("%s: landing request op %0d strm %0d pid %0d va %h len %0d, expected va %h len %0d",
+                     name, r.opcode, r.strm, r.pid, r.vaddr, r.len, LAND_BASE + off, 64*beats))
+    for (int j = 0; j < beats; j++) begin
+        `CHECK(c_d.size() != 0, $sformatf("%s: card beat %0d missing", name, j))
+        if (c_d.size() == 0) return;
+        `CHECK(c_d.pop_front() == lpat(off + 64*j) && c_k.pop_front() == '1 && c_l.pop_front() == (j == beats - 1),
+               $sformatf("%s: card beat %0d", name, j))
+    end
+endtask
+
+// The next landing store: 8 B at LAND_BASE + off, the word of lpat's line
+task automatic expect_land_store(input string name, input longint off);
+    req_t r;
+    logic [AXI_DATA_BITS-1:0] d, line;
+    `CHECK(land_seen.size() != 0 && c_d.size() != 0, {name, ": no landing store"})
+    if (land_seen.size() == 0 || c_d.size() == 0) return;
+    r = land_seen.pop_front();
+    `CHECK(r.opcode == LOCAL_WRITE && r.strm == STRM_CARD && r.pid == LAND_PID &&
+           r.vaddr == LAND_BASE + off && r.len == 8,
+           $sformatf("%s: store request va %h len %0d, expected va %h", name, r.vaddr, r.len, LAND_BASE + off))
+    line = lpat(off & ~64'd63);
+    d = c_d.pop_front();
+    `CHECK(d[63:0] == line[64*((off % 64) / 8) +: 64] && c_k.pop_front() == 64'hFF && c_l.pop_front(),
+           $sformatf("%s: store data %h at %h", name, d[63:0], off))
+endtask
 
 // ---------------------------------------------------------------------------
 // CSR access
@@ -155,11 +252,21 @@ task automatic copy(input logic [47:0] src, input logic [47:0] dst, input int le
 endtask
 
 task automatic wait_idle();
+    // idle twice in a row, 50 cycles apart: a landing packet can still be in
+    // the card stream's register slice when the ingress is already idle, and
+    // completions are issued one per 21 cycles
     logic [63:0] b;
-    do begin
+    int quiet = 0;
+    while (quiet < 2) begin
         repeat (50) @(posedge aclk);
         csr_rd(8, b);
-    end while (b[0] || cq_owed > 0);
+        if (b[0] || cq_owed > 0 || inst_dut.inst_loom_land.pk_open ||
+            !inst_dut.inst_loom_land.pq_empty || int'(inst_dut.inst_loom_land.ostate) != 0 ||
+            axis_card_send[0].tvalid || axis_host_send[0].tvalid)
+            quiet = 0;
+        else
+            quiet++;
+    end
     repeat (40) @(posedge aclk);
 endtask
 
@@ -202,6 +309,11 @@ task automatic expect_copy(input string name, input logic [47:0] src, input logi
 endtask
 
 logic [63:0] v, c0, c1;
+logic [63:0] lc0 [6], lc1 [6];
+
+task automatic land_counters(output logic [63:0] c [6]);
+    for (int i = 0; i < 6; i++) csr_rd(24 + i, c[i]);
+endtask
 
 initial begin
     axi_ctrl.awvalid = 0; axi_ctrl.wvalid = 0; axi_ctrl.arvalid = 0;
@@ -256,6 +368,61 @@ initial begin
     csr_rd(5, v); `CHECK(v == 64'h7f00_2000_0040, "T5: FENCE_VA")
     csr_rd(8, v); `CHECK(v == 0, "T5: BUSY")
     $display("ok   T5 readback");
+
+    // --- T6: the landing window ---
+    land_counters(lc0);
+    uwin_wr(0, 8);                                  // closed: dropped
+    csr_wr(16, 64'(LAND_BASE)); csr_wr(17, 64'd65536); csr_wr(18, 64'(LAND_PID));
+    csr_rd(16, v); `CHECK(v == 64'(LAND_BASE), "T6: LAND_BASE")
+    csr_rd(17, v); `CHECK(v == 65536, "T6: LAND_LEN")
+    csr_rd(18, v); `CHECK(v == LAND_PID, "T6: LAND_PID")
+    uwin_wr(64'h0000, 8);                           // a packet
+    repeat (40) @(posedge aclk);                    // past the idle flush
+    uwin_wr(64'h1000, 1, LO32);                     // a line as two 32 B halves
+    uwin_wr(64'h1020, 1, HI32);
+    uwin_wr(64'h2008, 1, 64'hFF << 8);              // an 8 B store at its own address
+    uwin_wr(64'h1_0000, 1);                         // past the window
+    uwin_wr(64'hFFC0, 2);                           // its second line past the end
+    wait_idle();
+    expect_land_pkt("T6", 64'h0000, 8);
+    for (int l = 0; l < 8; l++) expect_land_store("T6", 64'h1000 + 8*l);
+    expect_land_store("T6", 64'h2008);
+    `CHECK(land_seen.size() == 0 && c_d.size() == 0, $sformatf("T6: %0d requests / %0d beats left over", land_seen.size(), c_d.size()))
+    `CHECK(wr_seen.size() == 0 && h_d.size() == 0, "T6: host-stream traffic")
+    land_counters(lc1);
+    `CHECK(lc1[0] - lc0[0] == 10 && lc1[1] - lc0[1] == 10, $sformatf("T6: LAND_REQS %0d LAND_DONE %0d, expected 10", lc1[0] - lc0[0], lc1[1] - lc0[1]))
+    `CHECK(lc1[2] - lc0[2] == 4 && lc1[3] - lc0[3] == 3 && lc1[4] - lc0[4] == 9 && lc1[5] - lc0[5] == 0,
+           $sformatf("T6: bursts %0d drops %0d stores %0d partial %0d", lc1[2] - lc0[2], lc1[3] - lc0[3], lc1[4] - lc0[4], lc1[5] - lc0[5]))
+    $display("ok   T6 landing window");
+
+    // --- T7: a copy and a landing at once, under backpressure ---
+    bp = 1;
+    land_counters(lc0);
+    fork
+        begin
+            copy(48'h7f00_1300_0000, 48'h7e00_0030_0000, 16384, 48'h7f00_2000_0080);
+        end
+        for (int k = 0; k < 64; k++) uwin_wr(64'h4000 + 256*k, 4);
+    join
+    wait_idle();
+    expect_copy("T7", 48'h7f00_1300_0000, 48'h7e00_0030_0000, 16384, 48'h7f00_2000_0080, 5);
+    begin
+        // the landing's packets: consecutive 4-beat bursts gathered up to PMTU
+        longint off = 64'h4000;
+        int left = 256;
+        while (left > 0 && land_seen.size() != 0) begin
+            int n = land_seen[0].len / 64;
+            `CHECK(n > 0 && n <= left, $sformatf("T7: landing packet of %0d beats with %0d left", n, left))
+            expect_land_pkt("T7", off, n);
+            off += 64*n; left -= n;
+        end
+        `CHECK(left == 0, $sformatf("T7: %0d landing beats missing", left))
+    end
+    `CHECK(land_seen.size() == 0 && c_d.size() == 0 && wr_seen.size() == 0 && h_d.size() == 0, "T7: traffic left over")
+    land_counters(lc1);
+    `CHECK(lc1[0] - lc0[0] == lc1[1] - lc0[1], $sformatf("T7: LAND_REQS %0d LAND_DONE %0d", lc1[0] - lc0[0], lc1[1] - lc0[1]))
+    bp = 0;
+    $display("ok   T7 copy and landing at once");
 
     if (errors == 0) $display("TB PASS (tb_loom_ce)");
     else             $display("TB FAIL (tb_loom_ce): %0d errors", errors);
