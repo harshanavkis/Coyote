@@ -160,6 +160,19 @@ void migrate_to_host(struct vfpga_dev *device, struct user_pages *user_pg);
 int offload_user_pages(struct vfpga_dev *device, uint64_t vaddr, uint32_t len, int32_t ctid);
 
 /**
+ * @brief Bind a mapped buffer's card pages to the user data window's HBM
+ * region (EN_UWIN_HBM shells, Versal): buffer offset x becomes uwin offset x,
+ * so what a peer writes into the exported window is in the buffer's card copy.
+ *
+ * @param device vFPGA char device
+ * @param vaddr Start of a buffer mapped with card pages (e.g. getMem), page-aligned
+ * @param len Length in bytes; the whole buffer must fit the window
+ * @param ctid Coyote thread ID
+ * @return 0 on success, negative error code on failure
+ */
+int uwin_hbm_bind(struct vfpga_dev *device, uint64_t vaddr, uint64_t len, int32_t ctid);
+
+/**
  * @brief Trigger sync operation; moving pages from card to host & updating mappings
  *
  * @param device vFPGA char device

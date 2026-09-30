@@ -370,6 +370,12 @@ extern bool en_hmm;
     #define MEM_START (256UL * 1024UL * 1024UL * 1024UL)
     #define N_SMALL_CHUNKS (64UL * 1024UL)
     #define N_LARGE_CHUNKS (64UL * 1024UL)
+
+    // EN_UWIN_HBM shells: the user data window lands in the last HBM block;
+    // uwin offset x is card physical address UWIN_HBM_BASE + x. The block is
+    // kept out of the allocator. Must match UWIN_HBM_BASE in lynx_pkg.
+    #define UWIN_HBM_BLOCK (N_MEM_BLOCKS - 1)
+    #define UWIN_HBM_BASE (MEM_START + UWIN_HBM_BLOCK * MEM_BLOCK_SIZE)
 #endif
 
 // Reconfiguration constants
@@ -431,6 +437,7 @@ extern bool en_hmm;
 #define IOCTL_SET_NOTIFICATION_PROCESSED _IOR('F', 18, unsigned long)
 #define IOCTL_GET_NOTIFICATION_VALUE _IOR('F', 19, unsigned long)
 #define IOCTL_EXPORT_DMABUF _IOWR('F', 20, unsigned long)
+#define IOCTL_UWIN_HBM_BIND _IOW('F', 21, unsigned long)
 
 // Regions IOCTL_EXPORT_DMABUF can export (a BAR range of this card)
 #define EXPORT_REGION_CTRL_USER 0   // the vFPGA's AXI-Lite user control region
@@ -784,6 +791,9 @@ struct user_pages {
 
     /// Set to true if explicit synchronization (i.e. dma_sync_single_for_{device,cpu}) is needed for this buffer, false otherwise
     bool needs_explicit_sync;
+
+    /// Set to true if the card pages are the user data window's HBM region (IOCTL_UWIN_HBM_BIND); never freed to the allocator
+    bool uwin_hbm;
 };
 
 /**

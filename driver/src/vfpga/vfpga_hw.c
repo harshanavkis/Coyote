@@ -205,8 +205,19 @@ int alloc_card_memory(struct vfpga_dev *device, uint64_t *card_physical_address,
     // If mem_block = -1, find first block with free space to store the buffer
     // Otherwise, use user-requested memory block
     int32_t target_block = mem_block;
+    #ifdef PLATFORM_VERSAL
+    // The user data window's HBM block is never allocated (IOCTL_UWIN_HBM_BIND)
+    if (mem_block == UWIN_HBM_BLOCK) {
+        pr_warn("memory block %d is reserved for the user data window\n", mem_block);
+        return -EINVAL;
+    }
+    #endif
+
     if (target_block == -1) {
         for (int i = 0; i < N_MEM_BLOCKS; i++) {
+            #ifdef PLATFORM_VERSAL
+            if (i == UWIN_HBM_BLOCK) continue;
+            #endif
             if (huge && (bus_data->card_lblocks[i].free_chunks > n_pages)) {
                 target_block = i;
                 break;

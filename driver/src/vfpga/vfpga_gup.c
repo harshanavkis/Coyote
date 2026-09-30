@@ -527,9 +527,10 @@ int tlb_put_user_pages(struct vfpga_dev *device, uint64_t vaddr, int32_t ctid, p
             // Unmap from TLB
             tlb_unmap_gup(device, tmp_entry, hpid);
 
-            // Release card memory
+            // Release card memory (the uwin's HBM region is never freed)
             if(bd_data->en_mem) {
-                free_card_memory(device, tmp_entry->cpages, tmp_entry->n_pages, tmp_entry->huge);
+                if (!tmp_entry->uwin_hbm)
+                    free_card_memory(device, tmp_entry->cpages, tmp_entry->n_pages, tmp_entry->huge);
                 vfree(tmp_entry->cpages);
             }     
             
@@ -601,9 +602,10 @@ int tlb_put_user_pages_ctid(struct vfpga_dev *device, int32_t ctid, pid_t hpid, 
         // Unmap from TLB
         tlb_unmap_gup(device, tmp_entry, hpid);
         
-        // Release card memory
+        // Release card memory (the uwin's HBM region is never freed)
         if(bd_data->en_mem) {
-            free_card_memory(device, tmp_entry->cpages, tmp_entry->n_pages, tmp_entry->huge);
+            if (!tmp_entry->uwin_hbm)
+                free_card_memory(device, tmp_entry->cpages, tmp_entry->n_pages, tmp_entry->huge);
             vfree(tmp_entry->cpages);
         }
 
@@ -682,6 +684,60 @@ void migrate_to_host(struct vfpga_dev *device, struct user_pages *user_pg) {
     atomic_set(&device->wait_sync, FLAG_CLR);
 
     mutex_unlock(&device->sync_lock);
+}
+
+int uwin_hbm_bind(struct vfpga_dev *device, uint64_t vaddr, uint64_t len, int32_t ctid) {
+#ifdef PLATFORM_VERSAL
+    BUG_ON(!device);
+    struct bus_driver_data *bd_data = device->bd_data;
+    BUG_ON(!bd_data);
+
+    if (!bd_data->en_mem || (vaddr & ~bd_data->stlb_meta->page_mask)) {
+        pr_warn("uwin HBM bind: needs card memory and a page-aligned buffer\n");
+        return -EINVAL;
+    }
+
+    pid_t hpid = device->pid_array[ctid];
+    uint64_t vaddr_pg = vaddr >> bd_data->stlb_meta->page_shift;
+    struct user_pages *tmp_entry, *found = NULL;
+    hash_for_each_possible(user_buff_map[device->id][ctid], tmp_entry, entry, vaddr_pg) {
+        if (tmp_entry->vaddr == vaddr_pg) found = tmp_entry;
+    }
+    if (!found || !found->cpages) {
+        pr_warn("uwin HBM bind: no mapped buffer starts at %llx\n", vaddr);
+        return -EINVAL;
+    }
+
+    const uint64_t bytes = found->n_pages * bd_data->stlb_meta->page_size;
+    if (bytes > device->uwin_size || bytes < len) {
+        pr_warn("uwin HBM bind: buffer of %llu bytes does not fit the %llu-byte window or is shorter than %llu\n",
+                bytes, device->uwin_size, len);
+        return -EINVAL;
+    }
+
+    // The buffer's card pages become the window's HBM region, page for page:
+    // buffer offset x is uwin offset x
+    const uint64_t base = UWIN_HBM_BASE + (uint64_t) device->id * device->uwin_size;
+    tlb_unmap_gup(device, found, hpid);
+    if (!found->uwin_hbm)
+        free_card_memory(device, found->cpages, found->n_pages, found->huge);
+    for (uint64_t i = 0; i < found->n_pages; i++)
+        found->cpages[i] = base + i * bd_data->stlb_meta->page_size;
+    found->uwin_hbm = true;
+
+    struct pf_aligned_desc pf_desc;
+    pf_desc.vaddr = found->vaddr;
+    pf_desc.n_pages = found->n_pages;
+    pf_desc.ctid = ctid;
+    pf_desc.hugepages = found->huge;
+    tlb_map_gup(device, &pf_desc, found, hpid);
+
+    dbg_info("uwin HBM bind: vaddr %llx, %llu pages at card %llx\n", vaddr, found->n_pages, base);
+    return 0;
+#else
+    pr_warn("uwin HBM bind is only available on Versal\n");
+    return -EINVAL;
+#endif
 }
 
 int offload_user_pages(struct vfpga_dev *device, uint64_t vaddr, uint32_t len, int32_t ctid) {
@@ -1006,7 +1062,8 @@ int p2p_detach_dma_buf(struct vfpga_dev *device, uint64_t vaddr, int32_t ctid, i
         
             // Release card memory
             if(bd_data->en_mem) {
-                free_card_memory(device, tmp_entry->cpages, tmp_entry->n_pages, tmp_entry->huge);
+                if (!tmp_entry->uwin_hbm)
+                    free_card_memory(device, tmp_entry->cpages, tmp_entry->n_pages, tmp_entry->huge);
                 vfree(tmp_entry->cpages);
             }
             

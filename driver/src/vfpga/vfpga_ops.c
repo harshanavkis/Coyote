@@ -435,6 +435,21 @@ long vfpga_dev_ioctl(struct file *file, unsigned int command, unsigned long arg)
 
         // Sync user buffer from card memory
         // Args: virtual address, buffer length, Coyote thread ID (ctid)
+        // Bind a buffer's card pages to the user data window's HBM region
+        // Args: virtual address, length, Coyote thread ID (ctid)
+        case IOCTL_UWIN_HBM_BIND:
+            ret_val = copy_from_user(&tmp, (unsigned long *) arg, 3 * sizeof(unsigned long));
+            if (ret_val != 0) {
+                pr_warn("user data could not be coppied, return %d\n", ret_val);
+            } else {
+                mutex_lock(&device->mmu_lock);
+                change_tlb_lock(device);
+                ret_val = uwin_hbm_bind(device, tmp[0], tmp[1], (int32_t) tmp[2]);
+                change_tlb_lock(device);
+                mutex_unlock(&device->mmu_lock);
+            }
+            break;
+
         case IOCTL_SYNC_REQ:
             if (!device_data->en_mem) {
                 pr_warn("cannot sync buffer when shell is built without memory\n");
