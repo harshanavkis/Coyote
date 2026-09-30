@@ -138,8 +138,7 @@ int run_server(uint16_t port, uint64_t size, bool land) {
         v80 = new coyote::cThread(0, getpid(), 0, nullptr, "coyote_versal_fpga");
         L = new land_v80::Landing(*v80, size + 4096);
         const int lfd = L->export_fd();
-        void *lva = mmap(nullptr, size + 4096, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-        if (lva == MAP_FAILED) throw std::runtime_error("mmap for a reserved address failed");
+        void *lva = loom_switch::reserve_va(size + 4096);
         t_data.importDmabuf(lfd, lva);
         dst   = static_cast<uint64_t *>(lva);
         fence = dst + size / 8;
@@ -258,8 +257,7 @@ int run_client(const std::string &ip, uint16_t port, int reps, int window) {
 
     const uint64_t win_len = size + 4096;
     const int dfd = u280.exportDmabuf(EXPORT_REGION_UWIN, 0, win_len);
-    void *uva = mmap(nullptr, win_len, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (uva == MAP_FAILED) throw std::runtime_error("mmap for a reserved address failed");
+    void *uva = loom_switch::reserve_va(win_len);
     v80.importDmabuf(dfd, uva);
 
     uint64_t *src = static_cast<uint64_t *>(v80.getMem({coyote::CoyoteAllocType::HPF, size}));

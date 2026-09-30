@@ -68,8 +68,7 @@ int main() {
 
     // The uwin's first max_len bytes, imported into the V80
     const int fd = u280.exportDmabuf(EXPORT_REGION_UWIN, 0, max_len);
-    void *uva = mmap(nullptr, max_len, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (uva == MAP_FAILED) throw std::runtime_error("mmap for a reserved address failed");
+    void *uva = loom_switch::reserve_va(max_len);
     v80.importDmabuf(fd, uva);
 
     // p2p+: a local window over the same uwin range, onto a U280 host buffer

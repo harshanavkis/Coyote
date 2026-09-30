@@ -213,7 +213,10 @@ can be up to 128 MB (a 64 MiB push fits one binding).
   Then:
   `cd /scratch/harshanavkis/loom-proj/Coyote/examples/loom_switch/sw/build_sim && xilinx-shell -c "COYOTE_SIM_DIR=/scratch/harshanavkis/loom-proj/Coyote/examples/loom_switch/hw/build_sim stdbuf -oL ./uwin_probe 16384 16"`
   (compiles, elaborates and runs; minutes of wall clock)
-- **On hardware (clara, and rose for G4).** Images:
+- **On hardware (clara, and rose for G4).** Every card sits on NUMA node 1
+  on both hosts; unpinned runs get buffers on node 0 at random and lose
+  up to 3x, so every run below is pinned with numactl (from nix; the same
+  store path on clara and rose). Images:
   `examples/loom_switch/hw/build_sep29_uwin/bitstreams/cyt_top.bit` (U280) and
   `examples/loom_ce/hw/build_sep29_ce/bitstreams/cyt_top.pdi` (V80), both from
   `492e2a25`. The drivers come from this tree (`driver/build`,
@@ -229,19 +232,19 @@ can be up to 128 MB (a 64 MiB push fits one binding).
   3. Program clara's V80 (never rose's, it is another user's):
      `cd /scratch/harshanavkis/loom-proj/Coyote && scripts/fpga/program_v80.sh examples/loom_ce/hw/build_sep29_ce/bitstreams/cyt_top.pdi 0000:81:00.0`
   4. G2 on clara (1 MiB bulk, 256 stores):
-     `cd /scratch/harshanavkis/loom-proj/Coyote/examples/loom_switch/sw/build && sudo ./uwin_probe 1048576 256`
+     `cd /scratch/harshanavkis/loom-proj/Coyote/examples/loom_switch/sw/build && sudo /nix/store/4sjg21zq04394ci22lj67vgpw7ykw9bg-numactl-2.0.18/bin/numactl -N 1 -m 1 ./uwin_probe 1048576 256`
   5. G4, local half, on clara (1 MiB, 3 copies):
-     `cd /scratch/harshanavkis/loom-proj/Coyote/examples/loom_ce/sw/build && sudo ./ce_local 1048576 3`
+     `cd /scratch/harshanavkis/loom-proj/Coyote/examples/loom_ce/sw/build && sudo /nix/store/4sjg21zq04394ci22lj67vgpw7ykw9bg-numactl-2.0.18/bin/numactl -N 1 -m 1 ./ce_local 1048576 3`
   6. G4: sync the binaries and library to rose, start the server there, then
      the client on clara:
      - clara: `rsync -a /scratch/harshanavkis/loom-proj/Coyote/examples/loom_ce/sw/build/ rose.dos.cit.tum.de:/scratch/harshanavkis/loom-proj/Coyote/examples/loom_ce/sw/build/`
-     - rose: `cd /scratch/harshanavkis/loom-proj/Coyote/examples/loom_ce/sw/build && sudo ./ce_remote --server --size 1048576`
-     - clara: `cd /scratch/harshanavkis/loom-proj/Coyote/examples/loom_ce/sw/build && sudo ./ce_remote --client 131.159.102.21 --reps 3`
+     - rose: `cd /scratch/harshanavkis/loom-proj/Coyote/examples/loom_ce/sw/build && sudo /nix/store/4sjg21zq04394ci22lj67vgpw7ykw9bg-numactl-2.0.18/bin/numactl -N 1 -m 1 ./ce_remote --server --size 1048576`
+     - clara: `cd /scratch/harshanavkis/loom-proj/Coyote/examples/loom_ce/sw/build && sudo /nix/store/4sjg21zq04394ci22lj67vgpw7ykw9bg-numactl-2.0.18/bin/numactl -N 1 -m 1 ./ce_remote --client 131.159.102.21 --reps 3`
   7. The V80's write bandwidth, to host memory and peer-to-peer into the
      uwin, on clara. It needs example 07 on the V80 instead of `loom_ce`
      (step 3 puts `loom_ce` back):
      `cd /scratch/harshanavkis/loom-proj/Coyote && scripts/fpga/program_v80.sh examples/07_perf_fpga/hw/build_v80/bitstreams/cyt_top.pdi 0000:81:00.0`
-     `cd /scratch/harshanavkis/loom-proj/Coyote/examples/loom_ce/sw/build && sudo ./p2p_bw`
+     `cd /scratch/harshanavkis/loom-proj/Coyote/examples/loom_ce/sw/build && sudo /nix/store/4sjg21zq04394ci22lj67vgpw7ykw9bg-numactl-2.0.18/bin/numactl -N 1 -m 1 ./p2p_bw`
 - **The receive side into V80 HBM (G6), clara and rose.** Images:
   `examples/loom_switch/hw/build_sep30_uwin2/bitstreams/cyt_top.bit` (U280)
   and `examples/loom_ce/hw/build_sep30_land/bitstreams/cyt_top.pdi` (V80,
@@ -261,11 +264,11 @@ can be up to 128 MB (a 64 MiB push fits one binding).
      - rose: `cd /scratch/harshanavkis/loom-proj/Coyote && scripts/fpga/program_v80.sh /home/harshanavkis/coyote-bitstreams/loom-ce-sep30/cyt_top.pdi 0000:61:00.0`
   4. V80 → U280 → V80 on clara (the U280 → V80 hop; compare its rate with
      the same size landing in host memory, the second line):
-     `cd /scratch/harshanavkis/loom-proj/Coyote/examples/loom_ce/sw/build && sudo ./ce_local --land-v80 16777216 3`
-     `cd /scratch/harshanavkis/loom-proj/Coyote/examples/loom_ce/sw/build && sudo ./ce_local 16777216 3`
+     `cd /scratch/harshanavkis/loom-proj/Coyote/examples/loom_ce/sw/build && sudo /nix/store/4sjg21zq04394ci22lj67vgpw7ykw9bg-numactl-2.0.18/bin/numactl -N 1 -m 1 ./ce_local --land-v80 16777216 3`
+     `cd /scratch/harshanavkis/loom-proj/Coyote/examples/loom_ce/sw/build && sudo /nix/store/4sjg21zq04394ci22lj67vgpw7ykw9bg-numactl-2.0.18/bin/numactl -N 1 -m 1 ./ce_local 16777216 3`
   5. clara V80 → rose V80 HBM, a fresh port each run:
-     - rose: `cd /scratch/harshanavkis/loom-proj/Coyote/examples/loom_ce/sw/build && sudo ./ce_remote --server --size 1048576 --land-v80 --port 18600`
-     - clara: `cd /scratch/harshanavkis/loom-proj/Coyote/examples/loom_ce/sw/build && sudo ./ce_remote --client 131.159.102.21 --reps 3 --port 18600`
+     - rose: `cd /scratch/harshanavkis/loom-proj/Coyote/examples/loom_ce/sw/build && sudo /nix/store/4sjg21zq04394ci22lj67vgpw7ykw9bg-numactl-2.0.18/bin/numactl -N 1 -m 1 ./ce_remote --server --size 1048576 --land-v80 --port 18600`
+     - clara: `cd /scratch/harshanavkis/loom-proj/Coyote/examples/loom_ce/sw/build && sudo /nix/store/4sjg21zq04394ci22lj67vgpw7ykw9bg-numactl-2.0.18/bin/numactl -N 1 -m 1 ./ce_remote --client 131.159.102.21 --reps 3 --port 18600`
 
 ## Found on the way: `RX_CHUNK` is not wired in `examples/loom`
 

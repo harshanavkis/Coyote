@@ -2,6 +2,8 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <stdexcept>
+#include <sys/mman.h>
 #include <coyote/cThread.hpp>
 
 /**
@@ -55,6 +57,19 @@ inline const char *const ING_NAMES[N_ING] = {
     "W wait: no aw", "W wait: B slot", "W wait: fifo", "W wait: queue", "W wait: stores",
     "drop: no window", "drop: past end",
     "bursts 1 beat", "bursts 2-4", "bursts >4", "misaligned"};
+
+// An address range to import a peer's dma-buf at: 2 MiB-aligned, so the
+// driver can map the peer's contiguous BAR pages as huge TLB entries
+// (vfpga_gup.c coalesces 4 KiB pages only at 2 MiB-aligned VAs). At a
+// 4 KiB-aligned VA every page takes a small-TLB entry, and a window larger
+// than the small TLB is served through page faults.
+inline void *reserve_va(uint64_t len) {
+    constexpr uint64_t HUGE = 2ULL << 20;
+    void *p = mmap(nullptr, len + HUGE, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (p == MAP_FAILED) throw std::runtime_error("mmap for a reserved address failed");
+    const uint64_t a = (reinterpret_cast<uint64_t>(p) + HUGE - 1) & ~(HUGE - 1);
+    return reinterpret_cast<void *>(a);
+}
 
 inline void csr_write(coyote::cThread &t, uint32_t word, uint64_t val) { t.setCSR(val, word); }
 inline uint64_t csr_read(coyote::cThread &t, uint32_t word) { return t.getCSR(word); }
