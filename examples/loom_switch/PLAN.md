@@ -151,15 +151,21 @@ can be up to 128 MB (a 64 MiB push fits one binding).
   CSRs, `sq_rd` from card memory (`STRM_CARD`, `EN_MEM=1`), the read stream
   forwarded to `sq_wr` on the host stream (dst VA), and a completion fence
   write.
-  - **Receive side (`EN_UWIN` on Versal):** the V80's BAR4 reaches the shell
-    as `axi_main` like the U280's bypass BAR, so it has the same uwin. The
-    far U280's `loom_rx` writes into it peer-to-peer (the V80 driver exports
-    it, the U280's imports it), and a copy of `loom_ingress` (local route,
-    `LOCAL_STRM = STRM_CARD`, one window at `LAND_BASE`, words 16-18) lands
-    it in card memory: packets as card writes, the fence as an 8 B store.
-    The copy engine and the landing share `sq_wr` per request. Counters:
-    24-29 landing requests / completions / bursts / drops / stores, 32-45 the
-    landing's ingress debug counters, 48-50 the copy engine's stalls.
+  - **Receive side (`EN_UWIN_HBM`):** the V80's BAR4 reaches the shell as
+    `axi_main` like the U280's bypass BAR, so it has the same uwin; with
+    `EN_UWIN_HBM` the uwin does not go to the vFPGA but through its own HBM
+    channel (`uwin_hbm` + `axi_stripe`, striped like the card channels)
+    into the last HBM block: uwin offset x is card physical address
+    `UWIN_HBM_BASE + x` (`0x47_E000_0000`). The driver keeps that block out
+    of its allocator, and `IOCTL_UWIN_HBM_BIND` (`cThread::uwinHbmBind`)
+    points a buffer's card pages at it. So the far U280's `loom_rx` (or a
+    local window) writes peer-to-peer straight into HBM, like into a GPU's
+    BAR, and the copy engine reads the same bytes by VA on its card stream.
+    Reads through the window return HBM too. The V80's NoC keeps same-ID
+    writes in order (first-generation NoC: strict write ordering), so a
+    fence written after the data lands after it. (The earlier vFPGA
+    landing path - a `loom_ingress` copy issuing card writes and sharing
+    `sq_wr` with the copy engine - reset the hosts and is gone.)
 
 ## 4. Testbenches
 
@@ -188,7 +194,12 @@ can be up to 128 MB (a 64 MiB push fits one binding).
   request replaced by `loom_rx`'s); it is switched off for that test only,
   and the test checks that no request is lost.
 - `tb_loom_ce`: descriptor → `sq_rd`/`sq_wr` sequence, stream forwarding,
-  fence.
+  fence, the stall counters. `tb_uwin_hbm`: the window path (`uwin_hbm` +
+  `axi_stripe`) and a card channel (`axi_stripe`) on one memory model - a
+  peer's writes through the window (256 B bursts, lines, 32 B halves, an
+  8 B store) are what the card path reads at `UWIN_HBM_BASE` + offset, and
+  the reverse; exact `rlast` on window reads. Run:
+  `examples/loom_ce/hw/tb/run_tbs.sh`.
 - Same style as `examples/loom/hw/tb/`. `hw/tb/run_tbs.sh` runs both block
   TBs against this app's own generated package and wrapper (`hw/build_sim`,
   generated once as the script says).
@@ -247,21 +258,21 @@ can be up to 128 MB (a 64 MiB push fits one binding).
      `cd /scratch/harshanavkis/loom-proj/Coyote/examples/loom_ce/sw/build && sudo /nix/store/4sjg21zq04394ci22lj67vgpw7ykw9bg-numactl-2.0.18/bin/numactl -N 1 -m 1 ./p2p_bw`
 - **The receive side into V80 HBM (G6), clara and rose.** Images:
   `examples/loom_switch/hw/build_sep30_uwin2/bitstreams/cyt_top.bit` (U280)
-  and `examples/loom_ce/hw/build_sep30_land/bitstreams/cyt_top.pdi` (V80,
-  `EN_UWIN`). Both V80s run `loom_ce`; rose's needs the V80 driver from this
-  tree.
+  and `examples/loom_ce/hw/build_sep30_uwinhbm/bitstreams/cyt_top.pdi` (V80,
+  `EN_UWIN_HBM`). Both V80s run `loom_ce` and need the V80 driver from this
+  tree (the uwin HBM bind).
   1. Flash both U280s as in step 2 above, from
      `~/coyote-bitstreams/loom-switch-sep30` (copy `build_sep30_uwin2`'s
      `cyt_top.bit` and `cyt_top.ltx` there first).
   2. The V80 image to the shared home, the V80 driver and the software to
      rose (on clara):
-     `mkdir -p ~/coyote-bitstreams/loom-ce-sep30 && cp /scratch/harshanavkis/loom-proj/Coyote/examples/loom_ce/hw/build_sep30_land/bitstreams/cyt_top.pdi ~/coyote-bitstreams/loom-ce-sep30/`
+     `mkdir -p ~/coyote-bitstreams/loom-ce-uwinhbm && cp /scratch/harshanavkis/loom-proj/Coyote/examples/loom_ce/hw/build_sep30_uwinhbm/bitstreams/cyt_top.pdi ~/coyote-bitstreams/loom-ce-uwinhbm/`
      `rsync -a /scratch/harshanavkis/loom-proj/Coyote/driver/build_versal/ rose.dos.cit.tum.de:/scratch/harshanavkis/loom-proj/Coyote/driver/build_versal/`
      `rsync -a /scratch/harshanavkis/loom-proj/Coyote/examples/loom_ce/sw/build/ rose.dos.cit.tum.de:/scratch/harshanavkis/loom-proj/Coyote/examples/loom_ce/sw/build/`
      `rsync -a /scratch/harshanavkis/loom-proj/Coyote/scripts/fpga/ rose.dos.cit.tum.de:/scratch/harshanavkis/loom-proj/Coyote/scripts/fpga/`
   3. Program both V80s:
-     - clara: `cd /scratch/harshanavkis/loom-proj/Coyote && scripts/fpga/program_v80.sh /home/harshanavkis/coyote-bitstreams/loom-ce-sep30/cyt_top.pdi 0000:81:00.0`
-     - rose: `cd /scratch/harshanavkis/loom-proj/Coyote && scripts/fpga/program_v80.sh /home/harshanavkis/coyote-bitstreams/loom-ce-sep30/cyt_top.pdi 0000:61:00.0`
+     - clara: `cd /scratch/harshanavkis/loom-proj/Coyote && scripts/fpga/program_v80.sh /home/harshanavkis/coyote-bitstreams/loom-ce-uwinhbm/cyt_top.pdi 0000:81:00.0`
+     - rose: `cd /scratch/harshanavkis/loom-proj/Coyote && scripts/fpga/program_v80.sh /home/harshanavkis/coyote-bitstreams/loom-ce-uwinhbm/cyt_top.pdi 0000:61:00.0`
   4. V80 → U280 → V80 on clara (the U280 → V80 hop; compare its rate with
      the same size landing in host memory, the second line):
      `cd /scratch/harshanavkis/loom-proj/Coyote/examples/loom_ce/sw/build && sudo /nix/store/4sjg21zq04394ci22lj67vgpw7ykw9bg-numactl-2.0.18/bin/numactl -N 1 -m 1 ./ce_local --land-v80 16777216 3`
