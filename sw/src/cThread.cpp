@@ -387,6 +387,17 @@ int cThread::exportDmabuf(uint32_t region, uint64_t offset, uint64_t len) {
     return static_cast<int>(tmp[3]);
 }
 
+void cThread::uwinHbmBind(void *vaddr, uint64_t len) {
+    DBG1("cThread: Called uwinHbmBind, vaddr " << vaddr << ", length " << len);
+    uint64_t tmp[MAX_USER_ARGS];
+    tmp[0] = reinterpret_cast<uint64_t>(vaddr);
+    tmp[1] = len;
+    tmp[2] = static_cast<uint64_t>(ctid);
+    if (ioctl(fd, IOCTL_UWIN_HBM_BIND, &tmp)) {
+        throw std::runtime_error("ERROR: IOCTL_UWIN_HBM_BIND failed");
+    }
+}
+
 void *cThread::mapUwin(uint64_t len) {
     DBG1("cThread: Called mapUwin, length " << len);
     unmapUwin();

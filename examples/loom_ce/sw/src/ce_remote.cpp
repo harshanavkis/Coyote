@@ -28,6 +28,17 @@
  *   4. per copy: fill the source, offload it to HBM, announce it, start
  *      loom_ce with the fence behind the data, report the server's answer
  *
+ * Both directions at once (one QP, one process per host, each host both
+ * sender and lander):
+ *     ce_remote --bidir-server [--port N] [--size BYTES] [--reps N] [--no-send]
+ *     ce_remote --bidir-client <server_ip> [--port N] [--reps N] [--window P] [--no-send]
+ *   each side lands the peer's copies in its own host buffers and pushes
+ *   its own V80's copies into the peer's; per copy both start together
+ *   (a TCP barrier), and each side times the peer's copy from the barrier
+ *   to the fence landing, checks every byte, and reports its copy engine's
+ *   cycles (the outgoing push). --no-send keeps that side's copy engine
+ *   idle: the one-way control in the same setup.
+ *
  * The QP port is N, the hello's TCP port N + 1 (N defaults to Coyote's).
  * --window sets the client's ack window (packets unacked, TX_CTL; 16 after
  * reset). Each side prints where its switch's cycles went during a copy:
@@ -113,10 +124,6 @@ void print_v80_words(coyote::cThread &v80, const uint64_t *before, uint32_t firs
         if (d && names[i][0]) printf("    %-17s %lu\n", names[i], (unsigned long) d);
     }
 }
-const char *const LAND_NAMES[6]  = {"land reqs", "land done", "land bursts", "land drops", "land stores", "land partial"};
-const char *const LDBG_NAMES[14] = {"land out bp", "", "land fifo empty", "land W: no aw", "land W: B slot",
-                                    "land W: fifo", "land W: queue", "land W: stores", "land drop: no win",
-                                    "land drop: end", "land 1 beat", "land 2-4", "land >4", "land misaligned"};
 const char *const CE_NAMES[3]    = {"CE out bp", "CE in wait", "sq_wr wait"};
 void snap(coyote::cThread &v80, uint64_t *out, uint32_t first, int n) {
     for (int i = 0; i < n; i++) out[i] = v80.getCSR(first + i);
@@ -133,7 +140,6 @@ int run_server(uint16_t port, uint64_t size, bool land) {
     uint64_t *dst, *fence;
     coyote::cThread *v80 = nullptr;
     land_v80::Landing *L = nullptr;
-    uint64_t stores_base = 0;
     if (land) {
         v80 = new coyote::cThread(0, getpid(), 0, nullptr, "coyote_versal_fpga");
         L = new land_v80::Landing(*v80, size + 4096);
@@ -142,7 +148,6 @@ int run_server(uint16_t port, uint64_t size, bool land) {
         t_data.importDmabuf(lfd, lva);
         dst   = static_cast<uint64_t *>(lva);
         fence = dst + size / 8;
-        stores_base = L->csr(land_v80::LAND_STORES);
         printf("server: V80 uwin imported at %p, landing at card VA %p\n", lva, (void *) L->buf);
     } else {
         dst   = static_cast<uint64_t *>(t_data.getMem({coyote::CoyoteAllocType::HPF, size}));
@@ -170,15 +175,13 @@ int run_server(uint16_t port, uint64_t size, bool land) {
     volatile uint64_t *vdst = dst;
     int errors = 0, copies = 0;
     Announce an;
-    uint64_t l0[6], d0[14];
     while (read_full(c, &an, sizeof(an)) && an.rep != ~0ULL) {
         const Counters k0 = Counters::read(t_qp);
-        if (land) { snap(*v80, l0, land_v80::LAND_REQS, 6); snap(*v80, d0, 32, 14); }
         auto t0 = std::chrono::steady_clock::now();
         Verdict v{};
         if (land) {
             // one fence store per copy so far, then every card write complete
-            (void) L->wait(stores_base + copies);
+            (void) L->wait(size, an.fence);
             v.wait_us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
             L->pull();
             vdst = L->buf;
@@ -201,11 +204,6 @@ int run_server(uint16_t port, uint64_t size, bool land) {
         printf("     loom_rx over %lu cycles: %lu moving, %lu starved (nothing arrived), %lu stalled (host write not ready), rx FIFO full %lu\n",
                (unsigned long) k1.d(k0, C_CYC), (unsigned long) k1.d(k0, C_RX_MOVE), (unsigned long) k1.d(k0, C_RX_STARVE),
                (unsigned long) k1.d(k0, C_RX_STALL), (unsigned long) k1.d(k0, C_RX_FF));
-        if (land) {
-            printf("     V80 landing:\n");
-            print_v80_words(*v80, l0, land_v80::LAND_REQS, 6, LAND_NAMES);
-            print_v80_words(*v80, d0, 32, 14, LDBG_NAMES);
-        }
         errors += (v.bad != 0);
         copies++;
         // the next copy must write every byte again
@@ -223,6 +221,140 @@ int run_server(uint16_t port, uint64_t size, bool land) {
     delete v80;
     printf(errors || !copies ? "G4 FAIL (server)\n" : "G4 PASS (server)\n");
     return errors || !copies ? 1 : 0;
+}
+
+// --bidir: one process per host, both directions over one QP
+struct BiHello { uint32_t magic; uint32_t dst_ctid; uint64_t staging_va, dst_va, fence_va, size; };
+struct BiGo    { uint64_t rep, fence; uint32_t send, pad; };                 // my fence value, if I send
+struct BiDone  { uint64_t bad; double wait_us; uint64_t ce_cycles; };
+
+uint64_t bi_pattern(uint64_t off, uint64_t rep, int side) { return pattern(off, rep) ^ (uint64_t(side + 1) << 40); }
+
+int run_bidir(const std::string &ip, uint16_t port, uint64_t size, int reps, int window, bool send) {
+    const bool server = ip.empty();
+    const int me = server ? 0 : 1, peer = 1 - me;
+    coyote::cThread t_qp(0, getpid(), 0, nullptr, "coyote_fpga");     // QP owner, CSR page, rdma windows
+    coyote::cThread t_data(0, getpid(), 0, nullptr, "coyote_fpga");   // owns the landing buffers
+    coyote::cThread v80(0, getpid(), 0, nullptr, "coyote_versal_fpga");
+    printf("%s: QP exchange on port %u ...\n", server ? "server" : "client", port);
+    void *staging = server ? t_qp.initRDMA(STAGING_SIZE, port) : t_qp.initRDMA(STAGING_SIZE, port, ip.c_str());
+    if (!staging) { printf("FAIL: initRDMA\n"); return 1; }
+
+    // Landing buffers for the peer's copies
+    uint64_t *dst   = static_cast<uint64_t *>(t_data.getMem({coyote::CoyoteAllocType::HPF, size}));
+    uint64_t *fence = static_cast<uint64_t *>(t_data.getMem({coyote::CoyoteAllocType::HPF, 4096}));
+    memset(dst, 0, size);
+    memset(fence, 0, 4096);
+
+    // Hello both ways
+    int fd = -1;
+    if (server) {
+        int lfd = ::socket(AF_INET, SOCK_STREAM, 0), one = 1;
+        ::setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+        sockaddr_in a{};
+        a.sin_family = AF_INET; a.sin_addr.s_addr = INADDR_ANY; a.sin_port = htons(port + 1);
+        if (::bind(lfd, reinterpret_cast<sockaddr *>(&a), sizeof(a)) < 0 || ::listen(lfd, 1) < 0) {
+            printf("FAIL: hello listener on port %u\n", port + 1);
+            return 1;
+        }
+        fd = ::accept(lfd, nullptr, nullptr);
+        ::close(lfd);
+    } else {
+        for (int i = 0; i < 300 && fd < 0; i++) {
+            fd = ::socket(AF_INET, SOCK_STREAM, 0);
+            sockaddr_in a{};
+            a.sin_family = AF_INET; a.sin_port = htons(port + 1);
+            ::inet_pton(AF_INET, ip.c_str(), &a.sin_addr);
+            if (::connect(fd, reinterpret_cast<sockaddr *>(&a), sizeof(a)) < 0) { ::close(fd); fd = -1; usleep(100000); }
+        }
+    }
+    BiHello mine{MAGIC, uint32_t(t_data.getCtid()), reinterpret_cast<uint64_t>(staging),
+                 reinterpret_cast<uint64_t>(dst), reinterpret_cast<uint64_t>(fence), size}, h{};
+    if (fd < 0 || !write_full(fd, &mine, sizeof(mine)) || !read_full(fd, &h, sizeof(h)) || h.magic != MAGIC || h.size != size) {
+        printf("FAIL: hello (sizes must match on both sides)\n");
+        return 1;
+    }
+
+    // Outgoing: rdma windows onto the peer's buffers, the uwin exported to the V80
+    if (window >= 0) loom_switch::csr_write(t_qp, loom_switch::TX_CTL, uint64_t(window));
+    loom_switch::csr_write(t_qp, loom_switch::RDMA_STAGING_VA, h.staging_va);
+    loom_switch::program_window(t_qp, 1, true, t_qp.getCtid(), reinterpret_cast<void *>(h.dst_va), size, 0, h.dst_ctid);
+    loom_switch::program_window(t_qp, 2, true, t_qp.getCtid(), reinterpret_cast<void *>(h.fence_va), 4096, size, h.dst_ctid);
+    const uint64_t win_len = size + 4096;
+    const int dfd = t_qp.exportDmabuf(EXPORT_REGION_UWIN, 0, win_len);
+    void *uva = loom_switch::reserve_va(win_len);
+    v80.importDmabuf(dfd, uva);
+    uint64_t *src = static_cast<uint64_t *>(v80.getMem({coyote::CoyoteAllocType::HPF, size}));
+    printf("%s: up; sending %s, receiving from a peer that %s\n", server ? "server" : "client",
+           send ? "yes" : "no", "announces per copy");
+
+    volatile uint64_t *vfence = fence;
+    int errors = 0;
+    for (int r = 0; r < reps; r++) {
+        if (send) {
+            for (uint64_t i = 0; i < size / 8; i++) src[i] = bi_pattern(8 * i, r, me);
+            v80.invoke(coyote::CoyoteOper::LOCAL_OFFLOAD, coyote::syncSg{src, size});
+            v80.setCSR(reinterpret_cast<uint64_t>(src), SRC_VA);
+            v80.setCSR(reinterpret_cast<uint64_t>(uva), DST_VA);
+            v80.setCSR(size, LEN);
+            v80.setCSR(v80.getCtid(), PID);
+            v80.setCSR(reinterpret_cast<uint64_t>(uva) + size, FENCE_VA);
+        }
+        const loom_switch::IngressCounters c0 = loom_switch::IngressCounters::read(t_qp);
+        const Counters k0 = Counters::read(t_qp);
+
+        // Barrier: exchange what each side will do, then both start
+        BiGo g{uint64_t(r), send ? v80.getCSR(COPIES) + 1 : 0, uint32_t(send), 0}, pg{};
+        if (!write_full(fd, &g, sizeof(g)) || !read_full(fd, &pg, sizeof(pg)) || pg.rep != uint64_t(r)) {
+            printf("FAIL: barrier\n");
+            return 1;
+        }
+        const auto t0 = std::chrono::steady_clock::now();
+        if (send) v80.setCSR(1, START);
+
+        BiDone d{0, 0, 0};
+        if (pg.send) {
+            while (*vfence != pg.fence && std::chrono::steady_clock::now() - t0 < std::chrono::seconds(5))
+                _mm_pause();
+            d.wait_us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
+            if (*vfence == pg.fence)
+                for (uint64_t i = 0; i < size / 8; i++) d.bad += (dst[i] != bi_pattern(8 * i, r, peer));
+            else
+                d.bad = size / 8;
+        }
+        if (send) {
+            while (v80.getCSR(BUSY) && std::chrono::steady_clock::now() - t0 < std::chrono::seconds(5)) _mm_pause();
+            d.ce_cycles = v80.getCSR(CYCLES);
+        }
+        const loom_switch::IngressCounters c1 = loom_switch::IngressCounters::read(t_qp);
+        const Counters k1 = Counters::read(t_qp);
+
+        BiDone pd{};
+        if (!write_full(fd, &d, sizeof(d)) || !read_full(fd, &pd, sizeof(pd))) { printf("FAIL: verdict\n"); return 1; }
+        const bool bad = (pg.send && d.bad) || (send && pd.bad);
+        errors += bad;
+        printf("%s copy %d: ", bad ? "FAIL" : "ok  ", r);
+        if (pg.send) printf("in %lu B landed %.1f us after the barrier (%.2f GB/s), %lu words wrong; ",
+                            (unsigned long) size, d.wait_us, size / d.wait_us / 1e3, (unsigned long) d.bad);
+        if (send)    printf("out: CE %lu cycles (%.2f GB/s), peer saw it after %.1f us (%.2f GB/s), %lu words wrong",
+                            (unsigned long) d.ce_cycles, size / (d.ce_cycles * 4e-9) / 1e9, pd.wait_us,
+                            pd.wait_us > 0 ? size / pd.wait_us / 1e3 : 0.0, (unsigned long) pd.bad);
+        printf("\n");
+        printf("     ingress: %lu rdma packets, %lu dropped; waits over %lu cycles: ack window %lu, sq_wr rdma %lu / local %lu; "
+               "loom_rx moving %lu, starved %lu, stalled %lu\n",
+               (unsigned long) (c1.v[3] - c0.v[3]), (unsigned long) (c1.v[1] - c0.v[1]),
+               (unsigned long) k1.d(k0, C_CYC), (unsigned long) k1.d(k0, C_WINFULL),
+               (unsigned long) k1.d(k0, C_WAIT_RDMA), (unsigned long) k1.d(k0, C_WAIT_LOCAL),
+               (unsigned long) k1.d(k0, C_RX_MOVE), (unsigned long) k1.d(k0, C_RX_STARVE), (unsigned long) k1.d(k0, C_RX_STALL));
+        memset(dst, 0, size);
+        *vfence = 0;
+    }
+    ::close(fd);
+    loom_switch::release_window(t_qp, 1);
+    loom_switch::release_window(t_qp, 2);
+    t_qp.connSync(!server);
+    printf(errors ? "BIDIR FAIL\n" : "BIDIR PASS\n");
+    return errors ? 1 : 0;
 }
 
 int run_client(const std::string &ip, uint16_t port, int reps, int window) {
@@ -321,7 +453,7 @@ int main(int argc, char **argv) {
     uint64_t size = 1ULL << 20;
     int reps = 3;
     int window = -1;
-    bool land = false;
+    bool land = false, bidir = false, no_send = false;
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         if (a == "--server")                     server = true;
@@ -331,12 +463,17 @@ int main(int argc, char **argv) {
         else if (a == "--reps" && i + 1 < argc)   reps = atoi(argv[++i]);
         else if (a == "--window" && i + 1 < argc) window = atoi(argv[++i]);
         else if (a == "--land-v80")               land = true;
+        else if (a == "--bidir-server")           { bidir = true; server = true; }
+        else if (a == "--bidir-client" && i + 1 < argc) { bidir = true; ip = argv[++i]; }
+        else if (a == "--no-send")                no_send = true;
         else { server = false; ip.clear(); break; }
     }
     if (server == !ip.empty() || size == 0 || size % 4096 || size > (64ULL << 20)) {
         printf("usage: %s --server [--port N] [--size BYTES] [--land-v80] | --client <server_ip> [--port N] [--reps N] [--window P]\n"
+               "       | --bidir-server | --bidir-client <server_ip>  [--port N] [--size BYTES] [--reps N] [--window P] [--no-send]\n"
                "       (size: a multiple of 4 KiB, at most 64 MiB)\n", argv[0]);
         return 2;
     }
+    if (bidir) return run_bidir(server ? std::string() : ip, port, size, reps, window, !no_send);
     return server ? run_server(port, size, land) : run_client(ip, port, reps, window);
 }

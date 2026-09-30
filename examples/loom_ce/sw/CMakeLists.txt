@@ -22,3 +22,7 @@ target_link_libraries(ce_remote PUBLIC Coyote pthread)
 # The V80's write bandwidth to host memory vs peer-to-peer to the U280 (example 07 on the V80)
 add_executable(p2p_bw ${TARGET_DIR}/p2p_bw.cpp)
 target_link_libraries(p2p_bw PUBLIC Coyote pthread)
+
+# Bisecting a host reset: V80-only steps (CSR reads, copy to host memory)
+add_executable(v80_bisect ${TARGET_DIR}/v80_bisect.cpp)
+target_link_libraries(v80_bisect PUBLIC Coyote pthread)

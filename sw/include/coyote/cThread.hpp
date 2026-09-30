@@ -244,6 +244,19 @@ protected:
 	int exportDmabuf(uint32_t region, uint64_t offset, uint64_t len);
 
 	/**
+	 * @brief Binds a buffer's card memory to the user data window's HBM region
+	 * (EN_UWIN_HBM shells, Versal): buffer offset x becomes uwin offset x, so
+	 * what a peer writes into the exported window (exportDmabuf with
+	 * EXPORT_REGION_UWIN) is the buffer's card copy, and a card-stream access
+	 * to the buffer reads it. The buffer must have card pages (e.g. getMem)
+	 * and fit the window.
+	 *
+	 * @param vaddr Start of the buffer, page-aligned
+	 * @param len Length in bytes
+	 */
+	void uwinHbmBind(void *vaddr, uint64_t len);
+
+	/**
 	 * @brief Maps a dma-buf exported by another device (e.g. a peer FPGA's BAR
 	 * region) into this vFPGA's MMU at vaddr, so the vFPGA can address it.
 	 * vaddr only has to be unique in this thread's address space; nothing is

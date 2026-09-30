@@ -13,19 +13,18 @@
  *   4. the host waits for the count in the fence page and checks every byte
  *
  * With --land-v80 the destination is the V80's own card memory instead of
- * a host buffer, through the receive side's landing window:
+ * a host buffer: the V80's window is its HBM (EN_UWIN_HBM), so
  *
  *   V80 HBM --loom_ce, P2P--> U280 uwin --loom_ingress, local route, P2P-->
- *       V80 uwin --landing window--> V80 HBM
+ *       V80 uwin = V80 HBM
  *
- * the U280's windows point at the V80's uwin (exported by the V80 driver,
- * imported by the U280's), and the host waits for the fence store to land
- * and every card write to complete, then syncs the buffer back and checks
- * it. This is the U280 -> V80 hop's test and its rate.
+ * the U280's windows point at the V80's window (exported by the V80 driver,
+ * imported by the U280's), a V80 buffer is bound to the window's HBM region,
+ * and the host waits for the fence through the window, then syncs the
+ * buffer back and checks it. This is the U280 -> V80 hop's test and rate.
  *
  * Each copy prints the counters that say where its cycles went: the copy
- * engine's (V80 words 48-50), the U280 ingress's debug counters (95-108)
- * and, with --land-v80, the V80 landing's (24-29, 32-45).
+ * engine's (V80 words 48-50) and the U280 ingress's debug counters (95-108).
  *
  * Needs the loom_switch bitstream on the U280 (coyote_driver with
  * MMAP_UWIN / EXPORT_REGION_UWIN) and loom_ce on the V80
@@ -59,29 +58,22 @@ namespace {
 // loom_ce_ctrl.sv
 enum CeReg : uint32_t { START = 0, SRC_VA = 1, DST_VA = 2, LEN = 3, PID = 4, FENCE_VA = 5,
                         BUSY = 8, COPIES = 9, CYCLES = 10,
-                        CE_OUT_BP = 48, CE_IN_WAIT = 49, WR_WAIT = 50, LAND_DBG = 32 };
+                        CE_OUT_BP = 48, CE_IN_WAIT = 49, WR_WAIT = 50 };
 
-// V80 counters: the copy engine's, then the landing's and its debug counters
+// V80 counters: the copy engine's stalls (loom_ce_ctrl.sv 48-50)
 struct V80Counters {
-    static constexpr int N = 3 + 6 + 14;
+    static constexpr int N = 3;
     uint64_t v[N];
     static V80Counters read(coyote::cThread &t) {
         V80Counters c;
-        for (int i = 0; i < 3; i++)  c.v[i]      = t.getCSR(CE_OUT_BP + i);
-        for (int i = 0; i < 6; i++)  c.v[3 + i]  = t.getCSR(land_v80::LAND_REQS + i);
-        for (int i = 0; i < 14; i++) c.v[9 + i]  = t.getCSR(LAND_DBG + i);
+        for (int i = 0; i < N; i++) c.v[i] = t.getCSR(CE_OUT_BP + i);
         return c;
     }
 };
-const char *const V80_NAMES[V80Counters::N] = {
-    "CE out bp", "CE in wait", "sq_wr wait",
-    "land reqs", "land done", "land bursts", "land drops", "land stores", "land partial",
-    "land out bp", "(unused)", "land fifo empty",
-    "land W: no aw", "land W: B slot", "land W: fifo", "land W: queue", "land W: stores",
-    "land drop: no win", "land drop: end", "land 1 beat", "land 2-4", "land >4", "land misaligned"};
+const char *const V80_NAMES[V80Counters::N] = {"CE out bp", "CE in wait", "sq_wr wait"};
 
-void print_v80_delta(const V80Counters &a, const V80Counters &b, bool landing) {
-    for (int i = 0; i < (landing ? V80Counters::N : 3); i++)
+void print_v80_delta(const V80Counters &a, const V80Counters &b) {
+    for (int i = 0; i < V80Counters::N; i++)
         if (b.v[i] != a.v[i])
             printf("    %-17s %lu\n", V80_NAMES[i], (unsigned long) (b.v[i] - a.v[i]));
 }
@@ -176,7 +168,6 @@ int main(int argc, char **argv) {
         else      memset(dst, 0, size);
 
         const uint64_t before = v80.getCSR(COPIES);
-        const uint64_t stores0 = land ? L->csr(land_v80::LAND_STORES) : 0;
         loom_switch::IngressCounters c0 = loom_switch::IngressCounters::read(u280);
         const V80Counters k0 = V80Counters::read(v80);
         v80.setCSR(reinterpret_cast<uint64_t>(src), SRC_VA);
@@ -191,7 +182,7 @@ int main(int argc, char **argv) {
         // as the landing's one store, after which every card write completes
         const uint64_t *got = dst, *gfence = fence;
         if (land) {
-            (void) L->wait(stores0);
+            (void) L->wait(size, before + 1);
         } else {
             while (*vfence != before + 1 && std::chrono::steady_clock::now() - t0 < std::chrono::seconds(5))
                 _mm_pause();
@@ -229,7 +220,7 @@ int main(int argc, char **argv) {
         printf("     U280 ingress debug:\n");
         loom_switch::print_ingress_delta(c0, c1, loom_switch::I_DBG, loom_switch::N_ING - loom_switch::I_DBG);
         printf("     V80:\n");
-        print_v80_delta(k0, k1, land);
+        print_v80_delta(k0, k1);
     }
 
     loom_switch::release_window(u280, 1);

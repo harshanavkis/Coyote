@@ -102,6 +102,7 @@ namespace coyote {
 
 // Export a BAR region of this vFPGA as a dma-buf, for a peer device to import
 #define IOCTL_EXPORT_DMABUF                 _IOWR('F', 20, unsigned long)
+#define IOCTL_UWIN_HBM_BIND                 _IOW('F', 21, unsigned long)
 #define EXPORT_REGION_CTRL_USER             0   // the vFPGA's AXI-Lite user control region
 #define EXPORT_REGION_UWIN                  1   // the vFPGA's user data window (EN_UWIN shells)
 
