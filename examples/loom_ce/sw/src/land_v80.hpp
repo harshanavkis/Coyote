@@ -8,9 +8,14 @@
  * stream, and the host reads it back by syncing the buffer.
  *
  * A copy lands its data, then its fence (an 8 B write behind the data; the
- * V80's NoC keeps same-ID writes in order). wait() polls the fence word
- * through the window itself (reads return HBM), pull() syncs the buffer.
+ * V80's NoC keeps same-ID writes in order). settle() is the safe way to wait
+ * while a PEER writes into the window: it never reads the card while those
+ * writes are in flight (a host read stuck behind a stalled peer write has
+ * reset hosts), it waits a fixed time and then syncs the buffer back, so
+ * the fence and the data are checked in host memory. wait() polls the fence
+ * through the window itself - only for the host's own writes (v80_bisect).
  */
+#include <thread>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
@@ -53,6 +58,14 @@ struct Landing {
             _mm_pause();
         }
         return true;
+    }
+
+    // Wait `ms` without touching the card, then sync HBM back; true if the
+    // 8 B word at byte offset off then reads val (in host memory)
+    bool settle(uint64_t off, uint64_t val, std::chrono::milliseconds ms) {
+        std::this_thread::sleep_for(ms);
+        pull();
+        return buf[off / 8] == val;
     }
 
     // HBM back to host memory
