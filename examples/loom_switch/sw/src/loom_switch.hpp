@@ -25,6 +25,16 @@ constexpr uint32_t TX_CTL          = 66;
 constexpr uint32_t TX_STATE        = 67;
 constexpr uint32_t TX_ACKS         = 68;
 constexpr uint32_t RX_CHUNK        = 76;
+// Where the cycles go (loom_ctrl.sv)
+constexpr uint32_t TX_WINFULL      = 69;   // an rdma packet waited on the ack window
+constexpr uint32_t TX_REQWAIT      = 70;   // an rdma packet waited on sq_wr.ready
+constexpr uint32_t WR_WAIT_LOCAL   = 72;   // a local request waited on sq_wr.ready
+constexpr uint32_t WR_WAIT_RDMA    = 73;   // an rdma request waited on sq_wr.ready
+constexpr uint32_t RX_FIFO_FULL    = 14;   // loom_rx's ingress FIFO refused a beat
+constexpr uint32_t RX_BP           = 30;   // loom_rx refused a beat the FIFO offered
+constexpr uint32_t RX_MOVE         = 42;   // loom_rx forwarded a beat
+constexpr uint32_t RX_STARVE       = 43;   // loom_rx had nothing to forward
+constexpr uint32_t RX_STALL        = 44;   // loom_rx had a beat, the host write was not ready
 // Ingress counters, 88-94
 constexpr uint32_t ING_BURSTS      = 88;
 constexpr uint32_t ING_DROPS       = 89;

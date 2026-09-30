@@ -14,7 +14,7 @@
  *      server waits for it in the fence page, checks every byte, answers
  *
  * Client (the sending host; U280 + V80):
- *     ce_remote --client <server_ip> [--port N] [--reps N]
+ *     ce_remote --client <server_ip> [--port N] [--reps N] [--window P]
  *   1. QP exchange, then the hello
  *   2. staging CSR = the server's staging VA; rdma windows onto the
  *      server's destination (uwin 0) and fence page (right after it),
@@ -24,6 +24,10 @@
  *      loom_ce with the fence behind the data, report the server's answer
  *
  * The QP port is N, the hello's TCP port N + 1 (N defaults to Coyote's).
+ * --window sets the client's ack window (packets unacked, TX_CTL; 16 after
+ * reset). Each side prints where its switch's cycles went during a copy:
+ * the client its waits on the window and on sq_wr, the server loom_rx's
+ * moving / starved / stalled cycles.
  */
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -61,6 +65,23 @@ struct Hello {
 };
 struct Announce { uint64_t rep; uint64_t fence; };        // client -> server; rep ~0 = done
 struct Verdict  { uint64_t bad; uint64_t fence; double wait_us; };
+
+// A set of the switch's counters, read before and after a copy
+struct Counters {
+    static constexpr int N = 9;
+    static constexpr uint32_t W[N] = {loom_switch::CYC, loom_switch::TX_WINFULL, loom_switch::TX_REQWAIT,
+                                      loom_switch::WR_WAIT_LOCAL, loom_switch::WR_WAIT_RDMA,
+                                      loom_switch::RX_MOVE, loom_switch::RX_STARVE, loom_switch::RX_STALL,
+                                      loom_switch::RX_FIFO_FULL};
+    uint64_t v[N];
+    static Counters read(coyote::cThread &t) {
+        Counters c;
+        for (int i = 0; i < N; i++) c.v[i] = loom_switch::csr_read(t, W[i]);
+        return c;
+    }
+    uint64_t d(const Counters &before, int i) const { return v[i] - before.v[i]; }
+};
+enum { C_CYC, C_WINFULL, C_REQWAIT, C_WAIT_LOCAL, C_WAIT_RDMA, C_RX_MOVE, C_RX_STARVE, C_RX_STALL, C_RX_FF };
 
 uint64_t pattern(uint64_t off, uint64_t rep) { return 0xCE00000000000000ULL ^ (off * 0x9E3779B97F4A7C15ULL) ^ rep; }
 
@@ -108,17 +129,23 @@ int run_server(uint16_t port, uint64_t size) {
     int errors = 0, copies = 0;
     Announce an;
     while (read_full(c, &an, sizeof(an)) && an.rep != ~0ULL) {
+        const Counters k0 = Counters::read(t_qp);
         auto t0 = std::chrono::steady_clock::now();
         while (*vfence != an.fence && std::chrono::steady_clock::now() - t0 < std::chrono::seconds(5))
             _mm_pause();
         Verdict v{0, *vfence, std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count()};
+        const Counters k1 = Counters::read(t_qp);
         if (v.fence == an.fence)
             for (uint64_t i = 0; i < size / 8; i++) v.bad += (vdst[i] != pattern(8 * i, an.rep));
         else
             v.bad = size / 8;
-        printf("%s copy %lu: fence %lu (expected %lu), %lu of %lu words wrong\n",
+        printf("%s copy %lu: fence %lu (expected %lu), %lu of %lu words wrong, fence %.1f us after the announce (%.2f GB/s)\n",
                (v.bad ? "FAIL" : "ok  "), (unsigned long) an.rep, (unsigned long) v.fence,
-               (unsigned long) an.fence, (unsigned long) v.bad, (unsigned long) (size / 8));
+               (unsigned long) an.fence, (unsigned long) v.bad, (unsigned long) (size / 8),
+               v.wait_us, size / v.wait_us / 1e3);
+        printf("     loom_rx over %lu cycles: %lu moving, %lu starved (nothing arrived), %lu stalled (host write not ready), rx FIFO full %lu\n",
+               (unsigned long) k1.d(k0, C_CYC), (unsigned long) k1.d(k0, C_RX_MOVE), (unsigned long) k1.d(k0, C_RX_STARVE),
+               (unsigned long) k1.d(k0, C_RX_STALL), (unsigned long) k1.d(k0, C_RX_FF));
         errors += (v.bad != 0);
         copies++;
         memset(dst, 0, size);          // the next copy must write every byte again
@@ -134,7 +161,7 @@ int run_server(uint16_t port, uint64_t size) {
     return errors || !copies ? 1 : 0;
 }
 
-int run_client(const std::string &ip, uint16_t port, int reps) {
+int run_client(const std::string &ip, uint16_t port, int reps, int window) {
     coyote::cThread u280(0, getpid(), 0, nullptr, "coyote_fpga");     // QP owner and CSR page
     coyote::cThread v80(0, getpid(), 0, nullptr, "coyote_versal_fpga");
     if (!u280.initRDMA(STAGING_SIZE, port, ip.c_str())) { printf("FAIL: initRDMA\n"); return 1; }
@@ -153,6 +180,9 @@ int run_client(const std::string &ip, uint16_t port, int reps) {
     const uint64_t size = h.size;
     printf("client: server dst %lx, fence %lx, %lu bytes, landing ctid %u\n",
            (unsigned long) h.dst_va, (unsigned long) h.fence_va, (unsigned long) size, h.dst_ctid);
+
+    if (window >= 0) loom_switch::csr_write(u280, loom_switch::TX_CTL, uint64_t(window));
+    printf("client: ack window %lu packets\n", (unsigned long) loom_switch::csr_read(u280, loom_switch::TX_CTL));
 
     // rdma windows onto the server's buffers, over this QP, landing under its data ctid
     loom_switch::csr_write(u280, loom_switch::RDMA_STAGING_VA, h.staging_va);
@@ -175,6 +205,7 @@ int run_client(const std::string &ip, uint16_t port, int reps) {
 
         const uint64_t fence = v80.getCSR(COPIES) + 1;
         loom_switch::IngressCounters c0 = loom_switch::IngressCounters::read(u280);
+        const Counters k0 = Counters::read(u280);
         Announce an{uint64_t(r), fence};
         write_full(fd, &an, sizeof(an));
 
@@ -188,6 +219,7 @@ int run_client(const std::string &ip, uint16_t port, int reps) {
         Verdict v{};
         if (!read_full(fd, &v, sizeof(v))) { printf("FAIL: the server went away\n"); return 1; }
         loom_switch::IngressCounters c1 = loom_switch::IngressCounters::read(u280);
+        const Counters k1 = Counters::read(u280);
         printf("%s copy %d: %lu bytes, server saw the fence after %.1f us, %lu words wrong; CE %lu cycles\n",
                (v.bad ? "FAIL" : "ok  "), r, (unsigned long) size, v.wait_us, (unsigned long) v.bad,
                (unsigned long) v80.getCSR(CYCLES));
@@ -196,6 +228,9 @@ int run_client(const std::string &ip, uint16_t port, int reps) {
                (unsigned long) (c1.v[4] - c0.v[4]), (unsigned long) (c1.v[1] - c0.v[1]),
                (unsigned long) loom_switch::csr_read(u280, loom_switch::TX_ACKS),
                (unsigned long) loom_switch::csr_read(u280, loom_switch::TX_STATE));
+        printf("     switch waits over %lu cycles: ack window %lu, sq_wr (rdma) %lu, sq_wr any rdma %lu / local %lu\n",
+               (unsigned long) k1.d(k0, C_CYC), (unsigned long) k1.d(k0, C_WINFULL), (unsigned long) k1.d(k0, C_REQWAIT),
+               (unsigned long) k1.d(k0, C_WAIT_RDMA), (unsigned long) k1.d(k0, C_WAIT_LOCAL));
         errors += (v.bad != 0);
     }
     Announce done{~0ULL, 0};
@@ -216,6 +251,7 @@ int main(int argc, char **argv) {
     uint16_t port = coyote::DEF_PORT;
     uint64_t size = 1ULL << 20;
     int reps = 3;
+    int window = -1;
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         if (a == "--server")                     server = true;
@@ -223,12 +259,13 @@ int main(int argc, char **argv) {
         else if (a == "--port" && i + 1 < argc)   port = uint16_t(atoi(argv[++i]));
         else if (a == "--size" && i + 1 < argc)   size = strtoull(argv[++i], nullptr, 0);
         else if (a == "--reps" && i + 1 < argc)   reps = atoi(argv[++i]);
+        else if (a == "--window" && i + 1 < argc) window = atoi(argv[++i]);
         else { server = false; ip.clear(); break; }
     }
     if (server == !ip.empty() || size == 0 || size % 4096 || size > (64ULL << 20)) {
-        printf("usage: %s --server [--port N] [--size BYTES] | --client <server_ip> [--port N] [--reps N]\n"
+        printf("usage: %s --server [--port N] [--size BYTES] | --client <server_ip> [--port N] [--reps N] [--window P]\n"
                "       (size: a multiple of 4 KiB, at most 64 MiB)\n", argv[0]);
         return 2;
     }
-    return server ? run_server(port, size) : run_client(ip, port, reps);
+    return server ? run_server(port, size) : run_client(ip, port, reps, window);
 }
