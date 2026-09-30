@@ -31,7 +31,13 @@
  * MMAP_UWIN / EXPORT_REGION_UWIN) and loom_ce on the V80
  * (coyote_driver_versal).
  *
- * Usage: ce_local [--land-v80] [bytes (multiple of 4 KiB, at most 64 MiB)] [copies]
+ * With --discard SECONDS nothing lands: no U280 window is programmed, so
+ * loom_ingress accepts and drops every write, and loom_ce copies into the
+ * uwin back to back for SECONDS. It is a sustained load of peer-to-peer
+ * writes into the U280, for measuring what that load does to the U280's
+ * other traffic (e.g. loom_rx landings from the far host).
+ *
+ * Usage: ce_local [--land-v80 | --discard SECONDS] [bytes (multiple of 4 KiB, at most 64 MiB)] [copies]
  */
 #include <sys/mman.h>
 #include <unistd.h>
@@ -86,7 +92,9 @@ uint64_t pattern(uint64_t off, int rep) { return 0xCE00000000000000ULL ^ (off * 
 
 int main(int argc, char **argv) {
     bool land = false;
+    double discard_s = 0;
     if (argc > 1 && strcmp(argv[1], "--land-v80") == 0) { land = true; argv++; argc--; }
+    else if (argc > 2 && strcmp(argv[1], "--discard") == 0) { discard_s = atof(argv[2]); argv += 2; argc -= 2; }
     const uint64_t size = (argc > 1) ? strtoull(argv[1], nullptr, 0) : (1ULL << 20);
     const int reps      = (argc > 2) ? atoi(argv[2]) : 1;
     if (size == 0 || size % 4096 || size > (64ULL << 20)) {
@@ -96,6 +104,35 @@ int main(int argc, char **argv) {
 
     coyote::cThread u280(0, getpid(), 0, nullptr, "coyote_fpga");
     coyote::cThread v80(0, getpid(), 0, nullptr, "coyote_versal_fpga");
+
+    if (discard_s > 0) {
+        for (int w = 1; w <= 2; w++) loom_switch::release_window(u280, w);
+        const int fd = u280.exportDmabuf(EXPORT_REGION_UWIN, 0, size);
+        void *uva = loom_switch::reserve_va(size);
+        v80.importDmabuf(fd, uva);
+        uint64_t *src = static_cast<uint64_t *>(v80.getMem({coyote::CoyoteAllocType::HPF, size}));
+        for (uint64_t i = 0; i < size / 8; i++) src[i] = pattern(8 * i, 0);
+        v80.invoke(coyote::CoyoteOper::LOCAL_OFFLOAD, coyote::syncSg{src, size});
+        v80.setCSR(reinterpret_cast<uint64_t>(src), SRC_VA);
+        v80.setCSR(reinterpret_cast<uint64_t>(uva), DST_VA);
+        v80.setCSR(size, LEN);
+        v80.setCSR(v80.getCtid(), PID);
+        v80.setCSR(0, FENCE_VA);
+        loom_switch::IngressCounters c0 = loom_switch::IngressCounters::read(u280);
+        uint64_t copies = 0;
+        const auto t0 = std::chrono::steady_clock::now();
+        while (std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() < discard_s) {
+            v80.setCSR(1, START);
+            while (v80.getCSR(BUSY)) _mm_pause();
+            copies++;
+        }
+        const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        loom_switch::IngressCounters c1 = loom_switch::IngressCounters::read(u280);
+        printf("discard: %lu copies of %lu bytes in %.2f s = %.2f GB/s into the uwin; ingress dropped %lu bursts\n",
+               (unsigned long) copies, (unsigned long) size, s, copies * size / s / 1e9,
+               (unsigned long) (c1.v[1] - c0.v[1]));
+        return 0;
+    }
 
     // Destination and fence: host buffers of the U280's, or (--land-v80) the
     // V80's landing buffer, reached through its uwin imported into the U280;
