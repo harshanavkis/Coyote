@@ -57,7 +57,9 @@ module loom_ce (
     output logic [AXI_DATA_BITS/8-1:0]  m_tkeep,
     output logic                        m_tvalid,
     input  logic                        m_tready,
-    output logic                        m_tlast
+    output logic                        m_tlast,
+
+    output logic                        cnt_in_wait   // copying, and no card data presented
 );
 
 typedef enum logic [2:0] { ST_IDLE, ST_RD_REQ, ST_WR_REQ, ST_STREAM, ST_FN_REQ, ST_FN_DATA } state_t;
@@ -125,7 +127,8 @@ always_ff @(posedge aclk) begin
     end
 end
 
-assign busy = (state != ST_IDLE);
+assign busy        = (state != ST_IDLE);
+assign cnt_in_wait = (state == ST_STREAM) && !s_tvalid;
 
 always_comb begin
     rd_req        = '0;

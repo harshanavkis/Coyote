@@ -69,6 +69,8 @@ wire land_wr_done = cq_wr.valid && (cq_wr.data.strm == STRM_CARD);
 // Copy engine
 // ---------------------------------------------------------------------------
 logic cnt_land_burst, cnt_land_drop, cnt_land_store, cnt_land_partial;
+logic [13:0] cnt_land_dbg;
+logic        cnt_ce_in_wait;
 
 loom_ce_ctrl inst_loom_ce_ctrl (
     .aclk(aclk), .aresetn(aresetn), .axi_ctrl(axi_ctrl),
@@ -79,7 +81,11 @@ loom_ce_ctrl inst_loom_ce_ctrl (
     .cnt_land_req(land_wr_valid && sq_wr.ready && wr_sel_land),
     .cnt_land_done(land_wr_done),
     .cnt_land_burst(cnt_land_burst), .cnt_land_drop(cnt_land_drop),
-    .cnt_land_store(cnt_land_store), .cnt_land_partial(cnt_land_partial)
+    .cnt_land_store(cnt_land_store), .cnt_land_partial(cnt_land_partial),
+    .cnt_land_dbg(cnt_land_dbg),
+    .cnt_ce_out_bp(axis_host_out.tvalid && !axis_host_out.tready),
+    .cnt_ce_in_wait(cnt_ce_in_wait),
+    .cnt_wr_wait(sq_wr.valid && !sq_wr.ready)
 );
 
 loom_ce inst_loom_ce (
@@ -94,7 +100,8 @@ loom_ce inst_loom_ce (
     .s_tvalid(axis_card_in.tvalid), .s_tready(axis_card_in.tready),
     .m_tdata(axis_host_out.tdata), .m_tkeep(axis_host_out.tkeep),
     .m_tvalid(axis_host_out.tvalid), .m_tready(axis_host_out.tready),
-    .m_tlast(axis_host_out.tlast)
+    .m_tlast(axis_host_out.tlast),
+    .cnt_in_wait(cnt_ce_in_wait)
 );
 assign axis_host_out.tid = '0;
 
@@ -124,7 +131,7 @@ loom_ingress #(.HOST_DEST(0), .LOCAL_STRM(STRM_CARD)) inst_loom_land (
     .cnt_burst(cnt_land_burst), .cnt_drop(cnt_land_drop),
     .cnt_pkt_local(), .cnt_pkt_rdma(),
     .cnt_store(cnt_land_store), .cnt_store_drop(cnt_land_partial),
-    .cnt_flush(), .cnt_win_wait(), .cnt_req_wait(), .cnt_dbg()
+    .cnt_flush(), .cnt_win_wait(), .cnt_req_wait(), .cnt_dbg(cnt_land_dbg)
 );
 assign axis_card_out.tid = '0;
 

@@ -420,6 +420,14 @@ initial begin
     end
     `CHECK(land_seen.size() == 0 && c_d.size() == 0 && wr_seen.size() == 0 && h_d.size() == 0, "T7: traffic left over")
     land_counters(lc1);
+    begin
+        // the debug counters moved under backpressure: landing bursts by
+        // size (64 of 4 beats), card-out and copy-out backpressure, sq_wr waits
+        logic [63:0] d42, d43, d32, p48, p50;
+        csr_rd(43, d43); csr_rd(32, d32); csr_rd(48, p48); csr_rd(50, p50);
+        `CHECK(d43 >= 64 && d32 > 0 && p48 > 0 && p50 > 0,
+               $sformatf("T7: debug counters bursts 2-4 %0d, card out bp %0d, CE out bp %0d, sq_wr wait %0d", d43, d32, p48, p50))
+    end
     `CHECK(lc1[0] - lc0[0] == lc1[1] - lc0[1], $sformatf("T7: LAND_REQS %0d LAND_DONE %0d", lc1[0] - lc0[0], lc1[1] - lc0[1]))
     bp = 0;
     $display("ok   T7 copy and landing at once");

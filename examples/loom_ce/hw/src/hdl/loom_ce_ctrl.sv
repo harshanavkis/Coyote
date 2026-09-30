@@ -31,10 +31,23 @@ import lynxTypes::*;
  *  27 LAND_DROPS   (RO) uwin bursts dropped (outside the window)
  *  28 LAND_STORES  (RO) 8 B stores posted
  *  29 LAND_PARTIAL (RO) beats with a partial 8 B word (not landed)
+ *  32-45 (RO) the landing's loom_ingress debug counters (cnt_dbg, bit =
+ *             word - 32; the order of examples/loom_switch's words 95-108):
+ *             32 card out valid and not ready, 33 unused (net), 34 sending
+ *             with the data FIFO empty, 35-39 W beat waits (no burst looked
+ *             up, B slot, data FIFO, queue, stores), 40/41 drops (no window,
+ *             past the end), 42-44 bursts of 1 / 2-4 / >4 beats, 45 bursts
+ *             at a non-64 B-aligned address
+ *  48 CE_OUT_BP   (RO) cycles the copy's write stream was valid and not ready
+ *                      (the peer-to-peer writes into the U280 held back)
+ *  49 CE_IN_WAIT  (RO) cycles the copy waited for card data (HBM read)
+ *  50 WR_WAIT     (RO) cycles a request waited on sq_wr (either producer)
  * Counters are free-running; software takes deltas. LAND_DONE == LAND_REQS
  * means everything that entered the window is in card memory.
  */
-module loom_ce_ctrl (
+module loom_ce_ctrl #(
+    parameter integer N_DBG = 14
+) (
     input  logic                        aclk,
     input  logic                        aresetn,
 
@@ -59,11 +72,15 @@ module loom_ce_ctrl (
     input  logic                        cnt_land_burst,
     input  logic                        cnt_land_drop,
     input  logic                        cnt_land_store,
-    input  logic                        cnt_land_partial
+    input  logic                        cnt_land_partial,
+    input  logic [N_DBG-1:0]            cnt_land_dbg,
+    input  logic                        cnt_ce_out_bp,
+    input  logic                        cnt_ce_in_wait,
+    input  logic                        cnt_wr_wait
 );
 
 localparam integer ADDR_LSB = $clog2(AXIL_DATA_BITS/8);
-localparam integer CSR_BITS = 5;
+localparam integer CSR_BITS = 6;
 
 localparam integer R_START    = 0;
 localparam integer R_SRC_VA   = 1;
@@ -79,6 +96,9 @@ localparam integer R_LAND_LEN  = 17;
 localparam integer R_LAND_PID  = 18;
 localparam integer R_LAND_CNT  = 24;   // 24-29, in the order of cnt_land below
 localparam integer N_LAND_CNT  = 6;
+localparam integer R_LAND_DBG  = 32;   // 32-45
+localparam integer R_PERF      = 48;   // 48-50, in the order of perf_pulse below
+localparam integer N_PERF      = 3;
 
 logic [15:0] axi_awaddr, axi_araddr;
 logic        axi_awready, axi_arready, axi_wready, axi_bvalid, axi_rvalid, aw_en;
@@ -125,17 +145,29 @@ assign land_base = r_land_base[VADDR_BITS-1:0];
 assign land_len  = r_land_len[LEN_BITS-1:0];
 assign land_pid  = r_land_pid[PID_BITS-1:0];
 
-// Landing counters, the pulses registered once
+// Landing, landing-debug and copy counters, the pulses registered once
 logic [63:0] land_cnt [N_LAND_CNT];
+logic [63:0] dbg_cnt  [N_DBG];
+logic [63:0] perf_cnt [N_PERF];
 logic [N_LAND_CNT-1:0] land_pulse;
+logic [N_DBG-1:0]      dbg_pulse;
+logic [N_PERF-1:0]     perf_pulse;
 always_ff @(posedge aclk) begin
     if (!aresetn) begin
         land_pulse <= '0;
+        dbg_pulse  <= '0;
+        perf_pulse <= '0;
         for (int i = 0; i < N_LAND_CNT; i++) land_cnt[i] <= 0;
+        for (int i = 0; i < N_DBG; i++)      dbg_cnt[i]  <= 0;
+        for (int i = 0; i < N_PERF; i++)     perf_cnt[i] <= 0;
     end else begin
         land_pulse <= {cnt_land_partial, cnt_land_store, cnt_land_drop,
                        cnt_land_burst, cnt_land_done, cnt_land_req};
+        dbg_pulse  <= cnt_land_dbg;
+        perf_pulse <= {cnt_wr_wait, cnt_ce_in_wait, cnt_ce_out_bp};
         for (int i = 0; i < N_LAND_CNT; i++) if (land_pulse[i]) land_cnt[i] <= land_cnt[i] + 1;
+        for (int i = 0; i < N_DBG; i++)      if (dbg_pulse[i])  dbg_cnt[i]  <= dbg_cnt[i] + 1;
+        for (int i = 0; i < N_PERF; i++)     if (perf_pulse[i]) perf_cnt[i] <= perf_cnt[i] + 1;
     end
 end
 
@@ -157,6 +189,10 @@ always_ff @(posedge aclk) begin
             default:
                 if (rd_idx >= R_LAND_CNT && rd_idx < R_LAND_CNT + N_LAND_CNT)
                     axi_rdata <= land_cnt[rd_idx - R_LAND_CNT];
+                else if (rd_idx >= R_LAND_DBG && rd_idx < R_LAND_DBG + N_DBG)
+                    axi_rdata <= dbg_cnt[rd_idx - R_LAND_DBG];
+                else if (rd_idx >= R_PERF && rd_idx < R_PERF + N_PERF)
+                    axi_rdata <= perf_cnt[rd_idx - R_PERF];
                 else
                     axi_rdata <= 0;
         endcase
