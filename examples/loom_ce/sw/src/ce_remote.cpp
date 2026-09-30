@@ -5,13 +5,18 @@
  *   client V80 HBM --loom_ce, P2P--> client U280 uwin --loom_ingress, rdma
  *   route--> RoCE --> server U280 loom_rx --> server host buffer
  *
- * Server (the landing host; U280 only):
- *     ce_remote --server [--port N] [--size BYTES]
+ * Server (the landing host; U280, and its V80 with --land-v80):
+ *     ce_remote --server [--port N] [--size BYTES] [--land-v80]
  *   1. QP exchange (blocks for the client); the QP owner's staging buffer
  *   2. destination and fence buffers on a data cThread
  *   3. a TCP hello to the client: staging VA, both buffers, the data ctid
  *   4. per copy: the client announces the fence value to expect; the
  *      server waits for it in the fence page, checks every byte, answers
+ *   With --land-v80 the destination and fence are the server's V80 card
+ *   memory: the V80's uwin, exported by its driver, is imported into the
+ *   data cThread, so loom_rx lands peer-to-peer into the V80's landing
+ *   window. The server waits for the copy's fence store to land and every
+ *   card write to complete, syncs the buffer back and checks it.
  *
  * Client (the sending host; U280 + V80):
  *     ce_remote --client <server_ip> [--port N] [--reps N] [--window P]
@@ -27,7 +32,9 @@
  * --window sets the client's ack window (packets unacked, TX_CTL; 16 after
  * reset). Each side prints where its switch's cycles went during a copy:
  * the client its waits on the window and on sq_wr, the server loom_rx's
- * moving / starved / stalled cycles.
+ * moving / starved / stalled cycles; the client also its U280 ingress's
+ * debug counters and its copy engine's (V80 words 48-50), a V80-landing
+ * server the landing's (24-29, 32-45).
  */
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -45,6 +52,7 @@
 #include <string>
 
 #include <coyote/cThread.hpp>
+#include "land_v80.hpp"
 #include "loom_switch.hpp"
 
 namespace {
@@ -96,7 +104,25 @@ bool write_full(int fd, const void *p, size_t n) {
     return true;
 }
 
-int run_server(uint16_t port, uint64_t size) {
+// The V80 landing's counters (loom_ce_ctrl.sv 24-29, 32-45), the copy
+// engine's (48-50)
+void print_v80_words(coyote::cThread &v80, const uint64_t *before, uint32_t first, int n,
+                     const char *const *names) {
+    for (int i = 0; i < n; i++) {
+        const uint64_t d = v80.getCSR(first + i) - before[i];
+        if (d && names[i][0]) printf("    %-17s %lu\n", names[i], (unsigned long) d);
+    }
+}
+const char *const LAND_NAMES[6]  = {"land reqs", "land done", "land bursts", "land drops", "land stores", "land partial"};
+const char *const LDBG_NAMES[14] = {"land out bp", "", "land fifo empty", "land W: no aw", "land W: B slot",
+                                    "land W: fifo", "land W: queue", "land W: stores", "land drop: no win",
+                                    "land drop: end", "land 1 beat", "land 2-4", "land >4", "land misaligned"};
+const char *const CE_NAMES[3]    = {"CE out bp", "CE in wait", "sq_wr wait"};
+void snap(coyote::cThread &v80, uint64_t *out, uint32_t first, int n) {
+    for (int i = 0; i < n; i++) out[i] = v80.getCSR(first + i);
+}
+
+int run_server(uint16_t port, uint64_t size, bool land) {
     coyote::cThread t_qp(0, getpid(), 0, nullptr, "coyote_fpga");     // QP owner
     coyote::cThread t_data(0, getpid(), 0, nullptr, "coyote_fpga");   // owns the landing buffers
     printf("server: waiting for the QP exchange on port %u ...\n", port);
@@ -104,10 +130,27 @@ int run_server(uint16_t port, uint64_t size) {
     if (!staging) { printf("FAIL: initRDMA\n"); return 1; }
     loom_switch::csr_write(t_qp, loom_switch::RDMA_STAGING_VA, reinterpret_cast<uint64_t>(staging));
 
-    uint64_t *dst   = static_cast<uint64_t *>(t_data.getMem({coyote::CoyoteAllocType::HPF, size}));
-    uint64_t *fence = static_cast<uint64_t *>(t_data.getMem({coyote::CoyoteAllocType::HPF, 4096}));
-    memset(dst, 0, size);
-    memset(fence, 0, 4096);
+    uint64_t *dst, *fence;
+    coyote::cThread *v80 = nullptr;
+    land_v80::Landing *L = nullptr;
+    uint64_t stores_base = 0;
+    if (land) {
+        v80 = new coyote::cThread(0, getpid(), 0, nullptr, "coyote_versal_fpga");
+        L = new land_v80::Landing(*v80, size + 4096);
+        const int lfd = L->export_fd();
+        void *lva = mmap(nullptr, size + 4096, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (lva == MAP_FAILED) throw std::runtime_error("mmap for a reserved address failed");
+        t_data.importDmabuf(lfd, lva);
+        dst   = static_cast<uint64_t *>(lva);
+        fence = dst + size / 8;
+        stores_base = L->csr(land_v80::LAND_STORES);
+        printf("server: V80 uwin imported at %p, landing at card VA %p\n", lva, (void *) L->buf);
+    } else {
+        dst   = static_cast<uint64_t *>(t_data.getMem({coyote::CoyoteAllocType::HPF, size}));
+        fence = static_cast<uint64_t *>(t_data.getMem({coyote::CoyoteAllocType::HPF, 4096}));
+        memset(dst, 0, size);
+        memset(fence, 0, 4096);
+    }
     printf("server: QP up; staging %p, dst %p, fence %p, data ctid %d\n", staging, (void *) dst,
            (void *) fence, t_data.getCtid());
 
@@ -128,12 +171,25 @@ int run_server(uint16_t port, uint64_t size) {
     volatile uint64_t *vdst = dst;
     int errors = 0, copies = 0;
     Announce an;
+    uint64_t l0[6], d0[14];
     while (read_full(c, &an, sizeof(an)) && an.rep != ~0ULL) {
         const Counters k0 = Counters::read(t_qp);
+        if (land) { snap(*v80, l0, land_v80::LAND_REQS, 6); snap(*v80, d0, 32, 14); }
         auto t0 = std::chrono::steady_clock::now();
-        while (*vfence != an.fence && std::chrono::steady_clock::now() - t0 < std::chrono::seconds(5))
-            _mm_pause();
-        Verdict v{0, *vfence, std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count()};
+        Verdict v{};
+        if (land) {
+            // one fence store per copy so far, then every card write complete
+            (void) L->wait(stores_base + copies);
+            v.wait_us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
+            L->pull();
+            vdst = L->buf;
+            v.fence = L->buf[size / 8];
+        } else {
+            while (*vfence != an.fence && std::chrono::steady_clock::now() - t0 < std::chrono::seconds(5))
+                _mm_pause();
+            v.fence = *vfence;
+            v.wait_us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
+        }
         const Counters k1 = Counters::read(t_qp);
         if (v.fence == an.fence)
             for (uint64_t i = 0; i < size / 8; i++) v.bad += (vdst[i] != pattern(8 * i, an.rep));
@@ -146,9 +202,16 @@ int run_server(uint16_t port, uint64_t size) {
         printf("     loom_rx over %lu cycles: %lu moving, %lu starved (nothing arrived), %lu stalled (host write not ready), rx FIFO full %lu\n",
                (unsigned long) k1.d(k0, C_CYC), (unsigned long) k1.d(k0, C_RX_MOVE), (unsigned long) k1.d(k0, C_RX_STARVE),
                (unsigned long) k1.d(k0, C_RX_STALL), (unsigned long) k1.d(k0, C_RX_FF));
+        if (land) {
+            printf("     V80 landing:\n");
+            print_v80_words(*v80, l0, land_v80::LAND_REQS, 6, LAND_NAMES);
+            print_v80_words(*v80, d0, 32, 14, LDBG_NAMES);
+        }
         errors += (v.bad != 0);
         copies++;
-        memset(dst, 0, size);          // the next copy must write every byte again
+        // the next copy must write every byte again
+        if (land) L->clear();
+        else      memset(dst, 0, size);
         if (!write_full(c, &v, sizeof(v))) break;
     }
     printf("server: loom_rx forwarded %lu writes, rejected %lu headers\n",
@@ -157,6 +220,8 @@ int run_server(uint16_t port, uint64_t size) {
     ::close(c);
     ::close(lfd);
     t_qp.connSync(false);
+    delete L;
+    delete v80;
     printf(errors || !copies ? "G4 FAIL (server)\n" : "G4 PASS (server)\n");
     return errors || !copies ? 1 : 0;
 }
@@ -206,6 +271,8 @@ int run_client(const std::string &ip, uint16_t port, int reps, int window) {
         const uint64_t fence = v80.getCSR(COPIES) + 1;
         loom_switch::IngressCounters c0 = loom_switch::IngressCounters::read(u280);
         const Counters k0 = Counters::read(u280);
+        uint64_t e0[3];
+        snap(v80, e0, 48, 3);
         Announce an{uint64_t(r), fence};
         write_full(fd, &an, sizeof(an));
 
@@ -231,6 +298,10 @@ int run_client(const std::string &ip, uint16_t port, int reps, int window) {
         printf("     switch waits over %lu cycles: ack window %lu, sq_wr (rdma) %lu, sq_wr any rdma %lu / local %lu\n",
                (unsigned long) k1.d(k0, C_CYC), (unsigned long) k1.d(k0, C_WINFULL), (unsigned long) k1.d(k0, C_REQWAIT),
                (unsigned long) k1.d(k0, C_WAIT_RDMA), (unsigned long) k1.d(k0, C_WAIT_LOCAL));
+        printf("     U280 ingress debug:\n");
+        loom_switch::print_ingress_delta(c0, c1, loom_switch::I_DBG, loom_switch::N_ING - loom_switch::I_DBG);
+        printf("     V80 copy engine:\n");
+        print_v80_words(v80, e0, 48, 3, CE_NAMES);
         errors += (v.bad != 0);
     }
     Announce done{~0ULL, 0};
@@ -252,6 +323,7 @@ int main(int argc, char **argv) {
     uint64_t size = 1ULL << 20;
     int reps = 3;
     int window = -1;
+    bool land = false;
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         if (a == "--server")                     server = true;
@@ -260,12 +332,13 @@ int main(int argc, char **argv) {
         else if (a == "--size" && i + 1 < argc)   size = strtoull(argv[++i], nullptr, 0);
         else if (a == "--reps" && i + 1 < argc)   reps = atoi(argv[++i]);
         else if (a == "--window" && i + 1 < argc) window = atoi(argv[++i]);
+        else if (a == "--land-v80")               land = true;
         else { server = false; ip.clear(); break; }
     }
     if (server == !ip.empty() || size == 0 || size % 4096 || size > (64ULL << 20)) {
-        printf("usage: %s --server [--port N] [--size BYTES] | --client <server_ip> [--port N] [--reps N] [--window P]\n"
+        printf("usage: %s --server [--port N] [--size BYTES] [--land-v80] | --client <server_ip> [--port N] [--reps N] [--window P]\n"
                "       (size: a multiple of 4 KiB, at most 64 MiB)\n", argv[0]);
         return 2;
     }
-    return server ? run_server(port, size) : run_client(ip, port, reps, window);
+    return server ? run_server(port, size, land) : run_client(ip, port, reps, window);
 }

@@ -151,6 +151,15 @@ can be up to 128 MB (a 64 MiB push fits one binding).
   CSRs, `sq_rd` from card memory (`STRM_CARD`, `EN_MEM=1`), the read stream
   forwarded to `sq_wr` on the host stream (dst VA), and a completion fence
   write.
+  - **Receive side (`EN_UWIN` on Versal):** the V80's BAR4 reaches the shell
+    as `axi_main` like the U280's bypass BAR, so it has the same uwin. The
+    far U280's `loom_rx` writes into it peer-to-peer (the V80 driver exports
+    it, the U280's imports it), and a copy of `loom_ingress` (local route,
+    `LOCAL_STRM = STRM_CARD`, one window at `LAND_BASE`, words 16-18) lands
+    it in card memory: packets as card writes, the fence as an 8 B store.
+    The copy engine and the landing share `sq_wr` per request. Counters:
+    24-29 landing requests / completions / bursts / drops / stores, 32-45 the
+    landing's ingress debug counters, 48-50 the copy engine's stalls.
 
 ## 4. Testbenches
 
@@ -233,6 +242,30 @@ can be up to 128 MB (a 64 MiB push fits one binding).
      (step 3 puts `loom_ce` back):
      `cd /scratch/harshanavkis/loom-proj/Coyote && scripts/fpga/program_v80.sh examples/07_perf_fpga/hw/build_v80/bitstreams/cyt_top.pdi 0000:81:00.0`
      `cd /scratch/harshanavkis/loom-proj/Coyote/examples/loom_ce/sw/build && sudo ./p2p_bw`
+- **The receive side into V80 HBM (G6), clara and rose.** Images:
+  `examples/loom_switch/hw/build_sep30_uwin2/bitstreams/cyt_top.bit` (U280)
+  and `examples/loom_ce/hw/build_sep30_land/bitstreams/cyt_top.pdi` (V80,
+  `EN_UWIN`). Both V80s run `loom_ce`; rose's needs the V80 driver from this
+  tree.
+  1. Flash both U280s as in step 2 above, from
+     `~/coyote-bitstreams/loom-switch-sep30` (copy `build_sep30_uwin2`'s
+     `cyt_top.bit` and `cyt_top.ltx` there first).
+  2. The V80 image to the shared home, the V80 driver and the software to
+     rose (on clara):
+     `mkdir -p ~/coyote-bitstreams/loom-ce-sep30 && cp /scratch/harshanavkis/loom-proj/Coyote/examples/loom_ce/hw/build_sep30_land/bitstreams/cyt_top.pdi ~/coyote-bitstreams/loom-ce-sep30/`
+     `rsync -a /scratch/harshanavkis/loom-proj/Coyote/driver/build_versal/ rose.dos.cit.tum.de:/scratch/harshanavkis/loom-proj/Coyote/driver/build_versal/`
+     `rsync -a /scratch/harshanavkis/loom-proj/Coyote/examples/loom_ce/sw/build/ rose.dos.cit.tum.de:/scratch/harshanavkis/loom-proj/Coyote/examples/loom_ce/sw/build/`
+     `rsync -a /scratch/harshanavkis/loom-proj/Coyote/scripts/fpga/ rose.dos.cit.tum.de:/scratch/harshanavkis/loom-proj/Coyote/scripts/fpga/`
+  3. Program both V80s:
+     - clara: `cd /scratch/harshanavkis/loom-proj/Coyote && scripts/fpga/program_v80.sh /home/harshanavkis/coyote-bitstreams/loom-ce-sep30/cyt_top.pdi 0000:81:00.0`
+     - rose: `cd /scratch/harshanavkis/loom-proj/Coyote && scripts/fpga/program_v80.sh /home/harshanavkis/coyote-bitstreams/loom-ce-sep30/cyt_top.pdi 0000:61:00.0`
+  4. V80 → U280 → V80 on clara (the U280 → V80 hop; compare its rate with
+     the same size landing in host memory, the second line):
+     `cd /scratch/harshanavkis/loom-proj/Coyote/examples/loom_ce/sw/build && sudo ./ce_local --land-v80 16777216 3`
+     `cd /scratch/harshanavkis/loom-proj/Coyote/examples/loom_ce/sw/build && sudo ./ce_local 16777216 3`
+  5. clara V80 → rose V80 HBM, a fresh port each run:
+     - rose: `cd /scratch/harshanavkis/loom-proj/Coyote/examples/loom_ce/sw/build && sudo ./ce_remote --server --size 1048576 --land-v80 --port 18600`
+     - clara: `cd /scratch/harshanavkis/loom-proj/Coyote/examples/loom_ce/sw/build && sudo ./ce_remote --client 131.159.102.21 --reps 3 --port 18600`
 
 ## Found on the way: `RX_CHUNK` is not wired in `examples/loom`
 
@@ -264,6 +297,7 @@ candidate cause. `examples/loom` is left as it is.
 | G3 | TBs green, `ooc_synth` timing met on both apps |
 | G4 | clara V80 → clara U280 → rose U280 → rose host, byte-exact, 0 retransmits; then the local route |
 | G5 | performance rerun of PERFORMANCE.md (push, DMA ping-pong, store latency through the uwin) |
+| G6 | the receive side into V80 HBM: V80 → U280 → V80 on one host (`ce_local --land-v80`, also the U280 → V80 rate), then clara V80 → rose U280 → rose V80 HBM (`ce_remote --server --land-v80`), byte-exact |
 
 ## Builds in flight (2026-09-29)
 
