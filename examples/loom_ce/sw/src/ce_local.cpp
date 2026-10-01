@@ -42,7 +42,11 @@
  * self-loop, a local P2P path) without the U280 in front of it; the host
  * checks the fence and every byte as for --land-v80.
  *
- * Usage: ce_local [--land-v80 | --self | --discard SECONDS] [bytes (multiple of 4 KiB, at most 64 MiB)] [copies]
+ * With --host the U280 is not involved either: loom_ce copies HBM into a
+ * host buffer of the V80's own (memory node per numactl -m), the V80's
+ * write path to host memory; the host checks the fence and every byte.
+ *
+ * Usage: ce_local [--land-v80 | --self | --host | --discard SECONDS] [bytes (multiple of 4 KiB, at most 64 MiB)] [copies]
  */
 #include <sys/mman.h>
 #include <unistd.h>
@@ -89,10 +93,11 @@ uint64_t pattern(uint64_t off, int rep) { return 0xCE00000000000000ULL ^ (off * 
 }  // namespace
 
 int main(int argc, char **argv) {
-    bool land = false, self = false;
+    bool land = false, self = false, host = false;
     double discard_s = 0;
     if (argc > 1 && strcmp(argv[1], "--land-v80") == 0) { land = true; argv++; argc--; }
     else if (argc > 1 && strcmp(argv[1], "--self") == 0) { self = true; argv++; argc--; }
+    else if (argc > 1 && strcmp(argv[1], "--host") == 0) { host = true; argv++; argc--; }
     else if (argc > 2 && strcmp(argv[1], "--discard") == 0) { discard_s = atof(argv[2]); argv += 2; argc -= 2; }
     const uint64_t size = (argc > 1) ? strtoull(argv[1], nullptr, 0) : (1ULL << 20);
     const int reps      = (argc > 2) ? atoi(argv[2]) : 1;
@@ -131,6 +136,39 @@ int main(int argc, char **argv) {
                (unsigned long) copies, (unsigned long) size, s, copies * size / s / 1e9,
                (unsigned long) (c1.v[1] - c0.v[1]));
         return 0;
+    }
+
+    if (host) {
+        uint64_t *dst = static_cast<uint64_t *>(v80.getMem({coyote::CoyoteAllocType::HPF, size + 4096}));
+        volatile uint64_t *hfence = dst + size / 8;
+        uint64_t *src = static_cast<uint64_t *>(v80.getMem({coyote::CoyoteAllocType::HPF, size}));
+        int errors = 0;
+        for (int r = 0; r < reps; r++) {
+            for (uint64_t i = 0; i < size / 8; i++) src[i] = pattern(8 * i, r);
+            v80.invoke(coyote::CoyoteOper::LOCAL_OFFLOAD, coyote::syncSg{src, size});
+            memset(dst, 0, size + 4096);
+            const uint64_t before = v80.getCSR(COPIES);
+            v80.setCSR(reinterpret_cast<uint64_t>(src), SRC_VA);
+            v80.setCSR(reinterpret_cast<uint64_t>(dst), DST_VA);
+            v80.setCSR(size, LEN);
+            v80.setCSR(v80.getCtid(), PID);
+            v80.setCSR(reinterpret_cast<uint64_t>(dst) + size, FENCE_VA);
+            const auto t0 = std::chrono::steady_clock::now();
+            v80.setCSR(1, START);
+            while (*hfence != before + 1 && std::chrono::steady_clock::now() - t0 < std::chrono::seconds(5)) _mm_pause();
+            const auto t1 = std::chrono::steady_clock::now();
+            uint64_t bad = 0;
+            for (uint64_t i = 0; i < size / 8; i++) bad += (dst[i] != pattern(8 * i, r));
+            const double us = std::chrono::duration<double, std::micro>(t1 - t0).count();
+            const bool ok = *hfence == before + 1 && !bad;
+            errors += !ok;
+            printf("%s copy %d: %lu bytes, fence %s after %.1f us (%.2f GB/s), %lu of %lu words wrong; CE %lu cycles (%.2f GB/s)\n",
+                   ok ? "ok  " : "FAIL", r, (unsigned long) size, *hfence == before + 1 ? "seen" : "NOT seen", us, size / us / 1e3,
+                   (unsigned long) bad, (unsigned long) (size / 8), (unsigned long) v80.getCSR(CYCLES),
+                   size / (v80.getCSR(CYCLES) * 4e-9) / 1e9);
+        }
+        printf(errors ? "HOST FAIL\n" : "HOST PASS\n");
+        return errors ? 1 : 0;
     }
 
     if (self) {

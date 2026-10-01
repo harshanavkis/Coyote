@@ -6,7 +6,8 @@
  *   route--> RoCE --> server U280 loom_rx --> server host buffer
  *
  * Server (the landing host; U280, and its V80 with --land-v80):
- *     ce_remote --server [--port N] [--size BYTES] [--land-v80]
+ *     ce_remote --server [--port N] [--size BYTES] [--land-v80 [--land-offset B]]
+ *   (--land-offset: land B bytes into the V80 window, a multiple of 64 below 4096)
  *   1. QP exchange (blocks for the client); the QP owner's staging buffer
  *   2. destination and fence buffers on a data cThread
  *   3. a TCP hello to the client: staging VA, both buffers, the data ctid
@@ -129,7 +130,7 @@ void snap(coyote::cThread &v80, uint64_t *out, uint32_t first, int n) {
     for (int i = 0; i < n; i++) out[i] = v80.getCSR(first + i);
 }
 
-int run_server(uint16_t port, uint64_t size, bool land) {
+int run_server(uint16_t port, uint64_t size, bool land, uint64_t off) {
     coyote::cThread t_qp(0, getpid(), 0, nullptr, "coyote_fpga");     // QP owner
     coyote::cThread t_data(0, getpid(), 0, nullptr, "coyote_fpga");   // owns the landing buffers
     printf("server: waiting for the QP exchange on port %u ...\n", port);
@@ -142,11 +143,14 @@ int run_server(uint16_t port, uint64_t size, bool land) {
     land_v80::Landing *L = nullptr;
     if (land) {
         v80 = new coyote::cThread(0, getpid(), 0, nullptr, "coyote_versal_fpga");
-        L = new land_v80::Landing(*v80, size + 4096);
+        // --land-offset: the copy lands off bytes into the window (64: each
+        // message's packets then end on 4 KiB pages, the U280 splits none)
+        const uint64_t llen = size + 8192;
+        L = new land_v80::Landing(*v80, llen);
         const int lfd = L->export_fd();
-        void *lva = loom_switch::reserve_va(size + 4096);
+        void *lva = loom_switch::reserve_va(llen);
         t_data.importDmabuf(lfd, lva);
-        dst   = static_cast<uint64_t *>(lva);
+        dst   = static_cast<uint64_t *>(lva) + off / 8;
         fence = dst + size / 8;
         printf("server: V80 uwin imported at %p, landing at card VA %p\n", lva, (void *) L->buf);
     } else {
@@ -183,12 +187,12 @@ int run_server(uint16_t port, uint64_t size, bool land) {
         Verdict v{};
         if (land) {
             // the fence, read through the V80's window, then the data synced back
-            (void) L->wait(size, an.fence);
+            (void) L->wait(off + size, an.fence);
             v.wait_us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
             u1 = land_v80::Counters::read(L->win);
             L->pull();
-            vdst = L->buf;
-            v.fence = L->buf[size / 8];
+            vdst = L->buf + off / 8;
+            v.fence = L->buf[(off + size) / 8];
         } else {
             while (*vfence != an.fence && std::chrono::steady_clock::now() - t0 < std::chrono::seconds(5))
                 _mm_pause();
@@ -458,6 +462,7 @@ int main(int argc, char **argv) {
     int reps = 3;
     int window = -1;
     bool land = false, bidir = false, no_send = false;
+    uint64_t land_off = 0;
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         if (a == "--server")                     server = true;
@@ -467,17 +472,18 @@ int main(int argc, char **argv) {
         else if (a == "--reps" && i + 1 < argc)   reps = atoi(argv[++i]);
         else if (a == "--window" && i + 1 < argc) window = atoi(argv[++i]);
         else if (a == "--land-v80")               land = true;
+        else if (a == "--land-offset" && i + 1 < argc) land_off = strtoull(argv[++i], nullptr, 0);
         else if (a == "--bidir-server")           { bidir = true; server = true; }
         else if (a == "--bidir-client" && i + 1 < argc) { bidir = true; ip = argv[++i]; }
         else if (a == "--no-send")                no_send = true;
         else { server = false; ip.clear(); break; }
     }
-    if (server == !ip.empty() || size == 0 || size % 4096 || size > (64ULL << 20)) {
-        printf("usage: %s --server [--port N] [--size BYTES] [--land-v80] | --client <server_ip> [--port N] [--reps N] [--window P]\n"
+    if (server == !ip.empty() || size == 0 || size % 4096 || size > (64ULL << 20) || land_off % 64 || land_off >= 4096) {
+        printf("usage: %s --server [--port N] [--size BYTES] [--land-v80 [--land-offset B]] | --client <server_ip> [--port N] [--reps N] [--window P]\n"
                "       | --bidir-server | --bidir-client <server_ip>  [--port N] [--size BYTES] [--reps N] [--window P] [--no-send]\n"
                "       (size: a multiple of 4 KiB, at most 64 MiB)\n", argv[0]);
         return 2;
     }
     if (bidir) return run_bidir(server ? std::string() : ip, port, size, reps, window, !no_send);
-    return server ? run_server(port, size, land) : run_client(ip, port, reps, window);
+    return server ? run_server(port, size, land, land_off) : run_client(ip, port, reps, window);
 }

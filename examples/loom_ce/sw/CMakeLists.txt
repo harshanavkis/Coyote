@@ -24,5 +24,8 @@ add_executable(p2p_bw ${TARGET_DIR}/p2p_bw.cpp)
 target_link_libraries(p2p_bw PUBLIC Coyote pthread)
 
 # Bisecting a host reset: V80-only steps (CSR reads, copy to host memory)
+add_executable(p2p_bw_u280 ${TARGET_DIR}/p2p_bw_u280.cpp)
+target_link_libraries(p2p_bw_u280 PUBLIC Coyote pthread)
+
 add_executable(v80_bisect ${TARGET_DIR}/v80_bisect.cpp)
 target_link_libraries(v80_bisect PUBLIC Coyote pthread)
