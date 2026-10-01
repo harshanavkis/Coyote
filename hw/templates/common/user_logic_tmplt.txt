@@ -38,6 +38,11 @@ import lynxTypes::*;
 module design_user_logic_c{{ c_cnfg }}_{{ c_reg }} (
     // AXI4L CONTROL
     AXI4L.s                     axi_ctrl,
+{% if cnfg.en_uwin and not cnfg.en_uwin_hbm and cnfg.en_strm %}
+
+    // Host DMA boundary stall pulses (dynamic_top)
+    input  logic [2:0]          dbg_host_out,
+{% endif %}
 {% if cnfg.en_uwin and not cnfg.en_uwin_hbm %}
 
     // AXI4 USER DATA WINDOW

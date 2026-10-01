@@ -35,6 +35,9 @@ import lynxTypes::*;
  *   74 (RO) cycles the ingress had a request while loom_rx's was presented
  *   75 (RO) cycles loom_rx had a request and was not presented (must be 0)
  *   76 RX_CHUNK (RW) [3:0] PMTU packets per loom_rx host write, reset 1
+ *   81-84 (RO) the shell's host DMA boundary: 81 beats moved, 82 cycles a
+ *      beat waited on the DMA engine, 83 the longest such run, 84 cycles a
+ *      write request waited on the engine
  *   88-94 (RO) ingress: 88 bursts, 89 bursts dropped, 90 local packets,
  *          91 rdma packets, 92 stores, 93 beats with a partial 8 B word,
  *          94 packets closed by the idle timer
@@ -95,6 +98,12 @@ module loom_ctrl #(
     input  logic                        cnt_rx_req,
     input  logic                        cnt_rx_fifo_full,
 
+    // the shell's host DMA boundary (dynamic_top dbg_host_out): a beat moved,
+    // a beat waited on the DMA engine, a write request waited on it
+    input  logic                        cnt_hout_move,
+    input  logic                        cnt_hout_bp,
+    input  logic                        cnt_hreq_bp,
+
     // loom_ingress
     input  logic                        cnt_ing_burst,
     input  logic                        cnt_ing_drop,
@@ -143,6 +152,10 @@ localparam integer R_WR_WAIT_RDMA  = 73;
 localparam integer R_WR_BLK_ING    = 74;
 localparam integer R_WR_BLK_RX     = 75;
 localparam integer R_RX_CHUNK      = 76;
+localparam integer R_HOUT_MOVE     = 81;
+localparam integer R_HOUT_BP       = 82;
+localparam integer R_HOUT_BP_MAX   = 83;
+localparam integer R_HREQ_BP       = 84;
 localparam integer R_ING_BASE      = 88;
 localparam integer N_ING           = 7;
 localparam integer R_DBG_BASE      = 95;
@@ -217,6 +230,7 @@ logic [63:0] rx_fwd, rx_drop, rx_orphan, rx_move, rx_starve, rx_stall, rx_req;
 logic [63:0] rx_stall_run, rx_stall_max, rx_bp, rx_bp_run, rx_bp_max, rx_ff, rx_ff_run, rx_ff_max;
 logic [63:0] tx_acks, tx_winfull, tx_reqwait;
 logic [63:0] wr_wait_local, wr_wait_rdma, wr_blk_ing, wr_blk_rx;
+logic [63:0] hout_move, hout_bp, hout_bp_run, hout_bp_max, hreq_bp;
 logic [63:0] ing [N_ING];
 logic [63:0] dbg [N_DBG];
 logic [N_ING-1:0] ing_pulse;
@@ -240,6 +254,7 @@ always_ff @(posedge aclk) begin
         rx_ff <= 0; rx_ff_run <= 0; rx_ff_max <= 0;
         tx_acks <= 0; tx_winfull <= 0; tx_reqwait <= 0;
         wr_wait_local <= 0; wr_wait_rdma <= 0; wr_blk_ing <= 0; wr_blk_rx <= 0;
+        hout_move <= 0; hout_bp <= 0; hout_bp_run <= 0; hout_bp_max <= 0; hreq_bp <= 0;
         for (int i = 0; i < N_ING; i++) ing[i] <= 0;
         for (int i = 0; i < N_DBG; i++) dbg[i] <= 0;
     end else begin
@@ -272,6 +287,13 @@ always_ff @(posedge aclk) begin
         if (cnt_wr_wait_rdma)  wr_wait_rdma  <= wr_wait_rdma + 1;
         if (cnt_wr_blk_ing)    wr_blk_ing    <= wr_blk_ing + 1;
         if (cnt_wr_blk_rx)     wr_blk_rx     <= wr_blk_rx + 1;
+        if (cnt_hout_move)     hout_move     <= hout_move + 1;
+        if (cnt_hreq_bp)       hreq_bp       <= hreq_bp + 1;
+        if (cnt_hout_bp) begin
+            hout_bp     <= hout_bp + 1;
+            hout_bp_run <= hout_bp_run + 1;
+            if (hout_bp_run + 1 > hout_bp_max) hout_bp_max <= hout_bp_run + 1;
+        end else hout_bp_run <= 0;
         for (int i = 0; i < N_ING; i++) if (ing_pulse[i]) ing[i] <= ing[i] + 1;
         for (int i = 0; i < N_DBG; i++) if (dbg_pulse[i]) dbg[i] <= dbg[i] + 1;
     end
@@ -298,6 +320,10 @@ always_ff @(posedge aclk) begin
             R_RX_ORPHAN:        axi_rdata <= rx_orphan;
             R_RX_BP:            axi_rdata <= rx_bp;
             R_RX_BP_MAX:        axi_rdata <= rx_bp_max;
+            R_HOUT_MOVE:        axi_rdata <= hout_move;
+            R_HOUT_BP:          axi_rdata <= hout_bp;
+            R_HOUT_BP_MAX:      axi_rdata <= hout_bp_max;
+            R_HREQ_BP:          axi_rdata <= hreq_bp;
             R_RX_FWD:           axi_rdata <= rx_fwd;
             R_RX_DROP:          axi_rdata <= rx_drop;
             R_RX_MOVE:          axi_rdata <= rx_move;

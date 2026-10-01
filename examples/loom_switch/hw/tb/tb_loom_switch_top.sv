@@ -37,8 +37,11 @@ AXI4SR axis_rreq_send [N_RDMA_AXI] (.*);
 AXI4SR axis_rrsp_recv [N_RDMA_AXI] (.*);
 AXI4SR axis_rrsp_send [N_RDMA_AXI] (.*);
 
+// The shell's host DMA boundary pulses (dynamic_top dbg_host_out), driven by T9
+logic [2:0] dbg_host_out = '0;
+
 design_user_logic_c0_0 inst_dut (
-    .axi_ctrl(axi_ctrl), .axi_udata(axi_udata), .notify(notify),
+    .axi_ctrl(axi_ctrl), .dbg_host_out(dbg_host_out), .axi_udata(axi_udata), .notify(notify),
     .sq_rd(sq_rd), .sq_wr(sq_wr), .cq_rd(cq_rd), .cq_wr(cq_wr),
     .rq_rd(rq_rd), .rq_wr(rq_wr),
     .axis_host_recv(axis_host_recv), .axis_host_send(axis_host_send),
@@ -457,6 +460,25 @@ initial begin
     csr_rd(36, v); `CHECK(v - rxf0 == 24, $sformatf("T8: rx forwarded %0d in T7", v - rxf0))
     csr_rd(75, v); `CHECK(v == 0, "T8: WR_BLK_RX nonzero")
     $display("ok   T8 counters");
+
+    // --- T9: the host DMA boundary counters (81-84): 10 cycles moving, then
+    //     a 7-cycle and a 25-cycle engine stall, 4 cycles of request stall ---
+    begin
+        logic [63:0] h0 [4], h1 [4];
+        for (int i = 0; i < 4; i++) csr_rd(81 + i, h0[i]);
+        @(negedge aclk); dbg_host_out = 3'b001; repeat (10) @(negedge aclk);
+        dbg_host_out = 3'b010; repeat (7) @(negedge aclk);
+        dbg_host_out = 3'b001; repeat (2) @(negedge aclk);
+        dbg_host_out = 3'b010; repeat (25) @(negedge aclk);
+        dbg_host_out = 3'b100; repeat (4) @(negedge aclk);
+        dbg_host_out = 3'b000; repeat (4) @(negedge aclk);
+        for (int i = 0; i < 4; i++) csr_rd(81 + i, h1[i]);
+        `CHECK(h1[0] - h0[0] == 12, $sformatf("T9: moved %0d, want 12", h1[0] - h0[0]))
+        `CHECK(h1[1] - h0[1] == 32, $sformatf("T9: engine stall %0d, want 32", h1[1] - h0[1]))
+        `CHECK(h1[2] == 25,          $sformatf("T9: longest engine stall %0d, want 25", h1[2]))
+        `CHECK(h1[3] - h0[3] == 4,  $sformatf("T9: request stall %0d, want 4", h1[3] - h0[3]))
+    end
+    $display("ok   T9 host DMA boundary counters");
 
     if (errors == 0) $display("TB PASS (tb_loom_switch_top)");
     else             $display("TB FAIL (tb_loom_switch_top): %0d errors", errors);

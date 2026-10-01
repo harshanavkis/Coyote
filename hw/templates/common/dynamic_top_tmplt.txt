@@ -248,6 +248,14 @@ module design_dynamic_top #(
 
     axis_reg_array #(.N_STAGES(N_REG_DYN_HOST_S0)) inst_host_axis_reg_arr_s0_in  (.aclk(aclk), .aresetn(aresetn), .s_axis(s_axis_host),      .m_axis(axis_host_in_s0));
     axis_reg_array #(.N_STAGES(N_REG_DYN_HOST_S0)) inst_host_axis_reg_arr_s0_out (.aclk(aclk), .aresetn(aresetn), .s_axis(axis_host_out_s0), .m_axis(m_axis_host));
+{% if cnfg.en_uwin and not cnfg.en_uwin_hbm and cnfg.en_strm %}
+    // Where host writes wait at the DMA engine (vFPGA counters, loom_switch):
+    // [0] a beat moved, [1] a beat waited on the engine, [2] a write request waited on it
+    logic [2:0] dbg_host_out;
+    assign dbg_host_out = {m_host_dma_wr_req.valid && !m_host_dma_wr_req.ready,
+                           m_axis_host.tvalid && !m_axis_host.tready,
+                           m_axis_host.tvalid && m_axis_host.tready};
+{% endif %}
     
     // Multiplexing 
     // ----------------------------------------------------------------------
@@ -1138,6 +1146,9 @@ module design_dynamic_top #(
         .axi_ctrl_wstrb                 (axi_ctrl_user_ul[{{ i }}].wstrb),
         .axi_ctrl_wvalid                (axi_ctrl_user_ul[{{ i }}].wvalid),
 
+{% if cnfg.en_uwin and not cnfg.en_uwin_hbm and cnfg.en_strm %}
+        .dbg_host_out                    (dbg_host_out),
+{% endif %}
 {% if cnfg.en_uwin and not cnfg.en_uwin_hbm %}
         // AXI4 USER DATA WINDOW
         .axi_udata_araddr                (axim_udata_ul[{{ i }}].araddr),

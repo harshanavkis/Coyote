@@ -105,6 +105,7 @@ loom_ctrl inst_loom_ctrl (
     .cnt_rx_fwd(cnt_rx_fwd), .cnt_rx_drop(cnt_rx_drop), .cnt_rx_orphan(cnt_rx_orphan),
     .cnt_rx_move(rx_cnt_move), .cnt_rx_starve(rx_cnt_starve), .cnt_rx_stall(rx_cnt_stall),
     .cnt_rx_bp(rx_cnt_bp), .cnt_rx_req(rx_cnt_req), .cnt_rx_fifo_full(rx_cnt_fifo_full),
+    .cnt_hout_move(dbg_host_out[0]), .cnt_hout_bp(dbg_host_out[1]), .cnt_hreq_bp(dbg_host_out[2]),
     .cnt_ing_burst(cnt_ing_burst), .cnt_ing_drop(cnt_ing_drop),
     .cnt_ing_pkt_local(cnt_ing_pkt_local), .cnt_ing_pkt_rdma(cnt_ing_pkt_rdma),
     .cnt_ing_store(cnt_ing_store), .cnt_ing_store_drop(cnt_ing_store_drop),
@@ -149,14 +150,17 @@ loom_ingress #(.HOST_DEST(0), .NET_DEST(0)) inst_loom_ingress (
 );
 
 // ---------------------------------------------------------------------------
-// Ingress FIFO in front of loom_rx (as examples/loom: 512 beats decouple the
-// host write path from the RoCE receive path)
+// Ingress FIFO in front of loom_rx: decouples the host write path from the
+// RoCE receive path. 4096 beats (64 packets, URAM; init_ip.tcl) so the
+// sender's ack window fits while the host write path is slower than the
+// wire: with 512 beats (8 packets) under a 16-packet window, a slow landing
+// (the V80's window) made the stack lose packets -> go-back-N retransmits.
 // ---------------------------------------------------------------------------
 logic [511:0] rxf_tdata;
 logic [63:0]  rxf_tkeep;
 logic         rxf_tvalid, rxf_tready, rxf_tlast;
 
-axis_data_fifo_512 inst_rx_ingress_fifo (
+axis_data_fifo_rx4096 inst_rx_ingress_fifo (
     .s_axis_aclk(aclk), .s_axis_aresetn(aresetn),
     .s_axis_tdata(axis_rrsp_recv[0].tdata),
     .s_axis_tkeep(axis_rrsp_recv[0].tkeep),

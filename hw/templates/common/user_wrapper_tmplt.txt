@@ -57,6 +57,10 @@ module design_user_wrapper_{{ c_reg }} (
     (* io_buffer_type = "none" *) input  logic[(AXIL_DATA_BITS/8)-1:0]        axi_ctrl_wstrb,
     (* io_buffer_type = "none" *) input  logic                                axi_ctrl_wvalid,
 
+{% if cnfg.en_uwin and not cnfg.en_uwin_hbm and cnfg.en_strm %}
+    // Host DMA boundary stall pulses (dynamic_top dbg_host_out)
+    (* io_buffer_type = "none" *) input  logic[2:0]                               dbg_host_out,
+{% endif %}
 {% if cnfg.en_uwin and not cnfg.en_uwin_hbm %}
     // AXI4 USER DATA WINDOW
     (* io_buffer_type = "none" *) input  logic[AXI_ID_BITS-1:0]                   axi_udata_arid,
@@ -1167,6 +1171,9 @@ module design_user_wrapper_{{ c_reg }} (
 
     design_user_logic_c{{ c_cnfg }}_{{ c_reg }} inst_user_c{{ c_cnfg }}_{{ c_reg }} (
 	    .axi_ctrl(axi_ctrl_user),
+    {% if cnfg.en_uwin and not cnfg.en_uwin_hbm and cnfg.en_strm %}
+        .dbg_host_out(dbg_host_out),
+    {% endif %}
     {% if cnfg.en_uwin and not cnfg.en_uwin_hbm %}
         .axi_udata(axi_udata_user),
     {% endif %}
