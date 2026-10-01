@@ -315,7 +315,7 @@ proc cr_bd_design_static { parentCell } {
           CPM_PCIE0_PF0_BAR2_QDMA_TYPE {DMA} \
           CPM_PCIE0_PF0_BAR3_QDMA_AXCACHE {0} \
           CPM_PCIE0_PF0_BAR4_QDMA_64BIT {1} \
-          CPM_PCIE0_PF0_BAR4_QDMA_AXCACHE {0} \
+          CPM_PCIE0_PF0_BAR4_QDMA_AXCACHE {1} \
           CPM_PCIE0_PF0_BAR4_QDMA_ENABLED {1} \
           CPM_PCIE0_PF0_BAR4_QDMA_PREFETCHABLE {1} \
           CPM_PCIE0_PF0_BAR4_QDMA_SCALE {Megabytes} \
@@ -413,9 +413,10 @@ proc cr_bd_design_static { parentCell } {
     CONFIG.CATEGORY {pl} \
   ] [get_bd_intf_pins /axi_noc_0/M03_AXI]
 
-  # CPM_PCIE_NOC_0 is used for shell and static layer registers
+  # CPM_PCIE_NOC_0 is used for shell and static layer registers,
+  # and (M01, BAR4) for the user data window: peers' bulk writes into the card
   set_property -dict [ list \
-    CONFIG.CONNECTIONS {M00_AXI {read_bw {8} write_bw {8} read_avg_burst {4} write_avg_burst {4}} M01_AXI {read_bw {8} write_bw {8} read_avg_burst {4} write_avg_burst {4}}} \
+    CONFIG.CONNECTIONS {M00_AXI {read_bw {8} write_bw {8} read_avg_burst {4} write_avg_burst {4}} M01_AXI {read_bw {1000} write_bw {12800} read_avg_burst {64} write_avg_burst {64}}} \
     CONFIG.DEST_IDS {M01_AXI:0x0:M00_AXI:0x40} \
     CONFIG.NOC_PARAMS {} \
     CONFIG.CATEGORY {ps_pcie} \
