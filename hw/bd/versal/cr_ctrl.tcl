@@ -90,7 +90,7 @@ proc cr_bd_design_ctrl { parentCell } {
   set_property -dict [list \
     CONFIG.MAX_BURST_LENGTH {16} \
     CONFIG.ID_WIDTH {6} \
-    CONFIG.NUM_WRITE_OUTSTANDING {32} \
+    CONFIG.NUM_WRITE_OUTSTANDING {16} \
     CONFIG.NUM_READ_OUTSTANDING {8} \
     CONFIG.SUPPORTS_NARROW_BURST {0} \
     CONFIG.ADDR_WIDTH {64} \
@@ -164,7 +164,7 @@ proc cr_bd_design_ctrl { parentCell } {
                 CONFIG.HAS_RRESP {1} \
                 CONFIG.HAS_WSTRB {1} \
                 CONFIG.NUM_READ_OUTSTANDING {8} \
-                CONFIG.NUM_WRITE_OUTSTANDING {32} \
+                CONFIG.NUM_WRITE_OUTSTANDING {16} \
                 CONFIG.PROTOCOL {AXI4} \
                 CONFIG.READ_WRITE_MODE {READ_WRITE} \
               ] \$axim_udata_$i"
