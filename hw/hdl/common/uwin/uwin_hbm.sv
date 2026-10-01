@@ -28,6 +28,8 @@ import lynxTypes::*;
  *   4 W starved         10 most writes outstanding at once
  *     (beats announced by AW, !wvalid: PCIe side slow)
  *   5 AW stalled        11 W beats with a partial strobe
+ * Words 16-22: uwin_mon's counts of the shell's axi_main port (xclk), where
+ * the window's writes enter the shell - see uwin_mon.sv.
  */
 module uwin_hbm #(
     parameter integer          UWIN_BITS = 27,
@@ -38,8 +40,27 @@ module uwin_hbm #(
     input  logic                aresetn,
 
     AXI4.s                      s_axi,
-    AXI4.m                      m_axi
+    AXI4.m                      m_axi,
+
+    // uwin_mon's snapshot of axi_main (xclk), and its toggle
+    input  logic [64*7-1:0]     main_snap,
+    input  logic                main_tgl
 );
+
+// axi_main counters: captured when the synchronized toggle changes (the
+// snapshot has been stable since well before it flipped)
+localparam integer N_MAIN = 7;
+(* ASYNC_REG = "TRUE" *) logic [2:0] main_tgl_s;
+logic [64*N_MAIN-1:0] main_ctr;
+always_ff @(posedge aclk) begin
+    if (!aresetn) begin
+        main_tgl_s <= '0;
+        main_ctr   <= '0;
+    end else begin
+        main_tgl_s <= {main_tgl_s[1:0], main_tgl};
+        if (main_tgl_s[2] != main_tgl_s[1]) main_ctr <= main_snap;
+    end
+end
 
 // AR
 assign m_axi.araddr   = BASE + {{(64-UWIN_BITS){1'b0}}, s_axi.araddr[UWIN_BITS-1:0]};
@@ -130,6 +151,8 @@ always_comb begin
     ctr_data = '0;
     for (int j = 0; j < AXI_DATA_BITS/64; j++)
         if (8*r_line + j < N_CTR) ctr_data[64*j +: 64] = ctr[8*r_line + j];
+        else if (8*r_line + j >= 16 && 8*r_line + j < 16 + N_MAIN)
+            ctr_data[64*j +: 64] = main_ctr[64*(8*r_line + j - 16) +: 64];
 end
 wire ar_ctr = (s_axi.araddr[UWIN_BITS-1:12] == '1);
 

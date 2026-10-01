@@ -36,7 +36,18 @@ AXI4 win_mem (.aclk(aclk));         // after the stripe, to memory
 AXI4 card_in (.aclk(aclk));         // a vFPGA card channel
 AXI4 card_mem (.aclk(aclk));
 
-uwin_hbm #(.BASE(UWIN_HBM_BASE)) inst_uwin_hbm (.aclk(aclk), .aresetn(aresetn), .s_axi(win_in), .m_axi(win_hbm));
+// uwin_mon on its own clock (the shell's xclk), fed a known pattern (T6)
+logic xclk = 0;
+always #1.5 xclk = ~xclk;
+logic m_awvalid = 0, m_awready = 0, m_wvalid = 0, m_wready = 0, m_bvalid = 0, m_bready = 0;
+logic [7:0] m_awlen = 0;
+logic [64*7-1:0] main_snap;
+logic main_tgl;
+uwin_mon inst_uwin_mon (.xclk(xclk), .xresetn(aresetn), .awvalid(m_awvalid), .awready(m_awready), .awlen(m_awlen),
+                        .wvalid(m_wvalid), .wready(m_wready), .bvalid(m_bvalid), .bready(m_bready),
+                        .snap(main_snap), .snap_tgl(main_tgl));
+uwin_hbm #(.BASE(UWIN_HBM_BASE)) inst_uwin_hbm (.aclk(aclk), .aresetn(aresetn), .s_axi(win_in), .m_axi(win_hbm),
+                                               .main_snap(main_snap), .main_tgl(main_tgl));
 axi_stripe #(.N_STAGES(0)) inst_strp_win  (.aclk(aclk), .aresetn(aresetn), .s_axi(win_hbm), .m_axi(win_mem));
 axi_stripe #(.N_STAGES(0)) inst_strp_card (.aclk(aclk), .aresetn(aresetn), .s_axi(card_in), .m_axi(card_mem));
 
@@ -309,6 +320,50 @@ initial begin
     // reads elsewhere still return HBM
     rd_check("T5 HBM", 1, BAR + 64'h4_0000, UWIN_HBM_BASE + 64'h4_0000, 4, 4);
     $display("ok   T5 counters through the window's last page; other reads still HBM");
+
+    // --- T6: axi_main's counters (uwin_mon, xclk), across the clock crossing:
+    //     10 AWs of 4 beats, 40 W beats against a wready low every third
+    //     cycle, 10 Bs; then the page's words 16-22 after a snapshot
+    begin
+        int beats = 0, stalls = 0, starve = 0;
+        logic [63:0] c [8];
+        int got = 0;
+        @(negedge xclk); m_awvalid = 1; m_awready = 1; m_awlen = 3;
+        repeat (10) @(negedge xclk);
+        m_awvalid = 0; m_awready = 0;
+        repeat (5) @(negedge xclk);     // beats owed, nothing on W: starved
+        starve = 9 + 5;                 // after the first AW (9 cycles) and these 5
+        for (int k = 0; beats < 40; k++) begin
+            m_wvalid = 1; m_wready = (k % 3 != 0);
+            @(posedge xclk);
+            if (m_wready) beats++; else stalls++;
+            @(negedge xclk);
+        end
+        m_wvalid = 0; m_wready = 0;
+        m_bvalid = 1; m_bready = 1;
+        repeat (10) @(negedge xclk);
+        m_bvalid = 0; m_bready = 0;
+        repeat (700) @(negedge xclk);   // two snapshots later
+        @(negedge aclk); win_in.araddr = BAR + UWIN_SIZE - 4096 + 128; win_in.arlen = 0; win_in.arvalid = 1;
+        do @(posedge aclk); while (!win_in.arready);
+        @(negedge aclk); win_in.arvalid = 0;
+        while (!got) begin
+            @(posedge aclk);
+            if (win_in.rvalid && win_in.rready) begin
+                for (int j = 0; j < 8; j++) c[j] = win_in.rdata[64*j +: 64];
+                got = 1;
+            end
+        end
+        `CHECK(c[0] > 700,      $sformatf("T6: xclk cycles %0d", c[0]))
+        `CHECK(c[1] == 10,      $sformatf("T6: AW %0d, want 10", c[1]))
+        `CHECK(c[2] == 40,      $sformatf("T6: W beats %0d, want 40", c[2]))
+        `CHECK(c[3] == stalls,  $sformatf("T6: W stalled %0d, want %0d", c[3], stalls))
+        `CHECK(c[4] == starve,  $sformatf("T6: W starved %0d, want %0d", c[4], starve))
+        `CHECK(c[5] == 0,       $sformatf("T6: AW stalled %0d, want 0", c[5]))
+        `CHECK(c[6] == 10,      $sformatf("T6: B %0d, want 10", c[6]))
+        `CHECK(c[7] == 0,       $sformatf("T6: word 23 = %0d, want 0", c[7]))
+    end
+    $display("ok   T6 axi_main counters (uwin_mon) through the clock crossing");
 
     if (errors == 0) $display("TB PASS (tb_uwin_hbm)");
     else             $display("TB FAIL (tb_uwin_hbm): %0d errors", errors);

@@ -47,6 +47,12 @@ module design_dynamic_top #(
     AXI4.s                                      s_axim_udata [N_REGIONS],
 
 {% endif %}
+{% if cnfg.en_uwin_hbm %}
+    // uwin_mon's counts of axi_main (xclk), read through the window's counter page
+    input  logic [64*7-1:0]                     uwin_main_snap,
+    input  logic                                uwin_main_tgl,
+
+{% endif %}
 {% if cnfg.en_mem %}
     // AXI4 DDR (EN_UWIN_HBM: the user data window's HBM channel is the last)
     AXI4.m									    m_axi_ddr [1+N_REGIONS*N_CARD_AXI{% if cnfg.en_uwin_hbm %}+1{% endif %}],
@@ -994,7 +1000,8 @@ module design_dynamic_top #(
     // striped like the card channels, so a card physical address means the
     // same HBM location on both
     AXI4 axim_udata_hbm ();
-    uwin_hbm #(.BASE(UWIN_HBM_BASE)) inst_uwin_hbm (.aclk(aclk), .aresetn(aresetn), .s_axi(axim_udata_s1[0]), .m_axi(axim_udata_hbm));
+    uwin_hbm #(.BASE(UWIN_HBM_BASE)) inst_uwin_hbm (.aclk(aclk), .aresetn(aresetn), .s_axi(axim_udata_s1[0]), .m_axi(axim_udata_hbm),
+                                                   .main_snap(uwin_main_snap), .main_tgl(uwin_main_tgl));
     axi_stripe #(.N_STAGES(N_REG_DYN_CARD_S0)) inst_strp_uwin (.aclk(aclk), .aresetn(aresetn), .s_axi(axim_udata_hbm), .m_axi(m_axi_ddr[1+N_REGIONS*N_CARD_AXI]));
 {% else %}
     axi_decoupler (.decouple(decouple_uclk), .s_axi(axim_udata_s1), .m_axi(axim_udata_ul));

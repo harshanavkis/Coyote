@@ -31,10 +31,14 @@ constexpr uint64_t UWIN_SIZE = 1ULL << 27;    // the window (uwin_hbm UWIN_BITS)
 struct Counters {
     static constexpr int N = 12;
     enum { CYC, AW, W, W_STALL, W_STARVE, AW_STALL, B, B_STALL, OUT_CYC, OUT_SUM, OUT_MAX, PARTIAL };
-    uint64_t v[N];
+    // words 16-22: uwin_mon's axi_main counts (xclk), where the writes enter the shell
+    static constexpr int N_MAIN = 7;
+    enum { M_CYC, M_AW, M_W, M_W_STALL, M_W_STARVE, M_AW_STALL, M_B };
+    uint64_t v[N], m[N_MAIN];
     static Counters read(volatile uint64_t *win) {
         Counters c;
         for (int i = 0; i < N; i++) c.v[i] = win[(UWIN_SIZE - 4096) / 8 + i];
+        for (int i = 0; i < N_MAIN; i++) c.m[i] = win[(UWIN_SIZE - 4096) / 8 + 16 + i];
         return c;
     }
     void print(const Counters &b) const {
@@ -46,6 +50,10 @@ struct Counters {
                d(CYC), d(W), d(W_STALL), d(W_STARVE), d(AW_STALL), d(AW), d(W) / aw, d(PARTIAL), d(B), d(B_STALL),
                d(OUT_CYC), d(OUT_CYC) ? double(d(OUT_SUM)) / d(OUT_CYC) : 0.0, d(OUT_SUM) / aw,
                (unsigned long) v[OUT_MAX]);
+        auto e = [&](int i) { return (unsigned long) (m[i] - b.m[i]); };
+        printf("     axi_main (static -> shell, xclk) over %lu cycles: %lu W beats, %lu stalled (shell not ready), "
+               "%lu starved (static side), %lu AW, AW stalled %lu, B %lu (snapshots every 256 cycles)\n",
+               e(M_CYC), e(M_W), e(M_W_STALL), e(M_W_STARVE), e(M_AW), e(M_AW_STALL), e(M_B));
     }
 };
 

@@ -1483,6 +1483,20 @@ module shell_top (
     // DYNAMIC WRAPPER
     // ================-----------------------------------------------------------------
 
+{% if cnfg.en_uwin_hbm %}
+    // Where the user data window's writes enter the shell (axi_main, xclk):
+    // counted for the window's counter page (uwin_mon.sv)
+    logic [64*7-1:0] uwin_main_snap;
+    logic            uwin_main_tgl;
+    uwin_mon inst_uwin_mon (
+        .xclk(xclk), .xresetn(xresetn),
+        .awvalid(s_axi_main_awvalid), .awready(s_axi_main_awready), .awlen(s_axi_main_awlen),
+        .wvalid(s_axi_main_wvalid), .wready(s_axi_main_wready),
+        .bvalid(s_axi_main_bvalid), .bready(s_axi_main_bready),
+        .snap(uwin_main_snap), .snap_tgl(uwin_main_tgl)
+    );
+
+{% endif %}
     design_dynamic_top inst_dynamic (
         .s_axi_ctrl(axi_ctrl[0+:{{ cnfg.n_reg }}]),
 {% if cnfg.en_avx %}
@@ -1490,6 +1504,10 @@ module shell_top (
 {% endif %}
 {% if cnfg.en_uwin %}
         .s_axim_udata(axim_udata[0+:{{ cnfg.n_reg }}]),
+{% endif %}
+{% if cnfg.en_uwin_hbm %}
+        .uwin_main_snap(uwin_main_snap),
+        .uwin_main_tgl(uwin_main_tgl),
 {% endif %}
 {% if cnfg.en_mem %}
         .m_axi_ddr(axi_mem[{{ cnfg.n_net_chan }}+:{{ (1+cnfg.n_reg*cnfg.n_card_axi+(cnfg.en_uwin_hbm or 0)) }}]),

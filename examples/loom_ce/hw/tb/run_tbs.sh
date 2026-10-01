@@ -31,7 +31,7 @@ SRCS="$LYNX_PKG $COYOTE_ROOT/hw/hdl/pkg/axi_intf.sv $COYOTE_ROOT/hw/hdl/pkg/lynx
       $COYOTE_ROOT/hw/hdl/common/regs/axi_reg_array.sv $COYOTE_ROOT/hw/hdl/common/queues/fifo.sv \
       $COYOTE_ROOT/hw/hdl/common/queues/queue_meta.sv $COYOTE_ROOT/hw/hdl/stripe/axi_stripe_rd.sv \
       $COYOTE_ROOT/hw/hdl/stripe/axi_stripe_wr.sv $COYOTE_ROOT/hw/hdl/stripe/axi_stripe.sv \
-      $COYOTE_ROOT/hw/hdl/common/uwin/uwin_hbm.sv"
+      $COYOTE_ROOT/hw/hdl/common/uwin/uwin_hbm.sv $COYOTE_ROOT/hw/hdl/common/uwin/uwin_mon.sv"
 
 mkdir -p work && cd work
 
