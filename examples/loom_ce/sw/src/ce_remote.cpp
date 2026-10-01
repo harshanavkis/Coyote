@@ -130,7 +130,7 @@ void snap(coyote::cThread &v80, uint64_t *out, uint32_t first, int n) {
     for (int i = 0; i < n; i++) out[i] = v80.getCSR(first + i);
 }
 
-int run_server(uint16_t port, uint64_t size, bool land, uint64_t off) {
+int run_server(uint16_t port, uint64_t size, bool land, uint64_t off, unsigned poll_us) {
     coyote::cThread t_qp(0, getpid(), 0, nullptr, "coyote_fpga");     // QP owner
     coyote::cThread t_data(0, getpid(), 0, nullptr, "coyote_fpga");   // owns the landing buffers
     printf("server: waiting for the QP exchange on port %u ...\n", port);
@@ -187,7 +187,7 @@ int run_server(uint16_t port, uint64_t size, bool land, uint64_t off) {
         Verdict v{};
         if (land) {
             // the fence, read through the V80's window, then the data synced back
-            (void) L->wait(off + size, an.fence);
+            (void) L->wait(off + size, an.fence, std::chrono::milliseconds(5000), poll_us);
             v.wait_us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
             u1 = land_v80::Counters::read(L->win);
             L->pull();
@@ -463,6 +463,7 @@ int main(int argc, char **argv) {
     int window = -1;
     bool land = false, bidir = false, no_send = false;
     uint64_t land_off = 0;
+    unsigned poll_us = 0;
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         if (a == "--server")                     server = true;
@@ -473,17 +474,18 @@ int main(int argc, char **argv) {
         else if (a == "--window" && i + 1 < argc) window = atoi(argv[++i]);
         else if (a == "--land-v80")               land = true;
         else if (a == "--land-offset" && i + 1 < argc) land_off = strtoull(argv[++i], nullptr, 0);
+        else if (a == "--poll-us" && i + 1 < argc) poll_us = unsigned(atoi(argv[++i]));
         else if (a == "--bidir-server")           { bidir = true; server = true; }
         else if (a == "--bidir-client" && i + 1 < argc) { bidir = true; ip = argv[++i]; }
         else if (a == "--no-send")                no_send = true;
         else { server = false; ip.clear(); break; }
     }
     if (server == !ip.empty() || size == 0 || size % 4096 || size > (64ULL << 20) || land_off % 64 || land_off >= 4096) {
-        printf("usage: %s --server [--port N] [--size BYTES] [--land-v80 [--land-offset B]] | --client <server_ip> [--port N] [--reps N] [--window P]\n"
+        printf("usage: %s --server [--port N] [--size BYTES] [--land-v80 [--land-offset B] [--poll-us U]] | --client <server_ip> [--port N] [--reps N] [--window P]\n"
                "       | --bidir-server | --bidir-client <server_ip>  [--port N] [--size BYTES] [--reps N] [--window P] [--no-send]\n"
                "       (size: a multiple of 4 KiB, at most 64 MiB)\n", argv[0]);
         return 2;
     }
     if (bidir) return run_bidir(server ? std::string() : ip, port, size, reps, window, !no_send);
-    return server ? run_server(port, size, land, land_off) : run_client(ip, port, reps, window);
+    return server ? run_server(port, size, land, land_off, poll_us) : run_client(ip, port, reps, window);
 }

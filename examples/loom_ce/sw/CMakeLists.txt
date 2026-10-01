@@ -27,5 +27,8 @@ target_link_libraries(p2p_bw PUBLIC Coyote pthread)
 add_executable(p2p_bw_u280 ${TARGET_DIR}/p2p_bw_u280.cpp)
 target_link_libraries(p2p_bw_u280 PUBLIC Coyote pthread)
 
+add_executable(loom_csr ${TARGET_DIR}/loom_csr.cpp)
+target_link_libraries(loom_csr PUBLIC Coyote pthread)
+
 add_executable(v80_bisect ${TARGET_DIR}/v80_bisect.cpp)
 target_link_libraries(v80_bisect PUBLIC Coyote pthread)

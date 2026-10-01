@@ -83,11 +83,18 @@ struct Landing {
     }
 
     // Wait for the 8 B word at byte offset off to read val; false on timeout
-    bool wait(uint64_t off, uint64_t val, std::chrono::milliseconds timeout = std::chrono::milliseconds(5000)) {
+    // poll_us > 0: read the window only every poll_us microseconds
+    bool wait(uint64_t off, uint64_t val, std::chrono::milliseconds timeout = std::chrono::milliseconds(5000),
+              unsigned poll_us = 0) {
         const auto t0 = std::chrono::steady_clock::now();
         while (win[off / 8] != val) {
             if (std::chrono::steady_clock::now() - t0 > timeout) return false;
-            _mm_pause();
+            if (poll_us) {
+                const auto t1 = std::chrono::steady_clock::now() + std::chrono::microseconds(poll_us);
+                while (std::chrono::steady_clock::now() < t1) _mm_pause();
+            } else {
+                _mm_pause();
+            }
         }
         return true;
     }
