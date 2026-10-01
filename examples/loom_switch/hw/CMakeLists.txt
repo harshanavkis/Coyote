@@ -18,7 +18,7 @@ set(EN_UWIN 1)
 # Single vFPGA: every emulated XPU is a binding (a window) in it
 set(N_REGIONS 1)
 
-set(BUILD_OPT 0)
+set(BUILD_OPT 1)
 
 validation_checks_hw()
 
