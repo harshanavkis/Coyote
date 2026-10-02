@@ -31,8 +31,10 @@ import lynxTypes::*;
  * next offset are gathered into one packet, up to PMTU (64 beats) on either
  * route. A packet closes when it is full, when the next beat does not
  * continue it (another window or offset, or a store), or when no beat has
- * been presented for FLUSH_CYCLES - write combining, as a CPU's WC buffer
- * does; it decides only how a tail is packed, never where anything lands.
+ * been presented for FLUSH_CYCLES and the packet could leave at once (the
+ * output idle, nothing queued, room in the ack window) - write combining, as
+ * a CPU's WC buffer does; it decides only how a tail is packed, never where
+ * anything lands.
  * The request states the length, so a packet is stored before it is
  * forwarded; the data FIFO holds several, so the next one gathers while the
  * last one leaves.
@@ -332,7 +334,16 @@ logic [$clog2(FLUSH_CYCLES+1)-1:0] idle;
 wire good_beat = w_hs && b_ok && w_full;
 wire cont      = pk_open && (pk_idx == b_idx) && (pk_next == b_off);
 wire [BEAT_W-1:0] cap_cur = BEAT_W'(PKT_BEATS);
-wire flush     = pk_open && !w_in && !pq_full && (idle >= FLUSH_CYCLES - 1);
+// The idle timer closes a partial packet only when it can leave at once:
+// nothing queued or being sent ahead of it and, on the rdma route, room in
+// the ack window. Closing it earlier gets nothing on the wire sooner, it
+// only splits the run. Under backpressure that split fed itself: the
+// producer, held by the window, resumed with pauses past the timer; each
+// pause closed a short packet; short packets filled the packet-counted
+// window with less data, which held the producer again. 16 MiB copies went
+// out as ~11k packets instead of 4096, at ~4 GB/s instead of ~11.
+logic send_idle;
+wire flush     = pk_open && !w_in && send_idle && (idle >= FLUSH_CYCLES - 1);
 
 // Queue entries: a packet (its beats are in the data FIFO) or a store
 typedef struct packed {
@@ -470,6 +481,7 @@ pkt_t    o;
 logic [BEAT_W-1:0] o_left;
 
 assign pq_pop = (ostate == O_IDLE) && !pq_empty;
+assign send_idle = (ostate == O_IDLE) && pq_empty && (!pk_route || win_ok);
 wire   o_last = (o_left == BEAT_W'(1));
 wire   o_rdy  = o.route ? m_net_tready : m_host_tready;
 wire   o_beat = (ostate == O_DATA) && df_tvalid && o_rdy;

@@ -144,6 +144,7 @@ typedef struct {
     longint      uaddr;      // uwin address (the first beat's line is uaddr rounded down to 64 B)
     int          beats;
     bit          gap_after;  // idle past the flush timer after this burst
+    bit          gap_held;   // the same idle while the output is held: no close
     logic [63:0] strb [64];  // per beat
 } burst_t;
 
@@ -245,6 +246,10 @@ endtask
 // AXI master: AW and W run independently, so bursts go back to back
 // ---------------------------------------------------------------------------
 bit bp = 0;          // random backpressure and W bubbles
+bit win_shut = 0;    // hold the ack window shut until every burst is answered
+// the send state as a plain vector: xsim reads int'(dut.ostate) in a wait
+// as 0 while it is not
+wire [2:0] dut_ost = dut.ostate;
 int aw_q [$];        // indices into bursts
 int w_q  [$];
 int b_seen = 0, b_expect_id = 0;
@@ -284,7 +289,7 @@ always begin
             do @(posedge aclk); while (!axi.wready);
             axi.wvalid <= 0;
         end
-        if (bursts[k].gap_after) repeat (4*FLUSH) @(posedge aclk);
+        if (bursts[k].gap_after || bursts[k].gap_held) repeat (4*FLUSH) @(posedge aclk);
     end
 end
 
@@ -317,7 +322,7 @@ always @(posedge aclk) cyc++;
 
 always @(posedge aclk) begin
     wr_ready      <= bp ? ($urandom_range(0, 2) != 0) : 1'b1;
-    win_ok        <= bp ? ($urandom_range(0, 3) != 0) : 1'b1;
+    win_ok        <= win_shut ? 1'b0 : bp ? ($urandom_range(0, 3) != 0) : 1'b1;
     m_host_tready <= bp ? ($urandom_range(0, 2) != 0) : 1'b1;
     m_net_tready  <= bp ? ($urandom_range(0, 2) != 0) : 1'b1;
 end
@@ -377,7 +382,11 @@ task automatic run(input string name);
     // done when every burst answered and the output has gone quiet
     wait (b_seen == n_bursts);
     repeat (8*FLUSH + 200) @(posedge aclk);
-    wait (int'(dut.ostate) == 0 && dut.pq_empty);
+    win_shut = 0;
+    // a packet held open by the shut window flushes once it opens
+    do @(posedge aclk); while (dut.pk_open);
+    repeat (4) @(posedge aclk);
+    wait (dut_ost == 3'd0 && dut.pq_empty);
     repeat (20) @(posedge aclk);
 
     `CHECK(reqs.size() == exp_pkts.size(),
@@ -468,7 +477,7 @@ endtask
 
 function automatic void add(input longint uaddr, input int beats, input bit gap = 0);
     burst_t b;
-    b.uaddr = uaddr; b.beats = beats; b.gap_after = gap;
+    b.uaddr = uaddr; b.beats = beats; b.gap_after = gap; b.gap_held = 0;
     for (int j = 0; j < 64; j++) b.strb[j] = '1;
     bursts.push_back(b);
 endfunction
@@ -530,6 +539,18 @@ task automatic suite(input string tag);
     // an offset gap inside one window, and an idle gap inside a run
     add(W1, 4); add(W1 + 1024, 4); add(W1 + 1280, 4, 1); add(W1 + 1536, 4);
     run({tag, "gaps"});
+
+    // a run that pauses past the timer while the window is shut stays one
+    // packet: the timer closes a packet only when it could leave at once.
+    // (Closing on every pause under backpressure split 16 MiB copies into
+    // ~11k packets.) The window opens after the last burst, which then
+    // flushes the open packet.
+    for (int k = 0; k < 8; k++) begin
+        add(W2 + 64'hE000 + 256*k, 4);
+        bursts[bursts.size()-1].gap_held = 1;
+    end
+    win_shut = 1;
+    run({tag, "pauses behind a shut window"});
 
     // drops: past the end, unmapped, invalid entry; good ones around them
     add(W3, 8);                // exactly fills the 512 B window

@@ -385,8 +385,12 @@ before it has landed", because every stage keeps order:
 **When a packet is sent.** A full 4 KiB packet leaves as soon as it fills.
 A partial packet leaves when the next write doesn't continue the run (the
 fence, a store, another window or offset) or, as a fallback, after
-`FLUSH_CYCLES` (16 cycles, 64 ns) with no write. That timer is write
-combining: it affects only how a tail is packed, never where anything lands.
+`FLUSH_CYCLES` (16 cycles, 64 ns) with no write, once it could leave at once:
+nothing queued or being sent ahead of it, and room in the ack window. While
+the output is busy, a pause in the producer's writes doesn't close the
+packet, so a producer held back by the window still fills 4 KiB packets.
+That timer is write combining: it affects only how a tail is packed, never
+where anything lands.
 It is a fixed parameter today. Making it a CSR, measuring the gaps between
 a producer's writes, and treating a read of the window as an explicit flush
 (PCIe reads can't pass posted writes) are proposed, not built.

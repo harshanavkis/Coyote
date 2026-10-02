@@ -465,6 +465,7 @@ int run_client(const std::string &ip, uint16_t port, int reps, int window, unsig
 
         const uint64_t fence = v80.getCSR(COPIES) + 1;
         loom_switch::IngressCounters c0 = loom_switch::IngressCounters::read(u280);
+        const uint64_t cut0 = loom_switch::csr_read(u280, 121);   // partial rdma packets cut by a write
         const Counters k0 = Counters::read(u280);
         uint64_t e0[3];
         snap(v80, e0, 48, 3);
@@ -485,8 +486,11 @@ int run_client(const std::string &ip, uint16_t port, int reps, int window, unsig
         printf("%s copy %d: %lu bytes, server saw the fence after %.1f us, %lu words wrong; CE %lu cycles\n",
                (v.bad ? "FAIL" : "ok  "), r, (unsigned long) size, v.wait_us, (unsigned long) v.bad,
                (unsigned long) v80.getCSR(CYCLES));
-        printf("     ingress: %lu bursts, %lu rdma packets, %lu stores, %lu dropped; acks %lu, unacked %lu\n",
+        printf("     ingress: %lu bursts, %lu rdma packets (%lu closed by the idle timer, %lu cut by a write), "
+               "%lu stores, %lu dropped; acks %lu, unacked %lu\n",
                (unsigned long) (c1.v[0] - c0.v[0]), (unsigned long) (c1.v[3] - c0.v[3]),
+               (unsigned long) (c1.v[6] - c0.v[6]),
+               (unsigned long) (loom_switch::csr_read(u280, 121) - cut0),
                (unsigned long) (c1.v[4] - c0.v[4]), (unsigned long) (c1.v[1] - c0.v[1]),
                (unsigned long) loom_switch::csr_read(u280, loom_switch::TX_ACKS),
                (unsigned long) loom_switch::csr_read(u280, loom_switch::TX_STATE));
