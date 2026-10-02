@@ -60,7 +60,7 @@ logic [AXI_DATA_BITS-1:0]   m_host_tdata, m_net_tdata;
 logic [AXI_DATA_BITS/8-1:0] m_host_tkeep, m_net_tkeep;
 logic m_host_tvalid, m_host_tready, m_host_tlast;
 logic m_net_tvalid, m_net_tready, m_net_tlast;
-logic cnt_burst, cnt_drop, cnt_pkt_local, cnt_pkt_rdma, cnt_store, cnt_store_drop, cnt_flush;
+logic cnt_burst, cnt_drop, cnt_pkt_local, cnt_pkt_rdma, cnt_store, cnt_store_drop, cnt_flush, cnt_msg;
 localparam integer N_DBG = 14;
 logic [N_DBG-1:0] cnt_dbg;
 
@@ -94,7 +94,9 @@ loom_ingress #(.UWIN_BITS(UWIN_BITS), .FLUSH_CYCLES(FLUSH)) dut (
     .m_net_tlast(m_net_tlast),
     .cnt_burst(cnt_burst), .cnt_drop(cnt_drop), .cnt_pkt_local(cnt_pkt_local),
     .cnt_pkt_rdma(cnt_pkt_rdma), .cnt_store(cnt_store), .cnt_store_drop(cnt_store_drop),
-    .cnt_flush(cnt_flush), .cnt_win_wait(), .cnt_req_wait(), .cnt_dbg(cnt_dbg)
+    .cnt_flush(cnt_flush), .cnt_win_wait(), .cnt_req_wait(),
+    .cnt_msg(cnt_msg), .cnt_msg_flush(), .cnt_hold(),
+    .cnt_dbg(cnt_dbg)
 );
 
 int errors = 0;
@@ -150,6 +152,9 @@ typedef struct {
     logic [VADDR_BITS-1:0] va;
     longint                uaddr;   // uwin address of the first beat
     int                    beats;
+    bit                    first;   // rdma: the message's first packet (header)
+    bit                    more;    // rdma: the message continues after it
+    longint                moff;    // rdma: wire offset in the message
 } pkt_t;
 
 burst_t bursts [$];
@@ -180,11 +185,17 @@ task automatic model();
     int     p_win;
     longint p_next;
     pkt_t   p;
+    // rdma message: a full packet ends the gathering but not the message;
+    // the next full beat at m_next of m_win continues it (that packet's
+    // more = 1), anything else ends it
+    bit     m_open = 0;
+    int     m_win, m_last;
+    longint m_next, m_moff;
     exp_pkts.delete();
     exp_drops = 0;
     exp_store_drops = 0;
     exp_nowin = 0; exp_oob = 0; exp_b1 = 0; exp_b4 = 0; exp_bmore = 0; exp_mis = 0;
-    p.store = 0; p.data = 0;
+    p.store = 0; p.data = 0; p.more = 0;
     foreach (bursts[k]) begin
         longint off;
         bit oob;
@@ -200,12 +211,13 @@ task automatic model();
         end
         for (int j = 0; j < bursts[k].beats; j++) begin
             longint o = off + 64*j;
-            int cap = W[wi].route ? PKT_BEATS-1 : PKT_BEATS;
             logic [63:0] sb = bursts[k].strb[j];
             if (sb != '1) begin
-                // stores: close the open packet, then one per whole word
+                // stores: close the open packet (and any message), then one
+                // per whole word
                 bit bad = 0;
                 if (open) begin exp_pkts.push_back(p); open = 0; end
+                m_open = 0;
                 for (int l = 0; l < 8; l++) begin
                     if (sb[8*l +: 8] == 8'hFF) begin
                         pkt_t st;
@@ -213,7 +225,7 @@ task automatic model();
                         st.store = 1; st.route = W[wi].route; st.pid = W[wi].pid;
                         st.dst_pid = W[wi].dst_pid; st.va = W[wi].base + o + 8*l;
                         st.uaddr = W[wi].ustart + o; st.beats = 0;
-                        st.data = line[64*l +: 64];
+                        st.data = line[64*l +: 64]; st.first = 0; st.more = 0; st.moff = 0;
                         exp_pkts.push_back(st);
                     end else if (sb[8*l +: 8] != 8'h00) bad = 1;
                 end
@@ -223,15 +235,28 @@ task automatic model();
             if (open && p_win == wi && p_next == o) begin
                 p.beats++;
             end else begin
-                if (open) exp_pkts.push_back(p);
+                bit mc = !open && m_open && m_win == wi && m_next == o;
+                if (open) begin exp_pkts.push_back(p); m_open = 0; end
+                if (mc) exp_pkts[m_last].more = 1;
+                else    m_open = 0;
                 p.route = W[wi].route; p.pid = W[wi].pid; p.dst_pid = W[wi].dst_pid;
                 p.va = W[wi].base + o; p.uaddr = W[wi].ustart + o; p.beats = 1;
+                p.first = !mc; p.more = 0; p.moff = mc ? m_moff : 0;
                 p_win = wi; open = 1;
             end
             p_next = o + 64;
-            if (p.beats == cap) begin exp_pkts.push_back(p); open = 0; end
+            if (p.beats == ((p.route && p.first) ? PKT_BEATS-1 : PKT_BEATS)) begin
+                exp_pkts.push_back(p); open = 0;
+                if (p.route) begin
+                    m_open = 1; m_win = wi; m_next = p_next; m_last = exp_pkts.size() - 1;
+                    m_moff = p.moff + 64*p.beats + (p.first ? 64 : 0);
+                end
+            end
         end
-        if (bursts[k].gap_after && open) begin exp_pkts.push_back(p); open = 0; end
+        if (bursts[k].gap_after) begin
+            if (open) begin exp_pkts.push_back(p); open = 0; end
+            m_open = 0;
+        end
     end
     if (open) exp_pkts.push_back(p);
 endtask
@@ -302,7 +327,7 @@ logic [AXI_DATA_BITS-1:0] host_beats [$], net_beats [$];
 logic [AXI_DATA_BITS/8-1:0] host_keep [$];
 bit   host_last [$], net_last [$];
 int   n_burst = 0, n_drop = 0, n_pkt_local = 0, n_pkt_rdma = 0, n_post = 0;
-int   n_store = 0, n_store_drop = 0;
+int   n_store = 0, n_store_drop = 0, n_msg = 0;
 int   n_dbg [N_DBG];
 bit   check_rate = 0;    // the next run's bursts must go in at one beat a cycle
 // Input rate: W beats taken between the first and the last
@@ -333,6 +358,7 @@ always @(posedge aclk) if (aresetn) begin
     n_post      += rdma_post;
     n_store     += cnt_store;
     n_store_drop += cnt_store_drop;
+    n_msg       += cnt_msg;
     for (int i = 0; i < N_DBG; i++) n_dbg[i] += cnt_dbg[i];
     // a W beat that waits is counted under exactly one reason
     `CHECK((axi.wvalid && !axi.wready) == (cnt_dbg[7:3] != 0) && $onehot0(cnt_dbg[7:3]),
@@ -356,7 +382,7 @@ task automatic run(input string name);
     reqs.delete(); host_beats.delete(); net_beats.delete();
     host_last.delete(); net_last.delete(); host_keep.delete();
     n_burst = 0; n_drop = 0; n_pkt_local = 0; n_pkt_rdma = 0; n_post = 0; b_seen = 0;
-    n_store = 0; n_store_drop = 0;
+    n_store = 0; n_store_drop = 0; n_msg = 0;
     for (int i = 0; i < N_DBG; i++) n_dbg[i] = 0;
     w_first = -1; w_beats = 0;
     salt = $urandom();
@@ -368,7 +394,7 @@ task automatic run(input string name);
     // done when every burst answered and the output has gone quiet
     wait (b_seen == n_bursts);
     repeat (8*FLUSH + 200) @(posedge aclk);
-    wait (int'(dut.ostate) == 0 && dut.pq_empty);
+    wait (int'(dut.ostate) == 0 && dut.pq_empty && !dut.h_valid && !dut.pk_open);
     repeat (20) @(posedge aclk);
 
     `CHECK(reqs.size() == exp_pkts.size(),
@@ -402,16 +428,23 @@ task automatic run(input string name);
             n_st++;
         end else if (e.route) begin
             logic [AXI_DATA_BITS-1:0] h;
-            `CHECK(r.opcode == RC_RDMA_WRITE_ONLY && r.strm == STRM_RDMA && r.mode == 1'b1 &&
-                   r.rdma && r.remote && r.dest == 0 && r.vaddr == STAGING &&
-                   r.len == LEN_BITS'(64 + 64*e.beats),
-                   $sformatf("%s pkt %0d: rdma request op %0h strm %0d dest %0d va %h len %0d, expected len %0d",
-                             name, i, r.opcode, r.strm, r.dest, r.vaddr, r.len, 64 + 64*e.beats))
-            h = net_beats.pop_front();
-            `CHECK(!net_last.pop_front(), $sformatf("%s pkt %0d: tlast on the header", name, i))
-            `CHECK(h[63:0] == {{(28-PID_BITS){1'b0}}, e.dst_pid, 28'(64*e.beats), 8'd1} &&
-                   h[127:64] == 64'(e.va) && h[AXI_DATA_BITS-1:128] == '0,
-                   $sformatf("%s pkt %0d: header %h %h, expected va %h beats %0d", name, i, h[127:64], h[63:0], e.va, e.beats))
+            logic [OPCODE_BITS-1:0] op = e.first ? (e.more ? RC_RDMA_WRITE_FIRST  : RC_RDMA_WRITE_ONLY)
+                                                 : (e.more ? RC_RDMA_WRITE_MIDDLE : RC_RDMA_WRITE_LAST);
+            int wlen = 64*e.beats + (e.first ? 64 : 0);
+            `CHECK(r.opcode == op && r.strm == STRM_RDMA && r.mode == 1'b1 &&
+                   r.rdma && r.remote && r.dest == 0 && r.vaddr == STAGING + VADDR_BITS'(e.moff) &&
+                   r.len == LEN_BITS'(wlen),
+                   $sformatf("%s pkt %0d: rdma request op %0h (want %0h) va %h len %0d, expected moff %0d len %0d",
+                             name, i, r.opcode, op, r.vaddr, r.len, e.moff, wlen))
+            // only full packets may continue a message (the wire's FIRST/MIDDLE are PMTU)
+            if (e.more) `CHECK(wlen == PMTU_BYTES, $sformatf("%s pkt %0d: a continuing packet of %0d B", name, i, wlen))
+            if (e.first) begin
+                h = net_beats.pop_front();
+                `CHECK(!net_last.pop_front(), $sformatf("%s pkt %0d: tlast on the header", name, i))
+                `CHECK(h[63:0] == {{(28-PID_BITS){1'b0}}, e.dst_pid, 28'd0, 8'd3} &&
+                       h[127:64] == 64'(e.va) && h[AXI_DATA_BITS-1:128] == '0,
+                       $sformatf("%s pkt %0d: header %h %h, expected va %h", name, i, h[127:64], h[63:0], e.va))
+            end
             for (int j = 0; j < e.beats; j++) begin
                 `CHECK(net_beats.pop_front() == pat(e.uaddr + 64*j), $sformatf("%s pkt %0d: payload beat %0d", name, i, j))
                 `CHECK(net_last.pop_front() == (j == e.beats - 1), $sformatf("%s pkt %0d: tlast at beat %0d", name, i, j))
@@ -436,6 +469,11 @@ task automatic run(input string name);
            $sformatf("%s: %0d bursts %0d drops, expected %0d / %0d", name, n_burst, n_drop, n_bursts - exp_drops, exp_drops))
     `CHECK(n_pkt_local == n_local && n_pkt_rdma == n_rdma && n_post == n_rdma + n_st_rdma,
            $sformatf("%s: counters local %0d rdma %0d post %0d", name, n_pkt_local, n_pkt_rdma, n_post))
+    begin
+        int e_msg = 0;
+        foreach (exp_pkts[i]) e_msg += (exp_pkts[i].route && !exp_pkts[i].store && exp_pkts[i].first);
+        `CHECK(n_msg == e_msg, $sformatf("%s: %0d rdma messages counted, expected %0d", name, n_msg, e_msg))
+    end
     `CHECK(n_store == n_st && n_store_drop == exp_store_drops,
            $sformatf("%s: counters store %0d store_drop %0d, expected %0d / %0d",
                      name, n_store, n_store_drop, n_st, exp_store_drops))
@@ -584,6 +622,20 @@ task automatic suite(input string tag);
     add_run(W1 + 64'hDC00 + 9*64, 4, 4);
     add_st(W3 + 512 - 32, HI32);
     run({tag, "inside a line"});
+
+    // messages: a run of exactly two full packets ended by another window,
+    // one full first packet ended by the idle timer, two full packets ended
+    // by a store (the held packet goes out as LAST before the store), a long
+    // message ending in a partial packet, and a message whose bursts are
+    // 4-beat (256 B, PCIe-sized) the whole way
+    add_run(W2 + 64'h10000, 63 + 64, 4);
+    add(W1 + 64'h10000, 4);
+    add_run(W2 + 64'h20000, 63, 3);
+    bursts[bursts.size()-1].gap_after = 1;
+    add_run(W2 + 64'h30000, 63 + 64, 4);
+    add_st(W2 + 64'h40000, word(0));
+    add_run(W2 + 64'h50000, 63 + 64*3 + 5, 4);
+    run({tag, "messages"});
 endtask
 
 initial begin

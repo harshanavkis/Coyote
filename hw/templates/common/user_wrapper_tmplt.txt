@@ -58,8 +58,8 @@ module design_user_wrapper_{{ c_reg }} (
     (* io_buffer_type = "none" *) input  logic                                axi_ctrl_wvalid,
 
 {% if cnfg.en_uwin and not cnfg.en_uwin_hbm and cnfg.en_strm %}
-    // Host DMA boundary stall pulses (dynamic_top dbg_host_out)
-    (* io_buffer_type = "none" *) input  logic[2:0]                               dbg_host_out,
+    // Host write path pulses (dynamic_top dbg_host_out)
+    (* io_buffer_type = "none" *) input  logic[9:0]                               dbg_host_out,
 {% endif %}
 {% if cnfg.en_uwin and not cnfg.en_uwin_hbm %}
     // AXI4 USER DATA WINDOW
@@ -818,6 +818,10 @@ module design_user_wrapper_{{ c_reg }} (
     AXI4SR axis_card_send_int [N_CARD_AXI] (.*);
     AXI4SR axis_card_recv_int [N_CARD_AXI] (.*); 
     
+{% if cnfg.en_uwin and not cnfg.en_uwin_hbm and cnfg.en_strm %}
+    // Credit-stage waits of each host stream's write requests (dbg_host_out)
+    logic [N_STRM_AXI-1:0] cred_wr_wait_data, cred_wr_wait_out;
+{% endif %}
 {% if cnfg.en_strm and cnfg.en_mem %}
     req_mux_stream_1_2 inst_stream_mux_rd (
         .s_req(local_sq_rd),
@@ -853,6 +857,10 @@ module design_user_wrapper_{{ c_reg }} (
         .aresetn(aresetn),
         .s_req(local_sq_wr_host),
         .m_req(local_cred_wr_host),
+    {% if cnfg.en_uwin and not cnfg.en_uwin_hbm %}
+        .dbg_wait_data(cred_wr_wait_data),
+        .dbg_wait_out(cred_wr_wait_out),
+    {% endif %}
         .s_axis(axis_host_send_int),
         .m_axis(axis_host_src_int)
     );
@@ -917,6 +925,10 @@ module design_user_wrapper_{{ c_reg }} (
         .aresetn(aresetn),
         .s_req(local_sq_wr_host),
         .m_req(local_cred_wr_host),
+    {% if cnfg.en_uwin and not cnfg.en_uwin_hbm %}
+        .dbg_wait_data(cred_wr_wait_data),
+        .dbg_wait_out(cred_wr_wait_out),
+    {% endif %}
         .s_axis(axis_host_send_int),
         .m_axis(axis_host_src_int)
     );
@@ -1172,7 +1184,9 @@ module design_user_wrapper_{{ c_reg }} (
     design_user_logic_c{{ c_cnfg }}_{{ c_reg }} inst_user_c{{ c_cnfg }}_{{ c_reg }} (
 	    .axi_ctrl(axi_ctrl_user),
     {% if cnfg.en_uwin and not cnfg.en_uwin_hbm and cnfg.en_strm %}
-        .dbg_host_out(dbg_host_out),
+        // [11] the last host stream's write request waited in the credit
+        // stage to go downstream, [10] waited there for its data
+        .dbg_host_out({cred_wr_wait_out[N_STRM_AXI-1], cred_wr_wait_data[N_STRM_AXI-1], dbg_host_out}),
     {% endif %}
     {% if cnfg.en_uwin and not cnfg.en_uwin_hbm %}
         .axi_udata(axi_udata_user),

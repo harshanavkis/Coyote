@@ -249,12 +249,15 @@ module design_dynamic_top #(
     axis_reg_array #(.N_STAGES(N_REG_DYN_HOST_S0)) inst_host_axis_reg_arr_s0_in  (.aclk(aclk), .aresetn(aresetn), .s_axis(s_axis_host),      .m_axis(axis_host_in_s0));
     axis_reg_array #(.N_STAGES(N_REG_DYN_HOST_S0)) inst_host_axis_reg_arr_s0_out (.aclk(aclk), .aresetn(aresetn), .s_axis(axis_host_out_s0), .m_axis(m_axis_host));
 {% if cnfg.en_uwin and not cnfg.en_uwin_hbm and cnfg.en_strm %}
-    // Where host writes wait at the DMA engine (vFPGA counters, loom_switch):
-    // [0] a beat moved, [1] a beat waited on the engine, [2] a write request waited on it
-    logic [2:0] dbg_host_out;
-    assign dbg_host_out = {m_host_dma_wr_req.valid && !m_host_dma_wr_req.ready,
-                           m_axis_host.tvalid && !m_axis_host.tready,
-                           m_axis_host.tvalid && m_axis_host.tready};
+    // Where host writes wait on their way to the DMA engine (vFPGA counters,
+    // loom_switch). At the engine: [0] a beat moved, [1] a beat waited on the
+    // engine, [2] a write request waited on it, [3] a write request issued.
+    // [9:4] are assigned at the MMU below.
+    wire [9:0] dbg_host_out;
+    assign dbg_host_out[3:0] = {m_host_dma_wr_req.valid && m_host_dma_wr_req.ready,
+                                m_host_dma_wr_req.valid && !m_host_dma_wr_req.ready,
+                                m_axis_host.tvalid && !m_axis_host.tready,
+                                m_axis_host.tvalid && m_axis_host.tready};
 {% endif %}
     
     // Multiplexing 
@@ -1118,6 +1121,26 @@ module design_dynamic_top #(
 {% endif %}	
         .usr_irq(m_usr_irq)
 	);
+
+{% if cnfg.en_uwin and not cnfg.en_uwin_hbm and cnfg.en_strm %}
+    // dbg_host_out, between the user region and the engine: [4] a host write
+    // request waited to enter the MMU, [5] the MMU took one, [6] host write
+    // data waited for its request to come out of the MMU (the data mux follows
+    // the MMU's issue order) or for the engine, [7] a page-fault interrupt
+    // (rising edge), [8] a completion writeback, [9] a writeback waited
+    logic dbg_irq_q;
+    always_ff @(posedge aclk) dbg_irq_q <= m_usr_irq[0];
+    assign dbg_host_out[4] = bpss_wr_sq[0].valid && !bpss_wr_sq[0].ready;
+    assign dbg_host_out[5] = bpss_wr_sq[0].valid && bpss_wr_sq[0].ready;
+    assign dbg_host_out[6] = axis_host_out_s1[0].tvalid && !axis_host_out_s1[0].tready;
+    assign dbg_host_out[7] = m_usr_irq[0] && !dbg_irq_q;
+{% if cnfg.en_wb %}
+    assign dbg_host_out[8] = m_wback.valid && m_wback.ready;
+    assign dbg_host_out[9] = m_wback.valid && !m_wback.ready;
+{% else %}
+    assign dbg_host_out[9:8] = 2'b00;
+{% endif %}
+{% endif %}
 	
 	// ================-----------------------------------------------------------------
 	// USER 

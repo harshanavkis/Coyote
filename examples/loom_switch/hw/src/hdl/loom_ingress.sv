@@ -13,25 +13,37 @@ import lynxTypes::*;
  *          base+off, len} + the payload beats on the m_host stream
  *          (LOCAL_STRM is STRM_HOST on the U280; the V80 lands in its card
  *          memory with STRM_CARD)
- *   packet, rdma: one single-packet Loom message: sq_wr {RC_RDMA_WRITE_ONLY,
- *          RAW, STRM_RDMA, dest NET_DEST, pid = QP owner, vaddr = staging,
- *          64 + len} + the header beat {op WRITE, len, dst_pid, base+off}
- *          + the payload beats, which is exactly what loom_engine's bulk
- *          path sends for a message that fits one packet, so the far
- *          loom_rx lands it unchanged
+ *   packet, rdma: one PMTU packet of a Loom message. A run of writes that
+ *          continues one binding at the next offset is ONE message: the
+ *          first packet carries the header beat {op STREAM, dst_pid, base+off}
+ *          (no length - nobody knows it when the run starts) and 63 payload
+ *          beats, every later packet 64 payload beats. Each packet is one
+ *          sq_wr {RC_RDMA_WRITE_FIRST/MIDDLE/LAST/ONLY, RAW, STRM_RDMA, dest
+ *          NET_DEST, pid = QP owner, vaddr = staging + offset in the message,
+ *          len}, last = 1 so it is acked on its own (the ack window counts
+ *          packets) - the framing loom_engine used for a descriptor
  *   store, local: sq_wr {LOCAL_WRITE, 8 B} + one beat, data in lane 0
  *   store, rdma: the 64 B inline message loom_engine sends for a store:
  *          {lane0 = op WRITE_INLINE, len 8, dst_pid; lane1 = base+off;
  *          lane2 = data}, which loom_rx lands as the exact 8 B write
  *
  * PACKETS. Full beats (all 64 strobes) that continue the same binding at the
- * next offset are gathered into one packet, up to PMTU on the wire (header
- * included, so 63 payload beats on rdma, 64 on local). A packet closes when
- * it is full, when the next beat does not continue it (another window or
- * offset, or a store), or when no beat has been presented for FLUSH_CYCLES.
- * Both the request and the rdma header state the length, so a packet is
- * stored before it is forwarded; the data FIFO holds several, so the next
- * one gathers while the last one leaves.
+ * next offset are gathered into one packet, up to PMTU on the wire (local:
+ * 64 beats; rdma: 63 in a message's first packet, which carries the header,
+ * 64 after). A packet closes when it is full, when the next beat does not
+ * continue it (another window or offset, or a store), or when no beat has
+ * been presented for FLUSH_CYCLES. The request states the length, so a
+ * packet is stored before it is forwarded; the data FIFO holds several, so
+ * the next one gathers while the last one leaves.
+ *
+ * MESSAGES (rdma). The far loom_rx keeps several host writes posted inside a
+ * message and restarts at every message boundary, so a copy must be one
+ * message, not one per packet. Only the wire's LAST/ONLY packet may be
+ * shorter than PMTU, and whether a full packet is the last is known only
+ * when the next beat arrives: a full packet is HELD (not queued) until then
+ * - the next beat continues the message (the held packet goes out as FIRST
+ * or MIDDLE) or ends it (another binding or offset, a store, or the idle
+ * timer: LAST or ONLY). A partial packet closed by those events is the last.
  *
  * STORES. A beat that is not full is a set of 8 B stores: every aligned 8 B
  * word whose strobes are all set is one store, in lane order, one per cycle.
@@ -130,11 +142,14 @@ module loom_ingress #(
     output logic                        cnt_flush,      // a packet closed by the idle timer
     output logic                        cnt_win_wait,   // an rdma request waited on the window
     output logic                        cnt_req_wait,   // an rdma request waited on wr_ready
+    output logic                        cnt_msg,        // an rdma message's first packet posted
+    output logic                        cnt_msg_flush,  // an rdma message ended by the idle timer
+    output logic                        cnt_hold,       // cycles a full rdma packet was held
     output logic [N_DBG-1:0]            cnt_dbg         // debug pulses, listed at N_DBG
 );
 
-localparam [7:0] MSG_OP_WRITE        = 8'd1;   // keep in sync with loom_rx.sv
-localparam [7:0] MSG_OP_WRITE_INLINE = 8'd2;
+localparam [7:0] MSG_OP_WRITE_INLINE = 8'd2;   // keep in sync with loom_rx.sv
+localparam [7:0] MSG_OP_STREAM       = 8'd3;
 localparam integer PKT_BEATS  = PMTU_BYTES / 64;
 localparam integer BEAT_W     = $clog2(PKT_BEATS + 1);
 
@@ -231,6 +246,7 @@ logic [AXI_ID_BITS-1:0] bq_id;
 logic   pq_full;
 logic   df_ready;
 logic   pk_open;
+logic   h_valid;
 
 wire w_in   = axi_udata.wvalid && b_act;
 wire b_room = !axi_udata.wlast || !bq_valid || axi_udata.bready;
@@ -257,10 +273,10 @@ end
 wire part       = w_in && b_ok && !w_full;
 // A partial beat first closes an open packet (so it cannot pass it), then
 // queues its words, and is taken with its last one (or at once if it has none)
-wire part_close = part && pk_open;
-wire part_store = part && !pk_open && (st_rem != 8'd0);
+wire part_close = part && (pk_open || h_valid);
+wire part_store = part && !(pk_open || h_valid) && (st_rem != 8'd0);
 wire part_last  = (st_rem & ~st_one) == 8'd0;
-wire part_take  = part && !pk_open && (!part_store || !pq_full) && part_last;
+wire part_take  = part && !(pk_open || h_valid) && (!part_store || !pq_full) && part_last;
 
 wire full_ok    = df_ready && !pq_full;
 
@@ -319,70 +335,115 @@ assign axi_udata.bresp  = 2'b00;
 // ---------------------------------------------------------------------------
 logic [3:0]            pk_idx;
 logic                  pk_route;
+logic                  pk_first;          // rdma: the message's first packet (carries the header)
 logic [PID_BITS-1:0]   pk_pid, pk_dst_pid;
 logic [VADDR_BITS-1:0] pk_va;             // base + offset of the first beat
 logic [LEN_BITS-1:0]   pk_next;           // binding offset the next beat must have
 logic [BEAT_W-1:0]     pk_beats;
+logic [31:0]           pk_moff;           // rdma: wire offset of this packet in its message
 logic [$clog2(FLUSH_CYCLES+1)-1:0] idle;
-
-wire good_beat = w_hs && b_ok && w_full;
-wire cont      = pk_open && (pk_idx == b_idx) && (pk_next == b_off);
-wire [BEAT_W-1:0] cap_cur = pk_route ? BEAT_W'(PKT_BEATS-1) : BEAT_W'(PKT_BEATS);
-wire flush     = pk_open && !w_in && !pq_full && (idle >= FLUSH_CYCLES - 1);
 
 // Queue entries: a packet (its beats are in the data FIFO) or a store
 typedef struct packed {
     logic                  store;
     logic                  route;
+    logic                  first;     // rdma: the header goes out ahead of the payload
+    logic                  more;      // rdma: the message continues (FIRST/MIDDLE)
     logic [PID_BITS-1:0]   pid;
     logic [PID_BITS-1:0]   dst_pid;
     logic [VADDR_BITS-1:0] va;
     logic [BEAT_W-1:0]     beats;
+    logic [31:0]           moff;
     logic [63:0]           data;
 } pkt_t;
 
+// The held packet: a full rdma packet whose successor is not known yet. While
+// one is held no packet is open, and the message it belongs to continues at
+// binding offset m_next of binding m_idx, wire offset m_moff.
+pkt_t                  h_pkt;
+logic [3:0]            m_idx;
+logic [LEN_BITS-1:0]   m_next;
+logic [31:0]           m_moff;
+
+wire good_beat = w_hs && b_ok && w_full;
+wire cont      = pk_open && (pk_idx == b_idx) && (pk_next == b_off);
+wire mcont     = h_valid && (m_idx == b_idx) && (m_next == b_off);
+wire [BEAT_W-1:0] cap_cur = (pk_route && pk_first) ? BEAT_W'(PKT_BEATS-1) : BEAT_W'(PKT_BEATS);
+wire fills     = cont && (pk_beats + 1'b1 == cap_cur);
+wire flush     = (pk_open || h_valid) && !w_in && !pq_full && (idle >= FLUSH_CYCLES - 1);
+
+pkt_t open_pkt;
+always_comb open_pkt = '{store: 1'b0, route: pk_route, first: pk_first, more: 1'b0,
+                         pid: pk_pid, dst_pid: pk_dst_pid, va: pk_va, beats: pk_beats,
+                         moff: pk_moff, data: 64'd0};
+
 // At most one entry is queued per cycle: the open packet when a full beat
-// does not continue it, when a beat fills it, when a partial beat arrives, or
-// on the idle timer (only in cycles with no beat); or one store
+// does not continue it, when a beat fills it (local), when a partial beat
+// arrives, or on the idle timer (only in cycles with no beat); the held
+// packet when the next beat or event decides it; or one store. A packet that
+// ends a message is queued with more = 0.
 logic pq_push;
 pkt_t pq_in;
 
 always_comb begin
     pq_push = 1'b0;
-    pq_in   = '{store: 1'b0, route: pk_route, pid: pk_pid, dst_pid: pk_dst_pid,
-                va: pk_va, beats: pk_beats, data: 64'd0};
+    pq_in   = open_pkt;
     if (good_beat) begin
         if (pk_open && !cont) begin
             pq_push = 1'b1;                           // close the open one
-        end else if (cont && (pk_beats + 1'b1 == cap_cur)) begin
+        end else if (fills && !pk_route) begin
             pq_push     = 1'b1;                       // this beat fills it
             pq_in.beats = pk_beats + 1'b1;
+        end else if (h_valid) begin
+            pq_push    = 1'b1;                        // the held one, decided
+            pq_in      = h_pkt;
+            pq_in.more = mcont;
         end
     end else if (part_close) begin
         pq_push = !pq_full;
+        if (h_valid) pq_in = h_pkt;
     end else if (part_store) begin
         pq_push = !pq_full;
-        pq_in   = '{store: 1'b1, route: b_route, pid: b_pid, dst_pid: b_dst_pid,
+        pq_in   = '{store: 1'b1, route: b_route, first: 1'b0, more: 1'b0, pid: b_pid,
+                    dst_pid: b_dst_pid,
                     va: b_base + VADDR_BITS'(b_off) + VADDR_BITS'({st_lane, 3'b0}),
-                    beats: '0, data: axi_udata.wdata[64*st_lane +: 64]};
+                    beats: '0, moff: '0, data: axi_udata.wdata[64*st_lane +: 64]};
     end else if (flush) begin
         pq_push = 1'b1;
+        if (h_valid) pq_in = h_pkt;
     end
 end
+
+// Wire bytes of the open packet once this beat joins it (header included)
+wire [31:0] fill_bytes = {pk_beats + 1'b1, 6'b0} + (pk_first ? 32'd64 : 32'd0);
 
 always_ff @(posedge aclk) begin
     if (!aresetn) begin
         pk_open <= 1'b0;
+        h_valid <= 1'b0;
         idle    <= '0;
     end else begin
-        if (w_in || !pk_open)              idle <= '0;
+        if (w_in || !(pk_open || h_valid)) idle <= '0;
         else if (idle != FLUSH_CYCLES - 1) idle <= idle + 1'b1;
         if (good_beat) begin
             if (cont) begin
                 pk_beats <= pk_beats + 1'b1;
                 pk_next  <= pk_next + LEN_BITS'(64);
-                if (pk_beats + 1'b1 == cap_cur) pk_open <= 1'b0;
+                if (fills) begin
+                    pk_open <= 1'b0;
+                    if (pk_route) begin
+                        // full rdma packet: held until the next beat says
+                        // whether the message goes on
+                        h_valid       <= 1'b1;
+                        h_pkt         <= '{store: 1'b0, route: 1'b1, first: pk_first, more: 1'b0,
+                                           pid: pk_pid, dst_pid: pk_dst_pid, va: pk_va,
+                                           beats: pk_beats + 1'b1, moff: pk_moff, data: 64'd0};
+                        m_next        <= pk_next + LEN_BITS'(64);
+                        m_moff        <= pk_moff + fill_bytes;
+                    end
+                end
             end else begin
+                h_valid    <= 1'b0;
                 pk_open    <= 1'b1;
                 pk_idx     <= b_idx;
                 pk_route   <= b_route;
@@ -391,14 +452,22 @@ always_ff @(posedge aclk) begin
                 pk_va      <= b_base + VADDR_BITS'(b_off);
                 pk_next    <= b_off + LEN_BITS'(64);
                 pk_beats   <= BEAT_W'(1);
+                // the message goes on behind the held packet, or a new one
+                // starts here
+                pk_first   <= !mcont;
+                pk_moff    <= mcont ? m_moff : 32'd0;
+                if (!mcont) m_idx <= b_idx;
             end
         end else if ((part_close && !pq_full) || flush) begin
             pk_open <= 1'b0;
+            h_valid <= 1'b0;
         end
     end
 end
 
-assign cnt_flush = flush;
+assign cnt_flush     = flush;
+assign cnt_msg_flush = flush && (h_valid || pk_route);
+assign cnt_hold      = h_valid;
 
 // ---------------------------------------------------------------------------
 // Queue: closed packets and stores waiting to be sent
@@ -476,7 +545,8 @@ always_ff @(posedge aclk) begin
         end
         O_REQ: if (wr_valid && wr_ready) begin
             o_left <= o.beats;
-            ostate <= o.route ? O_HDR : (o.store ? O_STORE : O_DATA);
+            ostate <= o.route ? ((o.store || o.first) ? O_HDR : O_DATA)
+                              : (o.store ? O_STORE : O_DATA);
         end
         O_HDR:   if (m_net_tready) ostate <= o.store ? O_IDLE : O_DATA;
         O_STORE: if (m_host_tready) ostate <= O_IDLE;
@@ -495,16 +565,22 @@ always_comb begin
     wr_req.last = 1'b1;
     wr_req.pid  = o.pid;
     if (o.route) begin
-        wr_req.opcode = RC_RDMA_WRITE_ONLY;
+        wr_req.opcode = o.store ? RC_RDMA_WRITE_ONLY :
+                        o.first ? (o.more ? RC_RDMA_WRITE_FIRST  : RC_RDMA_WRITE_ONLY)
+                                : (o.more ? RC_RDMA_WRITE_MIDDLE : RC_RDMA_WRITE_LAST);
         wr_req.strm   = STRM_RDMA;
         wr_req.mode   = 1'b1;          // RDMA_MODE_RAW: one request, one packet
         wr_req.rdma   = 1'b1;
         wr_req.remote = 1'b1;
         wr_req.actv   = 1'b1;
         wr_req.dest   = NET_DEST;
-        wr_req.vaddr  = rdma_staging_va;
-        // header beat + payload; a store is its header beat alone
-        wr_req.len    = o.store ? LEN_BITS'(64) : o_bytes + LEN_BITS'(64);
+        // staging + the packet's offset in the message, as the shell's own
+        // parser advanced it; only the first packet's goes into a RETH and
+        // the far side ignores it (the header names the target)
+        wr_req.vaddr  = rdma_staging_va + VADDR_BITS'(o.moff);
+        // a store is its header beat alone; a message's first packet adds
+        // the header beat to its payload
+        wr_req.len    = o.store ? LEN_BITS'(64) : o_bytes + (o.first ? LEN_BITS'(64) : LEN_BITS'(0));
     end else begin
         wr_req.opcode = LOCAL_WRITE;
         wr_req.strm   = LOCAL_STRM;
@@ -517,11 +593,14 @@ end
 assign rdma_post    = wr_valid && wr_ready && o.route;
 assign cnt_win_wait = (ostate == O_REQ) && o.route && !win_ok;
 assign cnt_req_wait = wr_valid && !wr_ready && o.route;
+assign cnt_msg      = rdma_post && o.first && !o.store;
 
 // Header lane 0: {zero, dst_pid, len[27:0], op}; lane 1: target VA; lane 2:
-// a store's data
-wire [63:0] hdr_q0 = {{(28-PID_BITS){1'b0}}, o.dst_pid, o_bytes,
-                      o.store ? MSG_OP_WRITE_INLINE : MSG_OP_WRITE};
+// a store's data. A STREAM header has no length: the message ends at its
+// LAST/ONLY packet, which the far stack flags on that packet's rq_wr.
+wire [63:0] hdr_q0 = {{(28-PID_BITS){1'b0}}, o.dst_pid,
+                      o.store ? 28'd8 : 28'd0,
+                      o.store ? MSG_OP_WRITE_INLINE : MSG_OP_STREAM};
 wire [63:0] hdr_q1 = {{(64-VADDR_BITS){1'b0}}, o.va};
 wire [63:0] hdr_q2 = o.store ? o.data : 64'd0;
 

@@ -38,6 +38,11 @@ module local_credits_host_wr #(
     AXI4SR.s                            s_axis [N_DESTS],
     AXI4S.m                             m_axis,
 
+    // Debug (optional): per dest, a write request waited in the credit stage
+    // for its data / waited to go downstream with its credits
+    output logic [N_DESTS-1:0]          dbg_wait_data,
+    output logic [N_DESTS-1:0]          dbg_wait_out,
+
     input  logic    					aclk,    
 	input  logic    					aresetn
 );
@@ -102,9 +107,14 @@ module local_credits_host_wr #(
         );
 
         assign xfer[i] = s_axis[i].tvalid & s_axis[i].tready;
+
+        assign dbg_wait_out[i]  = req_cred[i].valid && !req_cred[i].ready;
+        assign dbg_wait_data[i] = req_parsed[i].valid && !req_parsed[i].ready && !dbg_wait_out[i];
     end
 
 `else
+    assign dbg_wait_data = '0;
+    assign dbg_wait_out  = '0;
 
     // Mux
     metaIntf #(.STYPE(req_t)) req_q (.*);
