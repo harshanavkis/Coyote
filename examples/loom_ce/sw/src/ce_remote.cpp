@@ -22,7 +22,10 @@
  *   card write to complete, syncs the buffer back and checks it.
  *
  * Client (the sending host; U280 + V80):
- *     ce_remote --client <server_ip> [--port N] [--reps N] [--window P]
+ *     ce_remote --client <server_ip> [--port N] [--reps N] [--window P] [--gap-ms G]
+ *   (--gap-ms: idle G ms before each copy, to tell time-periodic effects from
+ *   data-periodic ones; the server stamps each copy with its time since the
+ *   first)
  *   1. QP exchange, then the hello
  *   2. rdma windows onto the server's destination (uwin 0) and fence page
  *      (right after it), over the QP owner's connection: their bases are
@@ -161,7 +164,7 @@ void snap(coyote::cThread &v80, uint64_t *out, uint32_t first, int n) {
     for (int i = 0; i < n; i++) out[i] = v80.getCSR(first + i);
 }
 
-int run_server(uint16_t port, uint64_t size, bool land, uint64_t off, unsigned poll_us) {
+int run_server(uint16_t port, uint64_t size, bool land, uint64_t off, unsigned poll_us, bool no_touch) {
     coyote::cThread t_qp(0, getpid(), 0, nullptr, "coyote_fpga");     // QP owner
     coyote::cThread t_data(0, getpid(), 0, nullptr, "coyote_fpga");   // owns the landing buffers
     printf("server: waiting for the QP exchange on port %u ...\n", port);
@@ -211,6 +214,7 @@ int run_server(uint16_t port, uint64_t size, bool land, uint64_t off, unsigned p
     volatile uint64_t *vfence = fence;
     volatile uint64_t *vdst = dst;
     int errors = 0, copies = 0;
+    std::chrono::steady_clock::time_point t_first;
     Announce an;
     while (read_full(c, &an, sizeof(an)) && an.rep != ~0ULL) {
         const Counters k0 = Counters::read(t_qp);
@@ -218,13 +222,14 @@ int run_server(uint16_t port, uint64_t size, bool land, uint64_t off, unsigned p
         land_v80::Counters u0{}, u1{};
         if (land) u0 = land_v80::Counters::read(L->win);
         auto t0 = std::chrono::steady_clock::now();
+        if (copies == 0) t_first = t0;
         Verdict v{};
         if (land) {
             // the fence, read through the V80's window, then the data synced back
             (void) L->wait(off + size, an.fence, std::chrono::milliseconds(5000), poll_us);
             v.wait_us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
             u1 = land_v80::Counters::read(L->win);
-            L->pull();
+            if (!no_touch) L->pull();
             vdst = L->buf + off / 8;
             v.fence = L->buf[(off + size) / 8];
         } else {
@@ -235,14 +240,16 @@ int run_server(uint16_t port, uint64_t size, bool land, uint64_t off, unsigned p
         }
         const Counters k1 = Counters::read(t_qp);
         const Shell s1 = Shell::read(t_qp);
-        if (v.fence == an.fence)
-            for (uint64_t i = 0; i < size / 8; i++) v.bad += (vdst[i] != pattern(8 * i, an.rep));
-        else
+        if (v.fence == an.fence) {
+            if (!no_touch)
+                for (uint64_t i = 0; i < size / 8; i++) v.bad += (vdst[i] != pattern(8 * i, an.rep));
+        } else
             v.bad = size / 8;
-        printf("%s copy %lu: fence %lu (expected %lu), %lu of %lu words wrong, fence %.1f us after the announce (%.2f GB/s)\n",
+        printf("%s copy %lu: fence %lu (expected %lu), %lu of %lu words wrong, fence %.1f us after the announce (%.2f GB/s) at t=%.1f ms\n",
                (v.bad ? "FAIL" : "ok  "), (unsigned long) an.rep, (unsigned long) v.fence,
                (unsigned long) an.fence, (unsigned long) v.bad, (unsigned long) (size / 8),
-               v.wait_us, size / v.wait_us / 1e3);
+               v.wait_us, size / v.wait_us / 1e3,
+               std::chrono::duration<double, std::milli>(t0 - t_first).count());
         printf("     loom_rx over %lu cycles: %lu moving, %lu starved (nothing arrived), %lu stalled (host write not ready), rx FIFO full %lu\n",
                (unsigned long) k1.d(k0, C_CYC), (unsigned long) k1.d(k0, C_RX_MOVE), (unsigned long) k1.d(k0, C_RX_STARVE),
                (unsigned long) k1.d(k0, C_RX_STALL), (unsigned long) k1.d(k0, C_RX_FF));
@@ -250,9 +257,12 @@ int run_server(uint16_t port, uint64_t size, bool land, uint64_t off, unsigned p
         if (land) u1.print(u0);
         errors += (v.bad != 0);
         copies++;
-        // the next copy must write every byte again
-        if (land) L->clear();
-        else      memset(dst, 0, size);
+        // the next copy must write every byte again (--no-touch: the
+        // buffer is left alone between copies, and not checked)
+        if (!no_touch) {
+            if (land) L->clear();
+            else      memset(dst, 0, size);
+        }
         if (!write_full(c, &v, sizeof(v))) break;
     }
     printf("server: loom_rx landed %lu writes, dropped %lu packets\n",
@@ -407,7 +417,7 @@ int run_bidir(const std::string &ip, uint16_t port, uint64_t size, int reps, int
     return errors ? 1 : 0;
 }
 
-int run_client(const std::string &ip, uint16_t port, int reps, int window) {
+int run_client(const std::string &ip, uint16_t port, int reps, int window, unsigned gap_ms, bool no_refill) {
     coyote::cThread u280(0, getpid(), 0, nullptr, "coyote_fpga");     // QP owner and CSR page
     coyote::cThread v80(0, getpid(), 0, nullptr, "coyote_versal_fpga");
     if (!u280.initRDMA(STAGING_SIZE, port, ip.c_str())) { printf("FAIL: initRDMA\n"); return 1; }
@@ -445,15 +455,20 @@ int run_client(const std::string &ip, uint16_t port, int reps, int window) {
     uint64_t *src = static_cast<uint64_t *>(v80.getMem({coyote::CoyoteAllocType::HPF, size}));
     int errors = 0;
     for (int r = 0; r < reps; r++) {
-        for (uint64_t i = 0; i < size / 8; i++) src[i] = pattern(8 * i, r);
-        v80.invoke(coyote::CoyoteOper::LOCAL_OFFLOAD, coyote::syncSg{src, size});
+        if (gap_ms) usleep(gap_ms * 1000);
+        // --no-refill: the source is filled and offloaded once (copy 0's
+        // pattern every time)
+        if (!no_refill || r == 0) {
+            for (uint64_t i = 0; i < size / 8; i++) src[i] = pattern(8 * i, r);
+            v80.invoke(coyote::CoyoteOper::LOCAL_OFFLOAD, coyote::syncSg{src, size});
+        }
 
         const uint64_t fence = v80.getCSR(COPIES) + 1;
         loom_switch::IngressCounters c0 = loom_switch::IngressCounters::read(u280);
         const Counters k0 = Counters::read(u280);
         uint64_t e0[3];
         snap(v80, e0, 48, 3);
-        Announce an{uint64_t(r), fence};
+        Announce an{no_refill ? 0 : uint64_t(r), fence};
         write_full(fd, &an, sizeof(an));
 
         v80.setCSR(reinterpret_cast<uint64_t>(src), SRC_VA);
@@ -505,7 +520,8 @@ int main(int argc, char **argv) {
     int window = -1;
     bool land = false, bidir = false, no_send = false;
     uint64_t land_off = 0;
-    unsigned poll_us = 0;
+    unsigned poll_us = 0, gap_ms = 0;
+    bool no_touch = false, no_refill = false;
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         if (a == "--server")                     server = true;
@@ -514,6 +530,9 @@ int main(int argc, char **argv) {
         else if (a == "--size" && i + 1 < argc)   size = strtoull(argv[++i], nullptr, 0);
         else if (a == "--reps" && i + 1 < argc)   reps = atoi(argv[++i]);
         else if (a == "--window" && i + 1 < argc) window = atoi(argv[++i]);
+        else if (a == "--gap-ms" && i + 1 < argc) gap_ms = unsigned(atoi(argv[++i]));
+        else if (a == "--no-touch")              no_touch = true;
+        else if (a == "--no-refill")             no_refill = true;
         else if (a == "--land-v80")               land = true;
         else if (a == "--land-offset" && i + 1 < argc) land_off = strtoull(argv[++i], nullptr, 0);
         else if (a == "--poll-us" && i + 1 < argc) poll_us = unsigned(atoi(argv[++i]));
@@ -529,5 +548,5 @@ int main(int argc, char **argv) {
         return 2;
     }
     if (bidir) return run_bidir(server ? std::string() : ip, port, size, reps, window, !no_send);
-    return server ? run_server(port, size, land, land_off, poll_us) : run_client(ip, port, reps, window);
+    return server ? run_server(port, size, land, land_off, poll_us, no_touch) : run_client(ip, port, reps, window, gap_ms, no_refill);
 }

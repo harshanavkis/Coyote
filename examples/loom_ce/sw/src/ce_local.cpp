@@ -250,6 +250,8 @@ int main(int argc, char **argv) {
     volatile uint64_t *vfence = fence;
     int errors = 0;
     for (int r = 0; r < reps; r++) {
+        // CE_GAP_MS: idle this long before each copy (time- vs data-periodic effects)
+        if (const char *g = getenv("CE_GAP_MS")) usleep(1000 * atoi(g));
         for (uint64_t i = 0; i < size / 8; i++) src[i] = pattern(8 * i, r);
         v80.invoke(coyote::CoyoteOper::LOCAL_OFFLOAD, coyote::syncSg{src, size});
         if (land) L->clear();
