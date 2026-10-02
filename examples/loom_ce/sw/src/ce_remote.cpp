@@ -109,14 +109,15 @@ enum { C_CYC, C_WINFULL, C_REQWAIT, C_WAIT_LOCAL, C_WAIT_RDMA, C_RX_MOVE, C_RX_S
 // at 144+, are since the bitstream was loaded, so a copy that raises one is
 // the copy that had that stall)
 struct Shell {
-    static constexpr int N = 8;
-    static constexpr uint32_t W[N] = {115, 123, 125, 129, 130, 131, 135, 112};
-    static constexpr uint32_t M[3] = {155, 157, 163};    // longest runs of 123, 125, 131
-    uint64_t v[N], m[3];
+    static constexpr int N = 12;
+    static constexpr uint32_t W[N] = {115, 123, 125, 129, 130, 131, 135, 112, 132, 133, 134, 127};
+    static constexpr int NM = 4;
+    static constexpr uint32_t M[NM] = {155, 157, 163, 166};    // longest runs of 123, 125, 131, 134
+    uint64_t v[N], m[NM];
     static Shell read(coyote::cThread &t) {
         Shell c;
         for (int i = 0; i < N; i++) c.v[i] = loom_switch::csr_read(t, W[i]);
-        for (int i = 0; i < 3; i++) c.m[i] = loom_switch::csr_read(t, M[i]);
+        for (int i = 0; i < NM; i++) c.m[i] = loom_switch::csr_read(t, M[i]);
         return c;
     }
     void print(const Shell &b) const {
@@ -124,9 +125,12 @@ struct Shell {
         auto mx = [&](int i) { return m[i] > b.m[i] ? " NEW" : ""; };
         printf("     shell: MMU entry wait %lu (longest %lu%s), data waited on MMU %lu (longest %lu%s), "
                "MMU completion wait %lu (longest %lu%s), %lu completions; credit stage: data %lu, downstream %lu; "
-               "rx post wait %lu, %lu packets\n",
+               "rx post wait %lu, %lu packets\n"
+               "            MMU write FSM: DMA port wait %lu, mutex wait %lu, miss/invalidate/locked %lu "
+               "(longest %lu%s); writebacks %lu\n",
                d(1), (unsigned long) m[0], mx(0), d(2), (unsigned long) m[1], mx(1),
-               d(5), (unsigned long) m[2], mx(2), d(6), d(3), d(4), d(0), d(7));
+               d(5), (unsigned long) m[2], mx(2), d(6), d(3), d(4), d(0), d(7),
+               d(8), d(9), d(10), (unsigned long) m[3], mx(3), d(11));
     }
 };
 
