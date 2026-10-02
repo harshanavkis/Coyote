@@ -10,13 +10,10 @@ import lynxTypes::*;
  *
  * Covers: table programming and CSR readback; bulk and stores through the
  * uwin on both routes, exact; the ack window holding rdma packets and
- * releasing them on acks; loom_rx landings (inline, and STREAM messages: one
- * write per packet, posted ahead of the data, last and tlast only on the
- * final packet), under host-side backpressure; a dropped message and orphan
- * beats; the ingress and loom_rx racing for sq_wr under backpressure, with
- * the arbitration invariants checked every cycle; a long copy through the
- * uwin replayed into loom_rx as the far stack would deliver it (rq_wr per
- * packet with last on LAST/ONLY), landing byte-exact; the counters.
+ * releasing them on acks; loom_rx landings (inline and a two-packet bulk
+ * message) and RX_CHUNK changing how many host writes that message takes;
+ * the ingress and loom_rx racing for sq_wr under backpressure, with the
+ * arbitration invariants checked every cycle; the ingress and rx counters.
  */
 module tb_loom_switch_top;
 
@@ -41,7 +38,7 @@ AXI4SR axis_rrsp_recv [N_RDMA_AXI] (.*);
 AXI4SR axis_rrsp_send [N_RDMA_AXI] (.*);
 
 // The shell's host DMA boundary pulses (dynamic_top dbg_host_out), driven by T9
-logic [11:0] dbg_host_out = '0;
+logic [2:0] dbg_host_out = '0;
 
 design_user_logic_c0_0 inst_dut (
     .axi_ctrl(axi_ctrl), .dbg_host_out(dbg_host_out), .axi_udata(axi_udata), .notify(notify),
@@ -224,10 +221,9 @@ end
 // Incoming messages: rq_wr per packet, then its beats on axis_rrsp_recv
 // ---------------------------------------------------------------------------
 semaphore rx_lock = new(1);
-task automatic rx_packet(input int len, input logic [AXI_DATA_BITS-1:0] beats [$], input bit last = 1);
+task automatic rx_packet(input int len, input logic [AXI_DATA_BITS-1:0] beats [$]);
     @(negedge aclk);
     rq_wr.data = '0; rq_wr.data.pid = 6'd2; rq_wr.data.vaddr = STAGING; rq_wr.data.len = len[LEN_BITS-1:0];
-    rq_wr.data.last = last;
     rq_wr.valid = 1;
     do @(posedge aclk); while (!rq_wr.ready);
     @(negedge aclk);
@@ -251,47 +247,21 @@ task automatic rx_inline(input int dst_pid, input logic [47:0] va, input logic [
     rx_lock.put();
 endtask
 
-// A STREAM message of len payload bytes, in PMTU packets as loom_ingress
-// frames it: packet 0 = header + PMTU-64, then PMTU, the tail shorter; the
-// stack's rq_wr has last on the final packet. op overrides the header's op.
-task automatic rx_stream(input int dst_pid, input logic [47:0] va, input int len, input int op = 3);
+// A bulk message of len payload bytes, in PMTU packets: packet 0 = header + PMTU-64
+task automatic rx_bulk(input int dst_pid, input logic [47:0] va, input int len);
     logic [AXI_DATA_BITS-1:0] b [$];
     logic [AXI_DATA_BITS-1:0] h = '0;
     int left = len, k = 0;
-    h[63:0] = {22'b0, 6'(dst_pid), 28'd0, 8'(op)}; h[127:64] = {16'b0, va};
+    h[63:0] = {22'b0, 6'(dst_pid), 28'(len), 8'd1}; h[127:64] = {16'b0, va};
     rx_lock.get();
     b.push_back(h);
     while (left > 0) begin
         int room = (PMTU_BYTES - 64*b.size()) / 64;
         while (room > 0 && left > 0) begin b.push_back(pat(64'(k))); k++; left -= 64; room--; end
-        rx_packet(64*b.size(), b, left == 0);
+        rx_packet(64*b.size(), b);
         b.delete();
     end
     rx_lock.put();
-endtask
-
-// Check a landed STREAM message: one write per packet, contiguous from va,
-// last only on the final one; the payload in order, tlast only at its end
-task automatic exp_stream(input string name, input logic [47:0] va, input int len, input int pid);
-    int left = len, off = 0, first = 1, nb = 0;
-    while (left > 0) begin
-        int plen = first ? ((left > PMTU_BYTES - 64) ? PMTU_BYTES - 64 : left)
-                         : ((left > PMTU_BYTES) ? PMTU_BYTES : left);
-        req_t r;
-        `CHECK(wr_rx.size() != 0, $sformatf("%s: write at offset %0d missing", name, off))
-        if (wr_rx.size() == 0) return;
-        r = wr_rx.pop_front();
-        `CHECK(r.opcode == LOCAL_WRITE && r.strm == STRM_HOST && r.dest == 1 && r.pid == pid &&
-               r.vaddr == va + 48'(off) && r.len == LEN_BITS'(plen) && r.last == (left == plen),
-               $sformatf("%s: write at offset %0d: va %h len %0d last %0d pid %0d", name, off, r.vaddr, r.len, r.last, r.pid))
-        left -= plen; off += plen; first = 0;
-    end
-    `CHECK(wr_rx.size() == 0, $sformatf("%s: %0d extra writes", name, wr_rx.size()))
-    `CHECK(h1_d.size() == len / 64, $sformatf("%s: %0d beats landed, want %0d", name, h1_d.size(), len / 64))
-    foreach (h1_d[j]) begin
-        `CHECK(h1_d[j] == pat(64'(j)), $sformatf("%s: beat %0d", name, j))
-        `CHECK(h1_l[j] == (j == len / 64 - 1), $sformatf("%s: tlast at beat %0d", name, j))
-    end
 endtask
 
 task automatic quiesce();
@@ -300,7 +270,6 @@ task automatic quiesce();
         @(posedge aclk);
         if (!sq_wr.valid && !inst_dut.inst_loom_rx.busy && inst_dut.inst_loom_ingress.pq_empty &&
             int'(inst_dut.inst_loom_ingress.ostate) == 0 && !inst_dut.inst_loom_ingress.pk_open &&
-            !inst_dut.inst_loom_ingress.h_valid &&
             !axis_host_send[0].tvalid && !axis_host_send[1].tvalid && !axis_rreq_send[0].tvalid)
             idle++;
         else idle = 0;
@@ -337,7 +306,7 @@ task automatic exp_rdma(input string name, input logic [47:0] va, input longint 
            r.vaddr == STAGING && r.len == LEN_BITS'(64 + 64*beats),
            $sformatf("%s: rdma request op %0d len %0d", name, r.opcode, r.len))
     h = n_d.pop_front(); void'(n_l.pop_front());
-    `CHECK(h[63:0] == {22'b0, 6'd9, 28'd0, 8'd3} && h[127:64] == 64'(va),
+    `CHECK(h[63:0] == {22'b0, 6'd9, 28'(64*beats), 8'd1} && h[127:64] == 64'(va),
            $sformatf("%s: header %h %h", name, h[127:64], h[63:0]))
     for (int j = 0; j < beats; j++)
         `CHECK(n_d.size() != 0 && n_d.pop_front() == pat(uaddr + 64*j) && n_l.pop_front() == (j == beats-1),
@@ -426,90 +395,23 @@ initial begin
     $display("ok   T5 rx inline");
     clear();
 
-    // --- T6: STREAM messages: three packets (4032 + 4096 + 1024 B), then one
-    //     of a single packet, then the three-packet one under host-side
-    //     backpressure and a slow sq_wr ---
-    rx_stream(7, 48'h7e00_0010_0000, 4032 + 4096 + 1024);
+    // --- T6: RX_CHUNK reaches loom_rx: a two-packet message takes two host
+    //     writes at 1 and one at 2 ---
+    rx_bulk(7, 48'h7e00_0010_0000, 4032 + 4096);
     quiesce();
-    exp_stream("T6 three packets", 48'h7e00_0010_0000, 4032 + 4096 + 1024, 7);
+    `CHECK(wr_rx.size() == 2 && wr_rx[0].len == 4032 && wr_rx[1].len == 4096,
+           $sformatf("T6: chunk 1: %0d writes, first len %0d", wr_rx.size(), wr_rx.size() ? wr_rx[0].len : 0))
+    `CHECK(h1_d.size() == 127, $sformatf("T6: chunk 1: %0d beats", h1_d.size()))
     clear();
-    rx_stream(4, 48'h7e00_0011_0000, 640);
+    csr_wr(76, 64'd2);
+    rx_bulk(7, 48'h7e00_0020_0000, 4032 + 4096);
     quiesce();
-    exp_stream("T6 one packet", 48'h7e00_0011_0000, 640, 4);
+    `CHECK(wr_rx.size() == 1 && wr_rx[0].len == 4032 + 4096,
+           $sformatf("T6: chunk 2: %0d writes, first len %0d", wr_rx.size(), wr_rx.size() ? wr_rx[0].len : 0))
+    `CHECK(h1_d.size() == 127, $sformatf("T6: chunk 2: %0d beats", h1_d.size()))
+    csr_wr(76, 64'd1);
+    $display("ok   T6 rx_chunk");
     clear();
-    bp = 1;
-    $assertoff(0, tb_loom_switch_top.sq_wr);
-    rx_stream(7, 48'h7e00_0012_0000, 4032 + 4096 + 1024);
-    quiesce();
-    bp = 0;
-    $asserton(0, tb_loom_switch_top.sq_wr);
-    exp_stream("T6 backpressure", 48'h7e00_0012_0000, 4032 + 4096 + 1024, 7);
-    clear();
-    $display("ok   T6 rx STREAM messages");
-
-    // --- T6b: writes are posted AHEAD of the data: with the host stream
-    //     stalled, every packet's write of a 3-packet message is posted ---
-    begin
-        int posted;
-        force axis_host_send[1].tready = 1'b0;
-        rx_lock.get();
-        fork
-            begin
-                logic [AXI_DATA_BITS-1:0] b [$];
-                logic [AXI_DATA_BITS-1:0] h = '0;
-                h[63:0] = {22'b0, 6'd7, 28'd0, 8'd3}; h[127:64] = {16'b0, 48'h7e00_0013_0000};
-                b.push_back(h);
-                for (int j = 0; j < 63; j++) b.push_back(pat(64'(j)));
-                rx_packet(4096, b, 0); b.delete();
-                for (int j = 0; j < 64; j++) b.push_back(pat(64'(63 + j)));
-                rx_packet(4096, b, 0); b.delete();
-                for (int j = 0; j < 16; j++) b.push_back(pat(64'(127 + j)));
-                rx_packet(1024, b, 1); b.delete();
-            end
-            begin
-                repeat (2000) @(posedge aclk);
-            end
-        join_any
-        repeat (200) @(posedge aclk);
-        posted = wr_rx.size();
-        `CHECK(posted == 3 && h1_d.size() == 0,
-               $sformatf("T6b: %0d writes posted with the host stream stalled, %0d beats landed", posted, h1_d.size()))
-        release axis_host_send[1].tready;
-        wait fork;
-        rx_lock.put();
-        quiesce();
-        exp_stream("T6b", 48'h7e00_0013_0000, 4032 + 4096 + 1024, 7);
-        clear();
-    end
-    $display("ok   T6b rx writes posted ahead");
-
-    // --- T6c: a message with a bad header is dropped whole (both packets);
-    //     beats nothing announced are swallowed; an inline after them lands ---
-    begin
-        logic [63:0] d0, d1, o0, o1;
-        logic [AXI_DATA_BITS-1:0] b [$];
-        csr_rd(41, d0); csr_rd(26, o0);
-        rx_stream(7, 48'h7e00_0014_0000, 4032 + 640, 1);       // op 1: not a STREAM header
-        // two beats with no rq_wr
-        @(negedge aclk);
-        for (int j = 0; j < 2; j++) begin
-            axis_rrsp_recv[0].tdata = pat(64'(1000 + j)); axis_rrsp_recv[0].tkeep = '1;
-            axis_rrsp_recv[0].tlast = (j == 1); axis_rrsp_recv[0].tvalid = 1;
-            do @(posedge aclk); while (!axis_rrsp_recv[0].tready);
-            @(negedge aclk);
-        end
-        axis_rrsp_recv[0].tvalid = 0;
-        repeat (100) @(posedge aclk);      // the orphans drain before the next announcement
-        rx_inline(7, 48'h7e00_0014_1000, 64'hABCD);
-        quiesce();
-        csr_rd(41, d1); csr_rd(26, o1);
-        `CHECK(d1 - d0 == 1, $sformatf("T6c: %0d messages dropped", d1 - d0))
-        `CHECK(o1 - o0 == 2, $sformatf("T6c: %0d orphan beats", o1 - o0))
-        `CHECK(wr_rx.size() == 1 && wr_rx[0].vaddr == 48'h7e00_0014_1000 && h1_d.size() == 1 &&
-               h1_d[0][63:0] == 64'hABCD, $sformatf("T6c: %0d writes after the drop", wr_rx.size()))
-        clear();
-    end
-    $display("ok   T6c rx drop and orphans");
 
     // --- T7: ingress and loom_rx race for sq_wr under backpressure ---
     // With sq_wr.ready low, loom_rx's request replaces the ingress's one
@@ -577,81 +479,6 @@ initial begin
         `CHECK(h1[3] - h0[3] == 4,  $sformatf("T9: request stall %0d, want 4", h1[3] - h0[3]))
     end
     $display("ok   T9 host DMA boundary counters");
-
-    // --- T9b: the shell's further pulses reach words 122-130 (dbg_host_out
-    //     [11:3]), each with its longest run at 154-162 ---
-    begin
-        logic [63:0] a0 [9], a1 [9], m [9];
-        for (int i = 0; i < 9; i++) csr_rd(122 + i, a0[i]);
-        @(negedge aclk); dbg_host_out = 12'hFF8; repeat (5) @(negedge aclk);
-        dbg_host_out = 12'h000; repeat (3) @(negedge aclk);
-        dbg_host_out = 12'hFF8; repeat (2) @(negedge aclk);
-        dbg_host_out = 12'h000; repeat (4) @(negedge aclk);
-        for (int i = 0; i < 9; i++) begin csr_rd(122 + i, a1[i]); csr_rd(154 + i, m[i]); end
-        for (int i = 0; i < 9; i++)
-            `CHECK(a1[i] - a0[i] == 7 && m[i] >= 5, $sformatf("T9b: word %0d moved %0d, longest %0d", 122 + i, a1[i] - a0[i], m[i]))
-    end
-    $display("ok   T9b shell write-path counters");
-
-    // --- T10: a long copy through the uwin on the rdma route (PCIe-sized
-    //     4-beat bursts, 300 beats), then its packets replayed into loom_rx
-    //     the way the far stack delivers them: one rq_wr per packet with its
-    //     wire length, last on LAST/ONLY. It must land byte-exact at the
-    //     window's target, one write per packet ---
-    begin
-        req_t pk [$];
-        logic [AXI_DATA_BITS-1:0] nd [$];
-        int nbeats = 300, nmsg0, nmsg1, imsg0, imsg1;
-        logic [63:0] v0, v1;
-        csr_rd(112, v0); nmsg0 = int'(v0); csr_rd(119, v0); imsg0 = int'(v0);
-        clear();
-        for (int k = 0; k < nbeats; k += 4) uwr(U2 + 64'h20000 + 64*k, 4);
-        quiesce();
-        `CHECK(wr_ing.size() == 5, $sformatf("T10: %0d rdma packets for 300 beats (want 5: 63 + 64 x 3 + 45)", wr_ing.size()))
-        foreach (wr_ing[i]) begin
-            logic [OPCODE_BITS-1:0] want = (i == 0) ? RC_RDMA_WRITE_FIRST :
-                                           (i == wr_ing.size() - 1) ? RC_RDMA_WRITE_LAST : RC_RDMA_WRITE_MIDDLE;
-            `CHECK(wr_ing[i].opcode == want && wr_ing[i].last &&
-                   wr_ing[i].vaddr == STAGING + 48'(4096 * i) &&
-                   wr_ing[i].len == ((i == 4) ? 45*64 : 4096),
-                   $sformatf("T10: packet %0d op %0h len %0d va %h", i, wr_ing[i].opcode, wr_ing[i].len, wr_ing[i].vaddr))
-        end
-        `CHECK(n_d.size() == nbeats + 1, $sformatf("T10: %0d wire beats, want %0d", n_d.size(), nbeats + 1))
-        foreach (wr_ing[i]) pk.push_back(wr_ing[i]);
-        foreach (n_d[i]) nd.push_back(n_d[i]);
-        clear();
-        rx_lock.get();
-        foreach (pk[i]) begin
-            logic [AXI_DATA_BITS-1:0] b [$];
-            b.delete();     // static in this block: one per packet
-            for (int j = 0; j < pk[i].len / 64; j++) b.push_back(nd.pop_front());
-            rx_packet(int'(pk[i].len), b, pk[i].opcode == RC_RDMA_WRITE_LAST || pk[i].opcode == RC_RDMA_WRITE_ONLY);
-        end
-        rx_lock.put();
-        quiesce();
-        begin
-            int off = 0;
-            `CHECK(wr_rx.size() == 5, $sformatf("T10: %0d landing writes", wr_rx.size()))
-            foreach (wr_rx[i]) begin
-                int plen = (i == 0) ? 4032 : (i == 4) ? 45*64 : 4096;
-                `CHECK(wr_rx[i].vaddr == B2 + 48'h20000 + 48'(off) && wr_rx[i].len == plen &&
-                       wr_rx[i].pid == 9 && wr_rx[i].last == (i == 4),
-                       $sformatf("T10: landing %0d va %h len %0d pid %0d last %0d", i, wr_rx[i].vaddr, wr_rx[i].len, wr_rx[i].pid, wr_rx[i].last))
-                off += plen;
-            end
-            `CHECK(h1_d.size() == nbeats, $sformatf("T10: %0d beats landed", h1_d.size()))
-            foreach (h1_d[j]) begin
-                `CHECK(h1_d[j] == pat(U2 + 64'h20000 + 64*j), $sformatf("T10: landed beat %0d: addr %h want %h", j, h1_d[j][31:0], 32'(U2 + 64'h20000 + 64*j)))
-                `CHECK(h1_l[j] == (j == nbeats - 1), $sformatf("T10: tlast at landed beat %0d", j))
-            end
-        end
-        csr_rd(112, v1); nmsg1 = int'(v1); csr_rd(119, v1); imsg1 = int'(v1);
-        `CHECK(nmsg1 - nmsg0 == 1 && imsg1 - imsg0 == 1,
-               $sformatf("T10: messages counted rx %0d ingress %0d, want 1 / 1", nmsg1 - nmsg0, imsg1 - imsg0))
-        csr_rd(118, v1); `CHECK(v1 == 0, $sformatf("T10: %0d rq_wr lost to a full queue", v1))
-        clear();
-    end
-    $display("ok   T10 long copy, uwin to landing");
 
     if (errors == 0) $display("TB PASS (tb_loom_switch_top)");
     else             $display("TB FAIL (tb_loom_switch_top): %0d errors", errors);

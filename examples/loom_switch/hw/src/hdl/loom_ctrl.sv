@@ -34,7 +34,7 @@ import lynxTypes::*;
  *   72/73 (RO) cycles a local / rdma request waited on sq_wr.ready
  *   74 (RO) cycles the ingress had a request while loom_rx's was presented
  *   75 (RO) cycles loom_rx had a request and was not presented (must be 0)
- *   76 RX_CHUNK (RW) [3:0] unused since loom_rx posts one write per packet; reset 1
+ *   76 RX_CHUNK (RW) [3:0] PMTU packets per loom_rx host write, reset 1
  *   81-84 (RO) the shell's host DMA boundary: 81 beats moved, 82 cycles a
  *      beat waited on the DMA engine, 83 the longest such run, 84 cycles a
  *      write request waited on the engine
@@ -49,31 +49,11 @@ import lynxTypes::*;
  *          still sending its stores; 103/104 bursts dropped for no window /
  *          past the window's end; 105-107 bursts of 1, 2-4, more than 4
  *          beats; 108 bursts at a non-64 B-aligned address
- *   112-130 (RO) cnt_x[i] at word 112+i, its longest run of consecutive
- *          cycles at 144+i (since the bitstream was loaded):
- *     loom_rx:  112 STREAM messages started, 113 messages ended, 114 writes
- *               posted, 115 cycles a write waited on sq_wr, 116 cycles an
- *               announced packet waited on RX_WR_OUTSTANDING, 117 cycles a
- *               beat waited for its packet's write to be posted, 118 rq_wr
- *               lost to a full announcement queue (must be 0)
- *     ingress:  119 rdma messages started, 120 messages ended by the idle
- *               timer, 121 cycles a full rdma packet was held (next beat
- *               decides MIDDLE vs LAST)
- *     shell (dynamic_top / user_wrapper dbg_host_out[11:3]): 122 host DMA
- *               write requests issued, 123 cycles a host write request
- *               waited to enter the MMU, 124 requests the MMU took, 125
- *               cycles host write data waited inside the shell for its
- *               request to come out of the MMU (data ahead of the request
- *               order), 126 page-fault interrupts, 127 completion writebacks,
- *               128 cycles a writeback waited, 129 cycles loom_rx's (dest 1)
- *               write request waited in the credit stage for its data,
- *               130 cycles it waited there to go downstream (to the MMU)
  * Counters are free-running and never cleared (software takes deltas). The
  * ingress pulses are registered once before they count.
  */
 module loom_ctrl #(
-    parameter integer N_DBG = 14,
-    parameter integer N_X   = 19
+    parameter integer N_DBG = 14
 ) (
     input  logic                        aclk,
     input  logic                        aresetn,
@@ -132,10 +112,7 @@ module loom_ctrl #(
     input  logic                        cnt_ing_store,
     input  logic                        cnt_ing_store_drop,
     input  logic                        cnt_ing_flush,
-    input  logic [N_DBG-1:0]            cnt_ing_dbg,
-
-    // Further pulses, word 112+i (list in the map above)
-    input  logic [N_X-1:0]              cnt_x
+    input  logic [N_DBG-1:0]            cnt_ing_dbg
 );
 
 localparam integer ADDR_LSB = $clog2(AXIL_DATA_BITS/8);   // 3
@@ -182,8 +159,6 @@ localparam integer R_HREQ_BP       = 84;
 localparam integer R_ING_BASE      = 88;
 localparam integer N_ING           = 7;
 localparam integer R_DBG_BASE      = 95;
-localparam integer R_X_BASE        = 112;
-localparam integer R_XMAX_BASE     = 144;
 
 // -------------------------------------------------------------------------
 // AXI4-Lite handshake (single outstanding write and read, as examples/loom)
@@ -260,16 +235,11 @@ logic [63:0] ing [N_ING];
 logic [63:0] dbg [N_DBG];
 logic [N_ING-1:0] ing_pulse;
 logic [N_DBG-1:0] dbg_pulse;
-logic [N_X-1:0]   x_pulse;
-logic [63:0]      xc [N_X];
-logic [31:0]      xrun [N_X], xmax [N_X];
 always_ff @(posedge aclk) begin
     if (!aresetn) begin
         ing_pulse <= '0;
         dbg_pulse <= '0;
-        x_pulse   <= '0;
     end else begin
-        x_pulse   <= cnt_x;
         ing_pulse <= {cnt_ing_flush, cnt_ing_store_drop, cnt_ing_store, cnt_ing_pkt_rdma,
                       cnt_ing_pkt_local, cnt_ing_drop, cnt_ing_burst};
         dbg_pulse <= cnt_ing_dbg;
@@ -329,20 +299,6 @@ always_ff @(posedge aclk) begin
     end
 end
 
-always_ff @(posedge aclk) begin
-    if (!aresetn) begin
-        for (int i = 0; i < N_X; i++) begin xc[i] <= 0; xrun[i] <= 0; xmax[i] <= 0; end
-    end else begin
-        for (int i = 0; i < N_X; i++) begin
-            if (x_pulse[i]) begin
-                xc[i]   <= xc[i] + 1;
-                xrun[i] <= xrun[i] + 1;
-                if (xrun[i] + 1 > xmax[i]) xmax[i] <= xrun[i] + 1;
-            end else xrun[i] <= 0;
-        end
-    end
-end
-
 // -------------------------------------------------------------------------
 // Read data
 // -------------------------------------------------------------------------
@@ -390,10 +346,6 @@ always_ff @(posedge aclk) begin
                     axi_rdata <= ing[rd_idx - R_ING_BASE];
                 else if (rd_idx >= R_DBG_BASE && rd_idx < R_DBG_BASE + N_DBG)
                     axi_rdata <= dbg[rd_idx - R_DBG_BASE];
-                else if (rd_idx >= R_X_BASE && rd_idx < R_X_BASE + N_X)
-                    axi_rdata <= xc[rd_idx - R_X_BASE];
-                else if (rd_idx >= R_XMAX_BASE && rd_idx < R_XMAX_BASE + N_X)
-                    axi_rdata <= {32'b0, xmax[rd_idx - R_XMAX_BASE]};
         endcase
     end
 end
