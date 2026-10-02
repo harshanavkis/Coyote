@@ -13,25 +13,29 @@ import lynxTypes::*;
  *          base+off, len} + the payload beats on the m_host stream
  *          (LOCAL_STRM is STRM_HOST on the U280; the V80 lands in its card
  *          memory with STRM_CARD)
- *   packet, rdma: one single-packet Loom message: sq_wr {RC_RDMA_WRITE_ONLY,
- *          RAW, STRM_RDMA, dest NET_DEST, pid = QP owner, vaddr = staging,
- *          64 + len} + the header beat {op WRITE, len, dst_pid, base+off}
- *          + the payload beats, which is exactly what loom_engine's bulk
- *          path sends for a message that fits one packet, so the far
- *          loom_rx lands it unchanged
+ *   packet, rdma: one self-describing RDMA write: sq_wr {RC_RDMA_WRITE_ONLY,
+ *          RAW, STRM_RDMA, dest NET_DEST, pid = QP owner, vaddr = base+off,
+ *          len} + the payload beats, nothing else. For an rdma binding,
+ *          base is a REMOTE REFERENCE, not a VA: {export index [47:40],
+ *          offset [39:0]} into the far host's export table, so the RETH of
+ *          every packet says where that packet lands. The far loom_rx needs
+ *          no header, no message and no end-of-transfer: it lands each
+ *          packet on its own, the moment the stack announces it.
  *   store, local: sq_wr {LOCAL_WRITE, 8 B} + one beat, data in lane 0
- *   store, rdma: the 64 B inline message loom_engine sends for a store:
- *          {lane0 = op WRITE_INLINE, len 8, dst_pid; lane1 = base+off;
- *          lane2 = data}, which loom_rx lands as the exact 8 B write
+ *   store, rdma: a 64 B inline message, RETH = {INLINE_EXP, 0}:
+ *          {lane0 = op WRITE_INLINE, len 8; lane1 = base+off (the remote
+ *          reference of the word); lane2 = data}, which loom_rx lands as
+ *          the exact 8 B write
  *
  * PACKETS. Full beats (all 64 strobes) that continue the same binding at the
- * next offset are gathered into one packet, up to PMTU on the wire (header
- * included, so 63 payload beats on rdma, 64 on local). A packet closes when
- * it is full, when the next beat does not continue it (another window or
- * offset, or a store), or when no beat has been presented for FLUSH_CYCLES.
- * Both the request and the rdma header state the length, so a packet is
- * stored before it is forwarded; the data FIFO holds several, so the next
- * one gathers while the last one leaves.
+ * next offset are gathered into one packet, up to PMTU (64 beats) on either
+ * route. A packet closes when it is full, when the next beat does not
+ * continue it (another window or offset, or a store), or when no beat has
+ * been presented for FLUSH_CYCLES - write combining, as a CPU's WC buffer
+ * does; it decides only how a tail is packed, never where anything lands.
+ * The request states the length, so a packet is stored before it is
+ * forwarded; the data FIFO holds several, so the next one gathers while the
+ * last one leaves.
  *
  * STORES. A beat that is not full is a set of 8 B stores: every aligned 8 B
  * word whose strobes are all set is one store, in lane order, one per cycle.
@@ -94,9 +98,6 @@ module loom_ingress #(
     input  logic [LEN_BITS:0]           ua_end,
     input  logic [3:0]                  ua_idx,
 
-    // RDMA staging VA (RETH vaddr of every outgoing message)
-    input  logic [VADDR_BITS-1:0]       rdma_staging_va,
-
     // sq_wr (shared with loom_rx in vfpga_top)
     output req_t                        wr_req,
     output logic                        wr_valid,
@@ -130,11 +131,14 @@ module loom_ingress #(
     output logic                        cnt_flush,      // a packet closed by the idle timer
     output logic                        cnt_win_wait,   // an rdma request waited on the window
     output logic                        cnt_req_wait,   // an rdma request waited on wr_ready
+    output logic                        cnt_rdma_full,  // a full (PMTU) rdma packet queued
+    output logic                        cnt_rdma_flush, // a partial rdma packet closed by the idle timer
+    output logic                        cnt_rdma_cut,   // a partial rdma packet closed by a non-continuing write
     output logic [N_DBG-1:0]            cnt_dbg         // debug pulses, listed at N_DBG
 );
 
-localparam [7:0] MSG_OP_WRITE        = 8'd1;   // keep in sync with loom_rx.sv
-localparam [7:0] MSG_OP_WRITE_INLINE = 8'd2;
+localparam [7:0] MSG_OP_WRITE_INLINE = 8'd2;   // keep in sync with loom_rx.sv
+localparam [7:0] INLINE_EXP          = 8'hFF;  // RETH export index of an inline message
 localparam integer PKT_BEATS  = PMTU_BYTES / 64;
 localparam integer BEAT_W     = $clog2(PKT_BEATS + 1);
 
@@ -327,7 +331,7 @@ logic [$clog2(FLUSH_CYCLES+1)-1:0] idle;
 
 wire good_beat = w_hs && b_ok && w_full;
 wire cont      = pk_open && (pk_idx == b_idx) && (pk_next == b_off);
-wire [BEAT_W-1:0] cap_cur = pk_route ? BEAT_W'(PKT_BEATS-1) : BEAT_W'(PKT_BEATS);
+wire [BEAT_W-1:0] cap_cur = BEAT_W'(PKT_BEATS);
 wire flush     = pk_open && !w_in && !pq_full && (idle >= FLUSH_CYCLES - 1);
 
 // Queue entries: a packet (its beats are in the data FIFO) or a store
@@ -398,7 +402,10 @@ always_ff @(posedge aclk) begin
     end
 end
 
-assign cnt_flush = flush;
+assign cnt_flush      = flush;
+assign cnt_rdma_full  = pq_push && !pq_in.store && pq_in.route && (pq_in.beats == BEAT_W'(PKT_BEATS));
+assign cnt_rdma_flush = flush && pk_route;
+assign cnt_rdma_cut   = pq_push && !pq_in.store && pq_in.route && (pq_in.beats != BEAT_W'(PKT_BEATS)) && !flush;
 
 // ---------------------------------------------------------------------------
 // Queue: closed packets and stores waiting to be sent
@@ -476,9 +483,9 @@ always_ff @(posedge aclk) begin
         end
         O_REQ: if (wr_valid && wr_ready) begin
             o_left <= o.beats;
-            ostate <= o.route ? O_HDR : (o.store ? O_STORE : O_DATA);
+            ostate <= o.store ? (o.route ? O_HDR : O_STORE) : O_DATA;
         end
-        O_HDR:   if (m_net_tready) ostate <= o.store ? O_IDLE : O_DATA;
+        O_HDR:   if (m_net_tready) ostate <= O_IDLE;
         O_STORE: if (m_host_tready) ostate <= O_IDLE;
         O_DATA: if (o_beat) begin
             o_left <= o_left - 1'b1;
@@ -502,9 +509,10 @@ always_comb begin
         wr_req.remote = 1'b1;
         wr_req.actv   = 1'b1;
         wr_req.dest   = NET_DEST;
-        wr_req.vaddr  = rdma_staging_va;
-        // header beat + payload; a store is its header beat alone
-        wr_req.len    = o.store ? LEN_BITS'(64) : o_bytes + LEN_BITS'(64);
+        // the RETH: where this packet lands (a remote reference), or the
+        // inline marker for a store's 64 B message
+        wr_req.vaddr  = o.store ? {INLINE_EXP, 40'd0} : o.va;
+        wr_req.len    = o.store ? LEN_BITS'(64) : o_bytes;
     end else begin
         wr_req.opcode = LOCAL_WRITE;
         wr_req.strm   = LOCAL_STRM;
@@ -518,12 +526,11 @@ assign rdma_post    = wr_valid && wr_ready && o.route;
 assign cnt_win_wait = (ostate == O_REQ) && o.route && !win_ok;
 assign cnt_req_wait = wr_valid && !wr_ready && o.route;
 
-// Header lane 0: {zero, dst_pid, len[27:0], op}; lane 1: target VA; lane 2:
-// a store's data
-wire [63:0] hdr_q0 = {{(28-PID_BITS){1'b0}}, o.dst_pid, o_bytes,
-                      o.store ? MSG_OP_WRITE_INLINE : MSG_OP_WRITE};
+// Inline message (a store on the rdma route): lane 0 {zero, len 8, op};
+// lane 1 the word's remote reference; lane 2 its data
+wire [63:0] hdr_q0 = {28'd0, 28'd8, MSG_OP_WRITE_INLINE};
 wire [63:0] hdr_q1 = {{(64-VADDR_BITS){1'b0}}, o.va};
-wire [63:0] hdr_q2 = o.store ? o.data : 64'd0;
+wire [63:0] hdr_q2 = o.data;
 
 assign df_tready = (ostate == O_DATA) && o_rdy;
 
@@ -535,7 +542,7 @@ always_comb begin
 
     m_net_tdata   = (ostate == O_HDR) ? {{(AXI_DATA_BITS-192){1'b0}}, hdr_q2, hdr_q1, hdr_q0} : df_tdata;
     m_net_tkeep   = '1;
-    m_net_tlast   = ((ostate == O_HDR) && o.store) || ((ostate == O_DATA) && o_last);
+    m_net_tlast   = (ostate == O_HDR) || ((ostate == O_DATA) && o_last);
     m_net_tvalid  = (ostate == O_HDR) || ((ostate == O_DATA) && o.route && df_tvalid);
 end
 

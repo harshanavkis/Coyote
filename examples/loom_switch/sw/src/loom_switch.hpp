@@ -20,6 +20,13 @@ constexpr uint32_t TBL_BASE        = 3;
 constexpr uint32_t TBL_LEN         = 4;
 constexpr uint32_t TBL_COMMIT      = 5;
 constexpr uint32_t TBL_USTART      = 80;   // the window's start in the uwin
+// This host's export table: where peers' self-describing packets may land
+constexpr uint32_t EXP_IDX         = 176;
+constexpr uint32_t EXP_CFG         = 177;  // bit0 valid
+constexpr uint32_t EXP_PID         = 178;  // the landing address space
+constexpr uint32_t EXP_BASE        = 179;  // the landing VA
+constexpr uint32_t EXP_LEN         = 180;
+constexpr uint32_t EXP_COMMIT      = 181;
 constexpr uint32_t RDMA_STAGING_VA = 16;
 constexpr uint32_t RX_FWD          = 36;
 constexpr uint32_t RX_DROP         = 41;
@@ -74,8 +81,13 @@ inline void *reserve_va(uint64_t len) {
 inline void csr_write(coyote::cThread &t, uint32_t word, uint64_t val) { t.setCSR(val, word); }
 inline uint64_t csr_read(coyote::cThread &t, uint32_t word) { return t.getCSR(word); }
 
+// A remote reference: what an rdma window's base holds, and what every
+// packet's RETH carries - export idx of the far host, offset into it
+inline uint64_t export_ref(uint32_t idx, uint64_t off = 0) { return (uint64_t(idx) << 40) | off; }
+
 // One window: uwin bytes [ustart, ustart + len) land at base + offset under
-// pid (local), or go to the far pid's base + offset over pid's QP (rdma)
+// pid (local), or, over pid's QP (rdma), at the far host's export
+// reference base + offset (base = export_ref(idx, off) from that host)
 inline void program_window(coyote::cThread &t, uint32_t win, bool rdma, uint32_t pid,
                            const void *base, uint64_t len, uint64_t ustart,
                            uint32_t dst_pid = 0) {
@@ -96,6 +108,25 @@ inline void release_window(coyote::cThread &t, uint32_t win) {
     csr_write(t, TBL_IDX,    win);
     csr_write(t, TBL_CFG,    0);
     csr_write(t, TBL_COMMIT, 1);
+}
+
+// Export idx (0..15): peers' packets for export_ref(idx, off) land at
+// base + off under pid, if off + their length <= len; anything else is
+// dropped (and counted) by loom_rx
+inline void program_export(coyote::cThread &t, uint32_t idx, uint32_t pid, const void *base, uint64_t len) {
+    csr_write(t, EXP_IDX,    idx);
+    csr_write(t, EXP_CFG,    1);
+    csr_write(t, EXP_PID,    pid & 0x3F);
+    csr_write(t, EXP_BASE,   reinterpret_cast<uint64_t>(base));
+    csr_write(t, EXP_LEN,    len);
+    csr_write(t, EXP_COMMIT, 1);
+    (void) csr_read(t, EXP_IDX);     // in place before a peer can send
+}
+
+inline void release_export(coyote::cThread &t, uint32_t idx) {
+    csr_write(t, EXP_IDX,    idx);
+    csr_write(t, EXP_CFG,    0);
+    csr_write(t, EXP_COMMIT, 1);
 }
 
 struct IngressCounters {

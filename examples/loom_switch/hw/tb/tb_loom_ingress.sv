@@ -8,8 +8,11 @@ import lynxTypes::*;
  * ack window).
  *
  * Every test lists its bursts; a reference packetiser turns them into the
- * packets expected (route, pid, target VA, beats, payload), and the checker
- * compares the requests, rdma headers and payload beats exactly, in order.
+ * packets expected (route, pid, target, beats, payload), and the checker
+ * compares the requests, inline messages and payload beats exactly, in
+ * order. An rdma packet is self-describing: its request's vaddr (the RETH)
+ * is the binding's far export reference plus the offset, and its payload
+ * follows with no header.
  *
  * Covers: aligned packets on both routes, a run that starts mid-packet,
  * back-to-back bursts over several packets, 1-beat bursts at one a cycle,
@@ -61,6 +64,7 @@ logic [AXI_DATA_BITS/8-1:0] m_host_tkeep, m_net_tkeep;
 logic m_host_tvalid, m_host_tready, m_host_tlast;
 logic m_net_tvalid, m_net_tready, m_net_tlast;
 logic cnt_burst, cnt_drop, cnt_pkt_local, cnt_pkt_rdma, cnt_store, cnt_store_drop, cnt_flush;
+logic cnt_rdma_full, cnt_rdma_flush, cnt_rdma_cut;
 localparam integer N_DBG = 14;
 logic [N_DBG-1:0] cnt_dbg;
 
@@ -83,7 +87,6 @@ loom_ingress #(.UWIN_BITS(UWIN_BITS), .FLUSH_CYCLES(FLUSH)) dut (
     .ua_addr(ua_addr), .ua_hit(ua_hit), .ua_route(ua_route), .ua_pid(ua_pid),
     .ua_dst_pid(ua_dst_pid), .ua_base(ua_base), .ua_ustart(ua_ustart),
     .ua_end(ua_end), .ua_idx(ua_idx),
-    .rdma_staging_va(STAGING),
     .wr_req(wr_req), .wr_valid(wr_valid), .wr_ready(wr_ready),
     .win_ok(win_ok), .rdma_post(rdma_post),
     .m_host_tdata(m_host_tdata), .m_host_tkeep(m_host_tkeep),
@@ -94,7 +97,9 @@ loom_ingress #(.UWIN_BITS(UWIN_BITS), .FLUSH_CYCLES(FLUSH)) dut (
     .m_net_tlast(m_net_tlast),
     .cnt_burst(cnt_burst), .cnt_drop(cnt_drop), .cnt_pkt_local(cnt_pkt_local),
     .cnt_pkt_rdma(cnt_pkt_rdma), .cnt_store(cnt_store), .cnt_store_drop(cnt_store_drop),
-    .cnt_flush(cnt_flush), .cnt_win_wait(), .cnt_req_wait(), .cnt_dbg(cnt_dbg)
+    .cnt_flush(cnt_flush), .cnt_win_wait(), .cnt_req_wait(),
+    .cnt_rdma_full(cnt_rdma_full), .cnt_rdma_flush(cnt_rdma_flush), .cnt_rdma_cut(cnt_rdma_cut),
+    .cnt_dbg(cnt_dbg)
 );
 
 int errors = 0;
@@ -200,7 +205,7 @@ task automatic model();
         end
         for (int j = 0; j < bursts[k].beats; j++) begin
             longint o = off + 64*j;
-            int cap = W[wi].route ? PKT_BEATS-1 : PKT_BEATS;
+            int cap = PKT_BEATS;
             logic [63:0] sb = bursts[k].strb[j];
             if (sb != '1) begin
                 // stores: close the open packet, then one per whole word
@@ -303,6 +308,7 @@ logic [AXI_DATA_BITS/8-1:0] host_keep [$];
 bit   host_last [$], net_last [$];
 int   n_burst = 0, n_drop = 0, n_pkt_local = 0, n_pkt_rdma = 0, n_post = 0;
 int   n_store = 0, n_store_drop = 0;
+int   n_full = 0, n_part = 0;
 int   n_dbg [N_DBG];
 bit   check_rate = 0;    // the next run's bursts must go in at one beat a cycle
 // Input rate: W beats taken between the first and the last
@@ -333,6 +339,8 @@ always @(posedge aclk) if (aresetn) begin
     n_post      += rdma_post;
     n_store     += cnt_store;
     n_store_drop += cnt_store_drop;
+    n_full      += cnt_rdma_full;
+    n_part      += cnt_rdma_flush + cnt_rdma_cut;
     for (int i = 0; i < N_DBG; i++) n_dbg[i] += cnt_dbg[i];
     // a W beat that waits is counted under exactly one reason
     `CHECK((axi.wvalid && !axi.wready) == (cnt_dbg[7:3] != 0) && $onehot0(cnt_dbg[7:3]),
@@ -352,11 +360,12 @@ end
 // ---------------------------------------------------------------------------
 task automatic run(input string name);
     int n_local = 0, n_rdma = 0, n_st = 0, n_st_rdma = 0, n_bursts;
+    int e_full = 0, e_part = 0;
     int e0 = errors;
     reqs.delete(); host_beats.delete(); net_beats.delete();
     host_last.delete(); net_last.delete(); host_keep.delete();
     n_burst = 0; n_drop = 0; n_pkt_local = 0; n_pkt_rdma = 0; n_post = 0; b_seen = 0;
-    n_store = 0; n_store_drop = 0;
+    n_store = 0; n_store_drop = 0; n_full = 0; n_part = 0;
     for (int i = 0; i < N_DBG; i++) n_dbg[i] = 0;
     w_first = -1; w_beats = 0;
     salt = $urandom();
@@ -382,11 +391,11 @@ task automatic run(input string name);
         if (e.store && e.route) begin
             logic [AXI_DATA_BITS-1:0] h;
             `CHECK(r.opcode == RC_RDMA_WRITE_ONLY && r.strm == STRM_RDMA && r.mode == 1'b1 &&
-                   r.dest == 0 && r.vaddr == STAGING && r.len == 64,
-                   $sformatf("%s pkt %0d: rdma store request op %0h len %0d", name, i, r.opcode, r.len))
+                   r.dest == 0 && r.vaddr == {8'hFF, 40'd0} && r.len == 64,
+                   $sformatf("%s pkt %0d: rdma store request op %0h va %h len %0d", name, i, r.opcode, r.vaddr, r.len))
             h = net_beats.pop_front();
             `CHECK(net_last.pop_front(), $sformatf("%s pkt %0d: no tlast on the inline message", name, i))
-            `CHECK(h[63:0] == {{(28-PID_BITS){1'b0}}, e.dst_pid, 28'd8, 8'd2} && h[127:64] == 64'(e.va) &&
+            `CHECK(h[63:0] == {28'd0, 28'd8, 8'd2} && h[127:64] == 64'(e.va) &&
                    h[191:128] == e.data && h[AXI_DATA_BITS-1:192] == '0,
                    $sformatf("%s pkt %0d: inline message %h %h %h, expected va %h data %h",
                              name, i, h[191:128], h[127:64], h[63:0], e.va, e.data))
@@ -402,16 +411,14 @@ task automatic run(input string name);
             n_st++;
         end else if (e.route) begin
             logic [AXI_DATA_BITS-1:0] h;
+            // self-describing: the RETH is the binding's remote reference
+            // plus the offset, the payload follows with no header
             `CHECK(r.opcode == RC_RDMA_WRITE_ONLY && r.strm == STRM_RDMA && r.mode == 1'b1 &&
-                   r.rdma && r.remote && r.dest == 0 && r.vaddr == STAGING &&
-                   r.len == LEN_BITS'(64 + 64*e.beats),
-                   $sformatf("%s pkt %0d: rdma request op %0h strm %0d dest %0d va %h len %0d, expected len %0d",
-                             name, i, r.opcode, r.strm, r.dest, r.vaddr, r.len, 64 + 64*e.beats))
-            h = net_beats.pop_front();
-            `CHECK(!net_last.pop_front(), $sformatf("%s pkt %0d: tlast on the header", name, i))
-            `CHECK(h[63:0] == {{(28-PID_BITS){1'b0}}, e.dst_pid, 28'(64*e.beats), 8'd1} &&
-                   h[127:64] == 64'(e.va) && h[AXI_DATA_BITS-1:128] == '0,
-                   $sformatf("%s pkt %0d: header %h %h, expected va %h beats %0d", name, i, h[127:64], h[63:0], e.va, e.beats))
+                   r.rdma && r.remote && r.dest == 0 && r.vaddr == e.va &&
+                   r.len == LEN_BITS'(64*e.beats),
+                   $sformatf("%s pkt %0d: rdma request op %0h strm %0d dest %0d va %h len %0d, expected va %h len %0d",
+                             name, i, r.opcode, r.strm, r.dest, r.vaddr, r.len, e.va, 64*e.beats))
+            if (e.beats == PKT_BEATS) e_full++; else e_part++;
             for (int j = 0; j < e.beats; j++) begin
                 `CHECK(net_beats.pop_front() == pat(e.uaddr + 64*j), $sformatf("%s pkt %0d: payload beat %0d", name, i, j))
                 `CHECK(net_last.pop_front() == (j == e.beats - 1), $sformatf("%s pkt %0d: tlast at beat %0d", name, i, j))
@@ -436,6 +443,8 @@ task automatic run(input string name);
            $sformatf("%s: %0d bursts %0d drops, expected %0d / %0d", name, n_burst, n_drop, n_bursts - exp_drops, exp_drops))
     `CHECK(n_pkt_local == n_local && n_pkt_rdma == n_rdma && n_post == n_rdma + n_st_rdma,
            $sformatf("%s: counters local %0d rdma %0d post %0d", name, n_pkt_local, n_pkt_rdma, n_post))
+    `CHECK(n_full == e_full && n_part == e_part,
+           $sformatf("%s: rdma packets full %0d partial %0d, expected %0d / %0d", name, n_full, n_part, e_full, e_part))
     `CHECK(n_store == n_st && n_store_drop == exp_store_drops,
            $sformatf("%s: counters store %0d store_drop %0d, expected %0d / %0d",
                      name, n_store, n_store_drop, n_st, exp_store_drops))
@@ -594,13 +603,14 @@ initial begin
 
     w = '{valid: 1, route: 0, pid: 3, dst_pid: 0, base: 48'h1000_0000, len: 64'h10_0000, ustart: W1};
     program_win(1, w);
-    w = '{valid: 1, route: 1, pid: 5, dst_pid: 9, base: 48'h2000_0000, len: 64'h10_0000, ustart: W2};
+    // rdma bindings: base is the far export reference {index, offset}
+    w = '{valid: 1, route: 1, pid: 5, dst_pid: 0, base: {8'd3, 40'h10_0000}, len: 64'h10_0000, ustart: W2};
     program_win(2, w);
     w = '{valid: 1, route: 0, pid: 4, dst_pid: 0, base: 48'h3000_0000, len: 512, ustart: W3};
     program_win(3, w);
     w = '{valid: 0, route: 0, pid: 4, dst_pid: 0, base: 48'h4000_0000, len: 64'h10_0000, ustart: W4};
     program_win(4, w);
-    w = '{valid: 1, route: 1, pid: 6, dst_pid: 11, base: 48'h5000_0000, len: 64'h400_0000, ustart: W5};
+    w = '{valid: 1, route: 1, pid: 6, dst_pid: 0, base: {8'd7, 40'h0}, len: 64'h400_0000, ustart: W5};
     program_win(5, w);
 
     bp = 0;

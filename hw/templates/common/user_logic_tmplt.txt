@@ -40,8 +40,8 @@ module design_user_logic_c{{ c_cnfg }}_{{ c_reg }} (
     AXI4L.s                     axi_ctrl,
 {% if cnfg.en_uwin and not cnfg.en_uwin_hbm and cnfg.en_strm %}
 
-    // Host DMA boundary stall pulses (dynamic_top)
-    input  logic [2:0]          dbg_host_out,
+    // Host write path pulses (dynamic_top / user_wrapper; loom_ctrl's list)
+    input  logic [11:0]         dbg_host_out,
 {% endif %}
 {% if cnfg.en_uwin and not cnfg.en_uwin_hbm %}
 

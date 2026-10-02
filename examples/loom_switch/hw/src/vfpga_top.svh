@@ -4,9 +4,10 @@
  * One data path: everything that writes into a window - the V80 copy
  * engine peer-to-peer, the host CPU through its write-combining mapping -
  * arrives on axi_udata, and loom_ingress turns it into local writes or
- * Loom messages by binding (loom_table). loom_rx lands incoming messages
- * as local writes. loom_ctrl is the CSR page (table programming, staging
- * VA, ack window, counters).
+ * self-describing RDMA packets by binding (loom_table): each rdma packet's
+ * RETH names {far export index, offset}. loom_rx lands every incoming
+ * packet on its own, inside this host's exports (loom_exports). loom_ctrl
+ * is the CSR page (window and export programming, ack window, counters).
  *
  * Streams: the ingress sends on axis_host_send[0] and axis_rreq_send[0];
  * loom_rx lands on axis_host_send[1] (wr_req.dest 1) - a separate queue,
@@ -27,9 +28,11 @@ logic [VADDR_BITS-1:0]  tbl_base;
 logic [LEN_BITS-1:0]    tbl_len;
 logic [26:0]            tbl_ustart;
 
-logic [VADDR_BITS-1:0]  rdma_staging_va;
+/* verilator lint_off UNUSED */
+logic [VADDR_BITS-1:0]  rdma_staging_va;     // CSR 16, unused: each packet's RETH is its own reference
+logic [3:0]             rx_chunk;            // CSR 76, unused
+/* verilator lint_on UNUSED */
 logic [7:0]             tx_window;
-logic [3:0]             rx_chunk;
 
 // table -> ingress
 logic [26:0]            ua_addr;
@@ -73,9 +76,23 @@ logic cnt_ing_store, cnt_ing_store_drop, cnt_ing_flush, cnt_ing_win_wait, cnt_in
 logic [13:0] cnt_ing_dbg;
 logic cnt_rx_fwd, cnt_rx_drop, cnt_rx_orphan, rx_cnt_move, rx_cnt_starve, rx_cnt_stall;
 logic rx_cnt_bp, rx_cnt_req, rx_cnt_fifo_full;
+logic rx_cnt_pkt, rx_cnt_store, rx_cnt_post_wait, rx_cnt_at_limit, rx_cnt_pkt_wait, rx_cnt_rq_ovfl;
+logic cnt_ing_rdma_full, cnt_ing_rdma_flush, cnt_ing_rdma_cut;
+
+// ctrl -> exports, and loom_rx's two lookups
+logic                   exp_commit, exp_valid;
+logic [7:0]             exp_idx;
+logic [PID_BITS-1:0]    exp_pid;
+logic [VADDR_BITS-1:0]  exp_base;
+logic [39:0]            exp_len;
+logic [7:0]             xa_idx, xb_idx;
+logic                   xa_hit, xb_hit;
+logic [PID_BITS-1:0]    xa_pid, xb_pid;
+logic [VADDR_BITS-1:0]  xa_base, xb_base;
+logic [39:0]            xa_len, xb_len;
 logic cnt_wr_wait_local, cnt_wr_wait_rdma, cnt_wr_blk_ing, cnt_wr_blk_rx;
 /* verilator lint_off UNUSED */
-logic rx_req_arb, rx_busy;
+logic rx_busy;
 /* verilator lint_on UNUSED */
 
 // Registered host streams, as examples/loom
@@ -98,6 +115,8 @@ loom_ctrl inst_loom_ctrl (
     .tbl_route(tbl_route), .tbl_pid(tbl_pid), .tbl_dst_pid(tbl_dst_pid),
     .tbl_base(tbl_base), .tbl_len(tbl_len), .tbl_ustart(tbl_ustart),
     .rdma_staging_va(rdma_staging_va), .tx_window(tx_window), .rx_chunk(rx_chunk),
+    .exp_commit(exp_commit), .exp_idx(exp_idx), .exp_valid(exp_valid), .exp_pid(exp_pid),
+    .exp_base(exp_base), .exp_len(exp_len),
     .tx_inflight(tx_inflight), .cnt_tx_ack(ack_valid),
     .cnt_tx_winfull(cnt_ing_win_wait), .cnt_tx_reqwait(cnt_ing_req_wait),
     .cnt_wr_wait_local(cnt_wr_wait_local), .cnt_wr_wait_rdma(cnt_wr_wait_rdma),
@@ -109,7 +128,20 @@ loom_ctrl inst_loom_ctrl (
     .cnt_ing_burst(cnt_ing_burst), .cnt_ing_drop(cnt_ing_drop),
     .cnt_ing_pkt_local(cnt_ing_pkt_local), .cnt_ing_pkt_rdma(cnt_ing_pkt_rdma),
     .cnt_ing_store(cnt_ing_store), .cnt_ing_store_drop(cnt_ing_store_drop),
-    .cnt_ing_flush(cnt_ing_flush), .cnt_ing_dbg(cnt_ing_dbg)
+    .cnt_ing_flush(cnt_ing_flush), .cnt_ing_dbg(cnt_ing_dbg),
+    // words 112+ (and their longest runs at 144+), in loom_ctrl's list
+    .cnt_x({dbg_host_out[11:3],
+            cnt_ing_rdma_cut, cnt_ing_rdma_flush, cnt_ing_rdma_full,
+            rx_cnt_rq_ovfl, rx_cnt_pkt_wait, rx_cnt_at_limit, rx_cnt_post_wait,
+            cnt_rx_drop, rx_cnt_store, rx_cnt_pkt})
+);
+
+loom_exports inst_loom_exports (
+    .aclk(aclk), .aresetn(aresetn),
+    .commit(exp_commit), .prog_idx(exp_idx), .prog_valid(exp_valid), .prog_pid(exp_pid),
+    .prog_base(exp_base), .prog_len(exp_len),
+    .a_idx(xa_idx), .a_hit(xa_hit), .a_pid(xa_pid), .a_base(xa_base), .a_len(xa_len),
+    .b_idx(xb_idx), .b_hit(xb_hit), .b_pid(xb_pid), .b_base(xb_base), .b_len(xb_len)
 );
 
 loom_table inst_loom_table (
@@ -131,7 +163,6 @@ loom_ingress #(.HOST_DEST(0), .NET_DEST(0)) inst_loom_ingress (
     .ua_addr(ua_addr), .ua_hit(ua_hit), .ua_route(ua_route), .ua_pid(ua_pid),
     .ua_dst_pid(ua_dst_pid), .ua_base(ua_base), .ua_ustart(ua_ustart),
     .ua_end(ua_end), .ua_idx(ua_idx),
-    .rdma_staging_va(rdma_staging_va),
     .wr_req(ing_wr_req), .wr_valid(ing_wr_valid),
     .wr_ready(sq_wr.ready && !rx_takes_wr),
     .win_ok(win_ok), .rdma_post(rdma_post),
@@ -146,6 +177,8 @@ loom_ingress #(.HOST_DEST(0), .NET_DEST(0)) inst_loom_ingress (
     .cnt_store(cnt_ing_store), .cnt_store_drop(cnt_ing_store_drop),
     .cnt_flush(cnt_ing_flush),
     .cnt_win_wait(cnt_ing_win_wait), .cnt_req_wait(cnt_ing_req_wait),
+    .cnt_rdma_full(cnt_ing_rdma_full), .cnt_rdma_flush(cnt_ing_rdma_flush),
+    .cnt_rdma_cut(cnt_ing_rdma_cut),
     .cnt_dbg(cnt_ing_dbg)
 );
 
@@ -178,8 +211,8 @@ assign rx_cnt_fifo_full = axis_rrsp_recv[0].tvalid && !axis_rrsp_recv[0].tready;
 loom_rx inst_loom_rx (
     .aclk(aclk), .aresetn(aresetn),
     .rq_req(rq_wr.data), .rq_valid(rq_wr.valid), .rq_ready(rq_wr.ready),
-    .rdma_staging_va(rdma_staging_va),
-    .rx_chunk(rx_chunk),
+    .xa_idx(xa_idx), .xa_hit(xa_hit), .xa_pid(xa_pid), .xa_base(xa_base), .xa_len(xa_len),
+    .xb_idx(xb_idx), .xb_hit(xb_hit), .xb_pid(xb_pid), .xb_base(xb_base), .xb_len(xb_len),
     .wr_req(rx_wr_req), .wr_valid(rx_wr_valid),
     .wr_ready(sq_wr.ready),
     .s_tdata(rxf_tdata), .s_tkeep(rxf_tkeep),
@@ -187,11 +220,14 @@ loom_rx inst_loom_rx (
     .s_tlast(rxf_tlast),
     .m_tdata(rx_tdata), .m_tkeep(rx_tkeep), .m_tvalid(rx_tvalid),
     .m_tready(axis_wr_rx.tready), .m_tlast(rx_tlast),
-    .req(rx_req_arb), .grant(1'b1), .busy(rx_busy),
+    .busy(rx_busy),
     .cnt_rx_move(rx_cnt_move), .cnt_rx_starve(rx_cnt_starve),
     .cnt_rx_stall(rx_cnt_stall), .cnt_rx_bp(rx_cnt_bp), .cnt_rx_req(rx_cnt_req),
     .cnt_rx_fwd(cnt_rx_fwd), .cnt_rx_drop(cnt_rx_drop),
-    .cnt_rx_orphan(cnt_rx_orphan)
+    .cnt_rx_orphan(cnt_rx_orphan),
+    .cnt_rx_pkt(rx_cnt_pkt), .cnt_rx_store(rx_cnt_store), .cnt_rx_post_wait(rx_cnt_post_wait),
+    .cnt_rx_at_limit(rx_cnt_at_limit), .cnt_rx_pkt_wait(rx_cnt_pkt_wait),
+    .cnt_rx_rq_ovfl(rx_cnt_rq_ovfl)
 );
 
 // ---------------------------------------------------------------------------

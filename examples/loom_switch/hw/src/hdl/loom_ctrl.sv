@@ -13,13 +13,15 @@ import lynxTypes::*;
  *    0 TBL_IDX      (RW) window index to program (1..15)
  *    1 TBL_CFG      (RW) bit0 = valid, bit1 = route (0 local, 1 rdma)
  *    2 TBL_PID      (RW) [5:0] local: destination pid; rdma: QP-owner pid.
- *                        [13:8] rdma: the far exporter's pid (message header)
- *    3 TBL_BASE     (RW) destination VA base (exporter's own VA)
+ *                        [13:8] unused
+ *    3 TBL_BASE     (RW) local: destination VA base; rdma: the REMOTE
+ *                        REFERENCE {far export index [47:40], offset [39:0]}
+ *                        that the window's offset 0 lands at
  *    4 TBL_LEN      (RW) window length in bytes (bounds)
  *    5 TBL_COMMIT   (W)  write 1 -> commit the staged entry to table[TBL_IDX]
  *   80 TBL_USTART   (RW) the window's start in the uwin (bytes); its own
  *                        64 B line, for the reason given at TX_CTL below
- *   16 RDMA_STAGING_VA (RW) RETH vaddr of every outgoing rdma message
+ *   16 RDMA_STAGING_VA (RW) unused (every packet's RETH is its own reference)
  *   14/15 (RO) rx ingress FIFO full while the shell had a beat; longest run
  *   24 (RO) rx longest stall run          26 (RO) rx orphan beats
  *   30/31 (RO) rx backpressure; longest run
@@ -34,7 +36,7 @@ import lynxTypes::*;
  *   72/73 (RO) cycles a local / rdma request waited on sq_wr.ready
  *   74 (RO) cycles the ingress had a request while loom_rx's was presented
  *   75 (RO) cycles loom_rx had a request and was not presented (must be 0)
- *   76 RX_CHUNK (RW) [3:0] PMTU packets per loom_rx host write, reset 1
+ *   76 RX_CHUNK (RW) [3:0] unused since loom_rx posts one write per packet; reset 1
  *   81-84 (RO) the shell's host DMA boundary: 81 beats moved, 82 cycles a
  *      beat waited on the DMA engine, 83 the longest such run, 84 cycles a
  *      write request waited on the engine
@@ -49,11 +51,36 @@ import lynxTypes::*;
  *          still sending its stores; 103/104 bursts dropped for no window /
  *          past the window's end; 105-107 bursts of 1, 2-4, more than 4
  *          beats; 108 bursts at a non-64 B-aligned address
+ *   176-181 the export table (loom_exports), staged then committed like
+ *          the window table: 176 EXP_IDX, 177 EXP_CFG (bit0 valid), 178
+ *          EXP_PID (landing pid), 179 EXP_BASE (landing VA), 180 EXP_LEN
+ *          (bytes), 181 EXP_COMMIT (write 1)
+ *   112-130 (RO) cnt_x[i] at word 112+i, its longest run of consecutive
+ *          cycles at 144+i (since the bitstream was loaded):
+ *     loom_rx:  112 bulk packets landed (writes posted), 113 stores landed,
+ *               114 packets dropped (no export, out of bounds, bad
+ *               inline), 115 cycles a write waited on sq_wr, 116 cycles an
+ *               announced packet waited on RX_WR_OUTSTANDING, 117 cycles a
+ *               beat waited for its packet's write to be posted, 118 rq_wr
+ *               lost to a full announcement queue (must be 0)
+ *     ingress:  119 full (PMTU) rdma packets, 120 partial rdma packets
+ *               closed by the idle timer, 121 partial rdma packets closed
+ *               by a non-continuing write or a store
+ *     shell (dynamic_top / user_wrapper dbg_host_out[11:3]): 122 host DMA
+ *               write requests issued, 123 cycles a host write request
+ *               waited to enter the MMU, 124 requests the MMU took, 125
+ *               cycles host write data waited inside the shell for its
+ *               request to come out of the MMU (data ahead of the request
+ *               order), 126 page-fault interrupts, 127 completion writebacks,
+ *               128 cycles a writeback waited, 129 cycles loom_rx's (dest 1)
+ *               write request waited in the credit stage for its data,
+ *               130 cycles it waited there to go downstream (to the MMU)
  * Counters are free-running and never cleared (software takes deltas). The
  * ingress pulses are registered once before they count.
  */
 module loom_ctrl #(
-    parameter integer N_DBG = 14
+    parameter integer N_DBG = 14,
+    parameter integer N_X   = 19
 ) (
     input  logic                        aclk,
     input  logic                        aresetn,
@@ -72,6 +99,14 @@ module loom_ctrl #(
     output logic [26:0]                 tbl_ustart,
 
     output logic [VADDR_BITS-1:0]       rdma_staging_va,
+
+    // Export programming (to loom_exports)
+    output logic                        exp_commit,
+    output logic [7:0]                  exp_idx,
+    output logic                        exp_valid,
+    output logic [PID_BITS-1:0]         exp_pid,
+    output logic [VADDR_BITS-1:0]       exp_base,
+    output logic [39:0]                 exp_len,
     output logic [7:0]                  tx_window,
     output logic [3:0]                  rx_chunk,
 
@@ -112,7 +147,10 @@ module loom_ctrl #(
     input  logic                        cnt_ing_store,
     input  logic                        cnt_ing_store_drop,
     input  logic                        cnt_ing_flush,
-    input  logic [N_DBG-1:0]            cnt_ing_dbg
+    input  logic [N_DBG-1:0]            cnt_ing_dbg,
+
+    // Further pulses, word 112+i (list in the map above)
+    input  logic [N_X-1:0]              cnt_x
 );
 
 localparam integer ADDR_LSB = $clog2(AXIL_DATA_BITS/8);   // 3
@@ -159,6 +197,14 @@ localparam integer R_HREQ_BP       = 84;
 localparam integer R_ING_BASE      = 88;
 localparam integer N_ING           = 7;
 localparam integer R_DBG_BASE      = 95;
+localparam integer R_X_BASE        = 112;
+localparam integer R_EXP_IDX       = 176;
+localparam integer R_EXP_CFG       = 177;
+localparam integer R_EXP_PID       = 178;
+localparam integer R_EXP_BASE      = 179;
+localparam integer R_EXP_LEN       = 180;
+localparam integer R_EXP_COMMIT    = 181;
+localparam integer R_XMAX_BASE     = 144;
 
 // -------------------------------------------------------------------------
 // AXI4-Lite handshake (single outstanding write and read, as examples/loom)
@@ -184,13 +230,16 @@ wire csr_rd  = (axi_araddr[15:12] == 4'd0);
 // -------------------------------------------------------------------------
 logic [63:0] r_tbl_idx, r_tbl_cfg, r_tbl_pid, r_tbl_base, r_tbl_len, r_tbl_ustart;
 logic [63:0] r_rdma_staging, r_tx_ctl, r_rx_chunk;
+logic [63:0] r_exp_idx, r_exp_cfg, r_exp_pid, r_exp_base, r_exp_len;
 
 wire commit_pulse = csr_wr && (wr_idx == R_TBL_COMMIT) && axi_ctrl.wstrb[0] && axi_ctrl.wdata[0];
+wire exp_pulse    = csr_wr && (wr_idx == R_EXP_COMMIT) && axi_ctrl.wstrb[0] && axi_ctrl.wdata[0];
 
 always_ff @(posedge aclk) begin
     if (!aresetn) begin
         r_tbl_idx <= 0; r_tbl_cfg <= 0; r_tbl_pid <= 0; r_tbl_base <= 0; r_tbl_len <= 0;
         r_tbl_ustart <= 0; r_rdma_staging <= 0;
+        r_exp_idx <= 0; r_exp_cfg <= 0; r_exp_pid <= 0; r_exp_base <= 0; r_exp_len <= 0;
         r_tx_ctl   <= 64'd16;
         r_rx_chunk <= 64'd1;
     end else if (csr_wr && (&axi_ctrl.wstrb)) begin
@@ -204,6 +253,11 @@ always_ff @(posedge aclk) begin
             R_RDMA_STAGING: r_rdma_staging <= axi_ctrl.wdata;
             R_TX_CTL:       r_tx_ctl       <= axi_ctrl.wdata;
             R_RX_CHUNK:     r_rx_chunk     <= axi_ctrl.wdata;
+            R_EXP_IDX:      r_exp_idx      <= axi_ctrl.wdata;
+            R_EXP_CFG:      r_exp_cfg      <= axi_ctrl.wdata;
+            R_EXP_PID:      r_exp_pid      <= axi_ctrl.wdata;
+            R_EXP_BASE:     r_exp_base     <= axi_ctrl.wdata;
+            R_EXP_LEN:      r_exp_len      <= axi_ctrl.wdata;
             default: ;
         endcase
     end
@@ -221,6 +275,12 @@ assign tbl_ustart      = r_tbl_ustart[26:0];
 assign rdma_staging_va = r_rdma_staging[VADDR_BITS-1:0];
 assign tx_window       = r_tx_ctl[7:0];
 assign rx_chunk        = (r_rx_chunk[3:0] == 4'd0) ? 4'd1 : r_rx_chunk[3:0];   // 0 is not a size
+assign exp_commit      = exp_pulse;
+assign exp_idx         = r_exp_idx[7:0];
+assign exp_valid       = r_exp_cfg[0];
+assign exp_pid         = r_exp_pid[PID_BITS-1:0];
+assign exp_base        = r_exp_base[VADDR_BITS-1:0];
+assign exp_len         = r_exp_len[39:0];
 
 // -------------------------------------------------------------------------
 // Counters
@@ -235,11 +295,16 @@ logic [63:0] ing [N_ING];
 logic [63:0] dbg [N_DBG];
 logic [N_ING-1:0] ing_pulse;
 logic [N_DBG-1:0] dbg_pulse;
+logic [N_X-1:0]   x_pulse;
+logic [63:0]      xc [N_X];
+logic [31:0]      xrun [N_X], xmax [N_X];
 always_ff @(posedge aclk) begin
     if (!aresetn) begin
         ing_pulse <= '0;
         dbg_pulse <= '0;
+        x_pulse   <= '0;
     end else begin
+        x_pulse   <= cnt_x;
         ing_pulse <= {cnt_ing_flush, cnt_ing_store_drop, cnt_ing_store, cnt_ing_pkt_rdma,
                       cnt_ing_pkt_local, cnt_ing_drop, cnt_ing_burst};
         dbg_pulse <= cnt_ing_dbg;
@@ -299,6 +364,20 @@ always_ff @(posedge aclk) begin
     end
 end
 
+always_ff @(posedge aclk) begin
+    if (!aresetn) begin
+        for (int i = 0; i < N_X; i++) begin xc[i] <= 0; xrun[i] <= 0; xmax[i] <= 0; end
+    end else begin
+        for (int i = 0; i < N_X; i++) begin
+            if (x_pulse[i]) begin
+                xc[i]   <= xc[i] + 1;
+                xrun[i] <= xrun[i] + 1;
+                if (xrun[i] + 1 > xmax[i]) xmax[i] <= xrun[i] + 1;
+            end else xrun[i] <= 0;
+        end
+    end
+end
+
 // -------------------------------------------------------------------------
 // Read data
 // -------------------------------------------------------------------------
@@ -341,11 +420,20 @@ always_ff @(posedge aclk) begin
             R_WR_BLK_ING:       axi_rdata <= wr_blk_ing;
             R_WR_BLK_RX:        axi_rdata <= wr_blk_rx;
             R_RX_CHUNK:         axi_rdata <= {60'b0, rx_chunk};
+            R_EXP_IDX:          axi_rdata <= r_exp_idx;
+            R_EXP_CFG:          axi_rdata <= r_exp_cfg;
+            R_EXP_PID:          axi_rdata <= r_exp_pid;
+            R_EXP_BASE:         axi_rdata <= r_exp_base;
+            R_EXP_LEN:          axi_rdata <= r_exp_len;
             default:
                 if (rd_idx >= R_ING_BASE && rd_idx < R_ING_BASE + N_ING)
                     axi_rdata <= ing[rd_idx - R_ING_BASE];
                 else if (rd_idx >= R_DBG_BASE && rd_idx < R_DBG_BASE + N_DBG)
                     axi_rdata <= dbg[rd_idx - R_DBG_BASE];
+                else if (rd_idx >= R_X_BASE && rd_idx < R_X_BASE + N_X)
+                    axi_rdata <= xc[rd_idx - R_X_BASE];
+                else if (rd_idx >= R_XMAX_BASE && rd_idx < R_XMAX_BASE + N_X)
+                    axi_rdata <= {32'b0, xmax[rd_idx - R_XMAX_BASE]};
         endcase
     end
 end

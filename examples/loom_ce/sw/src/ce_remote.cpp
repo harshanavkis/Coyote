@@ -10,7 +10,9 @@
  *   (--land-offset: land B bytes into the V80 window, a multiple of 64 below 4096)
  *   1. QP exchange (blocks for the client); the QP owner's staging buffer
  *   2. destination and fence buffers on a data cThread
- *   3. a TCP hello to the client: staging VA, both buffers, the data ctid
+ *   3. both buffers exported (loom_switch export table: 1 = destination,
+ *      2 = fence page, landing under the data cThread), and a TCP hello to
+ *      the client with their references
  *   4. per copy: the client announces the fence value to expect; the
  *      server waits for it in the fence page, checks every byte, answers
  *   With --land-v80 the destination and fence are the server's V80 card
@@ -22,9 +24,9 @@
  * Client (the sending host; U280 + V80):
  *     ce_remote --client <server_ip> [--port N] [--reps N] [--window P]
  *   1. QP exchange, then the hello
- *   2. staging CSR = the server's staging VA; rdma windows onto the
- *      server's destination (uwin 0) and fence page (right after it),
- *      over the QP owner's connection, landing under the server's data ctid
+ *   2. rdma windows onto the server's destination (uwin 0) and fence page
+ *      (right after it), over the QP owner's connection: their bases are
+ *      the server's export references, which every packet carries
  *   3. that part of the uwin exported to the V80
  *   4. per copy: fill the source, offload it to HBM, announce it, start
  *      loom_ce with the fence behind the data, report the server's answer
@@ -170,9 +172,11 @@ int run_server(uint16_t port, uint64_t size, bool land, uint64_t off, unsigned p
         printf("FAIL: hello listener on port %u\n", port + 1);
         return 1;
     }
+    loom_switch::program_export(t_qp, 1, t_data.getCtid(), dst, size);
+    loom_switch::program_export(t_qp, 2, t_data.getCtid(), fence, 4096);
     int c = ::accept(lfd, nullptr, nullptr);
     Hello h{MAGIC, uint32_t(t_data.getCtid()), reinterpret_cast<uint64_t>(staging),
-            reinterpret_cast<uint64_t>(dst), reinterpret_cast<uint64_t>(fence), size};
+            loom_switch::export_ref(1), loom_switch::export_ref(2), size};
     if (!write_full(c, &h, sizeof(h))) { printf("FAIL: hello\n"); return 1; }
 
     volatile uint64_t *vfence = fence;
@@ -219,11 +223,13 @@ int run_server(uint16_t port, uint64_t size, bool land, uint64_t off, unsigned p
         else      memset(dst, 0, size);
         if (!write_full(c, &v, sizeof(v))) break;
     }
-    printf("server: loom_rx forwarded %lu writes, rejected %lu headers\n",
+    printf("server: loom_rx landed %lu writes, dropped %lu packets\n",
            (unsigned long) loom_switch::csr_read(t_qp, loom_switch::RX_FWD),
            (unsigned long) loom_switch::csr_read(t_qp, loom_switch::RX_DROP));
     ::close(c);
     ::close(lfd);
+    loom_switch::release_export(t_qp, 1);
+    loom_switch::release_export(t_qp, 2);
     t_qp.connSync(false);
     delete L;
     delete v80;
@@ -276,8 +282,10 @@ int run_bidir(const std::string &ip, uint16_t port, uint64_t size, int reps, int
             if (::connect(fd, reinterpret_cast<sockaddr *>(&a), sizeof(a)) < 0) { ::close(fd); fd = -1; usleep(100000); }
         }
     }
+    loom_switch::program_export(t_qp, 1, t_data.getCtid(), dst, size);
+    loom_switch::program_export(t_qp, 2, t_data.getCtid(), fence, 4096);
     BiHello mine{MAGIC, uint32_t(t_data.getCtid()), reinterpret_cast<uint64_t>(staging),
-                 reinterpret_cast<uint64_t>(dst), reinterpret_cast<uint64_t>(fence), size}, h{};
+                 loom_switch::export_ref(1), loom_switch::export_ref(2), size}, h{};
     if (fd < 0 || !write_full(fd, &mine, sizeof(mine)) || !read_full(fd, &h, sizeof(h)) || h.magic != MAGIC || h.size != size) {
         printf("FAIL: hello (sizes must match on both sides)\n");
         return 1;
@@ -360,6 +368,8 @@ int run_bidir(const std::string &ip, uint16_t port, uint64_t size, int reps, int
     ::close(fd);
     loom_switch::release_window(t_qp, 1);
     loom_switch::release_window(t_qp, 2);
+    loom_switch::release_export(t_qp, 1);
+    loom_switch::release_export(t_qp, 2);
     t_qp.connSync(!server);
     printf(errors ? "BIDIR FAIL\n" : "BIDIR PASS\n");
     return errors ? 1 : 0;

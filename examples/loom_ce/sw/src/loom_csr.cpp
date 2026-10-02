@@ -21,7 +21,23 @@ int main() {
         {72, "wr wait local (sq_wr not ready)"}, {73, "wr wait rdma (sq_wr not ready)"},
         {74, "wr blocked by ingress"}, {75, "wr blocked by rx"}, {66, "tx ctl (ack window)"}, {68, "tx acks"},
         {81, "host out: beats moved"}, {82, "host out: beat waited on DMA"}, {83, "host out: DMA wait MAX run"},
-        {84, "host out: request waited on DMA"}};
+        {84, "host out: request waited on DMA"}, {41, "rx drop"},
+        // loom_rx: self-describing packets
+        {112, "rx packets landed"}, {113, "rx stores landed"}, {114, "rx packets dropped"},
+        {115, "rx write waited on sq_wr"}, {147, "rx write wait on sq_wr MAX run"},
+        {116, "rx at outstanding limit"}, {117, "rx beat waited for its write"},
+        {149, "rx beat wait for write MAX run"}, {118, "rx rq_wr lost (must be 0)"},
+        // loom_ingress
+        {119, "ingress full rdma packets"}, {120, "ingress partial: idle timer"},
+        {121, "ingress partial: cut by a write"},
+        // the shell's host write path, user region to DMA engine
+        {122, "shell: DMA write reqs issued"}, {123, "shell: req waited to enter MMU"},
+        {155, "shell: MMU entry wait MAX run"}, {124, "shell: reqs taken by MMU"},
+        {125, "shell: data waited on MMU order"}, {157, "shell: data wait MAX run"},
+        {126, "shell: page-fault irqs"}, {127, "shell: writebacks"},
+        {128, "shell: writeback waited"}, {160, "shell: writeback wait MAX run"},
+        {129, "shell: rx req waited for data"}, {161, "shell: rx req data wait MAX run"},
+        {130, "shell: rx req waited downstream"}, {162, "shell: rx req downstream MAX run"}};
     for (auto &r : regs) printf("%-34s %lu\n", r.name, (unsigned long) loom_switch::csr_read(u280, r.w));
     return 0;
 }
