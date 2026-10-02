@@ -105,6 +105,31 @@ struct Counters {
 };
 enum { C_CYC, C_WINFULL, C_REQWAIT, C_WAIT_LOCAL, C_WAIT_RDMA, C_RX_MOVE, C_RX_STARVE, C_RX_STALL, C_RX_FF };
 
+// The lander's host write path, per copy (loom_ctrl.sv 112-135; longest runs,
+// at 144+, are since the bitstream was loaded, so a copy that raises one is
+// the copy that had that stall)
+struct Shell {
+    static constexpr int N = 8;
+    static constexpr uint32_t W[N] = {115, 123, 125, 129, 130, 131, 135, 112};
+    static constexpr uint32_t M[3] = {155, 157, 163};    // longest runs of 123, 125, 131
+    uint64_t v[N], m[3];
+    static Shell read(coyote::cThread &t) {
+        Shell c;
+        for (int i = 0; i < N; i++) c.v[i] = loom_switch::csr_read(t, W[i]);
+        for (int i = 0; i < 3; i++) c.m[i] = loom_switch::csr_read(t, M[i]);
+        return c;
+    }
+    void print(const Shell &b) const {
+        auto d = [&](int i) { return (unsigned long) (v[i] - b.v[i]); };
+        auto mx = [&](int i) { return m[i] > b.m[i] ? " NEW" : ""; };
+        printf("     shell: MMU entry wait %lu (longest %lu%s), data waited on MMU %lu (longest %lu%s), "
+               "MMU completion wait %lu (longest %lu%s), %lu completions; credit stage: data %lu, downstream %lu; "
+               "rx post wait %lu, %lu packets\n",
+               d(1), (unsigned long) m[0], mx(0), d(2), (unsigned long) m[1], mx(1),
+               d(5), (unsigned long) m[2], mx(2), d(6), d(3), d(4), d(0), d(7));
+    }
+};
+
 uint64_t pattern(uint64_t off, uint64_t rep) { return 0xCE00000000000000ULL ^ (off * 0x9E3779B97F4A7C15ULL) ^ rep; }
 
 bool read_full(int fd, void *p, size_t n) {
@@ -185,6 +210,7 @@ int run_server(uint16_t port, uint64_t size, bool land, uint64_t off, unsigned p
     Announce an;
     while (read_full(c, &an, sizeof(an)) && an.rep != ~0ULL) {
         const Counters k0 = Counters::read(t_qp);
+        const Shell s0 = Shell::read(t_qp);
         land_v80::Counters u0{}, u1{};
         if (land) u0 = land_v80::Counters::read(L->win);
         auto t0 = std::chrono::steady_clock::now();
@@ -204,6 +230,7 @@ int run_server(uint16_t port, uint64_t size, bool land, uint64_t off, unsigned p
             v.wait_us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
         }
         const Counters k1 = Counters::read(t_qp);
+        const Shell s1 = Shell::read(t_qp);
         if (v.fence == an.fence)
             for (uint64_t i = 0; i < size / 8; i++) v.bad += (vdst[i] != pattern(8 * i, an.rep));
         else
@@ -215,6 +242,7 @@ int run_server(uint16_t port, uint64_t size, bool land, uint64_t off, unsigned p
         printf("     loom_rx over %lu cycles: %lu moving, %lu starved (nothing arrived), %lu stalled (host write not ready), rx FIFO full %lu\n",
                (unsigned long) k1.d(k0, C_CYC), (unsigned long) k1.d(k0, C_RX_MOVE), (unsigned long) k1.d(k0, C_RX_STARVE),
                (unsigned long) k1.d(k0, C_RX_STALL), (unsigned long) k1.d(k0, C_RX_FF));
+        s1.print(s0);
         if (land) u1.print(u0);
         errors += (v.bad != 0);
         copies++;
