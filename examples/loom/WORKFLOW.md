@@ -1,5 +1,11 @@
 # Loom example workflow (concrete, virtual addresses only)
 
+> This describes `examples/loom`, the single-card prototype (AXI-Lite
+> aperture, descriptors, Loom message headers), which is still built as the
+> control image. The current design (a V80 copy engine plus the U280 switch,
+> self-describing RDMA packets, receiver export tables) is described in
+> [`../loom_switch/WORKFLOW.md`](../loom_switch/WORKFLOW.md).
+
 Worked end-to-end example of the five data flows. Every address is an
 ordinary virtual address in some process's page tables; the vFPGA tables
 and the Coyote shell TLB carry transactions between address spaces. No
