@@ -59,7 +59,7 @@ module design_user_wrapper_{{ c_reg }} (
 
 {% if cnfg.en_uwin and not cnfg.en_uwin_hbm and cnfg.en_strm %}
     // Host write path pulses (dynamic_top dbg_host_out)
-    (* io_buffer_type = "none" *) input  logic[9:0]                               dbg_host_out,
+    (* io_buffer_type = "none" *) input  logic[14:0]                              dbg_host_out,
 {% endif %}
 {% if cnfg.en_uwin and not cnfg.en_uwin_hbm %}
     // AXI4 USER DATA WINDOW
@@ -1184,8 +1184,8 @@ module design_user_wrapper_{{ c_reg }} (
     design_user_logic_c{{ c_cnfg }}_{{ c_reg }} inst_user_c{{ c_cnfg }}_{{ c_reg }} (
 	    .axi_ctrl(axi_ctrl_user),
     {% if cnfg.en_uwin and not cnfg.en_uwin_hbm and cnfg.en_strm %}
-        // [11] the last host stream's write request waited in the credit
-        // stage to go downstream, [10] waited there for its data
+        // [16] the last host stream's write request waited in the credit
+        // stage to go downstream, [15] waited there for its data
         .dbg_host_out({cred_wr_wait_out[N_STRM_AXI-1], cred_wr_wait_data[N_STRM_AXI-1], dbg_host_out}),
     {% endif %}
     {% if cnfg.en_uwin and not cnfg.en_uwin_hbm %}

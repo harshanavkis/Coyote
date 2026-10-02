@@ -74,7 +74,13 @@ module tlb_fsm #(
 	// Mutex
 	output logic 						lock,
 	output logic 						unlock,
-	input  logic [1:0]					mutex
+	input  logic [1:0]					mutex,
+
+    // Debug (optional): [0] a host request waited for a completion (N_TLB_ACTV
+    // issued, none done), [1] it waited on the DMA request port, [2] waiting
+    // for the TLB mutex, [3] in a miss, invalidation or locked state, [4] a
+    // host DMA completion
+    output logic [4:0]                  dbg
 );
 
 // ----------------------------------------------------------------------------------------------------------
@@ -1222,6 +1228,34 @@ end
     `META_ASSIGN(card_done_q[0], m_card_done)
 `endif
 `endif
+
+// Debug pulses
+logic dbg_miss, dbg_inv_host, dbg_inv_card;
+assign dbg_miss = (state_C == ST_LOCKED) ||
+                  (state_C == ST_MISS_CACHE) || (state_C == ST_MISS_LUP_CACHE_CALC) ||
+                  (state_C == ST_MISS_LUP_CACHE_ASSIGN) || (state_C == ST_MISS_SEND) ||
+                  (state_C == ST_MISS_IDLE) || (state_C == ST_MISS_LUP_IDLE_CALC) ||
+                  (state_C == ST_MISS_LUP_IDLE_ASSIGN) || (state_C == ST_INVLDT_EVAL);
+`ifdef EN_STRM
+assign dbg[0] = (state_C == ST_HOST_SEND) && hdma_ready && issued_host_C && (head_host_C == tail_host_C);
+assign dbg[1] = (state_C == ST_HOST_SEND) && !hdma_ready;
+assign dbg[4] = hdma_rsp.done;
+assign dbg_inv_host = (state_C == ST_INVLDT_HOST) || (state_C == ST_INVLDT_LUP_HOST) ||
+                      (state_C == ST_INVLDT_WAIT_HOST) || (state_C == ST_INVLDT_CMP_HOST);
+`else
+assign dbg[0] = 1'b0;
+assign dbg[1] = 1'b0;
+assign dbg[4] = 1'b0;
+assign dbg_inv_host = 1'b0;
+`endif
+`ifdef EN_MEM
+assign dbg_inv_card = (state_C == ST_INVLDT_CARD) || (state_C == ST_INVLDT_LUP_CARD) ||
+                      (state_C == ST_INVLDT_WAIT_CARD) || (state_C == ST_INVLDT_CMP_CARD);
+`else
+assign dbg_inv_card = 1'b0;
+`endif
+assign dbg[2] = (state_C == ST_MUTEX) && !((mutex[1] == RDWR) && (mutex[0] == 1'b0));
+assign dbg[3] = dbg_miss || dbg_inv_host || dbg_inv_card;
 
 /////////////////////////////////////////////////////////////////////////////
 // DEBUG

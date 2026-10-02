@@ -130,7 +130,7 @@ loom_ctrl inst_loom_ctrl (
     .cnt_ing_store(cnt_ing_store), .cnt_ing_store_drop(cnt_ing_store_drop),
     .cnt_ing_flush(cnt_ing_flush), .cnt_ing_dbg(cnt_ing_dbg),
     // words 112+ (and their longest runs at 144+), in loom_ctrl's list
-    .cnt_x({dbg_host_out[11:3],
+    .cnt_x({dbg_host_out[14:10], dbg_host_out[16:15], dbg_host_out[9:3],
             cnt_ing_rdma_cut, cnt_ing_rdma_flush, cnt_ing_rdma_full,
             rx_cnt_rq_ovfl, rx_cnt_pkt_wait, rx_cnt_at_limit, rx_cnt_post_wait,
             cnt_rx_drop, rx_cnt_store, rx_cnt_pkt})

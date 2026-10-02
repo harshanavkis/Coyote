@@ -41,7 +41,7 @@ module design_user_logic_c{{ c_cnfg }}_{{ c_reg }} (
 {% if cnfg.en_uwin and not cnfg.en_uwin_hbm and cnfg.en_strm %}
 
     // Host write path pulses (dynamic_top / user_wrapper; loom_ctrl's list)
-    input  logic [11:0]         dbg_host_out,
+    input  logic [16:0]         dbg_host_out,
 {% endif %}
 {% if cnfg.en_uwin and not cnfg.en_uwin_hbm %}
 

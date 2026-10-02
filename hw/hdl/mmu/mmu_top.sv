@@ -125,7 +125,10 @@ module mmu_top #(
 `endif
 	
 	// Page fault IRQ
-	output logic [N_REGIONS-1:0]    	usr_irq
+	output logic [N_REGIONS-1:0]    	usr_irq,
+
+    // Debug (optional): region 0's write FSM pulses (tlb_fsm dbg)
+    output logic [4:0]                  dbg_mmu_wr
 );
 
 //
@@ -162,6 +165,8 @@ metaIntf #(.STYPE(inv_t)) rd_invldt_ctrl [N_REGIONS] (.*);
 metaIntf #(.STYPE(inv_t)) wr_invldt_ctrl [N_REGIONS] (.*);
 
 // Instantiate region MMUs
+logic [4:0] dbg_wr_r [N_REGIONS];
+assign dbg_mmu_wr = dbg_wr_r[0];
 for(genvar i = 0; i < N_REGIONS; i++) begin
     
     mmu_region_top #(
@@ -203,7 +208,8 @@ for(genvar i = 0; i < N_REGIONS; i++) begin
         .s_rd_invldt_ctrl(rd_invldt_ctrl[i]),
         .m_rd_invldt_irq(rd_invldt_irq[i]),
         .s_wr_invldt_ctrl(wr_invldt_ctrl[i]),
-        .m_wr_invldt_irq(wr_invldt_irq[i])
+        .m_wr_invldt_irq(wr_invldt_irq[i]),
+        .dbg_wr(dbg_wr_r[i])
     );
 
 end

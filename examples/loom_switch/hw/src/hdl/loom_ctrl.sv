@@ -66,7 +66,7 @@ import lynxTypes::*;
  *     ingress:  119 full (PMTU) rdma packets, 120 partial rdma packets
  *               closed by the idle timer, 121 partial rdma packets closed
  *               by a non-continuing write or a store
- *     shell (dynamic_top / user_wrapper dbg_host_out[11:3]): 122 host DMA
+ *     shell (dynamic_top / user_wrapper dbg_host_out): 122 host DMA
  *               write requests issued, 123 cycles a host write request
  *               waited to enter the MMU, 124 requests the MMU took, 125
  *               cycles host write data waited inside the shell for its
@@ -75,12 +75,17 @@ import lynxTypes::*;
  *               128 cycles a writeback waited, 129 cycles loom_rx's (dest 1)
  *               write request waited in the credit stage for its data,
  *               130 cycles it waited there to go downstream (to the MMU)
+ *     shell MMU, region 0's write FSM (tlb_fsm dbg): 131 cycles a host
+ *               request waited for a DMA completion (N_TLB_ACTV issued,
+ *               none done), 132 cycles it waited on the DMA request port,
+ *               133 cycles waiting for the TLB mutex, 134 cycles in a miss,
+ *               invalidation or locked state, 135 host DMA completions
  * Counters are free-running and never cleared (software takes deltas). The
  * ingress pulses are registered once before they count.
  */
 module loom_ctrl #(
     parameter integer N_DBG = 14,
-    parameter integer N_X   = 19
+    parameter integer N_X   = 24
 ) (
     input  logic                        aclk,
     input  logic                        aresetn,

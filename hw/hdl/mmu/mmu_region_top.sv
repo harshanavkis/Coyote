@@ -86,6 +86,9 @@ module mmu_region_top #(
     metaIntf.m                          m_rd_invldt_irq,
     metaIntf.s                          s_wr_invldt_ctrl,
     metaIntf.m                          m_wr_invldt_irq,
+
+    // Debug (optional): the write FSM's pulses (tlb_fsm dbg)
+    output logic [4:0]                  dbg_wr,
     
     input logic        					aclk,    
 	input logic    						aresetn
@@ -285,7 +288,8 @@ tlb_fsm #(
 
     .lock(rd_lock),
 	.unlock(rd_unlock),
-	.mutex(mutex)
+	.mutex(mutex),
+    .dbg()
 );
 
 // TLB wr FSM
@@ -316,7 +320,8 @@ tlb_fsm #(
 
     .lock(wr_lock),
 	.unlock(wr_unlock),
-	.mutex(mutex)
+	.mutex(mutex),
+    .dbg(dbg_wr)
 );
 
 // ----------------------------------------------------------------------------------------

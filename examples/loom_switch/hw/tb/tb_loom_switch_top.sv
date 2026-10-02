@@ -42,7 +42,7 @@ AXI4SR axis_rrsp_recv [N_RDMA_AXI] (.*);
 AXI4SR axis_rrsp_send [N_RDMA_AXI] (.*);
 
 // The shell's host DMA boundary pulses (dynamic_top dbg_host_out), driven by T9
-logic [11:0] dbg_host_out = '0;
+logic [16:0] dbg_host_out = '0;
 
 design_user_logic_c0_0 inst_dut (
     .axi_ctrl(axi_ctrl), .dbg_host_out(dbg_host_out), .axi_udata(axi_udata), .notify(notify),
@@ -567,18 +567,23 @@ initial begin
     end
     $display("ok   T9 host DMA boundary counters");
 
-    // --- T9b: the shell's further pulses reach words 122-130 (dbg_host_out
-    //     [11:3]), each with its longest run at 154-162 ---
+    // --- T9b: the shell's further pulses (dbg_host_out[16:3]) reach words
+    //     122-135, each with its longest run at 154-167; one bit at a time
+    //     checks the mapping: [9:3] -> 122-128, [15] -> 129, [16] -> 130,
+    //     [14:10] (the MMU write FSM) -> 131-135 ---
     begin
-        logic [63:0] a0 [9], a1 [9], m [9];
-        for (int i = 0; i < 9; i++) csr_rd(122 + i, a0[i]);
-        @(negedge aclk); dbg_host_out = 12'hFF8; repeat (5) @(negedge aclk);
-        dbg_host_out = 12'h000; repeat (3) @(negedge aclk);
-        dbg_host_out = 12'hFF8; repeat (2) @(negedge aclk);
-        dbg_host_out = 12'h000; repeat (4) @(negedge aclk);
-        for (int i = 0; i < 9; i++) begin csr_rd(122 + i, a1[i]); csr_rd(154 + i, m[i]); end
-        for (int i = 0; i < 9; i++)
-            `CHECK(a1[i] - a0[i] == 7 && m[i] >= 5, $sformatf("T9b: word %0d moved %0d, longest %0d", 122 + i, a1[i] - a0[i], m[i]))
+        int map [14] = '{3, 4, 5, 6, 7, 8, 9, 15, 16, 10, 11, 12, 13, 14};
+        logic [63:0] a0 [14], a1 [14], m [14];
+        for (int i = 0; i < 14; i++) csr_rd(122 + i, a0[i]);
+        for (int i = 0; i < 14; i++) begin
+            @(negedge aclk); dbg_host_out = 17'(1) << map[i]; repeat (i + 1) @(negedge aclk);
+            dbg_host_out = '0; repeat (2) @(negedge aclk);
+        end
+        repeat (4) @(negedge aclk);
+        for (int i = 0; i < 14; i++) begin csr_rd(122 + i, a1[i]); csr_rd(154 + i, m[i]); end
+        for (int i = 0; i < 14; i++)
+            `CHECK(a1[i] - a0[i] == i + 1 && m[i] >= i + 1,
+                   $sformatf("T9b: word %0d (bit %0d) moved %0d, longest %0d, want %0d", 122 + i, map[i], a1[i] - a0[i], m[i], i + 1))
     end
     $display("ok   T9b shell write-path counters");
 

@@ -37,7 +37,13 @@ int main() {
         {126, "shell: page-fault irqs"}, {127, "shell: writebacks"},
         {128, "shell: writeback waited"}, {160, "shell: writeback wait MAX run"},
         {129, "shell: rx req waited for data"}, {161, "shell: rx req data wait MAX run"},
-        {130, "shell: rx req waited downstream"}, {162, "shell: rx req downstream MAX run"}};
+        {130, "shell: rx req waited downstream"}, {162, "shell: rx req downstream MAX run"},
+        // the shell MMU's write FSM (region 0)
+        {131, "mmu: waited for a completion"}, {163, "mmu: completion wait MAX run"},
+        {132, "mmu: waited on DMA req port"}, {164, "mmu: DMA port wait MAX run"},
+        {133, "mmu: waited for TLB mutex"}, {165, "mmu: mutex wait MAX run"},
+        {134, "mmu: miss/invalidate/locked"}, {166, "mmu: miss/inv MAX run"},
+        {135, "mmu: DMA completions"}};
     for (auto &r : regs) printf("%-34s %lu\n", r.name, (unsigned long) loom_switch::csr_read(u280, r.w));
     return 0;
 }
