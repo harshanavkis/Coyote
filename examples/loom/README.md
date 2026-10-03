@@ -438,8 +438,7 @@ completes.
 
 ### Reproducing the bidirectional-bandwidth experiments
 
-`HANDOVER-bidir.md` states what is known about the halving; this is the
-command for each of its measurements, all from `examples/loom/` on clara
+These are the commands for the bidirectional measurements, all from `examples/loom/` on clara
 with the deployed bitstream (`~/coyote-bitstreams/loom/`, md5 4bb3b847 =
 `hw/build_sep16_arbiter_fixed`) and `loom_host` built from the same
 commit on both hosts. Every run flashes both cards first (~3 min) unless

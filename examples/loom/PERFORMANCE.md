@@ -74,8 +74,7 @@ run verified the landed bytes.
 | E810 | 6.33 (1 QP) | 6.0 + 6.3 |
 
 The halving is Coyote-specific. One RC QP carrying both directions doesn't
-halve on either ASIC NIC. The cause is still open; see
-`HANDOVER-bidir.md` and the ACK-gap lead in the project notes.
+halve on either ASIC NIC. The cause is still open.
 
 ## Small writes and reads, 8–64 B (µs)
 

@@ -1145,8 +1145,7 @@ void mx_serve(MxServerXpu x, DoneFn done) {
                     // with a LOCAL copy, not with a push of its own. Used by
                     // --rxlocal to give the sender's vFPGA the same number of
                     // incoming packets as a bidirectional round while all of
-                    // its OWN requests are local (STRM_HOST) - see the
-                    // head-of-line-blocking question in HANDOVER-bidir.md.
+                    // its OWN requests are local (STRM_HOST).
                     const uint64_t f = *x.fence;
                     x.xpu->copy(x.to_a[who - 1], uint32_t(MX_DATA), x.buf + MX_SRC / 8, len, x.fence);
                     if (!spin64_ge(x.fence, f + 1, 5e6)) { printf("FAIL: matrix pushme: B%d -> A%lu never fenced\n", x.me, (unsigned long) who); failures++; }
