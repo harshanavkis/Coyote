@@ -26,7 +26,10 @@
 
 // Simple module to enforce time gaps between processed ACKs, has to be used directly after a reasonably large FIFO to buffer incoming but gap-enforced packets
 
-module ack_gap_enforcer(
+// GAP: cycles the stream is held after each ACK (ACK_GAP_CYCLES in lynx_pkg; 0 = never held)
+module ack_gap_enforcer #(
+    parameter integer GAP = 85
+) (
     // Incoming clock and reset 
     input logic nclk, 
     input logic nresetn, 
@@ -50,7 +53,7 @@ module ack_gap_enforcer(
         end else begin
             if(is_ack) begin
                 // In case we witness an ACK, set the gap counter to 8'h28 = 40 
-                gap_counter <= 8'h55; // 90ns gap
+                gap_counter <= 8'(GAP);
             end else begin
                 // As long as the gap is present, decrement the counter 
                 if(gap_counter > 8'h0) begin

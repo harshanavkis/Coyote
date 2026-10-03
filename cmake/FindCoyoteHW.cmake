@@ -61,6 +61,11 @@ set(BUILD_APP 0 CACHE STRING "Build app portion of the design (on top of existin
 # Packetization size; data transfers (host, card or net) of size > PMTU_BYTES are split into multiple packets
 set(PMTU_BYTES 4096 CACHE STRING "Packetization size [B]")
 
+# RoCE RX: cycles the incoming stream is held after every incoming ACK (ack_gap_enforcer).
+# 85 is the Mellanox-compatibility value; it also blocks the data behind each ACK, which caps
+# bidirectional traffic at ~6.8 GB/s per direction on 100G. Upstream uses 16 on 200G DCMAC.
+set(ACK_GAP_CYCLES 85 CACHE STRING "Cycles the RoCE RX stream is held after each incoming ACK")
+
 # Unit tests/Simulation
 set(UNIT_TEST_DIR "${CMAKE_SOURCE_DIR}/unit-tests" CACHE STRING "Path to the unit-test folder.")
 set(SIM_DPI_LIB_NAME "coyote_sim" CACHE STRING "Name of the DPI-C library to link for simulation WITHOUT the '.so' extension.")

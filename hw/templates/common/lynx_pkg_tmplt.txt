@@ -374,6 +374,7 @@ package lynxTypes;
     localparam integer N_OUTSTANDING_REGION = {{ 4 * cnfg.n_outs }};
 
     localparam integer PMTU_BYTES = {{ cnfg.pmtu }};
+    localparam integer ACK_GAP_CYCLES = {{ cnfg.ack_gap }};
     
     localparam longint MEM_OFFSET = 64'd{{ cnfg.mem_offset }};
     localparam integer DDR_SIZE = {{ cnfg.ddr_size }};

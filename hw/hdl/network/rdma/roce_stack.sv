@@ -183,7 +183,7 @@ axis_data_fifo_512_cc_tx incoming_traffic_fifo (
 );
 
 // IPG-enforcer to enforce gaps between ACKs 
-ack_gap_enforcer inst_ack_gap_enforcer (
+ack_gap_enforcer #(.GAP(ACK_GAP_CYCLES)) inst_ack_gap_enforcer (
     .nclk(nclk),
     .nresetn(nresetn),
     .input_stream(fifo_to_gap_enforcer),
