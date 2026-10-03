@@ -28,8 +28,19 @@ import lynxTypes::*;
  *   4 W starved         10 most writes outstanding at once
  *     (beats announced by AW, !wvalid: PCIe side slow)
  *   5 AW stalled        11 W beats with a partial strobe
+ *                       12 bursts discarded (DISCARD below)
+ *                       13 bursts with a nonzero AWID
+ *                       15 the mode: 1 while discarding
  * Words 16-22: uwin_mon's counts of the shell's axi_main port (xclk), where
  * the window's writes enter the shell - see uwin_mon.sv.
+ *
+ * DISCARD (diagnostic): writes are accepted at once, counted, answered here
+ * (OKAY) and never reach HBM - the window's own rate with the memory taken
+ * out. A read of the counter page's line 63 (window offset UWIN_SIZE - 64)
+ * asks for it, line 62 (UWIN_SIZE - 128) for HBM again; reads always go to
+ * HBM. The mode changes only with no write in flight (none outstanding to
+ * HBM, none waiting here for W or B, no W beat owed), so B responses never
+ * mix the two sources, and word 15 says when it has.
  */
 module uwin_hbm #(
     parameter integer          UWIN_BITS = 27,
@@ -75,15 +86,27 @@ assign m_axi.arregion = s_axi.arregion;
 assign m_axi.arsize   = s_axi.arsize;
 // a read is accepted only with room to remember its length (and whether it
 // reads the counter page, from which line)
-localparam integer N_CTR = 12;
+localparam integer N_CTR = 16;
 logic [7:0] rq_len [N_RD];
 logic       rq_ctr [N_RD];
 logic [5:0] rq_line [N_RD];
 logic [$clog2(N_RD):0] rq_wp, rq_rp;
 wire rq_full  = (rq_wp - rq_rp) == ($clog2(N_RD)+1)'(N_RD);
 logic [7:0] r_beat;
+wire ar_ctr = (s_axi.araddr[UWIN_BITS-1:12] == '1);   // the counter page
 assign m_axi.arvalid  = s_axi.arvalid && !rq_full;
 assign s_axi.arready  = m_axi.arready && !rq_full;
+
+// DISCARD: one ring of AWIDs, in order (pushed on AW; lp passes an entry when
+// its burst's last W beat is taken; rp when its B is answered)
+localparam integer N_DQ = 32;
+logic                   discard;
+logic                   mode_pend, mode_val;
+logic [AXI_ID_BITS-1:0] dq_id [N_DQ];
+logic [$clog2(N_DQ):0]  dq_wp, dq_lp, dq_rp;
+wire dq_full  = (dq_wp - dq_rp) == ($clog2(N_DQ)+1)'(N_DQ);
+wire dq_w     = (dq_wp != dq_lp);          // a burst waiting for its W beats
+wire dq_b     = (dq_lp != dq_rp);          // a burst waiting for its B
 
 // AW
 assign m_axi.awaddr   = BASE + {{(64-UWIN_BITS){1'b0}}, s_axi.awaddr[UWIN_BITS-1:0]};
@@ -96,24 +119,25 @@ assign m_axi.awprot   = s_axi.awprot;
 assign m_axi.awqos    = s_axi.awqos;
 assign m_axi.awregion = s_axi.awregion;
 assign m_axi.awsize   = s_axi.awsize;
-assign m_axi.awvalid  = s_axi.awvalid;
-assign s_axi.awready  = m_axi.awready;
+assign m_axi.awvalid  = s_axi.awvalid && !discard;
+assign s_axi.awready  = discard ? !dq_full : m_axi.awready;
 
 // W
 assign m_axi.wdata    = s_axi.wdata;
 assign m_axi.wlast    = s_axi.wlast;
 assign m_axi.wstrb    = s_axi.wstrb;
-assign m_axi.wvalid   = s_axi.wvalid;
-assign s_axi.wready   = m_axi.wready;
+assign m_axi.wvalid   = s_axi.wvalid && !discard;
+assign s_axi.wready   = discard ? dq_w : m_axi.wready;
 
 // B, R
-assign s_axi.bid      = m_axi.bid;
-assign s_axi.bresp    = m_axi.bresp;
-assign s_axi.bvalid   = m_axi.bvalid;
-assign m_axi.bready   = s_axi.bready;
+assign s_axi.bid      = discard ? dq_id[dq_rp[$clog2(N_DQ)-1:0]] : m_axi.bid;
+assign s_axi.bresp    = discard ? 2'b00 : m_axi.bresp;
+assign s_axi.bvalid   = discard ? dq_b : m_axi.bvalid;
+assign m_axi.bready   = discard ? 1'b1 : s_axi.bready;
 
 // Counters
 logic [63:0] ctr [N_CTR];
+wire  ar_hs = s_axi.arvalid && s_axi.arready;
 logic signed [15:0] w_owed;          // beats announced by AW, not yet on W
 logic [15:0]        wr_out;          // AW taken, B not yet
 wire aw_hs = s_axi.awvalid && s_axi.awready;
@@ -140,6 +164,37 @@ always_ff @(posedge aclk) begin
         ctr[9]  <= ctr[9] + wr_out;
         if (64'(wr_out) > ctr[10]) ctr[10] <= 64'(wr_out);
         ctr[11] <= ctr[11] + (w_hs && (s_axi.wstrb != '1));
+        ctr[12] <= ctr[12] + (aw_hs && discard);
+        ctr[13] <= ctr[13] + (aw_hs && (s_axi.awid != '0));
+        ctr[15] <= 64'(discard);
+    end
+end
+
+// DISCARD: the mode request (a counter-page read of line 63 or 62), applied
+// once no write is in flight; the ring of discarded bursts
+wire wr_idle = (wr_out == 0) && (w_owed == 0) && (dq_wp == dq_rp);
+always_ff @(posedge aclk) begin
+    if (!aresetn) begin
+        discard   <= 1'b0;
+        mode_pend <= 1'b0;
+        mode_val  <= 1'b0;
+        dq_wp     <= '0;
+        dq_lp     <= '0;
+        dq_rp     <= '0;
+    end else begin
+        if (ar_hs && ar_ctr && (s_axi.araddr[11:7] == 5'h1F)) begin
+            mode_pend <= 1'b1;
+            mode_val  <= s_axi.araddr[6];
+        end else if (mode_pend && wr_idle && !(s_axi.awvalid && s_axi.awready)) begin
+            discard   <= mode_val;
+            mode_pend <= 1'b0;
+        end
+        if (discard && aw_hs) begin
+            dq_id[dq_wp[$clog2(N_DQ)-1:0]] <= s_axi.awid;
+            dq_wp <= dq_wp + 1'b1;
+        end
+        if (discard && w_hs && s_axi.wlast) dq_lp <= dq_lp + 1'b1;
+        if (discard && s_axi.bvalid && s_axi.bready) dq_rp <= dq_rp + 1'b1;
     end
 end
 
@@ -154,7 +209,6 @@ always_comb begin
         else if (8*r_line + j >= 16 && 8*r_line + j < 16 + N_MAIN)
             ctr_data[64*j +: 64] = main_ctr[64*(8*r_line + j - 16) +: 64];
 end
-wire ar_ctr = (s_axi.araddr[UWIN_BITS-1:12] == '1);
 
 assign s_axi.rdata    = rq_ctr[rp] ? ctr_data : m_axi.rdata;
 assign s_axi.rid      = m_axi.rid;

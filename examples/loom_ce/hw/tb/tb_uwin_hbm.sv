@@ -20,7 +20,10 @@ import lynxTypes::*;
  * peer reading through the window; the window address with and without the
  * BAR's 0x0800_0000 bit mapping to the same place; uwin_hbm emitting exactly
  * UWIN_HBM_BASE + offset; the window's last line; rlast exact on the window's
- * reads (uwin_hbm makes it: the stripe raises it on a fragment's every beat).
+ * reads (uwin_hbm makes it: the stripe raises it on a fragment's every beat);
+ * DISCARD (T7): switched on and off by counter-page reads, writes answered
+ * by uwin_hbm with their own IDs and never reaching memory, a switch held
+ * back while a write is in flight.
  */
 module tb_uwin_hbm;
 
@@ -213,6 +216,40 @@ always @(posedge aclk) if (win_hbm.awvalid && win_hbm.awready && aw_expect.size(
 end
 
 localparam longint BAR = 64'h0800_0000;     // the window's offset in the BAR, as the shell hands it over
+
+// T7: writes uwin_hbm passes on to memory, and the IDs the window must answer
+int hbm_aw = 0;
+always @(posedge aclk) if (win_hbm.awvalid && win_hbm.awready) hbm_aw++;
+bit t7_on = 0;
+logic [AXI_ID_BITS-1:0] t7_ids [$];
+int t7_b = 0;
+always @(posedge aclk) if (t7_on) begin
+    if (win_in.awvalid && win_in.awready) t7_ids.push_back(win_in.awid);
+    if (win_in.bvalid && win_in.bready) begin
+        logic [AXI_ID_BITS-1:0] e;
+        `CHECK(t7_ids.size() > 0, "T7: a B with no write outstanding")
+        if (t7_ids.size() > 0) begin
+            e = t7_ids.pop_front();
+            `CHECK(win_in.bid == e && win_in.bresp == 2'b00, $sformatf("T7: bid %0d resp %0d, want %0d OKAY", win_in.bid, win_in.bresp, e))
+        end
+        t7_b++;
+    end
+end
+
+// One beat of the counter page's line `line`: its eight words
+task automatic ctr_line(input int line, output logic [63:0] c [8]);
+    int got = 0;
+    @(negedge aclk); win_in.araddr = BAR + UWIN_SIZE - 4096 + 64*line; win_in.arlen = 0; win_in.arvalid = 1;
+    do @(posedge aclk); while (!win_in.arready);
+    @(negedge aclk); win_in.arvalid = 0;
+    while (!got) begin
+        @(posedge aclk);
+        if (win_in.rvalid && win_in.rready) begin
+            for (int j = 0; j < 8; j++) c[j] = win_in.rdata[64*j +: 64];
+            got = 1;
+        end
+    end
+endtask
 localparam logic [63:0] HI32 = 64'hFFFF_FFFF_0000_0000;
 localparam logic [63:0] LO32 = 64'h0000_0000_FFFF_FFFF;
 
@@ -364,6 +401,85 @@ initial begin
         `CHECK(c[7] == 0,       $sformatf("T6: word 23 = %0d, want 0", c[7]))
     end
     $display("ok   T6 axi_main counters (uwin_mon) through the clock crossing");
+
+    // --- T7: DISCARD. On (line 63), 40 bursts with AW running ahead of W (the
+    //     ID ring fills: 32), IDs 0-3; nothing reaches memory, each B carries
+    //     its burst's ID; off (line 62), writes land again; a switch asked for
+    //     while a write is in flight waits for its B
+    begin
+        logic [63:0] c [8], c0 [8];
+        int aw0, nb = 40;
+        ctr_line(1, c0);
+        ctr_line(63, c);                        // discard on
+        repeat (5) @(negedge aclk);
+        ctr_line(1, c);
+        `CHECK(c[7] == 1, $sformatf("T7: mode %0d after the line-63 read, want 1", c[7]))
+        aw0 = hbm_aw;
+        t7_on = 1;
+        fork
+            for (int k = 0; k < nb; k++) begin
+                @(negedge aclk); win_in.awaddr = BAR + 64'h8_0000 + 256*k; win_in.awlen = 3;
+                win_in.awid = AXI_ID_BITS'(k % 4); win_in.awvalid = 1;
+                do @(posedge aclk); while (!win_in.awready);
+                @(negedge aclk); win_in.awvalid = 0;
+            end
+            begin
+                repeat (60) @(negedge aclk);    // AW runs ahead: the ring fills
+                for (int k = 0; k < 4*nb; k++) begin
+                    @(negedge aclk); win_in.wdata = '1; win_in.wstrb = '1; win_in.wlast = (k % 4 == 3); win_in.wvalid = 1;
+                    do @(posedge aclk); while (!win_in.wready);
+                    @(negedge aclk); win_in.wvalid = 0;
+                end
+            end
+        join
+        wait (t7_b == nb);
+        repeat (5) @(negedge aclk);
+        t7_on = 0;
+        win_in.awid = 0;
+        `CHECK(hbm_aw == aw0, $sformatf("T7: %0d writes reached memory while discarding", hbm_aw - aw0))
+        `CHECK(t7_ids.size() == 0, $sformatf("T7: %0d writes never answered", t7_ids.size()))
+        ctr_line(1, c);
+        `CHECK(c[4] - c0[4] == nb, $sformatf("T7: bursts discarded %0d, want %0d", c[4] - c0[4], nb))
+        `CHECK(c[5] - c0[5] == 30, $sformatf("T7: bursts with a nonzero AWID %0d, want 30", c[5] - c0[5]))
+        `CHECK(c[2] == 32,         $sformatf("T7: most writes outstanding %0d, want 32 (the ring's depth)", c[2]))
+        ctr_line(62, c);                        // discard off
+        repeat (5) @(negedge aclk);
+        ctr_line(1, c);
+        `CHECK(c[7] == 0, $sformatf("T7: mode %0d after the line-62 read, want 0", c[7]))
+        // nothing landed where the discarded bursts went (memory reads zeros there)
+        begin
+            int got = 0;
+            @(negedge aclk); card_in.araddr = UWIN_HBM_BASE + 64'h8_0000; card_in.arlen = 8'(4*nb - 1); card_in.arvalid = 1;
+            do @(posedge aclk); while (!card_in.arready);
+            @(negedge aclk); card_in.arvalid = 0;
+            while (got < 4*nb) begin
+                @(posedge aclk);
+                if (card_in.rvalid && card_in.rready) begin
+                    `CHECK(card_in.rdata == '0, $sformatf("T7: beat %0d of the discarded range was written", got))
+                    got++;
+                end
+            end
+        end
+        // writes land again
+        wr_burst(1, BAR + 64'h8_0000, UWIN_HBM_BASE + 64'h8_0000, 4, '1, 7);
+        rd_check("T7 HBM again", 0, UWIN_HBM_BASE + 64'h8_0000, UWIN_HBM_BASE + 64'h8_0000, 4, 7);
+        // a switch asked for mid-write waits for that write's B
+        fork
+            wr_burst(1, BAR + 64'hA_0000, UWIN_HBM_BASE + 64'hA_0000, 4, '1, 8);
+            begin
+                wait (win_hbm.awvalid && win_hbm.awready);
+                ctr_line(63, c);
+            end
+        join
+        rd_check("T7 mid-write", 0, UWIN_HBM_BASE + 64'hA_0000, UWIN_HBM_BASE + 64'hA_0000, 4, 8);
+        ctr_line(1, c);
+        `CHECK(c[7] == 1, $sformatf("T7: mode %0d after the held switch, want 1", c[7]))
+        ctr_line(62, c);
+        repeat (5) @(negedge aclk);
+        ctr_line(1, c);
+        `CHECK(c[7] == 0, "T7: back to HBM")
+    end
+    $display("ok   T7 DISCARD: on/off by counter-page reads, IDs answered, memory untouched, switch held mid-write");
 
     if (errors == 0) $display("TB PASS (tb_uwin_hbm)");
     else             $display("TB FAIL (tb_uwin_hbm): %0d errors", errors);
