@@ -294,6 +294,19 @@ measurement stops at the sender's fence (last beat handed to the stack),
 which is exact to 0.01% at this size but not a delivery-based number for
 small messages - see the ping-pong bench below when it exists.
 
+Idle between bursts instead of between descriptors (`--burst N` with
+`--gap`): N descriptors back to back walking N x size bytes, then the idle;
+each burst prints its own time and retransmissions. 16 MiB as 4096
+single-packet messages per burst, 200 ms apart (against rose, as in the
+`SERVER_*` line of the two-host runner notes):
+
+```bash
+SERVER_HOST=rose.dos.cit.tum.de SERVER_IP=131.159.102.21 SERVER_BDF=c1:00.0 SERVER_FPGA_IP=0a000003 BIT=/home/harshanavkis/coyote-bitstreams/loom-ctrl-sep29/hw/bitstreams/cyt_top.bit ./run_two_host.py --size 4096 --iters 40960 --burst 4096 --gap 200000 --retries 0 --tx-window 32
+```
+
+That gave 2.1-2.3 GB/s per burst with 0 retransmissions (2026-10-02): the
+engine's ~1.9 us per descriptor is the limit at 4 KiB, not the idle.
+
 ### The ping-pong benchmark (delivery-based)
 
 The push benchmark stops its clock at the sender's fence. This one stops

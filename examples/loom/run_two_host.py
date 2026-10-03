@@ -516,6 +516,8 @@ def bench_env(args, gap):
     env += f"LOOM_BENCH_ITERS={args.iters}"
     if gap:
         env += f" LOOM_BENCH_GAP_US={gap}"
+    if args.burst:
+        env += f" LOOM_BENCH_BURST={args.burst}"
     if args.offset:
         env += f" LOOM_BENCH_OFF={args.offset}"
     if args.frm:
@@ -684,6 +686,10 @@ def main():
     ap.add_argument("--gap", default="0",
                     help="microseconds between messages; comma-separated for "
                          "a sweep, e.g. --gap 0,10,20,40,80")
+    ap.add_argument("--burst", type=int, default=0, metavar="N",
+                    help="with --gap: idle only after every N-th descriptor, "
+                         "descriptors walking N x size bytes; prints each "
+                         "burst's time and retransmissions")
     ap.add_argument("--no-flash", action="store_true",
                     help="skip the per-point teardown/flash/setup. FOR "
                          "DEBUGGING THE SCRIPT ONLY - the measurements it "

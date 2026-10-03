@@ -188,6 +188,16 @@ int bench_gap_us() {
     const char *e = getenv("LOOM_BENCH_GAP_US");
     return e ? atoi(e) : 0;
 }
+// LOOM_BENCH_BURST=N: the idle comes after every N-th descriptor instead of
+// after each one, and descriptor k lands at off + (k % N) * len, so a burst
+// walks N * len bytes the way one large copy would. Each burst prints its
+// own time and retransmissions. With 4 KiB descriptors this is loom_switch's
+// slow-copy pattern (16 MiB of single-packet messages, then idle) on the
+// old engine.
+int bench_burst() {
+    const char *e = getenv("LOOM_BENCH_BURST");
+    return e ? atoi(e) : 0;
+}
 // Descriptors the bench leaves unretired at once. loom_ctrl's order FIFO
 // is 64 deep and DROPS a push when full (deliberate: aperture stores stay
 // posted toward the host), so a long --iters burst would lose descriptors
@@ -782,9 +792,17 @@ void run_bench(coyote::cThread &t_ctrl, loom::Xpu &A, int win,
         auto t0 = std::chrono::steady_clock::now();
         const int iters  = bench_iters(len);
         const int gap_us = bench_gap_us();
+        const int burst  = bench_burst();
         double idle_us = 0.0;   // deliberate pacing idle, excluded below
+        auto tb0 = t0;
+        long rtb0 = rt0;
         for (int k = 0; k < iters; k++) {
-            A.copy(win, uint32_t(off), src, len, fence);
+            if (burst && k % burst == 0) {
+                rtb0 = net_stat("Retrans cnt");
+                tb0 = std::chrono::steady_clock::now();
+            }
+            const uint64_t dst = off + (burst ? uint64_t(k % burst) * len : 0);
+            A.copy(win, uint32_t(dst), src, len, fence);
             if (k + 1 > BENCH_UNRETIRED)           // stay under the order FIFO
                 spin64_ge(fence, base + uint64_t(k + 1 - BENCH_UNRETIRED), 5e6);
             // Pace against the RECEIVER, which nothing else here does. The
@@ -797,8 +815,17 @@ void run_bench(coyote::cThread &t_ctrl, loom::Xpu &A, int win,
             // the same instantaneous rate, so a gap should make ITERS=N look
             // like N separate clean runs. It does NOT reduce the rate within
             // a message, so loss occurring inside one will survive it.
-            if (gap_us) {
+            if (gap_us && (!burst || (k + 1) % burst == 0)) {
                 spin64_ge(fence, base + uint64_t(k + 1), 5e6);
+                if (burst) {
+                    const double b_us = std::chrono::duration<double, std::micro>(
+                        std::chrono::steady_clock::now() - tb0).count();
+                    printf("  burst %d: %d x %lu B in %.1f us = %.3f GB/s, "
+                           "%ld retrans\n", k / burst, burst,
+                           (unsigned long) len, b_us,
+                           double(len) * burst / (b_us * 1e3),
+                           net_stat("Retrans cnt") - rtb0);
+                }
                 // Spin, do not usleep. The kernel timer bounds usleep's
                 // resolution, so usleep(5) and usleep(20) both idle for
                 // hundreds of microseconds - a 5, 10 and 20 us sweep came
