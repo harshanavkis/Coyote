@@ -29,8 +29,9 @@ constexpr uint64_t UWIN_SIZE = 1ULL << 27;    // the window (uwin_hbm UWIN_BITS)
 
 // uwin_hbm's counters (hw/hdl/common/uwin/uwin_hbm.sv), read before and after a copy
 struct Counters {
-    static constexpr int N = 12;
-    enum { CYC, AW, W, W_STALL, W_STARVE, AW_STALL, B, B_STALL, OUT_CYC, OUT_SUM, OUT_MAX, PARTIAL };
+    static constexpr int N = 16;
+    enum { CYC, AW, W, W_STALL, W_STARVE, AW_STALL, B, B_STALL, OUT_CYC, OUT_SUM, OUT_MAX, PARTIAL,
+           DISCARDED, NZ_ID, RSVD14, MODE };
     // words 16-22: uwin_mon's axi_main counts (xclk), where the writes enter the shell
     static constexpr int N_MAIN = 7;
     enum { M_CYC, M_AW, M_W, M_W_STALL, M_W_STARVE, M_AW_STALL, M_B };
@@ -50,6 +51,9 @@ struct Counters {
                d(CYC), d(W), d(W_STALL), d(W_STARVE), d(AW_STALL), d(AW), d(W) / aw, d(PARTIAL), d(B), d(B_STALL),
                d(OUT_CYC), d(OUT_CYC) ? double(d(OUT_SUM)) / d(OUT_CYC) : 0.0, d(OUT_SUM) / aw,
                (unsigned long) v[OUT_MAX]);
+        if (d(DISCARDED) || d(NZ_ID) || v[MODE])
+            printf("     V80 window: %lu bursts discarded, %lu with a nonzero AWID; mode now %s\n",
+                   d(DISCARDED), d(NZ_ID), v[MODE] ? "DISCARD" : "HBM");
         auto e = [&](int i) { return (unsigned long) (m[i] - b.m[i]); };
         printf("     axi_main (static -> shell, xclk) over %lu cycles: %lu W beats, %lu stalled (shell not ready), "
                "%lu starved (static side), %lu AW, AW stalled %lu, B %lu (snapshots every 256 cycles)\n",
@@ -96,6 +100,17 @@ struct Landing {
                 _mm_pause();
             }
         }
+        return true;
+    }
+
+    // uwin_hbm's DISCARD mode (diagnostic): writes into the window answered
+    // without reaching HBM. A counter-page read of line 63 asks for it, line
+    // 62 for HBM; it applies once no write is in flight (word 15 says)
+    bool set_discard(bool on) {
+        (void) win[(UWIN_SIZE - (on ? 64 : 128)) / 8];
+        const auto t0 = std::chrono::steady_clock::now();
+        while (win[(UWIN_SIZE - 4096) / 8 + Counters::MODE] != uint64_t(on))
+            if (std::chrono::steady_clock::now() - t0 > std::chrono::seconds(1)) return false;
         return true;
     }
 

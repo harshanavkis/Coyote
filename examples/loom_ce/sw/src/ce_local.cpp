@@ -260,6 +260,8 @@ int main(int argc, char **argv) {
         const uint64_t before = v80.getCSR(COPIES);
         loom_switch::IngressCounters c0 = loom_switch::IngressCounters::read(u280);
         const V80Counters k0 = V80Counters::read(v80);
+        land_v80::Counters u0{}, u1{};          // the V80 window: the U280's writes into it
+        if (land) u0 = land_v80::Counters::read(L->win);
         v80.setCSR(reinterpret_cast<uint64_t>(src), SRC_VA);
         v80.setCSR(reinterpret_cast<uint64_t>(uva), DST_VA);
         v80.setCSR(size, LEN);
@@ -281,6 +283,8 @@ int main(int argc, char **argv) {
         loom_switch::IngressCounters c1 = loom_switch::IngressCounters::read(u280);
         const V80Counters k1 = V80Counters::read(v80);
         if (land) {
+            u1 = land_v80::Counters::read(L->win);
+            u1.print(u0);
             L->pull();
             got = L->buf;
             gfence = L->buf + size / 8;

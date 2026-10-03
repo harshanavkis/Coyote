@@ -279,6 +279,104 @@ int run_server(uint16_t port, uint64_t size, bool land, uint64_t off, unsigned p
     return errors || !copies ? 1 : 0;
 }
 
+// --passive: the landing half for a plain RDMA sender (perf_rdma's bitstream
+// and ~/loom-experiments/perf_rdma_landing/landing_client): the QP exchange
+// and the exports as for --server, no hello and no announcements. The sender
+// writes export_ref(1) + offset; two barriers frame its runs. Afterwards every
+// byte is checked (the sender's buffer holds int i at word i, MSG bytes per
+// write, each write MSG further into the export) and the receive path's
+// counters are printed for the whole session. Each of the REPS runs is
+// timed here, from its first landed packet to its last (loom_rx's landed
+// count, size / 4 KiB packets per run): the sender's completions are not used.
+int run_passive(uint16_t port, uint64_t size, bool land, uint64_t msg, int reps, bool discard) {
+    coyote::cThread t_qp(0, getpid(), 0, nullptr, "coyote_fpga");     // QP owner
+    coyote::cThread t_data(0, getpid(), 0, nullptr, "coyote_fpga");   // owns the landing buffer
+    printf("passive: waiting for the QP exchange on port %u ...\n", port);
+    void *staging = t_qp.initRDMA(STAGING_SIZE, port);
+    if (!staging) { printf("FAIL: initRDMA\n"); return 1; }
+
+    uint64_t *dst;
+    coyote::cThread *v80 = nullptr;
+    land_v80::Landing *L = nullptr;
+    if (land) {
+        v80 = new coyote::cThread(0, getpid(), 0, nullptr, "coyote_versal_fpga");
+        L = new land_v80::Landing(*v80, size + 8192);
+        void *lva = loom_switch::reserve_va(size + 8192);
+        t_data.importDmabuf(L->export_fd(), lva);
+        dst = static_cast<uint64_t *>(lva);
+        L->clear();
+        printf("passive: V80 uwin imported at %p, landing at card VA %p\n", lva, (void *) L->buf);
+        if (discard) {
+            // --discard: the V80 window answers the writes without HBM; nothing to check
+            if (!L->set_discard(true)) { printf("FAIL: the V80 window did not switch to DISCARD (image without it?)\n"); return 1; }
+            printf("passive: V80 window in DISCARD mode: writes are counted and dropped, not landed\n");
+        }
+    } else {
+        dst = static_cast<uint64_t *>(t_data.getMem({coyote::CoyoteAllocType::HPF, size}));
+        memset(dst, 0, size);
+    }
+    loom_switch::program_export(t_qp, 1, t_data.getCtid(), dst, size);
+    const Counters k0 = Counters::read(t_qp);
+    const Shell s0 = Shell::read(t_qp);
+    land_v80::Counters u0{}, u1{};
+    if (land) u0 = land_v80::Counters::read(L->win);
+    const uint64_t fwd0 = loom_switch::csr_read(t_qp, loom_switch::RX_FWD);
+    const uint64_t drop0 = loom_switch::csr_read(t_qp, loom_switch::RX_DROP);
+    printf("passive: export 1 = %lu B at %p (ctid %d); waiting for the sender\n",
+           (unsigned long) size, (void *) dst, t_data.getCtid());
+    t_qp.connSync(false);                 // the sender may start
+    const uint64_t per_run = size / 4096;
+    uint64_t landed = fwd0;
+    std::chrono::steady_clock::time_point t_first, t_prev_end;
+    for (int r = 0; r < reps; r++) {
+        const auto t_wait = std::chrono::steady_clock::now();
+        uint64_t f;
+        while ((f = loom_switch::csr_read(t_qp, loom_switch::RX_FWD)) == landed)
+            if (std::chrono::steady_clock::now() - t_wait > std::chrono::seconds(10)) break;
+        if (f == landed) { printf("FAIL run %d: nothing landed in 10 s\n", r); break; }
+        const auto t0 = std::chrono::steady_clock::now();
+        if (r == 0) t_first = t0;
+        while ((f = loom_switch::csr_read(t_qp, loom_switch::RX_FWD)) < landed + per_run)
+            if (std::chrono::steady_clock::now() - t0 > std::chrono::seconds(10)) break;
+        const auto t1 = std::chrono::steady_clock::now();
+        const double us = std::chrono::duration<double, std::micro>(t1 - t0).count();
+        printf("%s run %d: %lu of %lu packets landed in %.1f us = %.2f GB/s at t=%.1f ms (idle before: %.1f ms)\n",
+               f >= landed + per_run ? "ok  " : "FAIL", r, (unsigned long) (f - landed), (unsigned long) per_run,
+               us, double(size) / (us * 1e3), std::chrono::duration<double, std::milli>(t0 - t_first).count(),
+               r ? std::chrono::duration<double, std::milli>(t0 - t_prev_end).count() : 0.0);
+        t_prev_end = t1;
+        landed += per_run;
+    }
+    t_qp.connSync(false);                 // the sender is done
+    const Counters k1 = Counters::read(t_qp);
+    const Shell s1 = Shell::read(t_qp);
+    if (land) u1 = land_v80::Counters::read(L->win);
+
+    uint64_t bad = 0;
+    if (land && discard) {
+        if (!L->set_discard(false)) printf("WARN: the V80 window did not switch back to HBM\n");
+    } else {
+        const uint32_t *w;
+        if (land) { L->pull(); w = reinterpret_cast<const uint32_t *>(L->buf); }
+        else      w = reinterpret_cast<const uint32_t *>(dst);
+        for (uint64_t i = 0; i < size / 4; i++) bad += (w[i] != uint32_t(i % (msg / 4)));
+    }
+    printf("passive: loom_rx landed %lu writes, dropped %lu packets; %lu of %lu words wrong\n",
+           (unsigned long) (loom_switch::csr_read(t_qp, loom_switch::RX_FWD) - fwd0),
+           (unsigned long) (loom_switch::csr_read(t_qp, loom_switch::RX_DROP) - drop0),
+           (unsigned long) bad, (unsigned long) (size / 4));
+    printf("     loom_rx over %lu cycles: %lu moving, %lu starved (nothing arrived), %lu stalled (host write not ready), rx FIFO full %lu\n",
+           (unsigned long) k1.d(k0, C_CYC), (unsigned long) k1.d(k0, C_RX_MOVE), (unsigned long) k1.d(k0, C_RX_STARVE),
+           (unsigned long) k1.d(k0, C_RX_STALL), (unsigned long) k1.d(k0, C_RX_FF));
+    s1.print(s0);
+    if (land) u1.print(u0);
+    loom_switch::release_export(t_qp, 1);
+    delete L;
+    delete v80;
+    printf(bad ? "PASSIVE FAIL\n" : "PASSIVE PASS\n");
+    return bad ? 1 : 0;
+}
+
 // --bidir: one process per host, both directions over one QP
 struct BiHello { uint32_t magic; uint32_t dst_ctid; uint64_t staging_va, dst_va, fence_va, size; };
 struct BiGo    { uint64_t rep, fence; uint32_t send, pad; };                 // my fence value, if I send
@@ -526,6 +624,8 @@ int main(int argc, char **argv) {
     uint64_t land_off = 0;
     unsigned poll_us = 0, gap_ms = 0;
     bool no_touch = false, no_refill = false;
+    bool passive = false, discard = false;
+    uint64_t msg = 1ULL << 20;
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         if (a == "--server")                     server = true;
@@ -543,14 +643,19 @@ int main(int argc, char **argv) {
         else if (a == "--bidir-server")           { bidir = true; server = true; }
         else if (a == "--bidir-client" && i + 1 < argc) { bidir = true; ip = argv[++i]; }
         else if (a == "--no-send")                no_send = true;
+        else if (a == "--passive")                { passive = true; server = true; }
+        else if (a == "--msg" && i + 1 < argc)    msg = strtoull(argv[++i], nullptr, 0);
+        else if (a == "--discard")                discard = true;
         else { server = false; ip.clear(); break; }
     }
     if (server == !ip.empty() || size == 0 || size % 4096 || size > (64ULL << 20) || land_off % 64 || land_off >= 4096) {
         printf("usage: %s --server [--port N] [--size BYTES] [--land-v80 [--land-offset B] [--poll-us U]] | --client <server_ip> [--port N] [--reps N] [--window P]\n"
+               "       | --passive [--port N] [--size BYTES] [--msg BYTES] [--reps N] [--land-v80 [--discard]]  (landing for a plain RDMA sender)\n"
                "       | --bidir-server | --bidir-client <server_ip>  [--port N] [--size BYTES] [--reps N] [--window P] [--no-send]\n"
                "       (size: a multiple of 4 KiB, at most 64 MiB)\n", argv[0]);
         return 2;
     }
+    if (passive) return run_passive(port, size, land, msg, reps, discard);
     if (bidir) return run_bidir(server ? std::string() : ip, port, size, reps, window, !no_send);
     return server ? run_server(port, size, land, land_off, poll_us, no_touch) : run_client(ip, port, reps, window, gap_ms, no_refill);
 }

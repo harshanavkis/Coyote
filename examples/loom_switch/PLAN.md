@@ -281,6 +281,27 @@ can be up to 128 MB (a 64 MiB push fits one binding).
      - rose: `cd /scratch/harshanavkis/loom-proj/Coyote/examples/loom_ce/sw/build && sudo /nix/store/4sjg21zq04394ci22lj67vgpw7ykw9bg-numactl-2.0.18/bin/numactl -N 1 -m 1 ./ce_remote --server --size 1048576 --land-v80 --port 18600`
      - clara: `cd /scratch/harshanavkis/loom-proj/Coyote/examples/loom_ce/sw/build && sudo /nix/store/4sjg21zq04394ci22lj67vgpw7ykw9bg-numactl-2.0.18/bin/numactl -N 1 -m 1 ./ce_remote --client 131.159.102.21 --reps 3 --port 18600`
 
+- **The U280 -> V80 hop at full network rate, from a plain RDMA sender
+  (clara receives, rose sends).** rose's U280 runs perf_rdma
+  (`~/coyote-bitstreams/perf_rdma`, 3894367a) as the sender, with a client
+  kept out of tree (nothing is committed in `09_perf_rdma`):
+  `~/loom-experiments/perf_rdma_landing/` (`landing_client`; build:
+  `cd /home/harshanavkis/loom-experiments/perf_rdma_landing/build && nix-shell /scratch/harshanavkis/loom-proj/Coyote/shell.nix --run "cmake .. && make -j16"`).
+  clara's U280 runs loom_switch, clara's V80 `loom_ce` with the window's
+  discard mode (`~/coyote-bitstreams/loom-ce-discard`, 34dea8cf). The
+  receiver programs export 1, times each run from its first landed packet
+  to its last, and checks every byte; the perf_rdma image reports no write
+  completions to its sender, so the client does not wait for any.
+  1. clara (start first; `--discard`: the V80 window answers the writes
+     without HBM, nothing is checked; without `--land-v80` they land in
+     host memory):
+     `cd /scratch/harshanavkis/loom-proj/Coyote/examples/loom_ce/sw/build && sudo /nix/store/4sjg21zq04394ci22lj67vgpw7ykw9bg-numactl-2.0.18/bin/numactl -N 1 -m 1 ./ce_remote --passive --land-v80 --size 16777216 --msg 1048576 --reps 8 --port 19590`
+  2. rose:
+     `cd /home/harshanavkis/loom-experiments/perf_rdma_landing/build && sudo /nix/store/4sjg21zq04394ci22lj67vgpw7ykw9bg-numactl-2.0.18/bin/numactl -N 1 -m 1 ./landing_client 131.159.102.22 --size 16777216 --msg 1048576 --reps 8 --gap-ms 200 --port 19590`
+  2026-10-03: 8.83-8.86 GB/s into HBM, 8.85-8.88 discarded (host memory
+  11.2-11.8), byte-exact. `ce_local --land-v80` prints the V80 window's
+  counters per copy (the burst sizes of the U280's writes into the V80).
+
 ## Found on the way: `RX_CHUNK` is not wired in `examples/loom`
 
 `examples/loom/hw/src/vfpga_top.svh` connects neither `loom_ctrl`'s
