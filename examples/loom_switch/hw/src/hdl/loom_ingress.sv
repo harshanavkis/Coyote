@@ -26,6 +26,13 @@ import lynxTypes::*;
  *          {lane0 = op WRITE_INLINE, len 8; lane1 = base+off (the remote
  *          reference of the word); lane2 = data}, which loom_rx lands as
  *          the exact 8 B write
+ *   store, get window (rdma route with get set): the same message with op
+ *          GET_REQ: lane1 = base+off is the far reference to read from, lane2
+ *          the stored word {len/64 [63:48], return reference [47:0]}. The far
+ *          loom_rx/loom_rd read len bytes there and write them back to the
+ *          return reference (an export of THIS host), then the word itself
+ *          to return reference + len. A full beat on a get window is
+ *          dropped and counted (cnt_get_drop).
  *
  * PACKETS. Full beats (all 64 strobes) that continue the same binding at the
  * next offset are gathered into one packet, up to PMTU (64 beats) on either
@@ -93,6 +100,7 @@ module loom_ingress #(
     output logic [UWIN_BITS-1:0]        ua_addr,
     input  logic                        ua_hit,
     input  logic                        ua_route,
+    input  logic                        ua_get,
     input  logic [PID_BITS-1:0]         ua_pid,
     input  logic [PID_BITS-1:0]         ua_dst_pid,
     input  logic [VADDR_BITS-1:0]       ua_base,
@@ -136,10 +144,13 @@ module loom_ingress #(
     output logic                        cnt_rdma_full,  // a full (PMTU) rdma packet queued
     output logic                        cnt_rdma_flush, // a partial rdma packet closed by the idle timer
     output logic                        cnt_rdma_cut,   // a partial rdma packet closed by a non-continuing write
+    output logic                        cnt_get,        // a get request sent
+    output logic                        cnt_get_drop,   // a full beat on a get window, dropped
     output logic [N_DBG-1:0]            cnt_dbg         // debug pulses, listed at N_DBG
 );
 
 localparam [7:0] MSG_OP_WRITE_INLINE = 8'd2;   // keep in sync with loom_rx.sv
+localparam [7:0] MSG_OP_GET_REQ      = 8'd3;
 localparam [7:0] INLINE_EXP          = 8'hFF;  // RETH export index of an inline message
 localparam integer PKT_BEATS  = PMTU_BYTES / 64;
 localparam integer BEAT_W     = $clog2(PKT_BEATS + 1);
@@ -157,7 +168,7 @@ logic [UWIN_BITS:0]     s1_aend, s2_aend; // end of the burst's lines
 logic [7:0]             s1_len, s2_len, s3_len;
 logic [AXI_ID_BITS-1:0] s1_id, s2_id, s3_id;
 logic                   s1_mis, s2_mis, s3_mis;
-logic                   s3_hit, s3_ok, s3_route;
+logic                   s3_hit, s3_ok, s3_route, s3_get;
 logic [3:0]             s3_idx;
 logic [PID_BITS-1:0]    s3_pid, s3_dst_pid;
 logic [VADDR_BITS-1:0]  s3_base;
@@ -207,6 +218,7 @@ always_ff @(posedge aclk) begin
         s3_ok      <= ua_hit && ((LEN_BITS+1)'(s2_aend) <= ua_end);
         s3_idx     <= ua_idx;
         s3_route   <= ua_route;
+        s3_get     <= ua_get;
         s3_pid     <= ua_pid;
         s3_dst_pid <= ua_dst_pid;
         s3_base    <= ua_base;
@@ -223,7 +235,7 @@ end
 logic                  b_act;             // a burst is loaded
 logic                  b_ok;              // its beats are taken, not discarded
 logic [3:0]            b_idx;
-logic                  b_route;
+logic                  b_route, b_get;
 logic [PID_BITS-1:0]   b_pid, b_dst_pid;
 logic [VADDR_BITS-1:0] b_base;
 logic [LEN_BITS-1:0]   b_off;             // binding offset of the next beat
@@ -270,8 +282,9 @@ wire part_take  = part && !pk_open && (!part_store || !pq_full) && part_last;
 
 wire full_ok    = df_ready && !pq_full;
 
+// A full beat on a get window is taken and dropped
 assign axi_udata.wready = b_act && b_room &&
-                          (!b_ok || (w_full ? full_ok : part_take));
+                          (!b_ok || (w_full ? (b_get || full_ok) : part_take));
 wire w_hs    = axi_udata.wvalid && axi_udata.wready;
 wire w_end   = w_hs && axi_udata.wlast;
 
@@ -287,6 +300,7 @@ always_ff @(posedge aclk) begin
             b_ok      <= s3_ok;
             b_idx     <= s3_idx;
             b_route   <= s3_route;
+            b_get     <= s3_get;
             b_pid     <= s3_pid;
             b_dst_pid <= s3_dst_pid;
             b_base    <= s3_base;
@@ -308,6 +322,7 @@ end
 assign cnt_burst      = aw_take && s3_ok;
 assign cnt_drop       = aw_take && !s3_ok;
 assign cnt_store_drop = w_hs && b_ok && !w_full && (wd_bad != 8'd0);
+assign cnt_get_drop   = w_hs && b_ok && w_full && b_get;
 
 always_ff @(posedge aclk) begin
     if (!aresetn) bq_valid <= 1'b0;
@@ -331,7 +346,7 @@ logic [LEN_BITS-1:0]   pk_next;           // binding offset the next beat must h
 logic [BEAT_W-1:0]     pk_beats;
 logic [$clog2(FLUSH_CYCLES+1)-1:0] idle;
 
-wire good_beat = w_hs && b_ok && w_full;
+wire good_beat = w_hs && b_ok && w_full && !b_get;
 wire cont      = pk_open && (pk_idx == b_idx) && (pk_next == b_off);
 wire [BEAT_W-1:0] cap_cur = BEAT_W'(PKT_BEATS);
 // The idle timer closes a partial packet only when it can leave at once:
@@ -348,6 +363,7 @@ wire flush     = pk_open && !w_in && send_idle && (idle >= FLUSH_CYCLES - 1);
 // Queue entries: a packet (its beats are in the data FIFO) or a store
 typedef struct packed {
     logic                  store;
+    logic                  get;               // a store on a get window
     logic                  route;
     logic [PID_BITS-1:0]   pid;
     logic [PID_BITS-1:0]   dst_pid;
@@ -364,7 +380,7 @@ pkt_t pq_in;
 
 always_comb begin
     pq_push = 1'b0;
-    pq_in   = '{store: 1'b0, route: pk_route, pid: pk_pid, dst_pid: pk_dst_pid,
+    pq_in   = '{store: 1'b0, get: 1'b0, route: pk_route, pid: pk_pid, dst_pid: pk_dst_pid,
                 va: pk_va, beats: pk_beats, data: 64'd0};
     if (good_beat) begin
         if (pk_open && !cont) begin
@@ -377,7 +393,7 @@ always_comb begin
         pq_push = !pq_full;
     end else if (part_store) begin
         pq_push = !pq_full;
-        pq_in   = '{store: 1'b1, route: b_route, pid: b_pid, dst_pid: b_dst_pid,
+        pq_in   = '{store: 1'b1, get: b_get, route: b_route, pid: b_pid, dst_pid: b_dst_pid,
                     va: b_base + VADDR_BITS'(b_off) + VADDR_BITS'({st_lane, 3'b0}),
                     beats: '0, data: axi_udata.wdata[64*st_lane +: 64]};
     end else if (flush) begin
@@ -539,8 +555,9 @@ assign cnt_win_wait = (ostate == O_REQ) && o.route && !win_ok;
 assign cnt_req_wait = wr_valid && !wr_ready && o.route;
 
 // Inline message (a store on the rdma route): lane 0 {zero, len 8, op};
-// lane 1 the word's remote reference; lane 2 its data
-wire [63:0] hdr_q0 = {28'd0, 28'd8, MSG_OP_WRITE_INLINE};
+// lane 1 the word's remote reference; lane 2 its data. A get: op GET_REQ,
+// lane 1 the reference to read, lane 2 the request word
+wire [63:0] hdr_q0 = {28'd0, 28'd8, o.get ? MSG_OP_GET_REQ : MSG_OP_WRITE_INLINE};
 wire [63:0] hdr_q1 = {{(64-VADDR_BITS){1'b0}}, o.va};
 wire [63:0] hdr_q2 = o.data;
 
@@ -560,8 +577,9 @@ end
 
 assign cnt_pkt_local = o_beat && o_last && !o.route;
 assign cnt_pkt_rdma  = o_beat && o_last &&  o.route;
-assign cnt_store     = ((ostate == O_HDR) && o.store && m_net_tready) ||
+assign cnt_store     = ((ostate == O_HDR) && o.store && !o.get && m_net_tready) ||
                        ((ostate == O_STORE) && m_host_tready);
+assign cnt_get       = (ostate == O_HDR) && o.get && m_net_tready;
 
 // ---------------------------------------------------------------------------
 // Debug pulses (bit meanings at N_DBG)

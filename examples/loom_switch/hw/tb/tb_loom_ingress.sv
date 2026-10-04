@@ -46,7 +46,7 @@ logic [LEN_BITS-1:0]   tbl_len = 0;
 logic [UWIN_BITS-1:0]  tbl_ustart = 0;
 
 logic [UWIN_BITS-1:0]  ua_addr;
-logic                  ua_hit, ua_route;
+logic                  ua_hit, ua_route, ua_get;
 logic [3:0]            ua_idx;
 logic [PID_BITS-1:0]   ua_pid, ua_dst_pid;
 logic [VADDR_BITS-1:0] ua_base;
@@ -71,12 +71,12 @@ logic [N_DBG-1:0] cnt_dbg;
 loom_table #(.UWIN_BITS(UWIN_BITS)) inst_table (
     .aclk(aclk), .aresetn(aresetn),
     .commit(tbl_commit), .prog_idx(tbl_idx), .prog_valid(tbl_valid),
-    .prog_route(tbl_route), .prog_pid(tbl_pid), .prog_dst_pid(tbl_dst_pid),
+    .prog_route(tbl_route), .prog_get(1'b0), .prog_pid(tbl_pid), .prog_dst_pid(tbl_dst_pid),
     .prog_base(tbl_base), .prog_len(tbl_len), .prog_ustart(tbl_ustart),
     .lu_idx(4'd0), .lu_valid(), .lu_route(), .lu_pid(), .lu_dst_pid(),
     .lu_base(), .lu_len(),
     .ua_ce1(ua_ce1), .ua_ce2(ua_ce2),
-    .ua_addr(ua_addr), .ua_hit(ua_hit), .ua_idx(ua_idx), .ua_route(ua_route),
+    .ua_addr(ua_addr), .ua_hit(ua_hit), .ua_idx(ua_idx), .ua_route(ua_route), .ua_get(ua_get),
     .ua_pid(ua_pid), .ua_dst_pid(ua_dst_pid), .ua_base(ua_base),
     .ua_ustart(ua_ustart), .ua_end(ua_end)
 );
@@ -84,7 +84,7 @@ loom_table #(.UWIN_BITS(UWIN_BITS)) inst_table (
 loom_ingress #(.UWIN_BITS(UWIN_BITS), .FLUSH_CYCLES(FLUSH)) dut (
     .aclk(aclk), .aresetn(aresetn), .axi_udata(axi),
     .ua_ce1(ua_ce1), .ua_ce2(ua_ce2),
-    .ua_addr(ua_addr), .ua_hit(ua_hit), .ua_route(ua_route), .ua_pid(ua_pid),
+    .ua_addr(ua_addr), .ua_hit(ua_hit), .ua_route(ua_route), .ua_get(ua_get), .ua_pid(ua_pid),
     .ua_dst_pid(ua_dst_pid), .ua_base(ua_base), .ua_ustart(ua_ustart),
     .ua_end(ua_end), .ua_idx(ua_idx),
     .wr_req(wr_req), .wr_valid(wr_valid), .wr_ready(wr_ready),

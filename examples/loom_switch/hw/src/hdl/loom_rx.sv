@@ -13,6 +13,14 @@ import lynxTypes::*;
  *   inline store: index INLINE_EXP, one 64 B beat {lane0 op WRITE_INLINE,
  *                 len 8; lane1 the word's reference; lane2 data} - land the
  *                 exact 8 B
+ *   get request:  the same beat with op GET_REQ {lane1 the reference to read
+ *                 here; lane2 the request word {len/64 [63:48], the
+ *                 requester's return reference [47:0]}} - a job for loom_rd
+ *                 (m_job), which reads and writes back. A request with no
+ *                 export, out of bounds, len 0 or not 64 B-aligned (source or
+ *                 return) is still a job, marked err: loom_rd answers it with
+ *                 the error completion only. The beat waits while the job
+ *                 queue is full.
  *
  * The stack announces every packet on rq_wr (its RETH address and payload
  * length) before the packet's beats arrive (axis_mux_user_rq passes a
@@ -77,6 +85,17 @@ module loom_rx #(
     input  logic                        s_tlast,
     /* verilator lint_on UNUSED */
 
+    // Get jobs (to loom_rd): read len bytes at va under pid, write them back
+    // to ret, then cval to ret + len; err = answer with the error completion
+    output logic                        m_job_valid,
+    input  logic                        m_job_ready,
+    output logic [PID_BITS-1:0]         m_job_pid,
+    output logic [VADDR_BITS-1:0]       m_job_va,
+    output logic [22:0]                 m_job_len,
+    output logic [47:0]                 m_job_ret,
+    output logic [63:0]                 m_job_cval,
+    output logic                        m_job_err,
+
     // Payload out (axis_host_send[1])
     output logic [AXI_DATA_BITS-1:0]    m_tdata,
     output logic [AXI_DATA_BITS/8-1:0]  m_tkeep,
@@ -104,6 +123,7 @@ module loom_rx #(
 );
 
 localparam [7:0] MSG_OP_WRITE_INLINE = 8'd2;   // keep in sync with loom_ingress.sv
+localparam [7:0] MSG_OP_GET_REQ      = 8'd3;
 localparam [7:0] INLINE_EXP          = 8'hFF;
 
 localparam integer PLEN_W = 15;             // a packet's payload length (<= PMTU)
@@ -222,6 +242,22 @@ wire i_ok = (s_tdata[63:36] == '0) && (i_op == MSG_OP_WRITE_INLINE) && (i_len ==
 wire i_here = (dstate == D_INL_HDR) && s_tvalid;
 wire i_post = i_here && i_ok;
 
+// A get request: lane1 = i_ref, the source here; lane2 the request word
+wire        g_is   = (s_tdata[63:36] == '0) && (i_op == MSG_OP_GET_REQ) && (i_len == 28'd8);
+wire [63:0] g_word = s_tdata[128 +: 64];
+wire [22:0] g_len  = {g_word[63:48], 6'b0};
+wire [40:0] g_end  = {1'b0, i_ref[39:0]} + 41'(g_len);
+wire g_ok   = xb_hit && (g_word[63:48] != 16'd0) && (i_ref[5:0] == 6'b0) &&
+              (g_word[5:0] == 6'b0) && (g_end <= {1'b0, xb_len});
+
+assign m_job_valid = i_here && g_is;
+assign m_job_pid   = xb_pid;
+assign m_job_va    = xb_base + VADDR_BITS'(i_ref[39:0]);
+assign m_job_len   = g_len;
+assign m_job_ret   = g_word[47:0];
+assign m_job_cval  = g_word;
+assign m_job_err   = !g_ok;
+
 // The write: the generator's, or (while it waits) an inline store's
 assign wr_valid = l_post || i_post;
 always_comb begin
@@ -288,11 +324,13 @@ always_ff @(posedge aclk) begin
                 d_left <= d_left - 1'b1;
                 if (d_left == BTS_W'(1)) dstate <= D_IDLE;
             end
-            // an inline store: post its 8 B write (or drop it), then the beat
+            // an inline store: post its 8 B write (or drop it), then the
+            // beat; a get request: hand it to loom_rd
             D_INL_HDR: if (i_here) begin
                 d_inline <= s_tdata[128 +: 64];
-                if (!i_ok)          begin dstate <= D_IDLE; g_block <= 1'b0; end
-                else if (wr_ready)  dstate <= D_INL_DATA;
+                if (g_is)          begin if (m_job_ready) begin dstate <= D_IDLE; g_block <= 1'b0; end end
+                else if (!i_ok)    begin dstate <= D_IDLE; g_block <= 1'b0; end
+                else if (wr_ready) dstate <= D_INL_DATA;
             end
             D_INL_DATA: if (m_tready) begin
                 dstate  <= D_IDLE;
@@ -309,7 +347,7 @@ wire nothing = (dstate == D_IDLE) && oq_empty && !l_valid && (e_cnt == '0);
 always_comb begin
     s_tready = ((dstate == D_WRITE) && m_tready) ||
                (dstate == D_DROP) ||
-               ((dstate == D_INL_HDR) && (!i_ok || wr_ready)) ||
+               ((dstate == D_INL_HDR) && (g_is ? m_job_ready : (!i_ok || wr_ready))) ||
                nothing;
 
     if (dstate == D_INL_DATA) begin
@@ -330,7 +368,7 @@ assign busy = !nothing;
 
 wire w_end = (dstate == D_WRITE) && s_tvalid && m_tready && (d_left == BTS_W'(1));
 assign cnt_rx_fwd       = w_end || ((dstate == D_INL_DATA) && m_tready);
-assign cnt_rx_drop      = (l_pass && (l_kind == K_DROP)) || (i_here && !i_ok);
+assign cnt_rx_drop      = (l_pass && (l_kind == K_DROP)) || (i_here && !i_ok && !g_is);
 assign cnt_rx_orphan    = nothing && s_tvalid;
 assign cnt_rx_move      = (dstate == D_WRITE) &&  s_tvalid &&  m_tready;
 assign cnt_rx_starve    = (dstate == D_WRITE) && !s_tvalid;

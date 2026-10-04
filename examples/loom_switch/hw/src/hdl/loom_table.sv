@@ -13,6 +13,8 @@ import lynxTypes::*;
  *   route = 1 (rdma):  a Loom message on the QP owned by pid; dst_pid = the
  *                      exporter's ctid on the far host, carried in the
  *                      message header
+ *   get = 1 (with route 1): each 8 B store is a get request from the far
+ *                      export reference base + offset (loom_ingress)
  * base is always the exporter's own VA; len is the segment bounds.
  * Programmed only through the CSR page (loom_ctrl). Overlapping uwin ranges
  * are the daemon's to avoid; the lowest index wins.
@@ -34,6 +36,7 @@ module loom_table #(
     input  logic [3:0]              prog_idx,
     input  logic                    prog_valid,
     input  logic                    prog_route,
+    input  logic                    prog_get,
     input  logic [PID_BITS-1:0]     prog_pid,
     input  logic [PID_BITS-1:0]     prog_dst_pid,
     input  logic [VADDR_BITS-1:0]   prog_base,
@@ -57,6 +60,7 @@ module loom_table #(
     output logic                    ua_hit,
     output logic [3:0]              ua_idx,
     output logic                    ua_route,
+    output logic                    ua_get,
     output logic [PID_BITS-1:0]     ua_pid,
     output logic [PID_BITS-1:0]     ua_dst_pid,
     output logic [VADDR_BITS-1:0]   ua_base,
@@ -69,6 +73,7 @@ localparam integer END_BITS = LEN_BITS + 1;
 
 logic                  e_valid [N_WIN];
 logic                  e_route [N_WIN];
+logic                  e_get   [N_WIN];
 logic [PID_BITS-1:0]   e_pid   [N_WIN];
 logic [PID_BITS-1:0]   e_dpid  [N_WIN];
 logic [VADDR_BITS-1:0] e_base  [N_WIN];
@@ -82,6 +87,7 @@ always_ff @(posedge aclk) begin
     end else if (commit) begin
         e_valid[prog_idx]  <= prog_valid;
         e_route[prog_idx]  <= prog_route;
+        e_get[prog_idx]    <= prog_route && prog_get;
         e_pid[prog_idx]    <= prog_pid;
         e_dpid[prog_idx]   <= prog_dst_pid;
         e_base[prog_idx]   <= prog_base;
@@ -116,6 +122,7 @@ always_ff @(posedge aclk) if (ua_ce2) begin
     ua_hit     <= |s1_hit;
     ua_idx     <= s1_idx;
     ua_route   <= e_route[s1_idx];
+    ua_get     <= e_get[s1_idx];
     ua_pid     <= e_pid[s1_idx];
     ua_dst_pid <= e_dpid[s1_idx];
     ua_base    <= e_base[s1_idx];

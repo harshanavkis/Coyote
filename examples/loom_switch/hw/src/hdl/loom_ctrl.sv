@@ -11,7 +11,9 @@ import lynxTypes::*;
  *
  * CSR map (64-bit word indices; byte offset = idx * 8):
  *    0 TBL_IDX      (RW) window index to program (1..15)
- *    1 TBL_CFG      (RW) bit0 = valid, bit1 = route (0 local, 1 rdma)
+ *    1 TBL_CFG      (RW) bit0 = valid, bit1 = route (0 local, 1 rdma),
+ *                        bit2 = get (with route 1: a get window, each 8 B
+ *                        store a get request; base = the far reference read)
  *    2 TBL_PID      (RW) [5:0] local: destination pid; rdma: QP-owner pid.
  *                        [13:8] unused
  *    3 TBL_BASE     (RW) local: destination VA base; rdma: the REMOTE
@@ -55,6 +57,8 @@ import lynxTypes::*;
  *          the window table: 176 EXP_IDX, 177 EXP_CFG (bit0 valid), 178
  *          EXP_PID (landing pid), 179 EXP_BASE (landing VA), 180 EXP_LEN
  *          (bytes), 181 EXP_COMMIT (write 1)
+ *   184 RD_CTL (RW) [5:0] the QP owner pid the get responses (loom_rd) go
+ *          out on; reset 0. Its own 64 B line, as TX_CTL.
  *   112-130 (RO) cnt_x[i] at word 112+i, its longest run of consecutive
  *          cycles at 144+i (since the bitstream was loaded):
  *     loom_rx:  112 bulk packets landed (writes posted), 113 stores landed,
@@ -80,12 +84,17 @@ import lynxTypes::*;
  *               none done), 132 cycles it waited on the DMA request port,
  *               133 cycles waiting for the TLB mutex, 134 cycles in a miss,
  *               invalidation or locked state, 135 host DMA completions
+ *     gets:     136 get requests sent (ingress), 137 full beats dropped on
+ *               a get window; responder (loom_rd): 138 jobs taken, 139
+ *               error completions, 140 response packets, 141 completions,
+ *               142 cycles a response request waited on the window or
+ *               sq_wr, 143 cycles a response packet waited for its read data
  * Counters are free-running and never cleared (software takes deltas). The
  * ingress pulses are registered once before they count.
  */
 module loom_ctrl #(
     parameter integer N_DBG = 14,
-    parameter integer N_X   = 24
+    parameter integer N_X   = 32
 ) (
     input  logic                        aclk,
     input  logic                        aresetn,
@@ -97,6 +106,7 @@ module loom_ctrl #(
     output logic [3:0]                  tbl_idx,
     output logic                        tbl_valid,
     output logic                        tbl_route,
+    output logic                        tbl_get,
     output logic [PID_BITS-1:0]         tbl_pid,
     output logic [PID_BITS-1:0]         tbl_dst_pid,
     output logic [VADDR_BITS-1:0]       tbl_base,
@@ -114,6 +124,7 @@ module loom_ctrl #(
     output logic [39:0]                 exp_len,
     output logic [7:0]                  tx_window,
     output logic [3:0]                  rx_chunk,
+    output logic [PID_BITS-1:0]         rd_qp_pid,
 
     // Ack window state and waits
     input  logic [15:0]                 tx_inflight,
@@ -209,6 +220,7 @@ localparam integer R_EXP_PID       = 178;
 localparam integer R_EXP_BASE      = 179;
 localparam integer R_EXP_LEN       = 180;
 localparam integer R_EXP_COMMIT    = 181;
+localparam integer R_RD_CTL        = 184;
 localparam integer R_XMAX_BASE     = 144;
 
 // -------------------------------------------------------------------------
@@ -234,7 +246,7 @@ wire csr_rd  = (axi_araddr[15:12] == 4'd0);
 // take full-strobe writes only.
 // -------------------------------------------------------------------------
 logic [63:0] r_tbl_idx, r_tbl_cfg, r_tbl_pid, r_tbl_base, r_tbl_len, r_tbl_ustart;
-logic [63:0] r_rdma_staging, r_tx_ctl, r_rx_chunk;
+logic [63:0] r_rdma_staging, r_tx_ctl, r_rx_chunk, r_rd_ctl;
 logic [63:0] r_exp_idx, r_exp_cfg, r_exp_pid, r_exp_base, r_exp_len;
 
 wire commit_pulse = csr_wr && (wr_idx == R_TBL_COMMIT) && axi_ctrl.wstrb[0] && axi_ctrl.wdata[0];
@@ -247,6 +259,7 @@ always_ff @(posedge aclk) begin
         r_exp_idx <= 0; r_exp_cfg <= 0; r_exp_pid <= 0; r_exp_base <= 0; r_exp_len <= 0;
         r_tx_ctl   <= 64'd16;
         r_rx_chunk <= 64'd1;
+        r_rd_ctl   <= 64'd0;
     end else if (csr_wr && (&axi_ctrl.wstrb)) begin
         case (wr_idx)
             R_TBL_IDX:      r_tbl_idx      <= axi_ctrl.wdata;
@@ -258,6 +271,7 @@ always_ff @(posedge aclk) begin
             R_RDMA_STAGING: r_rdma_staging <= axi_ctrl.wdata;
             R_TX_CTL:       r_tx_ctl       <= axi_ctrl.wdata;
             R_RX_CHUNK:     r_rx_chunk     <= axi_ctrl.wdata;
+            R_RD_CTL:       r_rd_ctl       <= axi_ctrl.wdata;
             R_EXP_IDX:      r_exp_idx      <= axi_ctrl.wdata;
             R_EXP_CFG:      r_exp_cfg      <= axi_ctrl.wdata;
             R_EXP_PID:      r_exp_pid      <= axi_ctrl.wdata;
@@ -272,6 +286,8 @@ assign tbl_commit      = commit_pulse;
 assign tbl_idx         = r_tbl_idx[3:0];
 assign tbl_valid       = r_tbl_cfg[0];
 assign tbl_route       = r_tbl_cfg[1];
+assign tbl_get         = r_tbl_cfg[2];
+assign rd_qp_pid       = r_rd_ctl[PID_BITS-1:0];
 assign tbl_pid         = r_tbl_pid[PID_BITS-1:0];
 assign tbl_dst_pid     = r_tbl_pid[8 +: PID_BITS];
 assign tbl_base        = r_tbl_base[VADDR_BITS-1:0];
@@ -430,6 +446,7 @@ always_ff @(posedge aclk) begin
             R_EXP_PID:          axi_rdata <= r_exp_pid;
             R_EXP_BASE:         axi_rdata <= r_exp_base;
             R_EXP_LEN:          axi_rdata <= r_exp_len;
+            R_RD_CTL:           axi_rdata <= r_rd_ctl;
             default:
                 if (rd_idx >= R_ING_BASE && rd_idx < R_ING_BASE + N_ING)
                     axi_rdata <= ing[rd_idx - R_ING_BASE];
