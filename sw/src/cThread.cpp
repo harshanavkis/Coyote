@@ -424,7 +424,17 @@ void cThread::uwinWrite(uint64_t offset, const void *src, uint64_t len) {
     if (!uwin || offset + len > uwin_len) {
         throw std::runtime_error("ERROR: uwinWrite outside the mapped user data window (call mapUwin first)");
     }
-    memcpy(static_cast<char *>(uwin) + offset, src, len);
+    // Whole, aligned words: one 8 B store each, exactly once. memcpy may store
+    // a byte more than once (glibc copies 8..15 B as two overlapping 8 B
+    // stores, the same address twice at 8 B), and a get window takes every
+    // store as a request.
+    if (offset % 8 == 0 && len % 8 == 0 && reinterpret_cast<uintptr_t>(src) % 8 == 0) {
+        volatile uint64_t *d = reinterpret_cast<volatile uint64_t *>(static_cast<char *>(uwin) + offset);
+        const uint64_t *s = static_cast<const uint64_t *>(src);
+        for (uint64_t i = 0; i < len / 8; i++) d[i] = s[i];
+    } else {
+        memcpy(static_cast<char *>(uwin) + offset, src, len);
+    }
     _mm_sfence();
 }
 
