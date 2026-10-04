@@ -21,6 +21,12 @@ import lynxTypes::*;
  *                 return) is still a job, marked err: loom_rd answers it with
  *                 the error completion only. The beat waits while the job
  *                 queue is full.
+ *   read answer:  a packet whose index is RRET_EXP answers one of THIS
+ *                 switch's reads (loom_read): its RETH is {RRET_EXP, slot *
+ *                 8 KiB + offset}, and its lines go to the slot's buffer
+ *                 (m_land) instead of host memory; an inline store to
+ *                 RRET_EXP is the read's completion (m_cmp: the slot, and
+ *                 whether the word is all ones, the far side's rejection).
  *
  * The stack announces every packet on rq_wr (its RETH address and payload
  * length) before the packet's beats arrive (axis_mux_user_rq passes a
@@ -49,7 +55,8 @@ import lynxTypes::*;
  */
 module loom_rx #(
     parameter integer RX_WR_OUTSTANDING = 8,
-    parameter integer RQ_DEPTH          = 8192
+    parameter integer RQ_DEPTH          = 8192,
+    parameter integer N_SLOTS           = 64        // loom_read's read slots
 ) (
     input  logic                        aclk,
     input  logic                        aresetn,
@@ -96,6 +103,14 @@ module loom_rx #(
     output logic [63:0]                 m_job_cval,
     output logic                        m_job_err,
 
+    // Read answers (to loom_read): lines into the slot buffer, completions
+    output logic                        m_land_valid,
+    output logic [$clog2(N_SLOTS)+5:0]  m_land_line,
+    output logic [AXI_DATA_BITS-1:0]    m_land_data,
+    output logic                        m_cmp_valid,
+    output logic [$clog2(N_SLOTS)-1:0]  m_cmp_slot,
+    output logic                        m_cmp_err,
+
     // Payload out (axis_host_send[1])
     output logic [AXI_DATA_BITS-1:0]    m_tdata,
     output logic [AXI_DATA_BITS/8-1:0]  m_tkeep,
@@ -125,12 +140,15 @@ module loom_rx #(
 localparam [7:0] MSG_OP_WRITE_INLINE = 8'd2;   // keep in sync with loom_ingress.sv
 localparam [7:0] MSG_OP_GET_REQ      = 8'd3;
 localparam [7:0] INLINE_EXP          = 8'hFF;
+localparam [7:0] RRET_EXP            = 8'hFE;  // keep in sync with loom_read.sv
+localparam integer SLOT_W = $clog2(N_SLOTS);
+localparam integer LINE_W = SLOT_W + 6;
 
 localparam integer PLEN_W = 15;             // a packet's payload length (<= PMTU)
 localparam integer BTS_W  = 8;              // a packet's beats
 localparam integer OQ_W   = $clog2(RX_WR_OUTSTANDING + 1);
 
-typedef enum logic [1:0] { K_WRITE, K_DROP, K_INLINE } kind_t;
+typedef enum logic [1:0] { K_WRITE, K_DROP, K_INLINE, K_RRET } kind_t;
 
 function automatic logic [BTS_W-1:0] beats_of(input logic [PLEN_W-1:0] len);
     logic [PLEN_W:0] padded;
@@ -195,10 +213,11 @@ kind_t                 l_kind;
 logic [PID_BITS-1:0]   l_pid;
 logic [VADDR_BITS-1:0] l_va;
 logic [PLEN_W-1:0]     l_len;
+logic [LINE_W-1:0]     l_line;       // a read answer's first line in the slot buffer
 logic                  g_block;      // an inline store is between L and its landing
 
-// Posted-ahead packets, for the data side: {kind, beats}
-logic [BTS_W+1:0]      oq_mem [RX_WR_OUTSTANDING];
+// Posted-ahead packets, for the data side: {line, kind, beats}
+logic [LINE_W+BTS_W+1:0] oq_mem [RX_WR_OUTSTANDING];
 logic [OQ_W-1:0]       oq_cnt;
 logic [$clog2(RX_WR_OUTSTANDING)-1:0] oq_wp, oq_rp;
 wire                   oq_empty = (oq_cnt == '0);
@@ -210,6 +229,11 @@ assign xa_idx = e_addr[47:40];
 wire [40:0]  e_end   = {1'b0, e_off} + 41'(e_len);
 wire e_inline = (xa_idx == INLINE_EXP) && (e_len == PLEN_W'(64));
 wire e_ok     = xa_hit && (e_len != '0) && (e_len[5:0] == 6'b0) && (e_end <= {1'b0, xa_len});
+// A read answer: whole lines inside the first 4 KiB of a slot's 8 KiB
+wire e_rret   = (xa_idx == RRET_EXP);
+wire [15:0] e_rend = {4'd0, e_off[11:0]} + 16'(e_len);
+wire e_rret_ok = (e_len != '0) && (e_len[5:0] == 6'b0) && (e_off[5:0] == 6'b0) && !e_off[12] &&
+                 (e_off[39:13+SLOT_W] == '0) && (e_rend <= 16'd4096);
 
 // L posts (a write) or passes (a drop, an inline) when the oq has room
 wire l_post  = l_valid && (l_kind == K_WRITE) && !oq_full;
@@ -222,14 +246,16 @@ assign e_pop = l_load;
 // ---------------------------------------------------------------------------
 // Data side
 // ---------------------------------------------------------------------------
-typedef enum logic [2:0] { D_IDLE, D_WRITE, D_DROP, D_INL_HDR, D_INL_DATA } dstate_t;
+typedef enum logic [2:0] { D_IDLE, D_WRITE, D_DROP, D_INL_HDR, D_INL_DATA, D_RRET } dstate_t;
 dstate_t dstate;
 logic [BTS_W-1:0]      d_left;
+logic [LINE_W-1:0]     d_line;
 logic [63:0]           d_inline;
 
 wire oq_take = (dstate == D_IDLE) && !oq_empty;
 wire [BTS_W-1:0] oq_beats = oq_mem[oq_rp][BTS_W-1:0];
 wire [1:0]       oq_kind  = oq_mem[oq_rp][BTS_W +: 2];
+wire [LINE_W-1:0] oq_line = oq_mem[oq_rp][BTS_W+2 +: LINE_W];
 
 // An inline store's header, on the stream
 wire [7:0]       i_op  = s_tdata[7:0];
@@ -240,7 +266,12 @@ wire [40:0]      i_end = {1'b0, i_ref[39:0]} + 41'd8;
 wire i_ok = (s_tdata[63:36] == '0) && (i_op == MSG_OP_WRITE_INLINE) && (i_len == 28'd8) &&
             (i_ref[2:0] == 3'b0) && xb_hit && (i_end <= {1'b0, xb_len});
 wire i_here = (dstate == D_INL_HDR) && s_tvalid;
-wire i_post = i_here && i_ok;
+// A read's completion: an inline store to RRET_EXP (lane1 = the slot's
+// return reference + len, lane2 = the request word, or all ones)
+wire rr_is = (s_tdata[63:36] == '0) && (i_op == MSG_OP_WRITE_INLINE) && (i_len == 28'd8) &&
+             (i_ref[47:40] == RRET_EXP);
+wire rr_ok = rr_is && (i_ref[39:13+SLOT_W] == '0);
+wire i_post = i_here && i_ok && !rr_is;
 
 // A get request: lane1 = i_ref, the source here; lane2 the request word
 wire        g_is   = (s_tdata[63:36] == '0) && (i_op == MSG_OP_GET_REQ) && (i_len == 28'd8);
@@ -257,6 +288,15 @@ assign m_job_len   = g_len;
 assign m_job_ret   = g_word[47:0];
 assign m_job_cval  = g_word;
 assign m_job_err   = !g_ok;
+
+assign m_cmp_valid = i_here && rr_ok;
+assign m_cmp_slot  = i_ref[13 +: SLOT_W];
+assign m_cmp_err   = (s_tdata[128 +: 64] == '1);
+
+// A read answer's lines, to the slot buffer
+assign m_land_valid = (dstate == D_RRET) && s_tvalid;
+assign m_land_line  = d_line;
+assign m_land_data  = s_tdata;
 
 // The write: the generator's, or (while it waits) an inline store's
 assign wr_valid = l_post || i_post;
@@ -289,7 +329,9 @@ always_ff @(posedge aclk) begin
         // L
         if (l_load) begin
             l_valid <= 1'b1;
-            l_kind  <= e_inline ? K_INLINE : (e_ok ? K_WRITE : K_DROP);
+            l_kind  <= e_inline ? K_INLINE : e_rret ? (e_rret_ok ? K_RRET : K_DROP) :
+                                                      (e_ok ? K_WRITE : K_DROP);
+            l_line  <= {e_off[13 +: SLOT_W], e_off[11:6]};
             l_pid   <= xa_pid;
             l_va    <= xa_base + VADDR_BITS'(e_off);
             l_len   <= e_len;
@@ -300,7 +342,7 @@ always_ff @(posedge aclk) begin
 
         // posted-ahead queue
         if (l_done) begin
-            oq_mem[oq_wp] <= {l_kind, (l_kind == K_INLINE) ? BTS_W'(1) : beats_of(l_len)};
+            oq_mem[oq_wp] <= {l_line, l_kind, (l_kind == K_INLINE) ? BTS_W'(1) : beats_of(l_len)};
             oq_wp <= (oq_wp == RX_WR_OUTSTANDING - 1) ? '0 : oq_wp + 1'b1;
         end
         if (oq_take) oq_rp <= (oq_rp == RX_WR_OUTSTANDING - 1) ? '0 : oq_rp + 1'b1;
@@ -310,9 +352,11 @@ always_ff @(posedge aclk) begin
         case (dstate)
             D_IDLE: if (oq_take) begin
                 d_left <= oq_beats;
+                d_line <= oq_line;
                 case (kind_t'(oq_kind))
                     K_WRITE:  dstate <= D_WRITE;
                     K_DROP:   dstate <= D_DROP;
+                    K_RRET:   dstate <= D_RRET;
                     default:  dstate <= D_INL_HDR;
                 endcase
             end
@@ -324,12 +368,18 @@ always_ff @(posedge aclk) begin
                 d_left <= d_left - 1'b1;
                 if (d_left == BTS_W'(1)) dstate <= D_IDLE;
             end
+            D_RRET: if (s_tvalid) begin
+                d_left <= d_left - 1'b1;
+                d_line <= d_line + 1'b1;
+                if (d_left == BTS_W'(1)) dstate <= D_IDLE;
+            end
             // an inline store: post its 8 B write (or drop it), then the
-            // beat; a get request: hand it to loom_rd
+            // beat; a get request: hand it to loom_rd; a read's completion:
+            // hand it to loom_read
             D_INL_HDR: if (i_here) begin
                 d_inline <= s_tdata[128 +: 64];
                 if (g_is)          begin if (m_job_ready) begin dstate <= D_IDLE; g_block <= 1'b0; end end
-                else if (!i_ok)    begin dstate <= D_IDLE; g_block <= 1'b0; end
+                else if (rr_is || !i_ok) begin dstate <= D_IDLE; g_block <= 1'b0; end
                 else if (wr_ready) dstate <= D_INL_DATA;
             end
             D_INL_DATA: if (m_tready) begin
@@ -346,8 +396,8 @@ wire nothing = (dstate == D_IDLE) && oq_empty && !l_valid && (e_cnt == '0);
 
 always_comb begin
     s_tready = ((dstate == D_WRITE) && m_tready) ||
-               (dstate == D_DROP) ||
-               ((dstate == D_INL_HDR) && (g_is ? m_job_ready : (!i_ok || wr_ready))) ||
+               (dstate == D_DROP) || (dstate == D_RRET) ||
+               ((dstate == D_INL_HDR) && (g_is ? m_job_ready : (rr_is || !i_ok || wr_ready))) ||
                nothing;
 
     if (dstate == D_INL_DATA) begin
@@ -368,7 +418,8 @@ assign busy = !nothing;
 
 wire w_end = (dstate == D_WRITE) && s_tvalid && m_tready && (d_left == BTS_W'(1));
 assign cnt_rx_fwd       = w_end || ((dstate == D_INL_DATA) && m_tready);
-assign cnt_rx_drop      = (l_pass && (l_kind == K_DROP)) || (i_here && !i_ok && !g_is);
+assign cnt_rx_drop      = (l_pass && (l_kind == K_DROP)) || (i_here && !i_ok && !g_is && !rr_is) ||
+                          (i_here && rr_is && !rr_ok);
 assign cnt_rx_orphan    = nothing && s_tvalid;
 assign cnt_rx_move      = (dstate == D_WRITE) &&  s_tvalid &&  m_tready;
 assign cnt_rx_starve    = (dstate == D_WRITE) && !s_tvalid;

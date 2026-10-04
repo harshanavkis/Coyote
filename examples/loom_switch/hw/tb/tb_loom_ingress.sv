@@ -22,7 +22,8 @@ import lynxTypes::*;
  * dropped), writes that start inside a line (32 B half-lines, 8 B stores at
  * their own address, a burst from line+32), backpressure everywhere, the
  * debug counters (drop reasons, burst sizes, misaligned bursts, and every
- * cycle a W beat waits counted under exactly one reason), and reads.
+ * cycle a W beat waits counted under exactly one reason). Reads and get
+ * requests are loom_read's (tb_loom_switch_top).
  */
 module tb_loom_ingress;
 
@@ -46,7 +47,7 @@ logic [LEN_BITS-1:0]   tbl_len = 0;
 logic [UWIN_BITS-1:0]  tbl_ustart = 0;
 
 logic [UWIN_BITS-1:0]  ua_addr;
-logic                  ua_hit, ua_route, ua_get;
+logic                  ua_hit, ua_route;
 logic [3:0]            ua_idx;
 logic [PID_BITS-1:0]   ua_pid, ua_dst_pid;
 logic [VADDR_BITS-1:0] ua_base;
@@ -71,22 +72,25 @@ logic [N_DBG-1:0] cnt_dbg;
 loom_table #(.UWIN_BITS(UWIN_BITS)) inst_table (
     .aclk(aclk), .aresetn(aresetn),
     .commit(tbl_commit), .prog_idx(tbl_idx), .prog_valid(tbl_valid),
-    .prog_route(tbl_route), .prog_get(1'b0), .prog_pid(tbl_pid), .prog_dst_pid(tbl_dst_pid),
+    .prog_route(tbl_route), .prog_pid(tbl_pid), .prog_dst_pid(tbl_dst_pid),
     .prog_base(tbl_base), .prog_len(tbl_len), .prog_ustart(tbl_ustart),
     .lu_idx(4'd0), .lu_valid(), .lu_route(), .lu_pid(), .lu_dst_pid(),
     .lu_base(), .lu_len(),
     .ua_ce1(ua_ce1), .ua_ce2(ua_ce2),
-    .ua_addr(ua_addr), .ua_hit(ua_hit), .ua_idx(ua_idx), .ua_route(ua_route), .ua_get(ua_get),
+    .ua_addr(ua_addr), .ua_hit(ua_hit), .ua_idx(ua_idx), .ua_route(ua_route),
     .ua_pid(ua_pid), .ua_dst_pid(ua_dst_pid), .ua_base(ua_base),
-    .ua_ustart(ua_ustart), .ua_end(ua_end)
+    .ua_ustart(ua_ustart), .ua_end(ua_end),
+    .ub_ce1(1'b0), .ub_ce2(1'b0), .ub_addr('0), .ub_hit(), .ub_route(), .ub_pid(), .ub_base(),
+    .ub_ustart(), .ub_end()
 );
 
 loom_ingress #(.UWIN_BITS(UWIN_BITS), .FLUSH_CYCLES(FLUSH)) dut (
     .aclk(aclk), .aresetn(aresetn), .axi_udata(axi),
     .ua_ce1(ua_ce1), .ua_ce2(ua_ce2),
-    .ua_addr(ua_addr), .ua_hit(ua_hit), .ua_route(ua_route), .ua_get(ua_get), .ua_pid(ua_pid),
+    .ua_addr(ua_addr), .ua_hit(ua_hit), .ua_route(ua_route), .ua_pid(ua_pid),
     .ua_dst_pid(ua_dst_pid), .ua_base(ua_base), .ua_ustart(ua_ustart),
     .ua_end(ua_end), .ua_idx(ua_idx),
+    .s_get_valid(1'b0), .s_get_ready(), .s_get_pid('0), .s_get_ref('0), .s_get_word('0),
     .wr_req(wr_req), .wr_valid(wr_valid), .wr_ready(wr_ready),
     .win_ok(win_ok), .rdma_post(rdma_post),
     .m_host_tdata(m_host_tdata), .m_host_tkeep(m_host_tkeep),
@@ -639,25 +643,6 @@ initial begin
     bp = 1;
     suite("bp: ");
     bp = 0;
-
-    // reads: zeros, arlen+1 beats, rlast on the last
-    begin
-        int n = 0;
-        @(posedge aclk);
-        axi.araddr <= 64'h0800_0000; axi.arlen <= 8'd3; axi.arid <= 6'd5; axi.arvalid <= 1;
-        do @(posedge aclk); while (!axi.arready);
-        axi.arvalid <= 0;
-        while (n < 4) begin
-            @(posedge aclk);
-            if (axi.rvalid && axi.rready) begin
-                `CHECK(axi.rdata == '0 && axi.rid == 6'd5 && axi.rlast == (n == 3), $sformatf("read beat %0d", n))
-                n++;
-            end
-        end
-        @(posedge aclk);
-        `CHECK(!axi.rvalid, "read beats past rlast")
-        $display("ok   reads");
-    end
 
     if (errors == 0) $display("TB PASS (tb_loom_ingress)");
     else             $display("TB FAIL (tb_loom_ingress): %0d errors", errors);

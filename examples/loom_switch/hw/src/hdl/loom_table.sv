@@ -12,9 +12,8 @@ import lynxTypes::*;
  *   route = 0 (local): write via sq_wr {LOCAL_WRITE, STRM_HOST, pid, base+off}
  *   route = 1 (rdma):  a Loom message on the QP owned by pid; dst_pid = the
  *                      exporter's ctid on the far host, carried in the
- *                      message header
- *   get = 1 (with route 1): each 8 B store is a get request from the far
- *                      export reference base + offset (loom_ingress)
+ *                      message header. A read of the window is a get from
+ *                      the far reference base + offset (loom_read)
  * base is always the exporter's own VA; len is the segment bounds.
  * Programmed only through the CSR page (loom_ctrl). Overlapping uwin ranges
  * are the daemon's to avoid; the lowest index wins.
@@ -23,7 +22,9 @@ import lynxTypes::*;
  * (ua_ce1 takes ua_addr, ua_ce2 takes stage 1): stage 1 compares ua_addr
  * with every window's range (its end, ustart + len, is kept from commit),
  * stage 2 picks the lowest hit and its entry. A commit while a lookup is in
- * flight may give that lookup the old entry.
+ * flight may give that lookup the old entry. The ub_* port is the same
+ * lookup for reads (loom_read), so writes and reads never wait on each
+ * other.
  */
 module loom_table #(
     parameter integer UWIN_BITS = 27
@@ -36,7 +37,6 @@ module loom_table #(
     input  logic [3:0]              prog_idx,
     input  logic                    prog_valid,
     input  logic                    prog_route,
-    input  logic                    prog_get,
     input  logic [PID_BITS-1:0]     prog_pid,
     input  logic [PID_BITS-1:0]     prog_dst_pid,
     input  logic [VADDR_BITS-1:0]   prog_base,
@@ -60,12 +60,22 @@ module loom_table #(
     output logic                    ua_hit,
     output logic [3:0]              ua_idx,
     output logic                    ua_route,
-    output logic                    ua_get,
     output logic [PID_BITS-1:0]     ua_pid,
     output logic [PID_BITS-1:0]     ua_dst_pid,
     output logic [VADDR_BITS-1:0]   ua_base,
     output logic [UWIN_BITS-1:0]    ua_ustart,
-    output logic [LEN_BITS:0]       ua_end        // ustart + len
+    output logic [LEN_BITS:0]       ua_end,       // ustart + len
+
+    // Read lookup by uwin address (two stages, as ua_*)
+    input  logic                    ub_ce1,
+    input  logic                    ub_ce2,
+    input  logic [UWIN_BITS-1:0]    ub_addr,
+    output logic                    ub_hit,
+    output logic                    ub_route,
+    output logic [PID_BITS-1:0]     ub_pid,
+    output logic [VADDR_BITS-1:0]   ub_base,
+    output logic [UWIN_BITS-1:0]    ub_ustart,
+    output logic [LEN_BITS:0]       ub_end
 );
 
 localparam integer N_WIN    = 16;
@@ -73,7 +83,6 @@ localparam integer END_BITS = LEN_BITS + 1;
 
 logic                  e_valid [N_WIN];
 logic                  e_route [N_WIN];
-logic                  e_get   [N_WIN];
 logic [PID_BITS-1:0]   e_pid   [N_WIN];
 logic [PID_BITS-1:0]   e_dpid  [N_WIN];
 logic [VADDR_BITS-1:0] e_base  [N_WIN];
@@ -87,7 +96,6 @@ always_ff @(posedge aclk) begin
     end else if (commit) begin
         e_valid[prog_idx]  <= prog_valid;
         e_route[prog_idx]  <= prog_route;
-        e_get[prog_idx]    <= prog_route && prog_get;
         e_pid[prog_idx]    <= prog_pid;
         e_dpid[prog_idx]   <= prog_dst_pid;
         e_base[prog_idx]   <= prog_base;
@@ -122,12 +130,33 @@ always_ff @(posedge aclk) if (ua_ce2) begin
     ua_hit     <= |s1_hit;
     ua_idx     <= s1_idx;
     ua_route   <= e_route[s1_idx];
-    ua_get     <= e_get[s1_idx];
     ua_pid     <= e_pid[s1_idx];
     ua_dst_pid <= e_dpid[s1_idx];
     ua_base    <= e_base[s1_idx];
     ua_ustart  <= e_ustart[s1_idx];
     ua_end     <= e_end[s1_idx];
+end
+
+// The read lookup: the same two stages on ub_addr
+logic [N_WIN-1:0] t1_hit;
+always_ff @(posedge aclk) if (ub_ce1)
+    for (int i = 0; i < N_WIN; i++)
+        t1_hit[i] <= (i != 0) && e_valid[i] && (ub_addr >= e_ustart[i]) &&
+                     (END_BITS'(ub_addr) < e_end[i]);
+
+logic [3:0] t1_idx;
+always_comb begin
+    t1_idx = 4'd0;
+    for (int i = N_WIN-1; i >= 1; i--) if (t1_hit[i]) t1_idx = 4'(i);
+end
+
+always_ff @(posedge aclk) if (ub_ce2) begin
+    ub_hit    <= |t1_hit;
+    ub_route  <= e_route[t1_idx];
+    ub_pid    <= e_pid[t1_idx];
+    ub_base   <= e_base[t1_idx];
+    ub_ustart <= e_ustart[t1_idx];
+    ub_end    <= e_end[t1_idx];
 end
 
 endmodule

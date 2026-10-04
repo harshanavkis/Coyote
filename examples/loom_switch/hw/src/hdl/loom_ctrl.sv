@@ -11,9 +11,8 @@ import lynxTypes::*;
  *
  * CSR map (64-bit word indices; byte offset = idx * 8):
  *    0 TBL_IDX      (RW) window index to program (1..15)
- *    1 TBL_CFG      (RW) bit0 = valid, bit1 = route (0 local, 1 rdma),
- *                        bit2 = get (with route 1: a get window, each 8 B
- *                        store a get request; base = the far reference read)
+ *    1 TBL_CFG      (RW) bit0 = valid, bit1 = route (0 local, 1 rdma; a
+ *                        read of an rdma window is a get, loom_read)
  *    2 TBL_PID      (RW) [5:0] local: destination pid; rdma: QP-owner pid.
  *                        [13:8] unused
  *    3 TBL_BASE     (RW) local: destination VA base; rdma: the REMOTE
@@ -59,6 +58,12 @@ import lynxTypes::*;
  *          (bytes), 181 EXP_COMMIT (write 1)
  *   184 RD_CTL (RW) [5:0] the QP owner pid the get responses (loom_rd) go
  *          out on; reset 0. Its own 64 B line, as TX_CTL.
+ *   192-199 (RO) cnt_y[i] at word 192+i: reads on the uwin (loom_read):
+ *          192 reads taken, 193 reads answered, 194 reads answered with all
+ *          ones (no rdma window, past its end, a bad burst, or rejected by
+ *          the far side), 195 of those rejected by the far side, 196 cycles
+ *          a read waited for a free slot, 197 completions for a slot with no
+ *          get out (must be 0), 198 answer lines into the read buffer
  *   112-130 (RO) cnt_x[i] at word 112+i, its longest run of consecutive
  *          cycles at 144+i (since the bitstream was loaded):
  *     loom_rx:  112 bulk packets landed (writes posted), 113 stores landed,
@@ -84,8 +89,8 @@ import lynxTypes::*;
  *               none done), 132 cycles it waited on the DMA request port,
  *               133 cycles waiting for the TLB mutex, 134 cycles in a miss,
  *               invalidation or locked state, 135 host DMA completions
- *     gets:     136 get requests sent (ingress), 137 full beats dropped on
- *               a get window; responder (loom_rd): 138 jobs taken, 139
+ *     gets:     136 get requests sent (ingress), 137 unused; responder
+ *               (loom_rd): 138 jobs taken, 139
  *               error completions, 140 response packets, 141 completions,
  *               142 cycles a response request waited on the window or
  *               sq_wr, 143 cycles a response packet waited for its read data
@@ -94,7 +99,8 @@ import lynxTypes::*;
  */
 module loom_ctrl #(
     parameter integer N_DBG = 14,
-    parameter integer N_X   = 32
+    parameter integer N_X   = 32,
+    parameter integer N_Y   = 8
 ) (
     input  logic                        aclk,
     input  logic                        aresetn,
@@ -106,7 +112,6 @@ module loom_ctrl #(
     output logic [3:0]                  tbl_idx,
     output logic                        tbl_valid,
     output logic                        tbl_route,
-    output logic                        tbl_get,
     output logic [PID_BITS-1:0]         tbl_pid,
     output logic [PID_BITS-1:0]         tbl_dst_pid,
     output logic [VADDR_BITS-1:0]       tbl_base,
@@ -165,8 +170,9 @@ module loom_ctrl #(
     input  logic                        cnt_ing_flush,
     input  logic [N_DBG-1:0]            cnt_ing_dbg,
 
-    // Further pulses, word 112+i (list in the map above)
-    input  logic [N_X-1:0]              cnt_x
+    // Further pulses, word 112+i and 192+i (lists in the map above)
+    input  logic [N_X-1:0]              cnt_x,
+    input  logic [N_Y-1:0]              cnt_y
 );
 
 localparam integer ADDR_LSB = $clog2(AXIL_DATA_BITS/8);   // 3
@@ -222,6 +228,7 @@ localparam integer R_EXP_LEN       = 180;
 localparam integer R_EXP_COMMIT    = 181;
 localparam integer R_RD_CTL        = 184;
 localparam integer R_XMAX_BASE     = 144;
+localparam integer R_Y_BASE        = 192;
 
 // -------------------------------------------------------------------------
 // AXI4-Lite handshake (single outstanding write and read, as examples/loom)
@@ -286,7 +293,6 @@ assign tbl_commit      = commit_pulse;
 assign tbl_idx         = r_tbl_idx[3:0];
 assign tbl_valid       = r_tbl_cfg[0];
 assign tbl_route       = r_tbl_cfg[1];
-assign tbl_get         = r_tbl_cfg[2];
 assign rd_qp_pid       = r_rd_ctl[PID_BITS-1:0];
 assign tbl_pid         = r_tbl_pid[PID_BITS-1:0];
 assign tbl_dst_pid     = r_tbl_pid[8 +: PID_BITS];
@@ -319,13 +325,17 @@ logic [N_DBG-1:0] dbg_pulse;
 logic [N_X-1:0]   x_pulse;
 logic [63:0]      xc [N_X];
 logic [31:0]      xrun [N_X], xmax [N_X];
+logic [N_Y-1:0]   y_pulse;
+logic [63:0]      yc [N_Y];
 always_ff @(posedge aclk) begin
     if (!aresetn) begin
         ing_pulse <= '0;
         dbg_pulse <= '0;
         x_pulse   <= '0;
+        y_pulse   <= '0;
     end else begin
         x_pulse   <= cnt_x;
+        y_pulse   <= cnt_y;
         ing_pulse <= {cnt_ing_flush, cnt_ing_store_drop, cnt_ing_store, cnt_ing_pkt_rdma,
                       cnt_ing_pkt_local, cnt_ing_drop, cnt_ing_burst};
         dbg_pulse <= cnt_ing_dbg;
@@ -382,6 +392,14 @@ always_ff @(posedge aclk) begin
         end else hout_bp_run <= 0;
         for (int i = 0; i < N_ING; i++) if (ing_pulse[i]) ing[i] <= ing[i] + 1;
         for (int i = 0; i < N_DBG; i++) if (dbg_pulse[i]) dbg[i] <= dbg[i] + 1;
+    end
+end
+
+always_ff @(posedge aclk) begin
+    if (!aresetn) begin
+        for (int i = 0; i < N_Y; i++) yc[i] <= 0;
+    end else begin
+        for (int i = 0; i < N_Y; i++) if (y_pulse[i]) yc[i] <= yc[i] + 1;
     end
 end
 
@@ -456,6 +474,8 @@ always_ff @(posedge aclk) begin
                     axi_rdata <= xc[rd_idx - R_X_BASE];
                 else if (rd_idx >= R_XMAX_BASE && rd_idx < R_XMAX_BASE + N_X)
                     axi_rdata <= {32'b0, xmax[rd_idx - R_XMAX_BASE]};
+                else if (rd_idx >= R_Y_BASE && rd_idx < R_Y_BASE + N_Y)
+                    axi_rdata <= yc[rd_idx - R_Y_BASE];
         endcase
     end
 end

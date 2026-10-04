@@ -369,43 +369,51 @@ A window with route 0 holds `{pid, VA}` of a buffer on *this* host.
 with no RDMA involved: the CPU or V80 writes into the window and the bytes
 land in another process's buffer on the same host (`ce_local`, `uwin_probe`).
 
-### 6.5 Gets: clara reads rose's export (`get_bench`)
+### 6.5 Gets: a reader reads rose's export (`get_bench`)
 
-A get is two writes, so no RoCE READ is involved. The CPU (or anything that
-can write the window) stores one 8 B word into a **get window**. The far
-switch reads the data and writes it back as ordinary self-describing packets,
-then a completion word.
+A get is a read of a window. Whatever can read the window - a CPU load
+through `mapUwin`, a copy engine's DMA read peer to peer - reads the bytes the
+window is bound to, and the switches do the rest. No RoCE READ is involved:
+on the wire a get is two writes.
 
 - **Setup.**
   - rose exports the source: `program_export(1, ctid, src, size)`, plus
     `set_response_qp` (`RD_CTL`, the QP owner its answers go out on).
-  - clara exports its return buffer: `program_export(3, ctid, ret, len)`.
-  - clara binds a get window to rose's export: `program_get_window(1, QP
-    pid, export_ref(1), size, ustart 0)` (`TBL_CFG` bit 2).
-- **The request.** clara stores `get_word(len, export_ref(3, r))` =
-  `{len/64 [63:48], return reference [47:0]}` at window offset `s`.
-  `loom_ingress` sends it like any rdma store, as a 64 B inline message with
-  op `GET_REQ` (3): lane 1 = `export_ref(1) + s`, lane 2 = the word. A full
-  line written to a get window is dropped (word 137).
+  - The reader's host binds a window to it like any rdma window:
+    `program_window(1, rdma, QP pid, export_ref(1), size, ustart)`. Writing
+    the window puts, reading it gets.
+- **The read (reader's U280, `loom_read`).** A read of the window (AXI AR on
+  the uwin) takes one of 64 read slots, looks its address up in the window
+  table, and works out the 64 B lines its beats fall in (at most 64: a burst
+  stays inside its 4 KiB page). `loom_ingress` sends one 64 B inline message
+  with op `GET_REQ` (3): lane 1 = the window's reference + the first line's
+  offset, lane 2 = the request word `{lines [63:48], {0xFE, slot * 8 KiB}}`.
+  It goes out in the ingress queue's order, after the packet being gathered
+  (closed first), so a read leaves after every write taken before it.
 - **rose.**
-  - `loom_rx` checks the source against its exports: export there, `s + len`
-    within it, `s`, `r` and `len` 64 B multiples, `len` not 0. It hands
-    `loom_rd` a job.
-  - `loom_rd` reads `len` bytes at `src + s` (`sq_rd`, host stream 1) up to 4
-    jobs ahead. It sends them back in PMTU packets, RETH =
-    `export_ref(3, r) + offset`, each posted only once its data is buffered.
-    It then sends one inline store of the word to `export_ref(3, r + len)`.
-  - A rejected request gets that store only, carrying all ones (`GET_ERROR`).
+  - `loom_rx` checks the source against its exports: export there, in
+    bounds, 64 B-aligned, length not 0. It hands `loom_rd` a job.
+  - `loom_rd` reads the lines (`sq_rd`, host stream 1), up to 4 jobs ahead,
+    and sends them back in PMTU packets, RETH = the return reference +
+    offset, each posted once its data is buffered. Then one inline store of
+    the request word to return reference + length: the completion.
+  - A rejected request gets that store only, carrying all ones.
   - The answers share `sq_wr`, the ack window and the payload stream with
     rose's own ingress, in request order.
-- **clara.** `loom_rx` lands the answer in export 3 like any incoming
-  packet: the data, then the completion word. The CPU polls
-  `ret + r + len` for the word.
+- **Back on the reader's U280.** `loom_rx` sees export index 0xFE: the
+  answer's lines go into the slot's buffer (URAM, 4 KiB per slot) instead of
+  host memory, and the completion marks the slot done (8 KiB of reference
+  space per slot, so return reference + length still names the slot when
+  the word is all ones). `loom_read` answers R in AR order: each beat is the
+  line its address falls in.
+- **Failures.** A read with no window, on a local window, past the window's
+  end, or rejected by rose returns all ones (what a failed PCIe read
+  returns), counted at words 194/195. Nothing times out: a read whose answer
+  never comes holds its slot, and the reads behind it, until a reset.
 
-Order: a get is a store in the ingress queue, so it leaves after everything
-written into the window before it. Its read on rose is not ordered after
-rose's own earlier landings to the same bytes, so a get after a put to the
-same place needs the put's completion first.
+Order: rose's read is not ordered after rose's own earlier landings to the
+same bytes, so a get after a put to the same place needs the put's
+completion first.
 
 ## 7. Ordering and completion
 
@@ -429,9 +437,10 @@ the output is busy, a pause in the producer's writes doesn't close the
 packet, so a producer held back by the window still fills 4 KiB packets.
 That timer is write combining: it affects only how a tail is packed, never
 where anything lands.
-It is a fixed parameter today. Making it a CSR, measuring the gaps between
-a producer's writes, and treating a read of the window as an explicit flush
-(PCIe reads can't pass posted writes) are proposed, not built.
+It is a fixed parameter today. A read of an rdma window closes the packet
+being gathered and goes out after it (§6.5). Making the timer a CSR,
+measuring the gaps between a producer's writes, and treating a read of any
+window as an explicit flush are proposed, not built.
 
 ## 8. Flow control and loss
 

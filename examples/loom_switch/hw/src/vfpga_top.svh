@@ -15,12 +15,16 @@
  * request with loom_rx first, as in examples/loom (see its vfpga_top.svh for
  * why, and for the arbiter's two known defects, which carry over unchanged).
  *
- * Gets: a store into a get window goes out as a get request (loom_ingress);
- * an incoming one becomes a job (loom_rx) for loom_rd, which reads on
- * sq_rd / axis_host_recv[1] and writes the data back as rdma packets plus a
- * completion store. loom_rd shares sq_wr (after loom_rx, alternating with
- * the ingress), the ack window and axis_rreq_send[0] with the ingress; the
- * payload stream follows the order the two's requests were taken.
+ * Reads: whatever reads the uwin (a CPU load, a copy engine's DMA read)
+ * reads what the window is bound to. loom_read takes axi_udata's AR and R:
+ * a read of an rdma window becomes a get request, sent by loom_ingress in
+ * its queue order; the far loom_rx makes it a job for loom_rd, which reads
+ * on sq_rd / axis_host_recv[1] and writes the lines back as rdma packets
+ * plus a completion store; this side's loom_rx hands those to loom_read's
+ * slot buffer, and loom_read answers R. loom_rd shares sq_wr (after
+ * loom_rx, alternating with the ingress), the ack window and
+ * axis_rreq_send[0] with the ingress; the payload stream follows the order
+ * the two's requests were taken.
  */
 
 // ---------------------------------------------------------------------------
@@ -28,7 +32,7 @@
 // ---------------------------------------------------------------------------
 logic                   tbl_commit;
 logic [3:0]             tbl_idx;
-logic                   tbl_valid, tbl_route, tbl_get;
+logic                   tbl_valid, tbl_route;
 logic [PID_BITS-1:0]    tbl_pid, tbl_dst_pid;
 logic [VADDR_BITS-1:0]  tbl_base;
 logic [LEN_BITS-1:0]    tbl_len;
@@ -43,13 +47,36 @@ logic [PID_BITS-1:0]    rd_qp_pid;
 
 // table -> ingress
 logic [26:0]            ua_addr;
-logic                   ua_hit, ua_route, ua_get;
+logic                   ua_hit, ua_route;
 logic [3:0]             ua_idx;
 logic [PID_BITS-1:0]    ua_pid, ua_dst_pid;
 logic [VADDR_BITS-1:0]  ua_base;
 logic [26:0]            ua_ustart;
 logic [LEN_BITS:0]      ua_end;
 logic                   ua_ce1, ua_ce2;
+
+// table -> loom_read
+logic [26:0]            ub_addr;
+logic                   ub_ce1, ub_ce2, ub_hit, ub_route;
+logic [PID_BITS-1:0]    ub_pid;
+logic [VADDR_BITS-1:0]  ub_base;
+logic [26:0]            ub_ustart;
+logic [LEN_BITS:0]      ub_end;
+
+// loom_read <-> loom_ingress (get requests) and loom_rx (answers)
+localparam integer N_RD_SLOTS = 64;
+logic                   get_valid, get_ready;
+logic [PID_BITS-1:0]    get_pid;
+logic [VADDR_BITS-1:0]  get_ref;
+logic [63:0]            get_word;
+logic                   land_valid, rcmp_valid, rcmp_err;
+logic [$clog2(N_RD_SLOTS)+5:0] land_line;
+logic [AXI_DATA_BITS-1:0]      land_data;
+logic [$clog2(N_RD_SLOTS)-1:0] rcmp_slot;
+logic cnt_rdw_read, cnt_rdw_done, cnt_rdw_fail, cnt_rdw_far_err, cnt_rdw_slot_wait, cnt_rdw_stray;
+/* verilator lint_off UNUSED */
+logic rdw_busy;
+/* verilator lint_on UNUSED */
 
 // ---------------------------------------------------------------------------
 // Ack window: rdma packets and stores posted by the ingress and loom_rd and
@@ -86,7 +113,7 @@ logic [13:0] cnt_ing_dbg;
 logic cnt_rx_fwd, cnt_rx_drop, cnt_rx_orphan, rx_cnt_move, rx_cnt_starve, rx_cnt_stall;
 logic rx_cnt_bp, rx_cnt_req, rx_cnt_fifo_full;
 logic rx_cnt_pkt, rx_cnt_store, rx_cnt_post_wait, rx_cnt_at_limit, rx_cnt_pkt_wait, rx_cnt_rq_ovfl;
-logic cnt_ing_rdma_full, cnt_ing_rdma_flush, cnt_ing_rdma_cut, cnt_ing_get, cnt_ing_get_drop;
+logic cnt_ing_rdma_full, cnt_ing_rdma_flush, cnt_ing_rdma_cut, cnt_ing_get;
 
 // loom_rd: its requests, its payload, and loom_rx's jobs for it
 req_t rd_wr_req;
@@ -159,7 +186,7 @@ end
 loom_ctrl inst_loom_ctrl (
     .aclk(aclk), .aresetn(aresetn), .axi_ctrl(axi_ctrl),
     .tbl_commit(tbl_commit), .tbl_idx(tbl_idx), .tbl_valid(tbl_valid),
-    .tbl_route(tbl_route), .tbl_get(tbl_get), .tbl_pid(tbl_pid), .tbl_dst_pid(tbl_dst_pid),
+    .tbl_route(tbl_route), .tbl_pid(tbl_pid), .tbl_dst_pid(tbl_dst_pid),
     .tbl_base(tbl_base), .tbl_len(tbl_len), .tbl_ustart(tbl_ustart),
     .rdma_staging_va(rdma_staging_va), .tx_window(tx_window), .rx_chunk(rx_chunk),
     .rd_qp_pid(rd_qp_pid),
@@ -179,11 +206,14 @@ loom_ctrl inst_loom_ctrl (
     .cnt_ing_flush(cnt_ing_flush), .cnt_ing_dbg(cnt_ing_dbg),
     // words 112+ (and their longest runs at 144+), in loom_ctrl's list
     .cnt_x({cnt_rd_starve, cnt_rd_wait, cnt_rd_cmp, cnt_rd_pkt, cnt_rd_err, cnt_rd_job,
-            cnt_ing_get_drop, cnt_ing_get,
+            1'b0, cnt_ing_get,
             dbg_host_out[14:10], dbg_host_out[16:15], dbg_host_out[9:3],
             cnt_ing_rdma_cut, cnt_ing_rdma_flush, cnt_ing_rdma_full,
             rx_cnt_rq_ovfl, rx_cnt_pkt_wait, rx_cnt_at_limit, rx_cnt_post_wait,
-            cnt_rx_drop, rx_cnt_store, rx_cnt_pkt})
+            cnt_rx_drop, rx_cnt_store, rx_cnt_pkt}),
+    // words 192+
+    .cnt_y({1'b0, land_valid, cnt_rdw_stray, cnt_rdw_slot_wait, cnt_rdw_far_err, cnt_rdw_fail,
+            cnt_rdw_done, cnt_rdw_read})
 );
 
 loom_exports inst_loom_exports (
@@ -197,22 +227,26 @@ loom_exports inst_loom_exports (
 loom_table inst_loom_table (
     .aclk(aclk), .aresetn(aresetn),
     .commit(tbl_commit), .prog_idx(tbl_idx), .prog_valid(tbl_valid),
-    .prog_route(tbl_route), .prog_get(tbl_get), .prog_pid(tbl_pid), .prog_dst_pid(tbl_dst_pid),
+    .prog_route(tbl_route), .prog_pid(tbl_pid), .prog_dst_pid(tbl_dst_pid),
     .prog_base(tbl_base), .prog_len(tbl_len), .prog_ustart(tbl_ustart),
     // no aperture: the index lookup is unused
     .lu_idx(4'd0), .lu_valid(), .lu_route(), .lu_pid(), .lu_dst_pid(), .lu_base(), .lu_len(),
     .ua_ce1(ua_ce1), .ua_ce2(ua_ce2),
-    .ua_addr(ua_addr), .ua_hit(ua_hit), .ua_idx(ua_idx), .ua_route(ua_route), .ua_get(ua_get),
+    .ua_addr(ua_addr), .ua_hit(ua_hit), .ua_idx(ua_idx), .ua_route(ua_route),
     .ua_pid(ua_pid), .ua_dst_pid(ua_dst_pid), .ua_base(ua_base),
-    .ua_ustart(ua_ustart), .ua_end(ua_end)
+    .ua_ustart(ua_ustart), .ua_end(ua_end),
+    .ub_ce1(ub_ce1), .ub_ce2(ub_ce2), .ub_addr(ub_addr), .ub_hit(ub_hit), .ub_route(ub_route),
+    .ub_pid(ub_pid), .ub_base(ub_base), .ub_ustart(ub_ustart), .ub_end(ub_end)
 );
 
 loom_ingress #(.HOST_DEST(0), .NET_DEST(0)) inst_loom_ingress (
     .aclk(aclk), .aresetn(aresetn), .axi_udata(axi_udata),
     .ua_ce1(ua_ce1), .ua_ce2(ua_ce2),
-    .ua_addr(ua_addr), .ua_hit(ua_hit), .ua_route(ua_route), .ua_get(ua_get), .ua_pid(ua_pid),
+    .ua_addr(ua_addr), .ua_hit(ua_hit), .ua_route(ua_route), .ua_pid(ua_pid),
     .ua_dst_pid(ua_dst_pid), .ua_base(ua_base), .ua_ustart(ua_ustart),
     .ua_end(ua_end), .ua_idx(ua_idx),
+    .s_get_valid(get_valid), .s_get_ready(get_ready), .s_get_pid(get_pid),
+    .s_get_ref(get_ref), .s_get_word(get_word),
     .wr_req(ing_wr_req), .wr_valid(ing_wr_valid),
     .wr_ready(sq_wr.ready && !rx_takes_wr && !sel_rd),
     .win_ok(win_ok), .rdma_post(ing_post),
@@ -229,7 +263,7 @@ loom_ingress #(.HOST_DEST(0), .NET_DEST(0)) inst_loom_ingress (
     .cnt_win_wait(cnt_ing_win_wait), .cnt_req_wait(cnt_ing_req_wait),
     .cnt_rdma_full(cnt_ing_rdma_full), .cnt_rdma_flush(cnt_ing_rdma_flush),
     .cnt_rdma_cut(cnt_ing_rdma_cut),
-    .cnt_get(cnt_ing_get), .cnt_get_drop(cnt_ing_get_drop),
+    .cnt_get(cnt_ing_get),
     .cnt_dbg(cnt_ing_dbg)
 );
 
@@ -259,7 +293,7 @@ axis_data_fifo_rx4096 inst_rx_ingress_fifo (
 );
 assign rx_cnt_fifo_full = axis_rrsp_recv[0].tvalid && !axis_rrsp_recv[0].tready;
 
-loom_rx inst_loom_rx (
+loom_rx #(.N_SLOTS(N_RD_SLOTS)) inst_loom_rx (
     .aclk(aclk), .aresetn(aresetn),
     .rq_req(rq_wr.data), .rq_valid(rq_wr.valid), .rq_ready(rq_wr.ready),
     .xa_idx(xa_idx), .xa_hit(xa_hit), .xa_pid(xa_pid), .xa_base(xa_base), .xa_len(xa_len),
@@ -268,6 +302,8 @@ loom_rx inst_loom_rx (
     .wr_ready(sq_wr.ready),
     .m_job_valid(job_valid), .m_job_ready(job_ready), .m_job_pid(job_pid), .m_job_va(job_va),
     .m_job_len(job_len), .m_job_ret(job_ret), .m_job_cval(job_cval), .m_job_err(job_err),
+    .m_land_valid(land_valid), .m_land_line(land_line), .m_land_data(land_data),
+    .m_cmp_valid(rcmp_valid), .m_cmp_slot(rcmp_slot), .m_cmp_err(rcmp_err),
     .s_tdata(rxf_tdata), .s_tkeep(rxf_tkeep),
     .s_tvalid(rxf_tvalid), .s_tready(rxf_tready),
     .s_tlast(rxf_tlast),
@@ -299,6 +335,25 @@ loom_rd #(.NET_DEST(0), .RD_DEST(1)) inst_loom_rd (
     .busy(rd_busy),
     .cnt_job(cnt_rd_job), .cnt_err(cnt_rd_err), .cnt_pkt(cnt_rd_pkt), .cnt_cmp(cnt_rd_cmp),
     .cnt_wait(cnt_rd_wait), .cnt_starve(cnt_rd_starve)
+);
+
+// Reads on the uwin
+loom_read #(.N_SLOTS(N_RD_SLOTS)) inst_loom_read (
+    .aclk(aclk), .aresetn(aresetn),
+    .s_araddr(axi_udata.araddr[26:0]), .s_arlen(axi_udata.arlen), .s_arsize(axi_udata.arsize),
+    .s_arburst(axi_udata.arburst), .s_arid(axi_udata.arid),
+    .s_arvalid(axi_udata.arvalid), .s_arready(axi_udata.arready),
+    .s_rdata(axi_udata.rdata), .s_rresp(axi_udata.rresp), .s_rlast(axi_udata.rlast),
+    .s_rid(axi_udata.rid), .s_rvalid(axi_udata.rvalid), .s_rready(axi_udata.rready),
+    .ub_ce1(ub_ce1), .ub_ce2(ub_ce2), .ub_addr(ub_addr), .ub_hit(ub_hit), .ub_route(ub_route),
+    .ub_pid(ub_pid), .ub_base(ub_base), .ub_ustart(ub_ustart), .ub_end(ub_end),
+    .m_get_valid(get_valid), .m_get_ready(get_ready), .m_get_pid(get_pid),
+    .m_get_ref(get_ref), .m_get_word(get_word),
+    .s_land_valid(land_valid), .s_land_line(land_line), .s_land_data(land_data),
+    .s_cmp_valid(rcmp_valid), .s_cmp_slot(rcmp_slot), .s_cmp_err(rcmp_err),
+    .busy(rdw_busy),
+    .cnt_read(cnt_rdw_read), .cnt_done(cnt_rdw_done), .cnt_fail(cnt_rdw_fail),
+    .cnt_far_err(cnt_rdw_far_err), .cnt_slot_wait(cnt_rdw_slot_wait), .cnt_stray(cnt_rdw_stray)
 );
 
 // ---------------------------------------------------------------------------
@@ -367,8 +422,8 @@ always_comb begin
 end
 
 // ---------------------------------------------------------------------------
-// Tie-offs: no RoCE READs (gets are writes both ways); the reads' completions
-// are not needed (loom_rd counts the data)
+// Tie-offs: no RoCE READs (gets are writes both ways); the host reads'
+// completions are not needed (loom_rd counts the data)
 // ---------------------------------------------------------------------------
 always_comb notify.tie_off_m();
 always_comb cq_rd.ready = 1'b1;

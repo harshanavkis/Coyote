@@ -26,7 +26,7 @@ TBS="${TBS:-tb_loom_ingress tb_loom_switch_top}"
 # The shell primitives vfpga_top uses have behavioural stand-ins in
 # examples/loom's tb directory (the register slice and the rx FIFO IPs)
 SRCS="$LYNX_PKG $COYOTE_ROOT/hw/hdl/pkg/axi_intf.sv $COYOTE_ROOT/hw/hdl/pkg/lynx_intf.sv \
-      ../src/hdl/loom_table.sv ../src/hdl/loom_ingress.sv ../src/hdl/loom_ctrl.sv ../src/hdl/loom_rx.sv ../src/hdl/loom_rd.sv ../src/hdl/loom_exports.sv \
+      ../src/hdl/loom_table.sv ../src/hdl/loom_ingress.sv ../src/hdl/loom_ctrl.sv ../src/hdl/loom_rx.sv ../src/hdl/loom_rd.sv ../src/hdl/loom_read.sv ../src/hdl/loom_exports.sv \
       $LOOM_TB/sim_axisr_register_slice_512.sv $LOOM_TB/sim_axis_data_fifo_512.sv sim_axis_data_fifo_rx4096.sv \
       $COYOTE_ROOT/hw/hdl/common/regs/axisr_reg.sv $USER_LOGIC"
 

@@ -26,13 +26,12 @@ import lynxTypes::*;
  *          {lane0 = op WRITE_INLINE, len 8; lane1 = base+off (the remote
  *          reference of the word); lane2 = data}, which loom_rx lands as
  *          the exact 8 B write
- *   store, get window (rdma route with get set): the same message with op
- *          GET_REQ: lane1 = base+off is the far reference to read from, lane2
- *          the stored word {len/64 [63:48], return reference [47:0]}. The far
- *          loom_rx/loom_rd read len bytes there and write them back to the
- *          return reference (an export of THIS host), then the word itself
- *          to return reference + len. A full beat on a get window is
- *          dropped and counted (cnt_get_drop).
+ *   get request (a read of an rdma window, from loom_read on s_get): the
+ *          same message with op GET_REQ: lane1 = the far reference to read
+ *          from, lane2 the request word {len/64 [63:48], return reference
+ *          [47:0]}. The far loom_rx/loom_rd read len bytes there and write
+ *          them back to the return reference (a read slot of THIS switch),
+ *          then the word itself to return reference + len.
  *
  * PACKETS. Full beats (all 64 strobes) that continue the same binding at the
  * next offset are gathered into one packet, up to PMTU (64 beats) on either
@@ -53,9 +52,12 @@ import lynxTypes::*;
  * write-combining buffer that fills a whole line hands over a full beat,
  * which joins packets like bulk.
  *
- * ORDER. One queue for packets and stores: they leave in the order their
- * beats arrived, across bindings, so a flag stored after data stays behind
- * it.
+ * ORDER. One queue for packets, stores and get requests: they leave in the
+ * order their beats arrived, across bindings, so a flag stored after data
+ * stays behind it. A get request joins the queue in a cycle when the write
+ * path queues nothing, and after the packet being gathered (closed first
+ * if no beat is presented, else when it fills or is cut), so a read is
+ * sent after every write whose beats were taken before it.
  *
  * CONTRACT. Bursts are INCR bursts of full-width beats (awsize is not
  * looked at). The address is rounded down to 64 B and the strobes say which
@@ -64,7 +66,7 @@ import lynxTypes::*;
  * partial first beat, i.e. stores. Window starts and lengths are 64 B
  * multiples. A burst with no window, or whose lines end past the window's
  * length, is accepted, discarded and counted (cnt_drop). B is answered once
- * the burst's last beat is taken. Reads are answered with zeros.
+ * the burst's last beat is taken. The read channels are loom_read's.
  *
  * LOOKUP. AW goes through three register stages (the table's two, then the
  * offset and bounds), each advancing whenever the next has room, so up to
@@ -100,13 +102,20 @@ module loom_ingress #(
     output logic [UWIN_BITS-1:0]        ua_addr,
     input  logic                        ua_hit,
     input  logic                        ua_route,
-    input  logic                        ua_get,
     input  logic [PID_BITS-1:0]         ua_pid,
     input  logic [PID_BITS-1:0]         ua_dst_pid,
     input  logic [VADDR_BITS-1:0]       ua_base,
     input  logic [UWIN_BITS-1:0]        ua_ustart,
     input  logic [LEN_BITS:0]           ua_end,
     input  logic [3:0]                  ua_idx,
+
+    // Get requests (from loom_read): pid = the QP owner, ref = the far
+    // reference to read, word = the request word
+    input  logic                        s_get_valid,
+    output logic                        s_get_ready,
+    input  logic [PID_BITS-1:0]         s_get_pid,
+    input  logic [VADDR_BITS-1:0]       s_get_ref,
+    input  logic [63:0]                 s_get_word,
 
     // sq_wr (shared with loom_rx in vfpga_top)
     output req_t                        wr_req,
@@ -145,7 +154,6 @@ module loom_ingress #(
     output logic                        cnt_rdma_flush, // a partial rdma packet closed by the idle timer
     output logic                        cnt_rdma_cut,   // a partial rdma packet closed by a non-continuing write
     output logic                        cnt_get,        // a get request sent
-    output logic                        cnt_get_drop,   // a full beat on a get window, dropped
     output logic [N_DBG-1:0]            cnt_dbg         // debug pulses, listed at N_DBG
 );
 
@@ -168,7 +176,7 @@ logic [UWIN_BITS:0]     s1_aend, s2_aend; // end of the burst's lines
 logic [7:0]             s1_len, s2_len, s3_len;
 logic [AXI_ID_BITS-1:0] s1_id, s2_id, s3_id;
 logic                   s1_mis, s2_mis, s3_mis;
-logic                   s3_hit, s3_ok, s3_route, s3_get;
+logic                   s3_hit, s3_ok, s3_route;
 logic [3:0]             s3_idx;
 logic [PID_BITS-1:0]    s3_pid, s3_dst_pid;
 logic [VADDR_BITS-1:0]  s3_base;
@@ -218,7 +226,6 @@ always_ff @(posedge aclk) begin
         s3_ok      <= ua_hit && ((LEN_BITS+1)'(s2_aend) <= ua_end);
         s3_idx     <= ua_idx;
         s3_route   <= ua_route;
-        s3_get     <= ua_get;
         s3_pid     <= ua_pid;
         s3_dst_pid <= ua_dst_pid;
         s3_base    <= ua_base;
@@ -235,7 +242,7 @@ end
 logic                  b_act;             // a burst is loaded
 logic                  b_ok;              // its beats are taken, not discarded
 logic [3:0]            b_idx;
-logic                  b_route, b_get;
+logic                  b_route;
 logic [PID_BITS-1:0]   b_pid, b_dst_pid;
 logic [VADDR_BITS-1:0] b_base;
 logic [LEN_BITS-1:0]   b_off;             // binding offset of the next beat
@@ -282,9 +289,8 @@ wire part_take  = part && !pk_open && (!part_store || !pq_full) && part_last;
 
 wire full_ok    = df_ready && !pq_full;
 
-// A full beat on a get window is taken and dropped
 assign axi_udata.wready = b_act && b_room &&
-                          (!b_ok || (w_full ? (b_get || full_ok) : part_take));
+                          (!b_ok || (w_full ? full_ok : part_take));
 wire w_hs    = axi_udata.wvalid && axi_udata.wready;
 wire w_end   = w_hs && axi_udata.wlast;
 
@@ -300,7 +306,6 @@ always_ff @(posedge aclk) begin
             b_ok      <= s3_ok;
             b_idx     <= s3_idx;
             b_route   <= s3_route;
-            b_get     <= s3_get;
             b_pid     <= s3_pid;
             b_dst_pid <= s3_dst_pid;
             b_base    <= s3_base;
@@ -322,7 +327,6 @@ end
 assign cnt_burst      = aw_take && s3_ok;
 assign cnt_drop       = aw_take && !s3_ok;
 assign cnt_store_drop = w_hs && b_ok && !w_full && (wd_bad != 8'd0);
-assign cnt_get_drop   = w_hs && b_ok && w_full && b_get;
 
 always_ff @(posedge aclk) begin
     if (!aresetn) bq_valid <= 1'b0;
@@ -346,7 +350,7 @@ logic [LEN_BITS-1:0]   pk_next;           // binding offset the next beat must h
 logic [BEAT_W-1:0]     pk_beats;
 logic [$clog2(FLUSH_CYCLES+1)-1:0] idle;
 
-wire good_beat = w_hs && b_ok && w_full && !b_get;
+wire good_beat = w_hs && b_ok && w_full;
 wire cont      = pk_open && (pk_idx == b_idx) && (pk_next == b_off);
 wire [BEAT_W-1:0] cap_cur = BEAT_W'(PKT_BEATS);
 // The idle timer closes a partial packet only when it can leave at once:
@@ -363,7 +367,7 @@ wire flush     = pk_open && !w_in && send_idle && (idle >= FLUSH_CYCLES - 1);
 // Queue entries: a packet (its beats are in the data FIFO) or a store
 typedef struct packed {
     logic                  store;
-    logic                  get;               // a store on a get window
+    logic                  get;               // a get request (store set too)
     logic                  route;
     logic [PID_BITS-1:0]   pid;
     logic [PID_BITS-1:0]   dst_pid;
@@ -374,8 +378,10 @@ typedef struct packed {
 
 // At most one entry is queued per cycle: the open packet when a full beat
 // does not continue it, when a beat fills it, when a partial beat arrives, or
-// on the idle timer (only in cycles with no beat); or one store
-logic pq_push;
+// on the idle timer (only in cycles with no beat); or one store. In a cycle
+// the write path queues nothing, a waiting get request closes the open
+// packet (if no beat is presented) or, with none open, queues itself.
+logic pq_push, g_close, g_push;
 pkt_t pq_in;
 
 always_comb begin
@@ -393,13 +399,22 @@ always_comb begin
         pq_push = !pq_full;
     end else if (part_store) begin
         pq_push = !pq_full;
-        pq_in   = '{store: 1'b1, get: b_get, route: b_route, pid: b_pid, dst_pid: b_dst_pid,
+        pq_in   = '{store: 1'b1, get: 1'b0, route: b_route, pid: b_pid, dst_pid: b_dst_pid,
                     va: b_base + VADDR_BITS'(b_off) + VADDR_BITS'({st_lane, 3'b0}),
                     beats: '0, data: axi_udata.wdata[64*st_lane +: 64]};
     end else if (flush) begin
         pq_push = 1'b1;
     end
+    g_close = s_get_valid && !pq_push && !pq_full && pk_open && !w_in;
+    g_push  = s_get_valid && !pq_push && !pq_full && !pk_open;
+    if (g_close) pq_push = 1'b1;
+    if (g_push) begin
+        pq_push = 1'b1;
+        pq_in   = '{store: 1'b1, get: 1'b1, route: 1'b1, pid: s_get_pid, dst_pid: '0,
+                    va: s_get_ref, beats: '0, data: s_get_word};
+    end
 end
+assign s_get_ready = g_push;
 
 always_ff @(posedge aclk) begin
     if (!aresetn) begin
@@ -423,7 +438,7 @@ always_ff @(posedge aclk) begin
                 pk_next    <= b_off + LEN_BITS'(64);
                 pk_beats   <= BEAT_W'(1);
             end
-        end else if ((part_close && !pq_full) || flush) begin
+        end else if ((part_close && !pq_full) || flush || g_close) begin
             pk_open <= 1'b0;
         end
     end
@@ -601,30 +616,5 @@ assign cnt_dbg[10] = aw_take && (s3_len == 8'd0);
 assign cnt_dbg[11] = aw_take && (s3_len != 8'd0) && (s3_len < 8'd4);
 assign cnt_dbg[12] = aw_take && (s3_len >= 8'd4);
 assign cnt_dbg[13] = aw_take && s3_mis;
-
-// ---------------------------------------------------------------------------
-// Reads: zeros, one beat per requested beat
-// ---------------------------------------------------------------------------
-logic       r_act;
-logic [7:0] r_left;
-logic [AXI_ID_BITS-1:0] r_id;
-
-assign axi_udata.arready = !r_act;
-always_ff @(posedge aclk) begin
-    if (!aresetn) r_act <= 1'b0;
-    else if (!r_act && axi_udata.arvalid) begin
-        r_act  <= 1'b1;
-        r_left <= axi_udata.arlen;
-        r_id   <= axi_udata.arid;
-    end else if (r_act && axi_udata.rready) begin
-        if (r_left == 8'd0) r_act <= 1'b0;
-        r_left <= r_left - 1'b1;
-    end
-end
-assign axi_udata.rvalid = r_act;
-assign axi_udata.rdata  = '0;
-assign axi_udata.rresp  = 2'b00;
-assign axi_udata.rid    = r_id;
-assign axi_udata.rlast  = r_act && (r_left == 8'd0);
 
 endmodule

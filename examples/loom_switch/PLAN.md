@@ -302,7 +302,11 @@ can be up to 128 MB (a 64 MiB push fits one binding).
   11.2-11.8), byte-exact. `ce_local --land-v80` prints the V80 window's
   counters per copy (the burst sizes of the U280's writes into the V80).
 
-- **Gets (WORKFLOW 6.5), amy reads rose's export.** Both U280s run
+- **Gets (WORKFLOW 6.5), amy reads rose's export.** Since the commit after
+  6a3113e0 a get is a READ of an rdma window (`loom_read`); the image for
+  that is not built yet. The commands and results below are for the first
+  form (5f710592: the CPU stored a request word into a get window and
+  polled a completion word), which the reads replace. Both U280s run
   `~/coyote-bitstreams/loom-switch-get` (build_oct04_get, 5f710592,
   `-DACK_GAP_CYCLES=16`, md5 ac3f9ff1). amy and rose have older trees, so
   they are flashed with an out-of-tree helper that JTAG-programs by part

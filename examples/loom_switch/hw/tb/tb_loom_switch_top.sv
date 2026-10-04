@@ -18,11 +18,16 @@ import lynxTypes::*;
  * sq_wr, with the arbitration invariants checked every cycle; a long copy
  * through the uwin replayed into loom_rx as the far stack delivers it,
  * landing byte-exact; the counters, including the shell's write path ones.
- * Gets: a store into a get window becomes a get request; loom_rd answers an
- * incoming one (host read, response packets, completion), rejects bad ones
- * with the error completion, stays under the ack window, and shares the
- * payload stream with the ingress in request order; and a get end to end,
- * request and response replayed through loom_rx, landing byte-exact.
+ * Gets: loom_rd answers an incoming get (host read, response packets,
+ * completion), rejects bad ones with the error completion, stays under the
+ * ack window, and shares the payload stream with the ingress in request
+ * order. Reads on the uwin (loom_read): a read of an rdma window becomes a
+ * get request; window 3 is bound to export 7 HERE, so the request is
+ * replayed into loom_rx as the far side, loom_rd answers, and the answer is
+ * replayed into loom_rx as the reader, which answers R: a CPU-sized load,
+ * bursts in flight answered out of order (whole, unaligned, narrow, fixed),
+ * reads that fail (all ones), a read after an open write packet, and all
+ * slots in use, then wrapping, under backpressure.
  */
 module tb_loom_switch_top;
 
@@ -70,10 +75,10 @@ localparam logic [47:0] X2 = 48'h7e20_0000_0000;
 localparam logic [47:0] X7 = 48'h7e70_0000_0000;
 localparam longint      U1 = 64'h000_0000;
 localparam longint      U2 = 64'h010_0000;
-localparam longint      U3 = 64'h020_0000;            // window 3: get, far export 4
-localparam logic [47:0] G3 = {8'd4, 40'h1000};
-localparam longint      U4 = 64'h030_0000;            // window 4: get, export 7 here (T13's loop)
-localparam logic [47:0] G4 = {8'd7, 40'h3000};
+localparam longint      U3 = 64'h020_0000;            // window 3: rdma, QP pid 5, export 7 HERE at 0x3000
+localparam logic [47:0] R3 = {8'd7, 40'h3000};
+localparam longint      U4 = 64'h030_0000;            // window 4: rdma, export 5 here (not programmed)
+localparam logic [47:0] R4 = {8'd5, 40'h0};
 
 function automatic logic [AXI_DATA_BITS-1:0] pat(input longint uaddr);
     logic [AXI_DATA_BITS-1:0] d;
@@ -119,6 +124,7 @@ initial begin
 end
 
 always @(posedge aclk) begin
+    axi_udata.rready        <= bp ? ($urandom_range(0, 2) != 0) : 1'b1;
     sq_wr.ready             <= bp ? ($urandom_range(0, 2) != 0) : 1'b1;
     sq_rd.ready             <= bp ? ($urandom_range(0, 2) != 0) : 1'b1;
     axis_host_send[0].tready <= bp ? ($urandom_range(0, 2) != 0) : 1'b1;
@@ -145,9 +151,11 @@ req_t wr_ing [$], wr_rx [$], wr_rd [$];   // sq_wr handshakes, by producer
 typedef struct { bit rd; int beats; logic [47:0] va; } netreq_t;
 netreq_t net_req [$];                      // rdma requests in the order taken
 req_t rd_log [$];                          // sq_rd handshakes
-logic [AXI_DATA_BITS-1:0]   h0_d [$], h1_d [$], n_d [$];
+logic [AXI_DATA_BITS-1:0]   h0_d [$], h1_d [$], n_d [$], r_d [$];
 logic [AXI_DATA_BITS/8-1:0] h0_k [$];
-bit                         h0_l [$], h1_l [$], n_l [$];
+bit                         h0_l [$], h1_l [$], n_l [$], r_l [$];
+int                         r_id [$];
+logic [1:0]                 r_rs [$];
 
 always @(posedge aclk) if (aresetn) begin
     if (sq_wr.valid && sq_wr.ready) begin
@@ -172,6 +180,10 @@ always @(posedge aclk) if (aresetn) begin
     end
     if (axis_rreq_send[0].tvalid && axis_rreq_send[0].tready) begin
         n_d.push_back(axis_rreq_send[0].tdata); n_l.push_back(axis_rreq_send[0].tlast);
+    end
+    if (axi_udata.rvalid && axi_udata.rready) begin
+        r_d.push_back(axi_udata.rdata); r_l.push_back(axi_udata.rlast);
+        r_id.push_back(int'(axi_udata.rid)); r_rs.push_back(axi_udata.rresp);
     end
 end
 
@@ -253,18 +265,6 @@ task automatic program_win(input int idx, input bit route, input int pid, input 
     csr_wr(5, 64'd1);
 endtask
 
-// A get window: route rdma with get set (TBL_CFG 0b111)
-task automatic program_get_win(input int idx, input int pid, input logic [47:0] base,
-                               input longint len, input longint ustart);
-    csr_wr(0, 64'(idx));
-    csr_wr(1, 64'b111);
-    csr_wr(2, 64'(pid));
-    csr_wr(3, 64'(base));
-    csr_wr(4, 64'(len));
-    csr_wr(80, 64'(ustart));
-    csr_wr(5, 64'd1);
-endtask
-
 semaphore uwin_lock = new(1);
 int uwin_id = 0;
 task automatic uwr(input longint uaddr, input int beats, input logic [63:0] strb = '1);
@@ -290,7 +290,7 @@ endtask
 initial begin
     axi_udata.awburst = 2'b01; axi_udata.awsize = 3'd6; axi_udata.awcache = 0; axi_udata.awlock = 0;
     axi_udata.awprot = 0; axi_udata.awqos = 0; axi_udata.awregion = 0; axi_udata.awvalid = 0;
-    axi_udata.arvalid = 0; axi_udata.wvalid = 0; axi_udata.bready = 1; axi_udata.rready = 1;
+    axi_udata.arvalid = 0; axi_udata.wvalid = 0; axi_udata.bready = 1;
     axi_udata.araddr = 0; axi_udata.arlen = 0; axi_udata.arid = 0; axi_udata.arburst = 1;
     axi_udata.arsize = 6; axi_udata.arcache = 0; axi_udata.arlock = 0; axi_udata.arprot = 0;
     axi_udata.arqos = 0; axi_udata.arregion = 0;
@@ -326,28 +326,6 @@ task automatic rx_packet(input int len, input logic [AXI_DATA_BITS-1:0] beats [$
         @(negedge aclk);
     end
     axis_rrsp_recv[0].tvalid = 0;
-endtask
-
-// One 8 B store into the uwin at uaddr (8 B aligned): a 1-beat burst with
-// that word's strobes, value in its lane
-task automatic ustore(input longint uaddr, input logic [63:0] val);
-    int lane;
-    lane = int'((uaddr >> 3) & 7);
-    uwin_lock.get();
-    @(negedge aclk);
-    axi_udata.awaddr = 64'h0800_0000 + (uaddr & ~64'h3F); axi_udata.awlen = 8'd0;
-    axi_udata.awid = 6'(uwin_id++); axi_udata.awvalid = 1;
-    do @(posedge aclk); while (!axi_udata.awready);
-    @(negedge aclk);
-    axi_udata.awvalid = 0;
-    axi_udata.wdata = '0; axi_udata.wdata[64*lane +: 64] = val;
-    axi_udata.wstrb = word(lane); axi_udata.wlast = 1; axi_udata.wvalid = 1;
-    do @(posedge aclk); while (!axi_udata.wready);
-    @(negedge aclk);
-    axi_udata.wvalid = 0;
-    while (!axi_udata.bvalid) @(posedge aclk);
-    @(negedge aclk);
-    uwin_lock.put();
 endtask
 
 // An incoming get request: RETH {0xFF, 0}, one beat {op 3, len 8; the
@@ -458,15 +436,22 @@ task automatic quiesce();
         if (!sq_wr.valid && !inst_dut.inst_loom_rx.busy && inst_dut.inst_loom_ingress.pq_empty &&
             !inst_dut.inst_loom_rd.busy && rdq.size() == 0 && !sq_rd.valid &&
             int'(inst_dut.inst_loom_ingress.ostate) == 0 && !inst_dut.inst_loom_ingress.pk_open &&
-            !axis_host_send[0].tvalid && !axis_host_send[1].tvalid && !axis_rreq_send[0].tvalid)
+            !axis_host_send[0].tvalid && !axis_host_send[1].tvalid && !axis_rreq_send[0].tvalid &&
+            !inst_dut.inst_loom_read.busy && !axi_udata.rvalid)
             idle++;
         else idle = 0;
     end
 endtask
 
-task automatic clear();
+// Everything captured but the R beats (the loopback keeps those)
+task automatic clear_net();
     wr_ing.delete(); wr_rx.delete(); wr_rd.delete(); net_req.delete(); rd_log.delete();
     h0_d.delete(); h0_k.delete(); h0_l.delete(); h1_d.delete(); h1_l.delete(); n_d.delete(); n_l.delete();
+endtask
+
+task automatic clear();
+    clear_net();
+    r_d.delete(); r_l.delete(); r_id.delete(); r_rs.delete();
 endtask
 
 // Checks: the next ingress request and its beats
@@ -496,6 +481,91 @@ task automatic exp_rdma(input string name, input logic [47:0] va, input longint 
     for (int j = 0; j < beats; j++)
         `CHECK(n_d.size() != 0 && n_d.pop_front() == pat(uaddr + 64*j) && n_l.pop_front() == (j == beats-1),
                $sformatf("%s: beat %0d", name, j))
+endtask
+
+// ---------------------------------------------------------------------------
+// Reads on the uwin
+// ---------------------------------------------------------------------------
+semaphore ar_lock = new(1);
+task automatic uread(input longint uaddr, input int arlen, input int size = 6, input int burst = 1,
+                     input int id = 0);
+    ar_lock.get();
+    @(negedge aclk);
+    axi_udata.araddr = 64'h0800_0000 + uaddr; axi_udata.arlen = 8'(arlen);
+    axi_udata.arsize = 3'(size); axi_udata.arburst = 2'(burst); axi_udata.arid = 6'(id);
+    axi_udata.arvalid = 1;
+    do @(posedge aclk); while (!axi_udata.arready);
+    @(negedge aclk);
+    axi_udata.arvalid = 0;
+    ar_lock.put();
+endtask
+
+// The address of a read's beat i (AXI INCR or FIXED)
+function automatic longint beat_addr(input longint a, input int i, input int size, input int burst);
+    longint al = a & ~((64'd1 << size) - 1);
+    if (burst == 0 || i == 0) return a;
+    return al + (longint'(i) << size);
+endfunction
+
+// The R beats of a read at window-3 offset woff: each the line its address
+// falls in, as the far host reads it (hpat at export 7 + 0x3000 + line), or
+// all ones for a read that fails
+task automatic exp_read(input string name, input longint woff, input int arlen, input int size = 6,
+                        input int burst = 1, input int id = 0, input bit fail = 0);
+    for (int i = 0; i <= arlen; i++) begin
+        longint line = beat_addr(woff, i, size, burst) & ~64'h3F;
+        logic [AXI_DATA_BITS-1:0] want;
+        want = fail ? '1 : hpat(X7 + 48'h3000 + 48'(line));
+        `CHECK(r_d.size() != 0, $sformatf("%s: R beat %0d missing", name, i))
+        if (r_d.size() == 0) return;
+        `CHECK(r_d.pop_front() == want && r_id.pop_front() == id && r_l.pop_front() == (i == arlen) &&
+               r_rs.pop_front() == 2'b00, $sformatf("%s: R beat %0d (line %h)", name, i, line))
+    end
+endtask
+
+// The far side and the way back, by loopback: the get requests sent so far
+// (other rdma packets' beats skipped) are replayed into loom_rx as the far
+// side; loom_rd's answers, one group per get (packets, then the completion),
+// are replayed into loom_rx as the reader, in order or last get first
+task automatic loop_gets(input string name, input int want_gets, input bit reverse = 0);
+    logic [AXI_DATA_BITS-1:0] reqs [$], beats [$], b [$];
+    logic [47:0] pva [$];
+    int plen [$], pfirst [$], gfirst [$], gcnt [$];
+    quiesce();
+    foreach (net_req[i]) begin
+        for (int j = 0; j < net_req[i].beats; j++) begin
+            logic [AXI_DATA_BITS-1:0] d;
+            d = n_d.pop_front(); void'(n_l.pop_front());
+            if (net_req[i].va == {8'hFF, 40'd0} && d[7:0] == 8'd3) reqs.push_back(d);
+        end
+    end
+    `CHECK(reqs.size() == want_gets, $sformatf("%s: %0d get requests out, want %0d", name, reqs.size(), want_gets))
+    clear_net();
+    rx_lock.get();
+    foreach (reqs[i]) begin b.delete(); b.push_back(reqs[i]); rx_packet(64, b, {8'hFF, 40'd0}); end
+    rx_lock.put();
+    quiesce();
+    foreach (net_req[i]) begin
+        `CHECK(net_req[i].rd, $sformatf("%s: a request other than an answer", name))
+        if (gfirst.size() == gcnt.size()) gfirst.push_back(pva.size());
+        pva.push_back(net_req[i].va); plen.push_back(net_req[i].beats * 64); pfirst.push_back(beats.size());
+        for (int j = 0; j < net_req[i].beats; j++) begin beats.push_back(n_d.pop_front()); void'(n_l.pop_front()); end
+        if (net_req[i].va == {8'hFF, 40'd0}) gcnt.push_back(pva.size() - gfirst[gfirst.size() - 1]);
+    end
+    `CHECK(gcnt.size() == reqs.size() && gfirst.size() == gcnt.size(),
+           $sformatf("%s: %0d answers for %0d requests", name, gcnt.size(), reqs.size()))
+    clear_net();
+    rx_lock.get();
+    for (int k = 0; k < gcnt.size(); k++) begin
+        int g = reverse ? gcnt.size() - 1 - k : k;
+        for (int p = gfirst[g]; p < gfirst[g] + gcnt[g]; p++) begin
+            b.delete();
+            for (int j = 0; j < plen[p] / 64; j++) b.push_back(beats[pfirst[p] + j]);
+            rx_packet(plen[p], b, pva[p]);
+        end
+    end
+    rx_lock.put();
+    quiesce();
 endtask
 
 // ---------------------------------------------------------------------------
@@ -789,28 +859,36 @@ initial begin
     end
     $display("ok   T10 long copy, uwin to landing");
 
-    // --- T11: a get window turns each 8 B store into a get request (op 3,
-    //     lane1 = window base + offset, lane2 = the stored word); a full line
-    //     written to it is dropped and counted ---
+    // --- T11: a read of an rdma window is a get request: an 8 B load at
+    //     window 3 offset 0x48 asks export 7 (window 3's far reference) for
+    //     the line at 0x3040, back to read slot 0 (op 3; lane1 = the
+    //     reference, lane2 = {1 line, {0xFE, slot 0}}); answered by loopback,
+    //     R is that line ---
     begin
-        logic [63:0] g0, g1, d0, d1, gw;
-        program_get_win(3, 5, G3, 64'h1_0000, U3);
+        logic [63:0] g0, g1, y0 [8], y1 [8];
+        program_win(3, 1, 5, 0, R3, 64'h1_0000, U3);
+        csr_wr(184, 64'd5);
         clear();
-        csr_rd(136, g0); csr_rd(137, d0);
-        gw = gword(4096, {8'd2, 40'h8000});
-        ustore(U3 + 64'h48, gw);
-        uwr(U3 + 64'h100, 1);
+        csr_rd(136, g0);
+        for (int i = 0; i < 8; i++) csr_rd(192 + i, y0[i]);
+        uread(U3 + 64'h48, 0, 3, 1, 9);
         quiesce();
         `CHECK(wr_ing.size() == 1 && wr_ing[0].opcode == RC_RDMA_WRITE_ONLY && wr_ing[0].vaddr == {8'hFF, 40'd0} &&
                wr_ing[0].len == 64 && wr_ing[0].pid == 5, $sformatf("T11: %0d ingress requests", wr_ing.size()))
-        `CHECK(n_d.size() == 1 && n_d[0][63:0] == {28'd0, 28'd8, 8'd3} && n_d[0][127:64] == 64'(G3 + 48'h48) &&
-               n_d[0][191:128] == gw, "T11: get request message")
-        csr_rd(136, g1); csr_rd(137, d1);
-        `CHECK(g1 - g0 == 1 && d1 - d0 == 1, $sformatf("T11: %0d get requests, %0d full beats dropped", g1 - g0, d1 - d0))
-        `CHECK(rd_log.size() == 0 && wr_rd.size() == 0, "T11: the requester read or responded")
+        `CHECK(n_d.size() == 1 && n_d[0][63:0] == {28'd0, 28'd8, 8'd3} && n_d[0][127:64] == 64'(R3 + 48'h40) &&
+               n_d[0][191:128] == {16'd1, 8'hFE, 40'd0}, "T11: get request message")
+        `CHECK(r_d.size() == 0 && rd_log.size() == 0 && wr_rd.size() == 0, "T11: answered before the far side")
+        csr_rd(136, g1); `CHECK(g1 - g0 == 1, $sformatf("T11: %0d get requests counted", g1 - g0))
+        loop_gets("T11", 1);
+        exp_read("T11", 64'h48, 0, 3, 1, 9);
+        `CHECK(r_d.size() == 0, $sformatf("T11: %0d extra R beats", r_d.size()))
+        for (int i = 0; i < 8; i++) csr_rd(192 + i, y1[i]);
+        `CHECK(y1[0] - y0[0] == 1 && y1[1] - y0[1] == 1 && y1[2] == y0[2] && y1[5] == y0[5] && y1[6] - y0[6] == 1,
+               $sformatf("T11: reads %0d answered %0d failed %0d stray %0d lines %0d",
+                         y1[0] - y0[0], y1[1] - y0[1], y1[2] - y0[2], y1[5] - y0[5], y1[6] - y0[6]))
         clear();
     end
-    $display("ok   T11 get request out");
+    $display("ok   T11 a load is a get");
 
     // --- T12: loom_rd answers a get of 9 KiB from export 7 at 0x3000: one
     //     host read, packets of 4096 + 4096 + 1024 to the return reference,
@@ -922,65 +1000,106 @@ initial begin
     end
     $display("ok   T12d ingress and responses share the payload stream");
 
-    // --- T13: a get end to end. A store into get window 4 (export 7 here,
-    //     at 0x3000) asks for 8704 bytes from 0x3080 back to export 2 at
-    //     0x4_0000; the request is replayed into loom_rx as the far side,
-    //     loom_rd answers, and the answer is replayed into loom_rx as the
-    //     requester: the data lands byte-exact, then the completion word ---
+    // --- T13: reads in flight, as a copy engine issues them, answered out
+    //     of order (last get first): R still answers in AR order, each beat
+    //     the line its address falls in. A whole 4 KiB burst, a 64 B one, a
+    //     burst starting mid-line (4 lines), a narrow one (8 B beats over 3
+    //     lines), a fixed one (4 beats of one line) ---
     begin
-        req_t pk [$];
-        logic [AXI_DATA_BITS-1:0] nd [$], b [$];
-        logic [47:0] ret;
-        logic [63:0] gw;
-        int len = 2 * 4096 + 512;
-        ret = {8'd2, 40'h4_0000};
-        gw  = gword(len, ret);
-        program_get_win(4, 5, G4, 64'h1_0000, U4);
+        longint off [5] = '{64'h1000, 64'h40, 64'h2010, 64'h22F8, 64'h500};
+        int     len [5] = '{63, 0, 3, 15, 3};
+        int     sz  [5] = '{6, 6, 6, 3, 6};
+        int     bu  [5] = '{1, 1, 1, 1, 0};
         clear();
-        ustore(U4 + 64'h80, gw);
-        quiesce();
-        `CHECK(wr_ing.size() == 1 && n_d.size() == 1, $sformatf("T13: %0d requests out", wr_ing.size()))
-        b.push_back(n_d[0]);
-        pk.push_back(wr_ing[0]);
-        clear();
-        rx_lock.get();
-        rx_packet(64, b, pk[0].vaddr);                  // the far side receives the request
-        rx_lock.put();
-        quiesce();
-        pk.delete();
-        foreach (wr_rd[i]) pk.push_back(wr_rd[i]);
-        foreach (n_d[i]) nd.push_back(n_d[i]);
-        `CHECK(pk.size() == 4 && nd.size() == len / 64 + 1, $sformatf("T13: %0d responses, %0d beats", pk.size(), nd.size()))
-        clear();
-        rx_lock.get();
-        foreach (pk[i]) begin                           // the requester receives the answer
-            b.delete();
-            for (int j = 0; j < (pk[i].len + 63) / 64; j++) b.push_back(nd.pop_front());
-            rx_packet(int'(pk[i].len), b, pk[i].vaddr);
-        end
-        rx_lock.put();
-        quiesce();
-        begin
-            int off = 0;
-            `CHECK(wr_rx.size() == 4, $sformatf("T13: %0d landings", wr_rx.size()))
-            for (int i = 0; i < 3 && i < wr_rx.size(); i++) begin
-                int plen = (i == 2) ? 512 : 4096;
-                `CHECK(wr_rx[i].vaddr == X2 + 48'h4_0000 + 48'(off) && wr_rx[i].len == plen && wr_rx[i].pid == 9,
-                       $sformatf("T13: landing %0d va %h len %0d", i, wr_rx[i].vaddr, wr_rx[i].len))
-                off += plen;
-            end
-            if (wr_rx.size() == 4)
-                `CHECK(wr_rx[3].vaddr == X2 + 48'h4_0000 + 48'(len) && wr_rx[3].len == 8 && wr_rx[3].last,
-                       $sformatf("T13: completion landing va %h len %0d", wr_rx[3].vaddr, wr_rx[3].len))
-            `CHECK(h1_d.size() == len / 64 + 1, $sformatf("T13: %0d beats landed", h1_d.size()))
-            for (int j = 0; j < len / 64 && j < h1_d.size(); j++)
-                `CHECK(h1_d[j] == hpat(X7 + 48'h3080 + 48'(64*j)), $sformatf("T13: landed beat %0d", j))
-            if (h1_d.size() == len / 64 + 1)
-                `CHECK(h1_d[len / 64][63:0] == gw, $sformatf("T13: completion word %h", h1_d[len / 64][63:0]))
-        end
+        for (int k = 0; k < 5; k++) uread(U3 + off[k], len[k], sz[k], bu[k], 20 + k);
+        loop_gets("T13", 5, 1);
+        for (int k = 0; k < 5; k++) exp_read($sformatf("T13 read %0d", k), off[k], len[k], sz[k], bu[k], 20 + k);
+        `CHECK(r_d.size() == 0, $sformatf("T13: %0d extra R beats", r_d.size()))
         clear();
     end
-    $display("ok   T13 get end to end");
+    $display("ok   T13 reads in flight, answered out of order");
+
+    // --- T14: reads that fail are answered with all ones, and the reads
+    //     behind them still complete: no window, a local window, lines past
+    //     a window's end (window 4 is 0x1040 long), a burst crossing its 4 KiB
+    //     page; and one the far side rejects (window 4: export 5 is not
+    //     there) ---
+    begin
+        logic [63:0] y0 [8], y1 [8];
+        program_win(4, 1, 5, 0, R4, 64'h1040, U4);
+        clear();
+        for (int i = 0; i < 8; i++) csr_rd(192 + i, y0[i]);
+        uread(64'h070_0000, 0, 6, 1, 1);                 // no window
+        uread(U1 + 64'h40, 1, 6, 1, 2);                  // local window 1
+        uread(U4 + 64'h1000, 1, 6, 1, 3);                // its second line past the end
+        uread(U3 + 64'h0FC0, 1, 6, 1, 4);                // crosses 0x1000
+        uread(U4 + 64'h80, 0, 6, 1, 5);                  // the far side rejects it
+        uread(U3 + 64'h80, 0, 6, 1, 6);                  // a good one behind them
+        loop_gets("T14", 2);
+        exp_read("T14 no window", 0, 0, 6, 1, 1, 1);
+        exp_read("T14 local",     0, 1, 6, 1, 2, 1);
+        exp_read("T14 past end",  0, 1, 6, 1, 3, 1);
+        exp_read("T14 crossing",  0, 1, 6, 1, 4, 1);
+        exp_read("T14 rejected",  0, 0, 6, 1, 5, 1);
+        exp_read("T14 good",      64'h80, 0, 6, 1, 6);
+        `CHECK(r_d.size() == 0, $sformatf("T14: %0d extra R beats", r_d.size()))
+        for (int i = 0; i < 8; i++) csr_rd(192 + i, y1[i]);
+        `CHECK(y1[0] - y0[0] == 6 && y1[1] - y0[1] == 6 && y1[2] - y0[2] == 5 && y1[3] - y0[3] == 1 && y1[5] == y0[5],
+               $sformatf("T14: reads %0d answered %0d failed %0d far %0d stray %0d",
+                         y1[0] - y0[0], y1[1] - y0[1], y1[2] - y0[2], y1[3] - y0[3], y1[5] - y0[5]))
+        clear();
+    end
+    $display("ok   T14 failed reads");
+
+    // --- T15: a read goes out after the writes taken before it: 8 lines
+    //     written to window 3, then read at once, while their packet is still
+    //     open (the idle timer has not closed it): the read closes it, the
+    //     packet leaves whole, then the get request ---
+    begin
+        logic [63:0] c0x, c1x;
+        clear();
+        csr_rd(121, c0x);
+        uwr(U3 + 64'h100, 8);
+        uread(U3 + 64'h100, 7, 6, 1, 7);
+        quiesce();
+        `CHECK(net_req.size() == 2 && !net_req[0].rd && net_req[0].va == R3 + 48'h100 && net_req[0].beats == 8 &&
+               net_req[1].va == {8'hFF, 40'd0} && net_req[1].beats == 1,
+               $sformatf("T15: %0d requests on the wire, first %h x %0d", net_req.size(),
+                         net_req.size() ? net_req[0].va : 48'd0, net_req.size() ? net_req[0].beats : 0))
+        csr_rd(121, c1x); `CHECK(c1x - c0x == 1, $sformatf("T15: %0d packets cut", c1x - c0x))
+        loop_gets("T15", 1);
+        exp_read("T15", 64'h100, 7, 6, 1, 7);
+        clear();
+    end
+    $display("ok   T15 a read after an open write packet");
+
+    // --- T16: every slot in use, under backpressure: 64 one-line reads
+    //     take all 64 slots, a 65th waits for one (counted), and gets it once
+    //     the first 64 are answered; the ring wraps ---
+    $assertoff(0, tb_loom_switch_top.sq_wr);
+    bp = 1;
+    begin
+        logic [63:0] w0, w1;
+        bit took = 0;
+        clear();
+        csr_rd(196, w0);
+        for (int k = 0; k < 64; k++) uread(U3 + 64'h4000 + 64*k, 0, 6, 1, k);
+        fork begin uread(U3 + 64'h8000, 0, 6, 1, 40); took = 1; end join_none
+        repeat (300) @(posedge aclk);
+        `CHECK(!took, "T16: a 65th read was taken with every slot in use")
+        csr_rd(196, w1); `CHECK(w1 - w0 > 100, $sformatf("T16: %0d cycles waiting for a slot", w1 - w0))
+        loop_gets("T16", 64);
+        wait (took);
+        for (int k = 0; k < 64; k++) exp_read($sformatf("T16 read %0d", k), 64'h4000 + 64*k, 0, 6, 1, k);
+        loop_gets("T16 65th", 1);
+        exp_read("T16 65th", 64'h8000, 0, 6, 1, 40);
+        `CHECK(r_d.size() == 0, $sformatf("T16: %0d extra R beats", r_d.size()))
+        clear();
+    end
+    bp = 0;
+    repeat (50) @(posedge aclk);
+    $asserton(0, tb_loom_switch_top.sq_wr);
+    $display("ok   T16 every slot in use, then wrapping");
 
     if (errors == 0) $display("TB PASS (tb_loom_switch_top)");
     else             $display("TB FAIL (tb_loom_switch_top): %0d errors", errors);

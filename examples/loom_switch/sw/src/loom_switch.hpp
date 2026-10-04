@@ -14,7 +14,7 @@ namespace loom_switch {
 
 // Word indices
 constexpr uint32_t TBL_IDX         = 0;
-constexpr uint32_t TBL_CFG         = 1;    // bit0 valid, bit1 route (0 local, 1 rdma), bit2 get
+constexpr uint32_t TBL_CFG         = 1;    // bit0 valid, bit1 route (0 local, 1 rdma)
 constexpr uint32_t TBL_PID         = 2;    // [5:0] pid (local: destination; rdma: QP owner), [13:8] far pid
 constexpr uint32_t TBL_BASE        = 3;
 constexpr uint32_t TBL_LEN         = 4;
@@ -28,15 +28,22 @@ constexpr uint32_t EXP_BASE        = 179;  // the landing VA
 constexpr uint32_t EXP_LEN         = 180;
 constexpr uint32_t EXP_COMMIT      = 181;
 constexpr uint32_t RD_CTL          = 184;  // [5:0] the QP owner the get responses go out on
-// Gets (loom_ctrl.sv 136-143)
+// Gets (loom_ctrl.sv 136-143): a read of an rdma window is a get
 constexpr uint32_t GET_SENT        = 136;  // get requests sent
-constexpr uint32_t GET_FULL_DROP   = 137;  // full lines written to a get window, dropped
 constexpr uint32_t GET_JOBS        = 138;  // responder: requests taken
 constexpr uint32_t GET_ERRS        = 139;  // responder: error completions (bad requests)
 constexpr uint32_t GET_PKTS        = 140;  // responder: response packets
 constexpr uint32_t GET_CMPS        = 141;  // responder: completions
 constexpr uint32_t GET_WAIT        = 142;  // responder: cycles a request waited on the window or sq_wr
 constexpr uint32_t GET_STARVE      = 143;  // responder: cycles a packet waited for its read data
+// Reads on the uwin (loom_ctrl.sv 192-198, loom_read)
+constexpr uint32_t RD_READS        = 192;  // reads taken
+constexpr uint32_t RD_DONE         = 193;  // reads answered
+constexpr uint32_t RD_FAILED       = 194;  // reads answered with all ones
+constexpr uint32_t RD_FAR_ERR      = 195;  // ... because the far side rejected the get
+constexpr uint32_t RD_SLOT_WAIT    = 196;  // cycles a read waited for a free slot
+constexpr uint32_t RD_STRAY        = 197;  // completions for no outstanding get (must be 0)
+constexpr uint32_t RD_LINES        = 198;  // answer lines into the read buffer
 constexpr uint32_t RDMA_STAGING_VA = 16;
 constexpr uint32_t RX_FWD          = 36;
 constexpr uint32_t RX_DROP         = 41;
@@ -97,7 +104,10 @@ inline uint64_t export_ref(uint32_t idx, uint64_t off = 0) { return (uint64_t(id
 
 // One window: uwin bytes [ustart, ustart + len) land at base + offset under
 // pid (local), or, over pid's QP (rdma), at the far host's export
-// reference base + offset (base = export_ref(idx, off) from that host)
+// reference base + offset (base = export_ref(idx, off) from that host).
+// Reading an rdma window reads those bytes of the far host's export (a
+// failed read returns all ones); the far host answers with
+// set_response_qp done.
 inline void program_window(coyote::cThread &t, uint32_t win, bool rdma, uint32_t pid,
                            const void *base, uint64_t len, uint64_t ustart,
                            uint32_t dst_pid = 0) {
@@ -113,34 +123,6 @@ inline void program_window(coyote::cThread &t, uint32_t win, bool rdma, uint32_t
     // is in place before anything is written through it
     (void) csr_read(t, TBL_IDX);
 }
-
-// A get window: each 8 B store at window offset off (8 B aligned) asks the
-// far host for get_word's bytes from src_ref + off, over pid's QP. src_ref is
-// export_ref(idx, off) from that host; the far host answers with
-// set_response_qp done.
-inline void program_get_window(coyote::cThread &t, uint32_t win, uint32_t pid,
-                               uint64_t src_ref, uint64_t len, uint64_t ustart) {
-    csr_write(t, TBL_IDX,    win);
-    csr_write(t, TBL_CFG,    0b111);
-    csr_write(t, TBL_PID,    pid & 0x3F);
-    csr_write(t, TBL_BASE,   src_ref);
-    csr_write(t, TBL_LEN,    len);
-    csr_write(t, TBL_USTART, ustart);
-    csr_write(t, TBL_COMMIT, 1);
-    (void) csr_read(t, TBL_IDX);
-}
-
-// The word stored into a get window: len bytes (a multiple of 64, at most
-// 65535 * 64) back to ret_ref, a reference into an export of THIS host that
-// holds len + 8 bytes: the data lands at ret_ref, then the word itself at
-// ret_ref + len (the completion; all ones if the far host rejected the
-// request: no export, out of bounds, misaligned)
-inline uint64_t get_word(uint64_t len, uint64_t ret_ref) {
-    if (len == 0 || len % 64 || len / 64 > 0xFFFF || ret_ref % 64 || ret_ref >> 48)
-        throw std::runtime_error("get_word: len must be a multiple of 64 below 4 MiB, ret_ref 64 B aligned");
-    return ((len / 64) << 48) | ret_ref;
-}
-constexpr uint64_t GET_ERROR = ~0ULL;
 
 // This host answers peers' gets on pid's QP (the QP owner's ctid)
 inline void set_response_qp(coyote::cThread &t, uint32_t pid) {
