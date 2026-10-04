@@ -235,7 +235,10 @@ clara V80 ──P2P PCIe──> clara U280 ──RoCE──> rose U280 ──PCI
    semaphore release, and PCIe ordering keeps it behind the data.
 
 The engine knows nothing about Loom, RDMA or rose. It writes to a VA, as a
-GPU copy engine writes to a peer mapping.
+GPU copy engine writes to a peer mapping. Limits (prototype): `LEN` is a
+multiple of 64 with `SRC_VA` and `DST_VA` 64 B-aligned, and the engine runs
+one copy at a time (`START` is ignored while busy; there is no descriptor
+queue).
 
 ### 4.2 Into the switch (clara U280, `loom_ingress`)
 
@@ -330,6 +333,13 @@ The same as §4, from step 5 on. Only the producer changes.
 
 The window doesn't care what produced the writes: a copy engine, a CPU, or
 anything else that can write a PCIe address.
+
+**Limit (prototype).** Only whole, aligned 8 B words are delivered. A byte or
+4 B store, or the tail of a copy whose length is not a multiple of 8, arrives
+as a partial word and is dropped (CSR 93). Copy whole words: `memcpy` of a
+multiple of 8 bytes, or `cThread::uwinWrite`, which stores each aligned word
+once. Carrying a byte mask in the store message would lift this; it is not
+built.
 
 ## 6. Other endpoints
 
