@@ -17,3 +17,7 @@ set(TARGET_DIR "${CMAKE_SOURCE_DIR}/src/")
 # G2: host CPU writes through the user data window
 add_executable(uwin_probe ${TARGET_DIR}/uwin_probe.cpp)
 target_link_libraries(uwin_probe PUBLIC Coyote pthread)
+
+# Gets: the CPU reads the far host's export through a get window (two writes)
+add_executable(get_bench ${TARGET_DIR}/get_bench.cpp)
+target_link_libraries(get_bench PUBLIC Coyote pthread)

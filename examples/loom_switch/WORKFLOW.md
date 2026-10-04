@@ -369,6 +369,44 @@ A window with route 0 holds `{pid, VA}` of a buffer on *this* host.
 with no RDMA involved: the CPU or V80 writes into the window and the bytes
 land in another process's buffer on the same host (`ce_local`, `uwin_probe`).
 
+### 6.5 Gets: clara reads rose's export (`get_bench`)
+
+A get is two writes, so no RoCE READ is involved. The CPU (or anything that
+can write the window) stores one 8 B word into a **get window**. The far
+switch reads the data and writes it back as ordinary self-describing packets,
+then a completion word.
+
+- **Setup.**
+  - rose exports the source: `program_export(1, ctid, src, size)`, plus
+    `set_response_qp` (`RD_CTL`, the QP owner its answers go out on).
+  - clara exports its return buffer: `program_export(3, ctid, ret, len)`.
+  - clara binds a get window to rose's export: `program_get_window(1, QP
+    pid, export_ref(1), size, ustart 0)` (`TBL_CFG` bit 2).
+- **The request.** clara stores `get_word(len, export_ref(3, r))` =
+  `{len/64 [63:48], return reference [47:0]}` at window offset `s`.
+  `loom_ingress` sends it like any rdma store, as a 64 B inline message with
+  op `GET_REQ` (3): lane 1 = `export_ref(1) + s`, lane 2 = the word. A full
+  line written to a get window is dropped (word 137).
+- **rose.**
+  - `loom_rx` checks the source against its exports: export there, `s + len`
+    within it, `s`, `r` and `len` 64 B multiples, `len` not 0. It hands
+    `loom_rd` a job.
+  - `loom_rd` reads `len` bytes at `src + s` (`sq_rd`, host stream 1) up to 4
+    jobs ahead. It sends them back in PMTU packets, RETH =
+    `export_ref(3, r) + offset`, each posted only once its data is buffered.
+    It then sends one inline store of the word to `export_ref(3, r + len)`.
+  - A rejected request gets that store only, carrying all ones (`GET_ERROR`).
+  - The answers share `sq_wr`, the ack window and the payload stream with
+    rose's own ingress, in request order.
+- **clara.** `loom_rx` lands the answer in export 3 like any incoming
+  packet: the data, then the completion word. The CPU polls
+  `ret + r + len` for the word.
+
+Order: a get is a store in the ingress queue, so it leaves after everything
+written into the window before it. Its read on rose is not ordered after
+rose's own earlier landings to the same bytes, so a get after a put to the
+same place needs the put's completion first.
+
 ## 7. Ordering and completion
 
 A consumer may trust "the fence (or flag) has the new value, so everything

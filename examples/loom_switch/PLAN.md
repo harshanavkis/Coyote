@@ -302,6 +302,29 @@ can be up to 128 MB (a 64 MiB push fits one binding).
   11.2-11.8), byte-exact. `ce_local --land-v80` prints the V80 window's
   counters per copy (the burst sizes of the U280's writes into the V80).
 
+- **Gets (WORKFLOW 6.5), amy reads rose's export.** Both U280s run
+  `~/coyote-bitstreams/loom-switch-get` (build_oct04_get, 5f710592,
+  `-DACK_GAP_CYCLES=16`, md5 ac3f9ff1). amy and rose have older trees, so
+  they are flashed with an out-of-tree helper that JTAG-programs by part
+  and loads `~/coyote-drivers/coyote_driver-u280-0930.ko` with the host's
+  IP and MAC:
+  1. On clara:
+     `ssh amy.dos.cit.tum.de "bash ~/loom-experiments/get/flash_u280.sh /home/harshanavkis/coyote-bitstreams/loom-switch-get/hw/bitstreams/cyt_top.bit"`
+     `ssh rose.dos.cit.tum.de "bash ~/loom-experiments/get/flash_u280.sh /home/harshanavkis/coyote-bitstreams/loom-switch-get/hw/bitstreams/cyt_top.bit"`
+  2. The binary and library to both (on clara):
+     `for h in amy rose; do rsync -a /scratch/harshanavkis/loom-proj/Coyote/examples/loom_switch/sw/build/get_bench $h.dos.cit.tum.de:/scratch/harshanavkis/loom-proj/Coyote/examples/loom_switch/sw/build/ && rsync -a /scratch/harshanavkis/loom-proj/Coyote/examples/loom_switch/sw/build/coyote/libcoyote.so $h.dos.cit.tum.de:/scratch/harshanavkis/loom-proj/Coyote/examples/loom_switch/sw/build/coyote/; done`
+  3. rose, then amy (`~/loom-experiments/get/run_get.sh TAG` does both and
+     the nstats deltas):
+     - rose: `cd /scratch/harshanavkis/loom-proj/Coyote/examples/loom_switch/sw/build && sudo /nix/store/4sjg21zq04394ci22lj67vgpw7ykw9bg-numactl-2.0.18/bin/numactl -N 1 -m 1 ./get_bench --server`
+     - amy: `cd /scratch/harshanavkis/loom-proj/Coyote/examples/loom_switch/sw/build && sudo /nix/store/4sjg21zq04394ci22lj67vgpw7ykw9bg-numactl-2.0.18/bin/numactl -N 1 -m 1 ./get_bench --client 131.159.102.21`
+  2026-10-04: GET BENCH PASS twice, 9136 gets, every byte checked, 0
+  retransmissions. One get at a time 7.8-7.9 us (64-256 B), 8.2 (1 KiB),
+  8.8 (4 KiB), 9.8 (16 KiB), 13.9 (64 KiB); one 4 MiB get 11.65 GB/s;
+  256 KiB gets in flight 8.70 (1), 9.4-9.7 (2), 10.5-10.7 (4), 11.3 (8),
+  11.4-11.6 GB/s (16). The first run sent every get twice: `uwinWrite`'s
+  memcpy stored the 8 B request word twice (glibc copies 8 B as two
+  overlapping stores). It now stores whole aligned words once each.
+
 ## Found on the way: `RX_CHUNK` is not wired in `examples/loom`
 
 `examples/loom/hw/src/vfpga_top.svh` connects neither `loom_ctrl`'s
