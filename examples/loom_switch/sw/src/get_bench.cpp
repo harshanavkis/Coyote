@@ -22,6 +22,8 @@
  *     bulk       64 B .. 1 MiB (at most size) read with 32 B streaming loads,
  *                one transfer at a time: time, GB/s, and the reads the
  *                switch saw per transfer
+ *     parallel   k = 1 .. 16 threads at once, each reading 64 KiB that way
+ *                (a core has one load in flight, so k reads in flight)
  *     error      a load from window 2: the server rejects the get, the load
  *                returns all ones
  *   Every load reads a different line and every byte is checked against the
@@ -39,6 +41,7 @@
 #include <cstring>
 #include <immintrin.h>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <coyote/cThread.hpp>
@@ -186,6 +189,28 @@ int run_client(const std::string &ip, uint16_t port, uint64_t size, int reps) {
         const double m = median(us);
         printf("  %s %7lu B: median %9.2f us, %6.3f GB/s, %.1f reads per transfer%s\n", bad ? "FAIL" : "ok  ",
                (unsigned long) len, m, len / m / 1e3, double(g1 - g0) / n, bad ? " (data wrong)" : "");
+        if (bad) errors++;
+    }
+
+    // --- parallel: k threads loading at once ---
+    printf("parallel (k threads at once, each 64 KiB with 32 B streaming loads):\n");
+    for (int k = 1; k <= 16; k *= 2) {
+        constexpr uint64_t len = 64 << 10;
+        std::vector<uint64_t> off(k);
+        std::vector<std::vector<char>> dst(k, std::vector<char>(len));
+        for (auto &o : off) o = pick(len);
+        const uint64_t w0 = csr_read(t_qp, RD_SLOT_WAIT);
+        std::vector<std::thread> th;
+        const auto t0 = Clock::now();
+        for (int i = 0; i < k; i++) th.emplace_back([&, i] { copy32(win + off[i], dst[i].data(), len); });
+        for (auto &x : th) x.join();
+        const auto t1 = Clock::now();
+        const uint64_t w1 = csr_read(t_qp, RD_SLOT_WAIT);
+        uint64_t bad = 0;
+        for (int i = 0; i < k; i++) bad += check(dst[i].data(), off[i], len);
+        const double us = std::chrono::duration<double, std::micro>(t1 - t0).count();
+        printf("  %s %2d threads: %9.1f us, %6.3f GB/s, %lu cycles a read waited for a slot%s\n", bad ? "FAIL" : "ok  ",
+               k, us, k * len / us / 1e3, (unsigned long) (w1 - w0), bad ? " (data wrong)" : "");
         if (bad) errors++;
     }
 

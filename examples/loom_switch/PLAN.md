@@ -302,32 +302,40 @@ can be up to 128 MB (a 64 MiB push fits one binding).
   11.2-11.8), byte-exact. `ce_local --land-v80` prints the V80 window's
   counters per copy (the burst sizes of the U280's writes into the V80).
 
-- **Gets (WORKFLOW 6.5), amy reads rose's export.** Since the commit after
-  6a3113e0 a get is a READ of an rdma window (`loom_read`); the image for
-  that is not built yet. The commands and results below are for the first
-  form (5f710592: the CPU stored a request word into a get window and
-  polled a completion word), which the reads replace. Both U280s run
-  `~/coyote-bitstreams/loom-switch-get` (build_oct04_get, 5f710592,
-  `-DACK_GAP_CYCLES=16`, md5 ac3f9ff1). amy and rose have older trees, so
-  they are flashed with an out-of-tree helper that JTAG-programs by part
-  and loads `~/coyote-drivers/coyote_driver-u280-0930.ko` with the host's
-  IP and MAC:
+- **Gets (WORKFLOW 6.5): rose's CPU reads amy's export.** A get is a read of
+  an rdma window (`loom_read`). Both U280s run
+  `~/coyote-bitstreams/loom-switch-read` (build_oct04_read, b5a6b36d,
+  `-DACK_GAP_CYCLES=16`, md5 9fb3dbdf; WNS -0.371 in the shell's HBM and
+  rdma_mem_intf paths). The reader is rose: both hosts' root ports treat a
+  PCIe completion timeout as fatal (`UESvrt CmpltTO+`, 65-210 ms), so a
+  load that was never answered could reset the reader's host, and amy is
+  shared. amy and rose have older trees, so they are flashed with an
+  out-of-tree helper that JTAG-programs by part and loads
+  `~/coyote-drivers/coyote_driver-u280-0930.ko` with the host's IP and MAC:
   1. On clara:
-     `ssh amy.dos.cit.tum.de "bash ~/loom-experiments/get/flash_u280.sh /home/harshanavkis/coyote-bitstreams/loom-switch-get/hw/bitstreams/cyt_top.bit"`
-     `ssh rose.dos.cit.tum.de "bash ~/loom-experiments/get/flash_u280.sh /home/harshanavkis/coyote-bitstreams/loom-switch-get/hw/bitstreams/cyt_top.bit"`
+     `ssh amy.dos.cit.tum.de "bash ~/loom-experiments/get/flash_u280.sh /home/harshanavkis/coyote-bitstreams/loom-switch-read/hw/bitstreams/cyt_top.bit"`
+     `ssh rose.dos.cit.tum.de "bash ~/loom-experiments/get/flash_u280.sh /home/harshanavkis/coyote-bitstreams/loom-switch-read/hw/bitstreams/cyt_top.bit"`
   2. The binary and library to both (on clara):
      `for h in amy rose; do rsync -a /scratch/harshanavkis/loom-proj/Coyote/examples/loom_switch/sw/build/get_bench $h.dos.cit.tum.de:/scratch/harshanavkis/loom-proj/Coyote/examples/loom_switch/sw/build/ && rsync -a /scratch/harshanavkis/loom-proj/Coyote/examples/loom_switch/sw/build/coyote/libcoyote.so $h.dos.cit.tum.de:/scratch/harshanavkis/loom-proj/Coyote/examples/loom_switch/sw/build/coyote/; done`
-  3. rose, then amy (`~/loom-experiments/get/run_get.sh TAG` does both and
-     the nstats deltas):
-     - rose: `cd /scratch/harshanavkis/loom-proj/Coyote/examples/loom_switch/sw/build && sudo /nix/store/4sjg21zq04394ci22lj67vgpw7ykw9bg-numactl-2.0.18/bin/numactl -N 1 -m 1 ./get_bench --server`
-     - amy: `cd /scratch/harshanavkis/loom-proj/Coyote/examples/loom_switch/sw/build && sudo /nix/store/4sjg21zq04394ci22lj67vgpw7ykw9bg-numactl-2.0.18/bin/numactl -N 1 -m 1 ./get_bench --client 131.159.102.21`
-  2026-10-04: GET BENCH PASS twice, 9136 gets, every byte checked, 0
-  retransmissions. One get at a time 7.8-7.9 us (64-256 B), 8.2 (1 KiB),
-  8.8 (4 KiB), 9.8 (16 KiB), 13.9 (64 KiB); one 4 MiB get 11.65 GB/s;
-  256 KiB gets in flight 8.70 (1), 9.4-9.7 (2), 10.5-10.7 (4), 11.3 (8),
-  11.4-11.6 GB/s (16). The first run sent every get twice: `uwinWrite`'s
-  memcpy stored the 8 B request word twice (glibc copies 8 B as two
-  overlapping stores). It now stores whole aligned words once each.
+  3. A read with no network first, on rose (a load where no window is
+     bound: all ones, from the card): `sudo /nix/store/4sjg21zq04394ci22lj67vgpw7ykw9bg-numactl-2.0.18/bin/numactl -N 1 -m 1 /home/harshanavkis/loom-experiments/get/read_probe`
+  4. amy, then rose (`SRV=amy CLI=rose ~/loom-experiments/get/run_get.sh TAG
+     --port N` does both and the nstats deltas; a fresh port per run, the
+     last one's stays bound for a while):
+     - amy: `cd /scratch/harshanavkis/loom-proj/Coyote/examples/loom_switch/sw/build && sudo /nix/store/4sjg21zq04394ci22lj67vgpw7ykw9bg-numactl-2.0.18/bin/numactl -N 1 -m 1 ./get_bench --server --port 18501`
+     - rose: `cd /scratch/harshanavkis/loom-proj/Coyote/examples/loom_switch/sw/build && sudo /nix/store/4sjg21zq04394ci22lj67vgpw7ykw9bg-numactl-2.0.18/bin/numactl -N 1 -m 1 ./get_bench --client 131.159.102.20 --port 18501`
+  2026-10-05: GET BENCH PASS three times (300k reads, every byte checked,
+  0 retransmissions, 0 stray completions). One CPU load at a time, 8 B or
+  32 B: 7.26 us median (p99 7.5-7.9). The CPU keeps one uncached load in
+  flight per core, so a core reads 32 B per 7.3 us (0.004 GB/s; every 32 B
+  load is one read, nothing combines). k threads at once: 1, 2, 4, 8 take
+  the same 15.3 ms for 64 KiB each (k reads in flight, no slowdown); 16
+  take 27 ms (0.039 GB/s; likely the responder's 4 host reads ahead,
+  inferred). A load past amy's export returns all ones. Reads at bandwidth
+  need a DMA reader; the V80 copy engine reads only its own HBM today.
+  The first form (5f710592, the CPU stored a request word into a get
+  window and polled a completion word; amy reading rose: 7.8 us, 11.6 GB/s
+  with 16 x 256 KiB in flight) is replaced.
 
 ## Found on the way: `RX_CHUNK` is not wired in `examples/loom`
 
