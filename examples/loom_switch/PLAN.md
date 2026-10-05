@@ -343,8 +343,13 @@ can be up to 128 MB (a 64 MiB push fits one binding).
   same two slow copies as before (rose's copy engine); both ways at once
   (`~/loom-experiments/bidir/loom_bidir.sh`) 6.5-6.6 each way. That last
   one was 7.3 on 10-03, but today the 10-03 image (loom-switch-ackgap16)
-  gives 6.5-6.6 too after a reflash (one earlier run 7.1): the hosts'
-  state, not the RTL. The window's CPU mapping is uncached-minus, not
+  gives 6.5-6.6 too (one run 7.1), so it is not the RTL. Nor is it the
+  flash: the read image flashed 3 times, 2 runs each
+  (`~/loom-experiments/bidir/flashvar.sh`), gives 6.5-6.7 every run, with
+  identical PCIe settings and shell counters; the limit is clara's shell
+  write path (landing writes wait 1.6-2.6 M cycles a run to enter the
+  MMU, rose's ~0; the DMA engine never pushes back). What made the 7.1 and
+  7.3 runs faster is not known. The window's CPU mapping is uncached-minus, not
   write-combining: the driver `pci_iomap`s the whole bypass BAR, and PAT
   downgrades the window's write-combining mmap inside it. Every CPU store
   is its own PCIe write, so a CPU put never forms full-line packets
