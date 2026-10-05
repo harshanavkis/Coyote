@@ -91,6 +91,13 @@ nothing.
   none is answered (8 before, 32 after); `tb/static_pci` builds the static
   block design and checks the XDMA's parameter. (a9898fd1)
 
+32 is the most the XDMA allows: its master bridge (our bypass path)
+"can support up to 32 active PCIe MemRd request TLPs with pending
+completions" and its AXI master up to 32 outstanding reads (PG194 v3.0,
+Master Bridge; `c_m_axi_num_write` choices 2..32); the shell crossbar also
+tops out at 32. More reads in flight would need our own PCIe completer in
+place of the XDMA's bridge in the static region.
+
 Even at 32, gets stay ~10x below puts. Reaching RDMA's 12.2 GB/s across a
 6.6 us round trip needs ~80 KB in flight: ~315 reads of 256 B (the V80's
 size), ~1,260 CPU lines. The XDMA allows 32; even without that limit the V80
