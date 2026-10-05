@@ -402,8 +402,25 @@ can be up to 128 MB (a 64 MiB push fits one binding).
      - amy: `cd /scratch/harshanavkis/loom-proj/Coyote/examples/loom_switch/sw/build && sudo /nix/store/4sjg21zq04394ci22lj67vgpw7ykw9bg-numactl-2.0.18/bin/numactl -N 1 -m 1 ./get_bench --server --port 18601`
      - rose: `cd /scratch/harshanavkis/loom-proj/Coyote/examples/loom_ce/sw/build && sudo /nix/store/4sjg21zq04394ci22lj67vgpw7ykw9bg-numactl-2.0.18/bin/numactl -N 1 -m 1 ./ce_get --client 131.159.102.20 --port 18601 --reps 3`
   Each get prints the copy engine's time, every byte checked, and the
-  reads the U280 saw (their mean size is the V80's PCIe max read request
-  size, 512 B by default). Not run yet.
+  reads the U280 saw and their mean size.
+  2026-10-05, both V80s on `loom-ce-get` (md5 4ce86b05), CE GET PASS,
+  byte-exact, 0 retransmissions:
+  - `--local` (rose): 5.88 GB/s from 4 MiB. The V80 reads at most 256 B
+    (max read request 512 or 4096 B; 128 B reads at 128, 3.05 GB/s), and
+    each read costs ~43 ns whatever its size: a per-read limit upstream
+    of `loom_read` (whose answer path takes 3-4 cycles a read).
+  - over the network (rose reads amy): 0.31 GB/s from 1 MiB, 0.23 at
+    4 KiB; 8 x 256 B per ~6.6 us round trip, the shell's 8 reads in flight
+    into the window (`cr_ctrl.tcl`: `axi_main` / `axim_udata`
+    `NUM_READ_OUTSTANDING 8`).
+  - puts on the new image, unchanged: rose self-loop 10.91, V80 -> host
+    12.57, V80 -> U280 -> host 10.64 (amy 10.64), -> V80 HBM 10.62;
+    `uwin_probe` 1.22 (amy 0.96); `loom_pair.sh` rose -> amy 10.79-10.86,
+    amy -> rose 11.01-11.31, both ways 10.4-10.5 into rose and 10.7-10.8
+    into amy.
+  amy had crashed at 15:25 (kernel oopses in slab code with the Coyote
+  drivers loaded) and came back without its U280 on the bus: JTAG-program
+  the U280, warm reboot, then insmod the driver with amy's IP and MAC.
 
 ## Found on the way: `RX_CHUNK` is not wired in `examples/loom`
 
