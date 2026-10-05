@@ -26,7 +26,7 @@
 
 namespace {
 
-enum CeReg : uint32_t { START = 0, SRC_VA = 1, DST_VA = 2, LEN = 3, PID = 4, FENCE_VA = 5,
+enum CeReg : uint32_t { START = 0, SRC_VA = 1, DST_VA = 2, LEN = 3, PID = 4, FENCE_VA = 5, DIRECTION = 6,
                         BUSY = 8, COPIES = 9, CYCLES = 10 };
 
 uint64_t pattern(uint64_t off, int rep) { return 0xCE00000000000000ULL ^ (off * 0x9E3779B97F4A7C15ULL) ^ rep; }
@@ -94,6 +94,7 @@ int main(int argc, char **argv) {
         v80.setCSR(size, LEN);
         v80.setCSR(v80.getCtid(), PID);
         v80.setCSR(reinterpret_cast<uint64_t>(fence), FENCE_VA);
+        v80.setCSR(0, DIRECTION);   // a put; DIRECTION outlives a ce_get run
         const auto t0 = std::chrono::steady_clock::now();
         v80.setCSR(1, START);
         while (*vfence != want && std::chrono::steady_clock::now() - t0 < std::chrono::seconds(5)) _mm_pause();

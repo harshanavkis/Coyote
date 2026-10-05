@@ -74,7 +74,7 @@
 
 namespace {
 
-enum CeReg : uint32_t { START = 0, SRC_VA = 1, DST_VA = 2, LEN = 3, PID = 4, FENCE_VA = 5,
+enum CeReg : uint32_t { START = 0, SRC_VA = 1, DST_VA = 2, LEN = 3, PID = 4, FENCE_VA = 5, DIRECTION = 6,
                         BUSY = 8, COPIES = 9, CYCLES = 10 };
 
 constexpr uint32_t MAGIC        = 0x4C434552;   // "LCER"
@@ -455,6 +455,7 @@ int run_bidir(const std::string &ip, uint16_t port, uint64_t size, int reps, int
             v80.setCSR(size, LEN);
             v80.setCSR(v80.getCtid(), PID);
             v80.setCSR(reinterpret_cast<uint64_t>(uva) + size, FENCE_VA);
+            v80.setCSR(0, DIRECTION);   // a put; DIRECTION outlives a ce_get run
         }
         const loom_switch::IngressCounters c0 = loom_switch::IngressCounters::read(t_qp);
         const Counters k0 = Counters::read(t_qp);
@@ -575,6 +576,7 @@ int run_client(const std::string &ip, uint16_t port, int reps, int window, unsig
         v80.setCSR(size, LEN);
         v80.setCSR(v80.getCtid(), PID);
         v80.setCSR(reinterpret_cast<uint64_t>(uva) + size, FENCE_VA);
+        v80.setCSR(0, DIRECTION);   // a put; DIRECTION outlives a ce_get run
         v80.setCSR(1, START);
 
         Verdict v{};

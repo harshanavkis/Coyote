@@ -19,6 +19,10 @@ target_link_libraries(ce_local PUBLIC Coyote pthread)
 add_executable(ce_remote ${TARGET_DIR}/ce_remote.cpp)
 target_link_libraries(ce_remote PUBLIC Coyote pthread)
 
+# Gets: V80 HBM <- loom_ce, P2P reads <- U280 uwin <- RoCE <- far U280 <- far host buffer (get_bench --server)
+add_executable(ce_get ${TARGET_DIR}/ce_get.cpp)
+target_link_libraries(ce_get PUBLIC Coyote pthread)
+
 # The V80's write bandwidth to host memory vs peer-to-peer to the U280 (example 07 on the V80)
 add_executable(p2p_bw ${TARGET_DIR}/p2p_bw.cpp)
 target_link_libraries(p2p_bw PUBLIC Coyote pthread)

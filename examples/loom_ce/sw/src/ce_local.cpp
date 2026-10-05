@@ -66,7 +66,7 @@
 namespace {
 
 // loom_ce_ctrl.sv
-enum CeReg : uint32_t { START = 0, SRC_VA = 1, DST_VA = 2, LEN = 3, PID = 4, FENCE_VA = 5,
+enum CeReg : uint32_t { START = 0, SRC_VA = 1, DST_VA = 2, LEN = 3, PID = 4, FENCE_VA = 5, DIRECTION = 6,
                         BUSY = 8, COPIES = 9, CYCLES = 10,
                         CE_OUT_BP = 48, CE_IN_WAIT = 49, WR_WAIT = 50 };
 
@@ -122,6 +122,7 @@ int main(int argc, char **argv) {
         v80.setCSR(size, LEN);
         v80.setCSR(v80.getCtid(), PID);
         v80.setCSR(0, FENCE_VA);
+        v80.setCSR(0, DIRECTION);   // a put; DIRECTION outlives a ce_get run
         loom_switch::IngressCounters c0 = loom_switch::IngressCounters::read(u280);
         uint64_t copies = 0;
         const auto t0 = std::chrono::steady_clock::now();
@@ -153,6 +154,7 @@ int main(int argc, char **argv) {
             v80.setCSR(size, LEN);
             v80.setCSR(v80.getCtid(), PID);
             v80.setCSR(reinterpret_cast<uint64_t>(dst) + size, FENCE_VA);
+            v80.setCSR(0, DIRECTION);   // a put; DIRECTION outlives a ce_get run
             const auto t0 = std::chrono::steady_clock::now();
             v80.setCSR(1, START);
             while (*hfence != before + 1 && std::chrono::steady_clock::now() - t0 < std::chrono::seconds(5)) _mm_pause();
@@ -191,6 +193,7 @@ int main(int argc, char **argv) {
             v80.setCSR(size, LEN);
             v80.setCSR(v80.getCtid(), PID);
             v80.setCSR(reinterpret_cast<uint64_t>(sva) + size, FENCE_VA);
+            v80.setCSR(0, DIRECTION);   // a put; DIRECTION outlives a ce_get run
             const auto t0 = std::chrono::steady_clock::now();
             v80.setCSR(1, START);
             const bool landed = L.wait(size, before + 1);
@@ -267,6 +270,7 @@ int main(int argc, char **argv) {
         v80.setCSR(size, LEN);
         v80.setCSR(v80.getCtid(), PID);
         v80.setCSR(reinterpret_cast<uint64_t>(uva) + size, FENCE_VA);
+        v80.setCSR(0, DIRECTION);   // a put; DIRECTION outlives a ce_get run
         const auto t0 = std::chrono::steady_clock::now();
         v80.setCSR(1, START);
 

@@ -432,6 +432,13 @@ on the wire a get is two writes.
   returns), counted at words 194/195. Nothing times out: a read whose answer
   never comes holds its slot, and the reads behind it, until a reset.
 
+- **A copy engine as the reader (`ce_get`).** The V80's `loom_ce` with DIR
+  (CSR 6) = 1 reads the window imported into its address space (`sq_rd`
+  on the host stream: peer-to-peer reads, each at most the V80's PCIe max
+  read request size) and writes what comes back into HBM (`sq_wr` on the
+  card stream). BUSY drops, and the fence is written, only once that HBM
+  write has completed.
+
 Order: rose's read is not ordered after rose's own earlier landings to the
 same bytes, so a get after a put to the same place needs the put's
 completion first.

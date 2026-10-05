@@ -8,12 +8,15 @@ import lynxTypes::*;
  * sq_rd answered with card data, sq_wr and the host stream captured, cq_wr
  * completing each write.
  *
- * Card reads come back in 1 KB tlast-terminated segments, so only the beat
- * count can end a copy. Covers: a copy with a fence and one without, the
- * exact requests, data and fence value; START while busy ignored; a 64 KiB
- * copy under random backpressure on every channel; CSR readback; the cycle
+ * Reads come back in 1 KB tlast-terminated segments, so only the beat count
+ * can end a copy. Covers: a copy with a fence and one without, the exact
+ * requests, data and fence value; START while busy ignored; a 64 KiB copy
+ * under random backpressure on every channel; CSR readback; the cycle
  * counter stopping at the data write's completion; the stall counters (48-50)
- * moving under backpressure.
+ * moving under backpressure. Gets (DIR 1: host stream -> card memory): the
+ * requests, data and fence; the fence requested only after the data write
+ * completed, and BUSY held until then under slow completions and
+ * backpressure; a put after gets.
  */
 module tb_loom_ce;
 
@@ -58,7 +61,6 @@ initial begin
     cq_rd.valid = 0; cq_rd.data = '0;
     axis_host_recv[0].tvalid = 0; axis_host_recv[0].tdata = '0; axis_host_recv[0].tkeep = '0;
     axis_host_recv[0].tlast = 0; axis_host_recv[0].tid = '0;
-    axis_card_send[0].tready = 1;
     axis_card_recv[0].tvalid = 0; axis_card_recv[0].tdata = '0; axis_card_recv[0].tkeep = '0;
     axis_card_recv[0].tlast = 0; axis_card_recv[0].tid = '0;
     notify.ready = 1;
@@ -68,10 +70,11 @@ always @(posedge aclk) begin
     sq_rd.ready              <= bp ? ($urandom_range(0, 2) != 0) : 1'b1;
     sq_wr.ready              <= bp ? ($urandom_range(0, 2) != 0) : 1'b1;
     axis_host_send[0].tready <= bp ? ($urandom_range(0, 2) != 0) : 1'b1;
+    axis_card_send[0].tready <= bp ? ($urandom_range(0, 2) != 0) : 1'b1;
 end
 
-// Card reads: each accepted sq_rd is answered with its beats, in 1 KB
-// segments each ending in tlast
+// Reads: each accepted sq_rd is answered with its beats on its stream (card
+// or host), in 1 KB segments each ending in tlast
 req_t rd_q [$], rd_seen [$];
 always @(posedge aclk) if (aresetn && sq_rd.valid && sq_rd.ready) begin
     rd_q.push_back(sq_rd.data);
@@ -85,40 +88,64 @@ initial forever begin
     for (int k = 0; k < r.len / 64; k++) begin
         @(negedge aclk);
         if (bp) while ($urandom_range(0, 2) == 0) @(negedge aclk);
-        axis_card_recv[0].tdata  = pat(r.vaddr + 64*k);
-        axis_card_recv[0].tkeep  = '1;
-        axis_card_recv[0].tlast  = (k % 16 == 15) || (k == r.len / 64 - 1);
-        axis_card_recv[0].tvalid = 1;
-        do @(posedge aclk); while (!axis_card_recv[0].tready);
-        @(negedge aclk);
-        axis_card_recv[0].tvalid = 0;
+        if (r.strm == STRM_HOST) begin
+            axis_host_recv[0].tdata  = pat(r.vaddr + 64*k);
+            axis_host_recv[0].tkeep  = '1;
+            axis_host_recv[0].tlast  = (k % 16 == 15) || (k == r.len / 64 - 1);
+            axis_host_recv[0].tvalid = 1;
+            do @(posedge aclk); while (!axis_host_recv[0].tready);
+            @(negedge aclk);
+            axis_host_recv[0].tvalid = 0;
+        end else begin
+            axis_card_recv[0].tdata  = pat(r.vaddr + 64*k);
+            axis_card_recv[0].tkeep  = '1;
+            axis_card_recv[0].tlast  = (k % 16 == 15) || (k == r.len / 64 - 1);
+            axis_card_recv[0].tvalid = 1;
+            do @(posedge aclk); while (!axis_card_recv[0].tready);
+            @(negedge aclk);
+            axis_card_recv[0].tvalid = 0;
+        end
     end
 end
 
-// Writes: requests and beats captured; a write completes (cq_wr) a few
-// cycles after its last beat
-req_t wr_seen [$], wr_open [$];
-logic [AXI_DATA_BITS-1:0]   h_d [$];
-logic [AXI_DATA_BITS/8-1:0] h_k [$];
-bit                         h_l [$];
-int                         cq_owed = 0, cq_delay = 0;
+// Writes: requests and beats captured (host and card streams); a write
+// completes (cq_wr) cq_lat cycles after its last beat. A get's fence request
+// must come after its data write's completion: the time of the last card
+// write completion, and of each fence request, are kept.
+req_t wr_seen [$];
+logic [AXI_DATA_BITS-1:0]   h_d [$], c_d [$];
+logic [AXI_DATA_BITS/8-1:0] h_k [$], c_k [$];
+bit                         h_l [$], c_l [$];
+int                         cq_owed = 0, cq_delay = 0, cq_lat = 20;
+int                         card_owed = 0, card_done = 0;
+time                        t_card_done = 0, t_fence_req = 0;
+bit                         cq_card [$];
 
 always @(posedge aclk) if (aresetn) begin
-    if (sq_wr.valid && sq_wr.ready) begin wr_seen.push_back(sq_wr.data); wr_open.push_back(sq_wr.data); end
+    if (sq_wr.valid && sq_wr.ready) begin
+        wr_seen.push_back(sq_wr.data);
+        if (sq_wr.data.len == 8) t_fence_req = $time;
+    end
     if (axis_host_send[0].tvalid && axis_host_send[0].tready) begin
         h_d.push_back(axis_host_send[0].tdata); h_k.push_back(axis_host_send[0].tkeep);
         h_l.push_back(axis_host_send[0].tlast);
-        if (axis_host_send[0].tlast) begin void'(wr_open.pop_front()); cq_owed++; end
+        if (axis_host_send[0].tlast) begin cq_card.push_back(0); cq_owed++; end
+    end
+    if (axis_card_send[0].tvalid && axis_card_send[0].tready) begin
+        c_d.push_back(axis_card_send[0].tdata); c_k.push_back(axis_card_send[0].tkeep);
+        c_l.push_back(axis_card_send[0].tlast);
+        if (axis_card_send[0].tlast) begin cq_card.push_back(1); cq_owed++; end
     end
 end
 always @(posedge aclk) begin
     cq_wr.valid <= 1'b0;
     cq_wr.data  <= '0;
     if (cq_owed > 0) begin
-        if (cq_delay == 20) begin
+        if (cq_delay >= cq_lat) begin
             cq_wr.valid <= 1'b1;
             cq_owed--;
             cq_delay = 0;
+            if (cq_card.pop_front()) begin card_done++; t_card_done = $time; end
         end else cq_delay++;
     end
 end
@@ -149,9 +176,9 @@ task automatic csr_rd(input int word, output logic [63:0] data);
 endtask
 
 task automatic copy(input logic [47:0] src, input logic [47:0] dst, input int len,
-                    input logic [47:0] fence, input bit go = 1);
+                    input logic [47:0] fence, input bit go = 1, input bit get = 0);
     csr_wr(1, 64'(src)); csr_wr(2, 64'(dst)); csr_wr(3, 64'(len));
-    csr_wr(4, 64'd3);    csr_wr(5, 64'(fence));
+    csr_wr(4, 64'd3);    csr_wr(5, 64'(fence)); csr_wr(6, 64'(get));
     if (go) csr_wr(0, 64'd1);
 endtask
 
@@ -165,28 +192,37 @@ task automatic wait_idle();
 endtask
 
 // The next copy in the capture queues: its read, its write, its beats, then
-// the fence (if any) with the expected count
+// the fence (if any) with the expected count. A put reads the card stream
+// and writes the host stream, a get the other way round; the fence is on
+// the host stream either way.
 task automatic expect_copy(input string name, input logic [47:0] src, input logic [47:0] dst,
-                           input int len, input logic [47:0] fence, input int count);
+                           input int len, input logic [47:0] fence, input int count, input bit get = 0);
     req_t r;
     `CHECK(rd_seen.size() != 0, {name, ": no read request"})
     if (rd_seen.size() != 0) begin
         r = rd_seen.pop_front();
-        `CHECK(r.opcode == LOCAL_READ && r.strm == STRM_CARD && r.pid == 3 && r.vaddr == src &&
+        `CHECK(r.opcode == LOCAL_READ && r.strm == (get ? STRM_HOST : STRM_CARD) && r.pid == 3 && r.vaddr == src &&
                r.len == LEN_BITS'(len) && r.last, $sformatf("%s: read op %0d strm %0d va %h len %0d", name, r.opcode, r.strm, r.vaddr, r.len))
     end
     `CHECK(wr_seen.size() != 0, {name, ": no write request"})
     if (wr_seen.size() != 0) begin
         r = wr_seen.pop_front();
-        `CHECK(r.opcode == LOCAL_WRITE && r.strm == STRM_HOST && r.dest == 0 && r.pid == 3 &&
+        `CHECK(r.opcode == LOCAL_WRITE && r.strm == (get ? STRM_CARD : STRM_HOST) && r.dest == 0 && r.pid == 3 &&
                r.vaddr == dst && r.len == LEN_BITS'(len) && r.last,
                $sformatf("%s: write op %0d strm %0d va %h len %0d", name, r.opcode, r.strm, r.vaddr, r.len))
     end
     for (int k = 0; k < len / 64; k++) begin
-        `CHECK(h_d.size() != 0, $sformatf("%s: beat %0d missing", name, k))
-        if (h_d.size() == 0) break;
-        `CHECK(h_d.pop_front() == pat(src + 64*k) && h_k.pop_front() == '1 &&
-               h_l.pop_front() == (k == len / 64 - 1), $sformatf("%s: beat %0d", name, k))
+        if (get) begin
+            `CHECK(c_d.size() != 0, $sformatf("%s: card beat %0d missing", name, k))
+            if (c_d.size() == 0) break;
+            `CHECK(c_d.pop_front() == pat(src + 64*k) && c_k.pop_front() == '1 &&
+                   c_l.pop_front() == (k == len / 64 - 1), $sformatf("%s: card beat %0d", name, k))
+        end else begin
+            `CHECK(h_d.size() != 0, $sformatf("%s: beat %0d missing", name, k))
+            if (h_d.size() == 0) break;
+            `CHECK(h_d.pop_front() == pat(src + 64*k) && h_k.pop_front() == '1 &&
+                   h_l.pop_front() == (k == len / 64 - 1), $sformatf("%s: beat %0d", name, k))
+        end
     end
     if (fence != 0) begin
         logic [AXI_DATA_BITS-1:0] d;
@@ -261,8 +297,52 @@ initial begin
     csr_rd(3, v); `CHECK(v == 65536, "T5: LEN")
     csr_rd(4, v); `CHECK(v == 3, "T5: PID")
     csr_rd(5, v); `CHECK(v == 64'h7f00_2000_0040, "T5: FENCE_VA")
+    csr_rd(6, v); `CHECK(v == 0, "T5: DIR")
     csr_rd(8, v); `CHECK(v == 0, "T5: BUSY")
     $display("ok   T5 readback");
+
+    // --- T6: a 4 KB get with a fence: the fence after the HBM write's completion ---
+    cq_lat = 200;
+    copy(48'h7e00_0000_0000, 48'h7f00_1300_0000, 4096, 48'h7f00_2000_0080, 1, 1);
+    wait_idle();
+    expect_copy("T6", 48'h7e00_0000_0000, 48'h7f00_1300_0000, 4096, 48'h7f00_2000_0080, 5, 1);
+    `CHECK(card_done == 1, $sformatf("T6: %0d card write completions", card_done))
+    `CHECK(t_fence_req > t_card_done, "T6: fence requested before the HBM write completed")
+    csr_rd(9, v);  `CHECK(v == 5, $sformatf("T6: COPIES %0d", v))
+    csr_rd(6, v);  `CHECK(v == 1, "T6: DIR readback")
+    csr_rd(10, c0); `CHECK(c0 > 200, $sformatf("T6: CYCLES %0d (should include the completion)", c0))
+    `CHECK(rd_seen.size() == 0 && wr_seen.size() == 0 && h_d.size() == 0 && c_d.size() == 0, "T6: extra traffic")
+    $display("ok   T6 get with fence (%0d cycles)", c0);
+
+    // --- T7: a 64 KiB get, no fence, under backpressure: BUSY until the HBM write completes ---
+    bp = 1;
+    begin
+        logic [63:0] p0 [3], p1 [3];
+        for (int i = 0; i < 3; i++) csr_rd(48 + i, p0[i]);
+        copy(48'h7e00_0001_0000, 48'h7f00_1400_0000, 65536, 48'h0, 1, 1);
+        do csr_rd(8, v); while (v[0]);
+        `CHECK(card_done == 2, $sformatf("T7: BUSY dropped with %0d of 2 card write completions", card_done))
+        csr_rd(9, v); `CHECK(v == 6, $sformatf("T7: COPIES %0d", v))
+        wait_idle();
+        expect_copy("T7", 48'h7e00_0001_0000, 48'h7f00_1400_0000, 65536, 48'h0, 0, 1);
+        `CHECK(wr_seen.size() == 0 && h_d.size() == 0 && c_d.size() == 0, "T7: a fence was written")
+        for (int i = 0; i < 3; i++) csr_rd(48 + i, p1[i]);
+        // (one write request, so sq_wr may not have waited)
+        `CHECK(p1[0] > p0[0] && p1[1] > p0[1],
+               $sformatf("T7: stall counters CE out bp %0d, CE in wait %0d",
+                         p1[0] - p0[0], p1[1] - p0[1]))
+    end
+    bp = 0;
+    cq_lat = 20;
+    $display("ok   T7 64 KiB get under backpressure, BUSY until written");
+
+    // --- T8: a put after gets ---
+    copy(48'h7f00_1500_0000, 48'h7e00_0030_0000, 2048, 48'h7f00_2000_00c0, 1, 0);
+    wait_idle();
+    expect_copy("T8", 48'h7f00_1500_0000, 48'h7e00_0030_0000, 2048, 48'h7f00_2000_00c0, 7, 0);
+    `CHECK(rd_seen.size() == 0 && wr_seen.size() == 0 && h_d.size() == 0 && c_d.size() == 0, "T8: extra traffic")
+    `CHECK(card_done == 2, "T8: a put wrote card memory")
+    $display("ok   T8 put after gets");
 
     if (errors == 0) $display("TB PASS (tb_loom_ce)");
     else             $display("TB FAIL (tb_loom_ce): %0d errors", errors);

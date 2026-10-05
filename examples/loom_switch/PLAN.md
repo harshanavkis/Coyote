@@ -382,6 +382,29 @@ can be up to 128 MB (a 64 MiB push fits one binding).
     11.58; with clara both ways is winner-take-all (10.5-10.6 into clara,
     5.5-5.6 out), whichever host is its partner.
 
+- **Copy-engine gets (WORKFLOW 6.5): rose's V80 reads amy's export into
+  its HBM.** `loom_ce` with CSR 6 (DIR) = 1 reads the imported window and
+  writes HBM. V80 image: build_oct05_get (`examples/loom_ce/hw`, same
+  arguments as `loom-ce-discard`), staged to
+  `~/coyote-bitstreams/loom-ce-get`. U280s stay on `loom-switch-read`. The
+  put programs (`ce_local`, `ce_remote`, `v80_bisect`) write DIR = 0 before
+  every copy, so they run on either V80 image.
+  1. Build the software on clara and sync it to both hosts:
+     `cd /scratch/harshanavkis/loom-proj/Coyote/examples/loom_ce/sw/build && nix-shell ../../../../shell.nix --run "cmake .. && make -j16"`
+     `for h in amy rose; do rsync -a /scratch/harshanavkis/loom-proj/Coyote/examples/loom_ce/sw/build/ $h.dos.cit.tum.de:/scratch/harshanavkis/loom-proj/Coyote/examples/loom_ce/sw/build/; done`
+  2. Program rose's V80 (on rose; program again if it trains Gen4 x8):
+     `cd /scratch/harshanavkis/loom-proj/Coyote && scripts/fpga/program_v80.sh /home/harshanavkis/coyote-bitstreams/loom-ce-get/cyt_top.pdi 0000:c1:00.0`
+  3. No network first, on rose: reads where no window is bound, which the
+     U280 answers on the card with all ones, so this times the
+     peer-to-peer read path alone:
+     `cd /scratch/harshanavkis/loom-proj/Coyote/examples/loom_ce/sw/build && sudo /nix/store/4sjg21zq04394ci22lj67vgpw7ykw9bg-numactl-2.0.18/bin/numactl -N 1 -m 1 ./ce_get --local --reps 3`
+  4. amy serves, rose reads (a fresh port per run):
+     - amy: `cd /scratch/harshanavkis/loom-proj/Coyote/examples/loom_switch/sw/build && sudo /nix/store/4sjg21zq04394ci22lj67vgpw7ykw9bg-numactl-2.0.18/bin/numactl -N 1 -m 1 ./get_bench --server --port 18601`
+     - rose: `cd /scratch/harshanavkis/loom-proj/Coyote/examples/loom_ce/sw/build && sudo /nix/store/4sjg21zq04394ci22lj67vgpw7ykw9bg-numactl-2.0.18/bin/numactl -N 1 -m 1 ./ce_get --client 131.159.102.20 --port 18601 --reps 3`
+  Each get prints the copy engine's time, every byte checked, and the
+  reads the U280 saw (their mean size is the V80's PCIe max read request
+  size, 512 B by default). Not run yet.
+
 ## Found on the way: `RX_CHUNK` is not wired in `examples/loom`
 
 `examples/loom/hw/src/vfpga_top.svh` connects neither `loom_ctrl`'s

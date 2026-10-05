@@ -9,18 +9,23 @@ import lynxTypes::*;
  *
  * CSR map (64-bit word indices; byte offset = idx * 8):
  *   0 START    (W)  write 1 -> start the staged copy (ignored while busy)
- *   1 SRC_VA   (RW) source VA in card memory (HBM), 64 B-aligned
- *   2 DST_VA   (RW) destination VA: on the V80 MMU, the U280's uwin (dma-buf)
+ *   1 SRC_VA   (RW) source VA, 64 B-aligned: a put's in card memory (HBM), a
+ *                   get's on the V80 MMU the U280's uwin (dma-buf)
+ *   2 DST_VA   (RW) destination VA: a put's the U280's uwin, a get's in HBM
  *   3 LEN      (RW) bytes to copy, a multiple of 64
  *   4 PID      (RW) the cThread (ctid) whose address space both VAs are in
  *   5 FENCE_VA (RW) where the completion count is written after the data,
  *                   in the same address space; 0 = no fence
+ *   6 DIR      (RW) bit 0: 0 = put (HBM -> host stream), 1 = get (host
+ *                   stream -> HBM); taken at START
  *   8 BUSY     (RO) a copy is in flight
  *   9 COPIES   (RO) copies finished (the fence count)
  *  10 CYCLES   (RO) cycles from START to the data write's completion, last copy
  *  48 CE_OUT_BP  (RO) cycles the copy's write stream was valid and not ready
- *                     (the peer-to-peer writes into the U280 held back)
- *  49 CE_IN_WAIT (RO) cycles the copy waited for card data (HBM read)
+ *                     (a put: the peer-to-peer writes into the U280 held
+ *                     back; a get: the HBM writes)
+ *  49 CE_IN_WAIT (RO) cycles the copy waited for its read data (a put: HBM;
+ *                     a get: the peer-to-peer reads of the U280's window)
  *  50 WR_WAIT    (RO) cycles a write request waited on sq_wr
  * The counters are free-running (software takes deltas); the pulses are
  * registered once before they count.
@@ -37,6 +42,7 @@ module loom_ce_ctrl (
     output logic [LEN_BITS-1:0]         len,
     output logic [PID_BITS-1:0]         pid,
     output logic [VADDR_BITS-1:0]       fence_va,
+    output logic                        get,
 
     input  logic                        busy,
     input  logic [31:0]                 copies,
@@ -56,6 +62,7 @@ localparam integer R_DST_VA   = 2;
 localparam integer R_LEN      = 3;
 localparam integer R_PID      = 4;
 localparam integer R_FENCE_VA = 5;
+localparam integer R_DIR      = 6;
 localparam integer R_BUSY     = 8;
 localparam integer R_COPIES   = 9;
 localparam integer R_CYCLES   = 10;
@@ -76,11 +83,12 @@ wire [CSR_BITS-1:0] rd_idx = axi_araddr[ADDR_LSB +: CSR_BITS];
 // empty-strobe writes around a host ctrl write's line cannot fire it; the
 // other registers take full-strobe writes only (as examples/loom)
 logic [63:0] r_src, r_dst, r_len, r_pid, r_fence;
+logic        r_dir;
 assign start = ctrl_reg_wren && (wr_idx == R_START) && axi_ctrl.wstrb[0] && axi_ctrl.wdata[0];
 
 always_ff @(posedge aclk) begin
     if (!aresetn) begin
-        r_src <= 0; r_dst <= 0; r_len <= 0; r_pid <= 0; r_fence <= 0;
+        r_src <= 0; r_dst <= 0; r_len <= 0; r_pid <= 0; r_fence <= 0; r_dir <= 1'b0;
     end else if (ctrl_reg_wren && (&axi_ctrl.wstrb)) begin
         case (wr_idx)
             R_SRC_VA:   r_src   <= axi_ctrl.wdata;
@@ -88,6 +96,7 @@ always_ff @(posedge aclk) begin
             R_LEN:      r_len   <= axi_ctrl.wdata;
             R_PID:      r_pid   <= axi_ctrl.wdata;
             R_FENCE_VA: r_fence <= axi_ctrl.wdata;
+            R_DIR:      r_dir   <= axi_ctrl.wdata[0];
             default: ;
         endcase
     end
@@ -98,6 +107,7 @@ assign dst_va   = r_dst[VADDR_BITS-1:0];
 assign len      = r_len[LEN_BITS-1:0];
 assign pid      = r_pid[PID_BITS-1:0];
 assign fence_va = r_fence[VADDR_BITS-1:0];
+assign get      = r_dir;
 
 logic [63:0]       perf_cnt [N_PERF];
 logic [N_PERF-1:0] perf_pulse;
@@ -120,6 +130,7 @@ always_ff @(posedge aclk) begin
             R_LEN:      axi_rdata <= r_len;
             R_PID:      axi_rdata <= r_pid;
             R_FENCE_VA: axi_rdata <= r_fence;
+            R_DIR:      axi_rdata <= {63'b0, r_dir};
             R_BUSY:     axi_rdata <= {63'b0, busy};
             R_COPIES:   axi_rdata <= {32'b0, copies};
             R_CYCLES:   axi_rdata <= cycles;
