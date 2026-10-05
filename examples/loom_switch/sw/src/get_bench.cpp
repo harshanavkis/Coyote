@@ -8,13 +8,13 @@
  *   client loom_rx --> loom_read --> the load's data
  *
  * Server (the host read from):
- *     get_bench --server [--port N] [--size BYTES]
+ *     get_bench --server [--port N] [--size BYTES] [--window P]
  *   QP exchange (blocks for the client); a source buffer of size bytes with a
  *   known pattern, exported as export 1; answers gets on the QP owner's QP
  *   (RD_CTL); waits for the client, then prints its responder's counters.
  *
  * Client (the reader):
- *     get_bench --client <server_ip> [--port N] [--size BYTES] [--reps N]
+ *     get_bench --client <server_ip> [--port N] [--size BYTES] [--reps N] [--window P]
  *   window 1 onto the server's export 1 (uwin 0 .. size), window 2 just past
  *   its end, then
  *     latency    one 8 B load, and one 32 B load, at a time, reps each:
@@ -22,14 +22,16 @@
  *     bulk       64 B .. 1 MiB (at most size) read with 32 B streaming loads,
  *                one transfer at a time: time, GB/s, and the reads the
  *                switch saw per transfer
- *     parallel   k = 1 .. 16 threads at once, each reading 64 KiB that way
+ *     parallel   k = 1 .. 32 threads at once, each reading 64 KiB that way
  *                (a core has one load in flight, so k reads in flight)
  *     error      a load from window 2: the server rejects the get, the load
  *                returns all ones
  *   Every load reads a different line and every byte is checked against the
  *   pattern. Both sides use the same --size (default 16 MiB).
  *
- * The QP port is N (Coyote's default if not given).
+ * The QP port is N (Coyote's default if not given). --window sets this
+ * host's ack window (TX_CTL: rdma packets unacked, 0 = no limit; 16 after
+ * reset): the server's carries the answers, two packets per get.
  */
 #include <unistd.h>
 
@@ -95,11 +97,13 @@ uint64_t check(const char *d, uint64_t off, uint64_t len) {
 
 double median(std::vector<double> v) { std::sort(v.begin(), v.end()); return v[v.size() / 2]; }
 
-int run_server(uint16_t port, uint64_t size) {
+int run_server(uint16_t port, uint64_t size, int window) {
     coyote::cThread t_qp(0, getpid(), 0, nullptr, "coyote_fpga");     // QP owner, CSR page
     coyote::cThread t_data(0, getpid(), 0, nullptr, "coyote_fpga");   // owns the source
     printf("server: QP exchange on port %u ...\n", port);
     if (!t_qp.initRDMA(STAGING_SIZE, port)) { printf("FAIL: initRDMA\n"); return 1; }
+    if (window >= 0) csr_write(t_qp, TX_CTL, uint64_t(window));
+    printf("server: ack window %lu packets\n", (unsigned long) csr_read(t_qp, TX_CTL));
 
     uint64_t *src = static_cast<uint64_t *>(t_data.getMem({coyote::CoyoteAllocType::HPF, size}));
     for (uint64_t i = 0; i < size / 8; i++) src[i] = pattern(8 * i);
@@ -119,10 +123,12 @@ int run_server(uint16_t port, uint64_t size) {
     return 0;
 }
 
-int run_client(const std::string &ip, uint16_t port, uint64_t size, int reps) {
+int run_client(const std::string &ip, uint16_t port, uint64_t size, int reps, int window) {
     coyote::cThread t_qp(0, getpid(), 0, nullptr, "coyote_fpga");
     printf("client: QP exchange with %s on port %u ...\n", ip.c_str(), port);
     if (!t_qp.initRDMA(STAGING_SIZE, port, ip.c_str())) { printf("FAIL: initRDMA\n"); return 1; }
+    if (window >= 0) csr_write(t_qp, TX_CTL, uint64_t(window));
+    printf("client: ack window %lu packets\n", (unsigned long) csr_read(t_qp, TX_CTL));
 
     // Window 1: the server's export 1; window 2: past its end
     program_window(t_qp, 1, true, t_qp.getCtid(), reinterpret_cast<const void *>(export_ref(SRC_EXPORT)), size, 0);
@@ -194,7 +200,7 @@ int run_client(const std::string &ip, uint16_t port, uint64_t size, int reps) {
 
     // --- parallel: k threads loading at once ---
     printf("parallel (k threads at once, each 64 KiB with 32 B streaming loads):\n");
-    for (int k = 1; k <= 16; k *= 2) {
+    for (int k = 1; k <= 32; k *= 2) {
         constexpr uint64_t len = 64 << 10;
         std::vector<uint64_t> off(k);
         std::vector<std::vector<char>> dst(k, std::vector<char>(len));
@@ -243,6 +249,7 @@ int main(int argc, char *argv[]) {
     uint16_t port = coyote::DEF_PORT;
     uint64_t size = 16ULL << 20;
     int reps = 1000;
+    int window = -1;
     for (int i = 1; i < argc; i++) {
         const std::string a = argv[i];
         if (a == "--server")                     server = true;
@@ -250,11 +257,12 @@ int main(int argc, char *argv[]) {
         else if (a == "--port" && i + 1 < argc)  port = uint16_t(atoi(argv[++i]));
         else if (a == "--size" && i + 1 < argc)  size = strtoull(argv[++i], nullptr, 0);
         else if (a == "--reps" && i + 1 < argc)  reps = atoi(argv[++i]);
+        else if (a == "--window" && i + 1 < argc) window = atoi(argv[++i]);
         else { fprintf(stderr, "usage: see the header of get_bench.cpp\n"); return 2; }
     }
-    if (server == !ip.empty() || size < (64 << 10) || size % 4096 || reps < 1) {
+    if (server == !ip.empty() || size < (64 << 10) || size % 4096 || reps < 1 || window > 255) {
         fprintf(stderr, "usage: see the header of get_bench.cpp (--size: a multiple of 4096, at least 64 KiB)\n");
         return 2;
     }
-    return server ? run_server(port, size) : run_client(ip, port, size, reps);
+    return server ? run_server(port, size, window) : run_client(ip, port, size, reps, window);
 }

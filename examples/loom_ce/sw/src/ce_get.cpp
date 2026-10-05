@@ -13,7 +13,7 @@
  *   answered on its QP owner's QP.
  *
  * Client (the reader; U280 + V80):
- *     ce_get --client <server_ip> [--port N] [--size BYTES] [--reps N]
+ *     ce_get --client <server_ip> [--port N] [--size BYTES] [--reps N] [--window P]
  *   window 1 onto the server's export 1 (uwin 0 .. size), that part of the
  *   uwin exported to the V80, an HBM buffer of size bytes; then for each
  *   transfer of 4 KiB, 16 KiB, ... up to size, reps times: clear the HBM
@@ -31,7 +31,9 @@
  *   so this times the peer-to-peer read path alone (V80 -> U280 shell ->
  *   loom_read) and checks every byte is all ones.
  *
- * The QP port is N (Coyote's default if not given).
+ * The QP port is N (Coyote's default if not given). --window sets this
+ * host's ack window (TX_CTL: rdma packets unacked, 0 = no limit; 16 after
+ * reset); the server's is get_bench --window.
  */
 #include <unistd.h>
 
@@ -61,7 +63,7 @@ constexpr uint32_t SRC_EXPORT   = 1;     // on the server, as get_bench
 uint64_t pattern(uint64_t off) { return 0x5EED000000000000ULL ^ (off * 0x9E3779B97F4A7C15ULL); }
 
 // local: no window bound, every read answered with all ones on the card
-int run_client(const std::string &ip, uint16_t port, uint64_t size, int reps) {
+int run_client(const std::string &ip, uint16_t port, uint64_t size, int reps, int window) {
     const bool local = ip.empty();
     coyote::cThread u280(0, getpid(), 0, nullptr, "coyote_fpga");     // QP owner, CSR page
     coyote::cThread v80(0, getpid(), 0, nullptr, "coyote_versal_fpga");
@@ -70,6 +72,8 @@ int run_client(const std::string &ip, uint16_t port, uint64_t size, int reps) {
     } else {
         printf("client: QP exchange with %s on port %u ...\n", ip.c_str(), port);
         if (!u280.initRDMA(STAGING_SIZE, port, ip.c_str())) { printf("FAIL: initRDMA\n"); return 1; }
+        if (window >= 0) csr_write(u280, TX_CTL, uint64_t(window));
+        printf("client: ack window %lu packets\n", (unsigned long) csr_read(u280, TX_CTL));
         program_window(u280, 1, true, u280.getCtid(), reinterpret_cast<const void *>(export_ref(SRC_EXPORT)), size, 0);
     }
     const int dfd = u280.exportDmabuf(EXPORT_REGION_UWIN, 0, size);
@@ -143,6 +147,7 @@ int main(int argc, char *argv[]) {
     uint16_t port = coyote::DEF_PORT;
     uint64_t size = 16ULL << 20;
     int reps = 3;
+    int window = -1;
     for (int i = 1; i < argc; i++) {
         const std::string a = argv[i];
         if (a == "--client" && i + 1 < argc)     ip = argv[++i];
@@ -150,11 +155,12 @@ int main(int argc, char *argv[]) {
         else if (a == "--port" && i + 1 < argc)  port = uint16_t(atoi(argv[++i]));
         else if (a == "--size" && i + 1 < argc)  size = strtoull(argv[++i], nullptr, 0);
         else if (a == "--reps" && i + 1 < argc)  reps = atoi(argv[++i]);
+        else if (a == "--window" && i + 1 < argc) window = atoi(argv[++i]);
         else { fprintf(stderr, "usage: see the header of ce_get.cpp\n"); return 2; }
     }
-    if (local == !ip.empty() || size < 4096 || size % 4096 || size > (64ULL << 20) || reps < 1) {
+    if (local == !ip.empty() || size < 4096 || size % 4096 || size > (64ULL << 20) || reps < 1 || window > 255) {
         fprintf(stderr, "usage: see the header of ce_get.cpp (--size: a multiple of 4096, at most 64 MiB)\n");
         return 2;
     }
-    return run_client(ip, port, size, reps);
+    return run_client(ip, port, size, reps, window);
 }
