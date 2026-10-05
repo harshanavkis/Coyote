@@ -5,7 +5,7 @@
 #
 #   image.bit  e.g. examples/loom/hw/build_sep29_ctrl/bitstreams/cyt_top.bit
 #   bdf        the U280's PCIe address (default per host: clara/amy
-#              0000:e1:00.0, rose 0000:c1:00.0)
+#              0000:e1:00.0 on clara, amy and rose)
 #
 # Steps: unload coyote_driver, remove the card from PCIe, program it over JTAG
 # (Vivado 2023.2, device selected by part xcu280), let the link retrain, then

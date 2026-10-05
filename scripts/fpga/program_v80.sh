@@ -4,8 +4,8 @@
 #   scripts/fpga/program_v80.sh <image.pdi> [bdf]
 #
 #   image.pdi  e.g. examples/07_perf_fpga/hw/build_v80/bitstreams/cyt_top.pdi
-#   bdf        the V80's PCIe address (default per host: clara 0000:81:00.0,
-#              rose 0000:61:00.0)
+#   bdf        the V80's PCIe address (default per host: amy 0000:81:00.0,
+#              rose 0000:c1:00.0)
 #
 # Steps: unload coyote_driver_versal if loaded, remove the card (its root port
 # if the card is alone under it) from PCIe,
@@ -46,7 +46,9 @@ fi
 PORT=""
 if [ -e "$DEV" ]; then
     PARENT=$(basename "$(dirname "$(readlink -f "$DEV")")")
-    NDEV=$(ls -d "/sys/bus/pci/devices/$PARENT"/0000:* 2>/dev/null | wc -l)
+    # PCI functions only: the port's own service devices (0000:..:pcie001)
+    # live in the same directory
+    NDEV=$(ls -d "/sys/bus/pci/devices/$PARENT"/0000:??:??.? 2>/dev/null | wc -l)
     if [[ $PARENT == 0000:* ]] && [ "$NDEV" -eq 1 ]; then PORT=$PARENT; fi
     echo "   removing ${PORT:-$BDF} from PCIe (card was $(cat $DEV/vendor):$(cat $DEV/device))"
     echo 1 | sudo tee "/sys/bus/pci/devices/${PORT:-$BDF}/remove" >/dev/null

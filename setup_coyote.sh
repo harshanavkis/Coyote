@@ -3,11 +3,7 @@
 # sudo bash sw/util/hot_reset.sh "e1:00.0"
 
 host=`hostname`
-if [[ $host == "rose" ]]; then
-  BDF="c1:00.0"
-else
-  BDF="e1:00.0"
-fi
+BDF="e1:00.0"       # the U280, on clara, amy and rose
 
 # Unload any already-loaded instance before touching the device. The driver's
 # MODULE_DEVICE_TABLE lets udev auto-load it (without ip/mac parameters!) on

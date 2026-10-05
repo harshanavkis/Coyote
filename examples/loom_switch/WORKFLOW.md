@@ -26,6 +26,12 @@ work.
 | IOMMU | **off** (no IOMMU groups) | **on** (`amd_iommu=on`) |
 | Drivers | `coyote_driver` (U280) + `coyote_driver_versal` (V80), loaded side by side | same |
 
+Since 2026-10-05 the V80s sit elsewhere: clara's V80 is in **amy** (`81:00.0`,
+NUMA 1, a different root complex from amy's U280 at `e1:00.0`; IOMMU on), and
+rose's cards moved to `e1:00.0` (U280) and `c1:00.0` (V80), both NUMA 1, so
+nothing crosses sockets. clara keeps only its U280. The walk-through below
+still names clara and rose; amy now plays clara's part.
+
 The two U280s are linked by 100 G Ethernet through the N8550 switch, and RoCE
 v2 runs between the FPGA IPs. The U280 driver gets its IP and MAC as module
 parameters, from `setup_coyote.sh`.

@@ -41,10 +41,9 @@ export LD_LIBRARY_PATH=$ncurses/lib\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH};"
 # Default PCIe addresses of the cards, per host
 default_bdf() {   # <u280|v80>
     case "$(hostname)-$1" in
-        clara-u280|amy-u280) echo 0000:e1:00.0 ;;
-        rose-u280)           echo 0000:c1:00.0 ;;
-        clara-v80)           echo 0000:81:00.0 ;;
-        rose-v80)            echo 0000:61:00.0 ;;
+        clara-u280|amy-u280|rose-u280) echo 0000:e1:00.0 ;;
+        amy-v80)             echo 0000:81:00.0 ;;
+        rose-v80)            echo 0000:c1:00.0 ;;
         *) echo "no default $1 BDF for $(hostname); pass one" >&2; return 1 ;;
     esac
 }
