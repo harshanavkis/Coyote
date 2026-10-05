@@ -336,6 +336,19 @@ can be up to 128 MB (a 64 MiB push fits one binding).
   The first form (5f710592, the CPU stored a request word into a get
   window and polled a completion word; amy reading rose: 7.8 us, 11.6 GB/s
   with 16 x 256 KiB in flight) is replaced.
+  Writes on the same image, 2026-10-05 (clara, rose, all byte-exact, 0
+  retransmissions): `uwin_probe` (G2) PASS on clara and rose; `ce_local`
+  6.69-6.82 GB/s and `ce_local --land-v80` 4.43-4.72 (as before);
+  `ce_remote` clara -> rose 11.08-11.24, rose -> clara 9.8-10.1 with the
+  same two slow copies as before (rose's copy engine); both ways at once
+  (`~/loom-experiments/bidir/loom_bidir.sh`) 6.5-6.6 each way. That last
+  one was 7.3 on 10-03, but today the 10-03 image (loom-switch-ackgap16)
+  gives 6.5-6.6 too after a reflash (one earlier run 7.1): the hosts'
+  state, not the RTL. The window's CPU mapping is uncached-minus, not
+  write-combining: the driver `pci_iomap`s the whole bypass BAR, and PAT
+  downgrades the window's write-combining mmap inside it. Every CPU store
+  is its own PCIe write, so a CPU put never forms full-line packets
+  (`uwin_probe` bulk 0.02 GB/s on clara, 0.08 on rose).
 
 ## Found on the way: `RX_CHUNK` is not wired in `examples/loom`
 
