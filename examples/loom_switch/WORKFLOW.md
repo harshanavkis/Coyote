@@ -330,6 +330,11 @@ The same as §4, from step 5 on. Only the producer changes.
    (CSR 93).
 3. The flag store closes the open packet and follows it, so rose sees the
    data before the flag.
+   The write-combining buffers flush lines in no fixed address order, so
+   lines that don't continue the open packet close it: on the hosts here
+   CPU packets are ~1.5 lines. (The driver must not map the window's part
+   of the BAR in the kernel, or PAT turns this mapping uncached and every
+   store becomes its own PCIe write.)
 
 The window doesn't care what produced the writes: a copy engine, a CPU, or
 anything else that can write a PCIe address.

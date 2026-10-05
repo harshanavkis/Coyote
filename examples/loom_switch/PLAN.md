@@ -349,11 +349,19 @@ can be up to 128 MB (a 64 MiB push fits one binding).
   identical PCIe settings and shell counters; the limit is clara's shell
   write path (landing writes wait 1.6-2.6 M cycles a run to enter the
   MMU, rose's ~0; the DMA engine never pushes back). What made the 7.1 and
-  7.3 runs faster is not known. The window's CPU mapping is uncached-minus, not
-  write-combining: the driver `pci_iomap`s the whole bypass BAR, and PAT
-  downgrades the window's write-combining mmap inside it. Every CPU store
-  is its own PCIe write, so a CPU put never forms full-line packets
-  (`uwin_probe` bulk 0.02 GB/s on clara, 0.08 on rose).
+  7.3 runs faster is not known. The window's CPU mapping was uncached-minus, not
+  write-combining: the driver `pci_iomap`ed the whole bypass BAR, and PAT
+  downgraded the window's write-combining mmap inside it, so every CPU
+  store was its own PCIe write (`uwin_probe` bulk 0.02 GB/s on clara, 0.08
+  on rose). The driver now maps only the BAR below the window
+  (`coyote_driver-u280-uwinwc.ko`; PAT shows the window write-combining):
+  `uwin_probe` bulk 0.15-0.21 GB/s on clara, 1.06-1.27 on rose. Whole
+  lines arrive, but not in address order (~1.5 lines a packet, the
+  ingress queue full most of the run), and clara takes each host write
+  request slowly. CPU loads: same 7.3 us each, a thread's bulk read
+  0.044-0.076 GB/s (was 0.004; ~1 read per 64 B line up to 16 KiB), but
+  more threads add nothing (~0.045 in total, with free read slots: a cap
+  upstream of the switch, not identified). Copy-engine runs unchanged.
 
 ## Found on the way: `RX_CHUNK` is not wired in `examples/loom`
 

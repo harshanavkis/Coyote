@@ -387,6 +387,7 @@ int map_single_bar(struct bus_driver_data *bd_data, struct pci_dev *pdev, int id
     resource_size_t bar_start = pci_resource_start(pdev, idx);
     resource_size_t bar_len = pci_resource_len(pdev, idx);
     resource_size_t map_len = bar_len;
+    resource_size_t kmap_len;
     bd_data->bar[curr_idx] = NULL;
 
     // Error checking
@@ -400,9 +401,15 @@ int map_single_bar(struct bus_driver_data *bd_data, struct pci_dev *pdev, int id
         map_len = (resource_size_t) INT_MAX;
     }
 
-    // Map the BAR to the kernel address space
-    dbg_info("mapping BAR %d, %llu bytes to be mapped", idx, (u64) map_len);
-    bd_data->bar[curr_idx] = pci_iomap(pdev, idx, map_len);
+    // Map the BAR to the kernel address space. Of the shell BAR, only what lies
+    // below the user data window: the kernel never touches the window, and an
+    // uncached kernel mapping over it would make PAT downgrade the
+    // write-combining user mapping (MMAP_UWIN) to uncached-minus.
+    kmap_len = map_len;
+    if (curr_idx == BAR_SHELL_CONFIG && kmap_len > VFPGA_UWIN_OFFS)
+        kmap_len = VFPGA_UWIN_OFFS;
+    dbg_info("mapping BAR %d, %llu bytes to be mapped", idx, (u64) kmap_len);
+    bd_data->bar[curr_idx] = pci_iomap(pdev, idx, kmap_len);
 
     if (!bd_data->bar[curr_idx]) {
         dev_err(&pdev->dev, "could not map BAR%d\n", idx);
@@ -411,7 +418,7 @@ int map_single_bar(struct bus_driver_data *bd_data, struct pci_dev *pdev, int id
 
     dbg_info(
         "BAR%d at 0x%llx mapped at 0x%p, length=%llu, (%llu)\n",
-        idx, (u64) bar_start, bd_data->bar[curr_idx], (u64) map_len, (u64) bar_len
+        idx, (u64) bar_start, bd_data->bar[curr_idx], (u64) kmap_len, (u64) bar_len
     );
 
     // Populate metadata in the bus driver bd_data structure
