@@ -363,6 +363,25 @@ can be up to 128 MB (a 64 MiB push fits one binding).
   more threads add nothing (~0.045 in total, with free read slots: a cap
   upstream of the switch, not identified). Copy-engine runs unchanged.
 
+- **amy and rose, both with a V80 and a U280 (since 2026-10-05).** clara's
+  V80 moved to amy (`81:00.0`); rose's cards to `e1:00.0` / `c1:00.0`; all on
+  socket 1. U280s on `loom-switch-read` (write-combining driver), V80s on
+  `loom-ce-discard` (`scripts/fpga/program_v80.sh <pdi> <bdf>`; a V80 that
+  trains Gen4 x8 comes up x16 when programmed again). Runners in
+  `~/loom-experiments/bidir/`: `loom_pair.sh CLI SRV` (`ce_remote --bidir`
+  between any two hosts, SX/CX `--no-send` for one way), `bidir_pair.sh` /
+  `run_pr.sh` (stock perf_rdma). 2026-10-05, 16 MiB copies, byte-exact, 0
+  retransmissions:
+  - local (amy / rose): V80 self-loop 10.92 / 10.91 GB/s; V80 -> host
+    12.57 / 12.40; V80 -> U280 -> host 10.63 / 10.64; V80 -> U280 -> V80
+    HBM 10.62 / 10.62 (clara: 6.7 and 4.5).
+  - remote: amy -> rose 11.09-11.15, rose -> amy 10.83-11.23, both ways at
+    once 10.7 / 10.5 each way (clara <-> rose: 6.6).
+  - gets (rose reads amy): 7.28 us a load; CPU puts 0.87-1.03 GB/s.
+  - stock perf_rdma on the same U280s: one way 12.25, both ways 11.49 /
+    11.58; with clara both ways is winner-take-all (10.5-10.6 into clara,
+    5.5-5.6 out), whichever host is its partner.
+
 ## Found on the way: `RX_CHUNK` is not wired in `examples/loom`
 
 `examples/loom/hw/src/vfpga_top.svh` connects neither `loom_ctrl`'s
