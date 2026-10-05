@@ -177,7 +177,7 @@ proc cr_bd_design_static { parentCell } {
             CONFIG.HAS_REGION {1} \
             CONFIG.HAS_RRESP {1} \
             CONFIG.HAS_WSTRB {1} \
-            CONFIG.NUM_READ_OUTSTANDING {8} \
+            CONFIG.NUM_READ_OUTSTANDING {32} \
             CONFIG.NUM_WRITE_OUTSTANDING {8} \
             CONFIG.PROTOCOL {AXI4} \
             CONFIG.READ_WRITE_MODE {READ_WRITE} \
@@ -341,6 +341,7 @@ if {$cnfg(fdev) eq "u250" || $cnfg(fdev) eq "u200"} {
               CONFIG.xdma_wnum_chnl {[expr {$cnfg(n_hchan)}]} \
               CONFIG.xdma_wnum_rids {32} \
               CONFIG.xdma_rnum_rids {32} \
+              CONFIG.c_m_axi_num_write {32} \
               CONFIG.en_ext_ch_gt_drp {true} \
             ] \$xdma_0"
     eval $cmd
@@ -382,6 +383,7 @@ if {$cnfg(fdev) eq "u280" || $cnfg(fdev) eq "u55c"} {
               CONFIG.xdma_wnum_chnl {[expr {$cnfg(n_hchan)}]} \
               CONFIG.xdma_wnum_rids {32} \
               CONFIG.xdma_rnum_rids {32} \
+              CONFIG.c_m_axi_num_write {32} \
               CONFIG.pcie_blk_locn {PCIE4C_X1Y1} \
               CONFIG.en_ext_ch_gt_drp {true} \
             ] \$xdma_0"
@@ -420,6 +422,7 @@ if {$cnfg(fdev) eq "u50"} {
               CONFIG.xdma_wnum_chnl {[expr {$cnfg(n_hchan)}]} \
               CONFIG.xdma_wnum_rids {32} \
               CONFIG.xdma_rnum_rids {32} \
+              CONFIG.c_m_axi_num_write {32} \
               CONFIG.en_ext_ch_gt_drp {true} \
             ] \$xdma_0"
     eval $cmd
@@ -467,6 +470,7 @@ if {$cnfg(fdev) eq "vcu118"} {
               CONFIG.xdma_wnum_chnl {[expr {$cnfg(n_hchan)}]} \
               CONFIG.xdma_wnum_rids {32} \
               CONFIG.xdma_rnum_rids {32} \
+              CONFIG.c_m_axi_num_write {32} \
               CONFIG.en_ext_ch_gt_drp {true} \
             ] \$xdma_0"
     eval $cmd

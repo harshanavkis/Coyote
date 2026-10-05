@@ -210,6 +210,9 @@ can be up to 128 MB (a 64 MiB push fits one binding).
   `/scratch/harshanavkis/loom-proj/Coyote/examples/loom_switch/hw/tb/run_tbs.sh`
 - The shell window's block design:
   `/scratch/harshanavkis/loom-proj/Coyote/examples/loom_switch/hw/tb/shell_ctrl_uwin/run.sh`
+  (includes reads in flight into the window: 32)
+- The U280 static block design's XDMA (32 reads in flight on the bypass
+  master): `/scratch/harshanavkis/loom-proj/Coyote/examples/loom_switch/hw/tb/static_pci/run.sh`
 - Software:
   `cd /scratch/harshanavkis/loom-proj/Coyote/examples/loom_switch/sw && mkdir -p build && cd build && nix-shell ../../../../shell.nix --run "cmake .. && make -j16"`
 - G2 in Coyote's simulation (the whole vFPGA under `sim/hw/tb_user.sv`,

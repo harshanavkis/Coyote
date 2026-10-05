@@ -68,19 +68,33 @@ module axi4_sink #(parameter integer DW = 512) (
     assign bvalid = (n_b > 0);
     assign bid    = bid_r;
 
-    // Reads: one burst at a time; beat k of a read at A returns {k, A}
+    // Reads: one burst at a time; beat k of a read at A returns {k, A}.
+    // While r_hold is set every read is accepted and queued, none answered
+    // (n_ar counts the reads accepted); they are answered in order after.
     logic   r_act = 0;
     longint r_addr;
     int     r_left, r_k;
     logic [5:0] r_id;
+    bit     r_hold = 0;
+    int     n_ar = 0;
+    longint q_addr [$];
+    int     q_len  [$];
+    logic [5:0] q_id [$];
     assign rid     = r_id;
-    assign arready = !r_act;
+    assign arready = r_hold || (!r_act && q_addr.size() == 0);
     assign rvalid  = r_act;
     assign rlast   = r_act && (r_left == 0);
     assign rdata   = DW'({32'(r_k), r_addr[31:0]});
     always @(posedge aclk) begin
-        if (!r_act && arvalid) begin r_act <= 1; r_addr <= araddr; r_left <= arlen; r_k <= 0; r_id <= arid; end
-        else if (r_act && rready) begin
+        if (arvalid && arready) n_ar++;
+        if (r_hold && arvalid) begin q_addr.push_back(araddr); q_len.push_back(arlen); q_id.push_back(arid); end
+        if (!r_act) begin
+            if (!r_hold && q_addr.size() != 0) begin
+                r_act <= 1; r_addr <= q_addr.pop_front(); r_left <= q_len.pop_front(); r_k <= 0; r_id <= q_id.pop_front();
+            end else if (!r_hold && arvalid) begin
+                r_act <= 1; r_addr <= araddr; r_left <= arlen; r_k <= 0; r_id <= arid;
+            end
+        end else if (rready) begin
             if (r_left == 0) r_act <= 0;
             r_left <= r_left - 1; r_k <= r_k + 1;
         end
@@ -134,6 +148,7 @@ localparam integer NREG = 1;
 `endif
 localparam longint UWIN      = 64'h0800_0000;
 localparam longint UWIN_SIZE = 64'h0800_0000 / NREG;
+localparam integer RD_IN_FLIGHT = 32;     // the shell's reads in flight into a uwin (cr_ctrl.tcl)
 
 logic xclk = 0, xresetn = 0, sys_reset = 1;
 always #2 xclk = ~xclk;
@@ -426,6 +441,39 @@ initial begin
             `CHECK(s_ud0.w_data[k] == pat(UWIN + 256*(k/4), k%4), $sformatf("rate: beat %0d", k))
         $display("ok   rate: 256 beats reached axim_udata_0 in %0d aclk cycles",
                  s_ud0.last_w - s_ud0.first_w + 1);
+    end
+
+    // Reads in flight: the window takes reads and answers none, so the reads
+    // that reach axim_udata_0 are the shell's read acceptance (a peer's
+    // reads each wait a network round trip there); then all are answered
+    begin
+        int got = 0;
+        s_ud0.n_ar = 0;
+        s_ud0.r_hold = 1;
+        fork
+            begin
+                for (int k = 0; k < 64; k++) begin
+                    m_araddr <= UWIN + 256*k; m_arlen <= 3; m_arsize <= 6; m_arvalid <= 1;
+                    do @(posedge xclk); while (!m_arready);
+                end
+                m_arvalid <= 0;
+            end
+        join_none
+        repeat (2000) @(posedge aclk);
+        `CHECK(s_ud0.n_ar == RD_IN_FLIGHT, $sformatf("reads in flight: %0d reached axim_udata_0, expected %0d",
+                                                     s_ud0.n_ar, RD_IN_FLIGHT))
+        $display("ok   reads in flight: %0d reached axim_udata_0 with none answered", s_ud0.n_ar);
+        s_ud0.r_hold = 0;
+        while (got < 256) begin
+            @(posedge xclk);
+            if (m_rvalid) begin
+                `CHECK(m_rdata[63:0] == {32'(got % 4), 32'(UWIN + 256*(got/4))} && m_rresp == 0 && m_rlast == (got % 4 == 3),
+                       $sformatf("reads in flight: beat %0d: %h", got, m_rdata[63:0]))
+                got++;
+            end
+        end
+        `CHECK(s_ud0.n_ar == 64, $sformatf("reads in flight: %0d of 64 reads reached axim_udata_0", s_ud0.n_ar))
+        $display("ok   reads in flight: all 64 answered in order");
     end
 
     if (errors == 0) $display("TB PASS (tb_shell_ctrl_uwin, %0d regions)", NREG);

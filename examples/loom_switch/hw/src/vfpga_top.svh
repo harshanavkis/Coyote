@@ -319,7 +319,9 @@ loom_rx #(.N_SLOTS(N_RD_SLOTS)) inst_loom_rx (
     .cnt_rx_rq_ovfl(rx_cnt_rq_ovfl)
 );
 
-loom_rd #(.NET_DEST(0), .RD_DEST(1)) inst_loom_rd (
+// 32 host reads ahead: a peer copy engine's get arrives as 256 B reads, up
+// to 32 in flight (the shell's read acceptance), one job each
+loom_rd #(.NET_DEST(0), .RD_DEST(1), .RD_AHEAD(32), .BUF_BEATS(512)) inst_loom_rd (
     .aclk(aclk), .aresetn(aresetn),
     .s_job_valid(job_valid), .s_job_ready(job_ready), .s_job_pid(job_pid), .s_job_va(job_va),
     .s_job_len(job_len), .s_job_ret(job_ret), .s_job_cval(job_cval), .s_job_err(job_err),
