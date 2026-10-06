@@ -77,7 +77,8 @@ struct user_pages* map_present(struct vfpga_dev *device, struct pf_aligned_desc 
  * @param user_pg User pages structure
  * @param hpid Host process ID
  */
-void tlb_map_gup(struct vfpga_dev *device, struct pf_aligned_desc *pf_desc, struct user_pages *user_pg, pid_t hpid);
+uint32_t tlb_map_gup(struct vfpga_dev *device, struct pf_aligned_desc *pf_desc, struct user_pages *user_pg, pid_t hpid);
+void tlb_map_gup_all(struct vfpga_dev *device, struct pf_aligned_desc *pf_desc, struct user_pages *user_pg, pid_t hpid);
 
 /**
  * @brief Removes a TLB mapping for the given user pages

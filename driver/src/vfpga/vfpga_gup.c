@@ -132,7 +132,7 @@ struct user_pages* map_present(struct vfpga_dev *device, struct pf_aligned_desc 
     return 0;
 }
 
-void tlb_map_gup(struct vfpga_dev *device, struct pf_aligned_desc *pf_desc, struct user_pages *user_pg, pid_t hpid) {
+uint32_t tlb_map_gup(struct vfpga_dev *device, struct pf_aligned_desc *pf_desc, struct user_pages *user_pg, pid_t hpid) {
     BUG_ON(!device);
     struct bus_driver_data *bd_data = device->bd_data;
     BUG_ON(!bd_data);
@@ -142,6 +142,7 @@ void tlb_map_gup(struct vfpga_dev *device, struct pf_aligned_desc *pf_desc, stru
     uint32_t n_pages = pf_desc->n_pages;
 
     int32_t n_pg_mapped = 0;
+    uint32_t covered = 0;
     uint64_t vaddr_tmp = pf_desc->vaddr;
     if (user_pg->huge) {
         // Do mappings - huge pages
@@ -154,6 +155,7 @@ void tlb_map_gup(struct vfpga_dev *device, struct pf_aligned_desc *pf_desc, stru
 
             vaddr_tmp += bd_data->n_pages_in_huge;
             n_pg_mapped++;
+            covered = i + bd_data->n_pages_in_huge;
         }
     } else {
         // Do mappings - regular + regular pages coalesced into huge pages
@@ -195,6 +197,26 @@ void tlb_map_gup(struct vfpga_dev *device, struct pf_aligned_desc *pf_desc, stru
             i += is_huge ? bd_data->n_pages_in_huge : 1;
             n_pg_mapped++;
         }
+        covered = i;
+    }
+    return covered < n_pages ? covered : n_pages;
+}
+
+/*
+ * Map every page of pf_desc, in calls of at most MAX_N_MAP_PAGES entries
+ * each (one tlb_map_gup call stops there). For whole buffers mapped up
+ * front - above all an imported dma-buf: the page fault path pins user
+ * pages, and an import has none behind it - so a buffer of more than
+ * MAX_N_MAP_PAGES 4 KiB pages (a 1 MiB dma-buf window plus its fence page)
+ * is mapped to its end, not only its first 1 MiB.
+ */
+void tlb_map_gup_all(struct vfpga_dev *device, struct pf_aligned_desc *pf_desc, struct user_pages *user_pg, pid_t hpid) {
+    struct pf_aligned_desc d = *pf_desc;
+    while (d.n_pages) {
+        uint32_t done = tlb_map_gup(device, &d, user_pg, hpid);
+        if (!done) break;
+        d.vaddr += done;
+        d.n_pages -= done;
     }
 }
 
@@ -730,7 +752,7 @@ int uwin_hbm_bind(struct vfpga_dev *device, uint64_t vaddr, uint64_t len, int32_
     pf_desc.n_pages = found->n_pages;
     pf_desc.ctid = ctid;
     pf_desc.hugepages = found->huge;
-    tlb_map_gup(device, &pf_desc, found, hpid);
+    tlb_map_gup_all(device, &pf_desc, found, hpid);
 
     dbg_info("uwin HBM bind: vaddr %llx, %llu pages at card %llx\n", vaddr, found->n_pages, base);
     return 0;
@@ -766,7 +788,7 @@ int offload_user_pages(struct vfpga_dev *device, uint64_t vaddr, uint32_t len, i
                 tlb_unmap_gup(device, tmp_entry, hpid);
                 tmp_entry->host = CARD_ACCESS;
                 migrate_to_card(device, tmp_entry);
-                tlb_map_gup(device, &pf_desc, tmp_entry, hpid);
+                tlb_map_gup_all(device, &pf_desc, tmp_entry, hpid);
                 ret_val = 0;
 
                 vaddr_tmp += tmp_entry->n_pages;
@@ -805,7 +827,7 @@ int sync_user_pages(struct vfpga_dev *device, uint64_t vaddr, uint32_t len, int3
                 tlb_unmap_gup(device, tmp_entry, hpid);
                 tmp_entry->host = HOST_ACCESS;
                 migrate_to_host(device, tmp_entry);
-                tlb_map_gup(device, &pf_desc, tmp_entry, hpid);
+                tlb_map_gup_all(device, &pf_desc, tmp_entry, hpid);
                 ret_val = 0;
 
                 vaddr_tmp += tmp_entry->n_pages;
@@ -859,7 +881,7 @@ void p2p_move_notify(struct dma_buf_attachment *attach) {
                 for (int i = 0; i < sg_dma_len(tmp_sgl) >> PAGE_SHIFT; i++) {
                     tmp_entry->hpages[cnt + i] = sg_dma_address(tmp_sgl) + i * PAGE_SIZE;
                 }
-                cnt = sg_dma_len(tmp_sgl) >> PAGE_SHIFT;
+                cnt += sg_dma_len(tmp_sgl) >> PAGE_SHIFT;
                 tmp_sgl = sg_next(tmp_sgl);
             }
 
@@ -870,7 +892,7 @@ void p2p_move_notify(struct dma_buf_attachment *attach) {
             pf_desc.ctid = ctid;
             pf_desc.hugepages = false;
 
-            tlb_map_gup(device, &pf_desc, tmp_entry, hpid);
+            tlb_map_gup_all(device, &pf_desc, tmp_entry, hpid);
 
             tmp_entry->buf = attach->dmabuf;
             tmp_entry->dma_attach = attach;
@@ -1022,7 +1044,7 @@ int p2p_attach_dma_buf(struct vfpga_dev *device, int buf_fd, uint64_t vaddr, int
     pf_desc.n_pages = user_pg->n_pages;
     pf_desc.ctid = ctid;
     pf_desc.hugepages = false;
-    tlb_map_gup(device, &pf_desc, user_pg, hpid);
+    tlb_map_gup_all(device, &pf_desc, user_pg, hpid);
 
     dbg_info("dmabuf attached, n_pages %d\n", n_pages);
     return 0;
