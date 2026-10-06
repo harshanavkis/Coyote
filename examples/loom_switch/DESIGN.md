@@ -128,15 +128,37 @@ into their memory; a producer polling a far ack or credit only sees an older
 value), and no benchmark does. Read-your-writes in hardware would need both
 places to hold reads behind earlier writes; not built.
 
-## 7. Read coalescer (option, not built)
+## 7. Reads that continue each other share one get (read coalescer)
 
-A timer, restarted by each consecutive read that arrives, sends one get for
-all of them when it expires. Safe (nothing fetched before it is asked for),
-but it cannot raise bandwidth: at most 32 reads are open (8 KiB), and read
-33 cannot come before one of them is answered. It cuts get requests and
-completions 32x and, more to the point, turns 32 small host reads at the far
-responder into one: Phase 1's network gets (0.45 GB/s) are bound by that
-responder's per-get host read, so this is the next step for gets.
+`loom_read` gathers reads into the open get: a read of the same window and
+page that starts at the byte where the last one ended joins it. The get is
+sent when a read that does not continue it arrives (failed reads included),
+when it reaches the end of its page, or after `CO_WAIT` (32) cycles with no
+read joining.
+
+- Why: Phase 1's network gets (0.45 GB/s) are bound by the far responder's
+  host read per get (one 256 B DMA read, ~563 ns; section 5). A page of the
+  V80's 256 B reads is now one get and one 4 KiB host read: 16x fewer get
+  requests, completions and far-side host reads (64x for CPU lines).
+- Safe: a get only gathers reads that have arrived; nothing is fetched
+  before it is asked for. It cannot raise bandwidth past the 32 reads in
+  flight: ~32 x 256 B per round trip, ~1.2 GB/s (inferred).
+- At most one page (4 KiB): `loom_rx` lands an answer only in the first
+  4 KiB of a slot's 8 KiB return region. Larger gets would need that region
+  changed; not done unless measurements ask for it.
+- The answer lands in the get's first read's slot buffer and every read of
+  the get takes its lines from there; done and error are per get, so a
+  rejected get answers all its reads with all ones. That buffer is kept
+  until the get's last read is answered: a slot is taken only if it is not
+  the buffer of a read still waiting.
+- `CO_WAIT` = 32 cycles (128 ns): the V80's reads arrive ~42 ns (~10.5
+  cycles) apart (`ce_get --local`), so a get is not cut by ordinary jitter;
+  a cut only costs one more get. A lone read (a CPU load) leaves 128 ns
+  later, ~2% of the 7.3 us get latency.
+- Tests: `tb_loom_switch_top` T17-T23 (a page of reads, reads that must not
+  join, the timer, a page boundary, CPU loads inside lines, a rejected
+  shared get, the buffer kept); 19 mutations of the new logic all caught.
+  Out of context at 250 MHz: +0.95 ns, 1,422 LUTs (+240), 8 URAM (same).
 
 ## 8. Bulk data is moved by puts
 

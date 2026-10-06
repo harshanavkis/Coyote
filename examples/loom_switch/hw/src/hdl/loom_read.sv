@@ -14,10 +14,16 @@ import lynxTypes::*;
  *      read's beats fall in: from the line of araddr to the line of its last
  *      beat (INCR or FIXED; a burst stays inside its 4 KiB page, so a read
  *      is at most 64 lines).
- *   2. Send a get request for those lines through loom_ingress (s_get), in
- *      its queue order: ref = the window's far reference + the offset of the
- *      first line, word = {lines [63:48], return reference [47:0]}, the
- *      return reference being this slot: {RRET_EXP, slot * 8 KiB}.
+ *   2. Reads that continue each other share one get: a read of the same
+ *      window and page that starts at the byte where the previous one ended
+ *      joins the open get; the get is sent when a read that does not
+ *      continue it arrives, when it reaches the end of its page (so at most
+ *      4 KiB), or after CO_WAIT cycles with no read joining. Nothing is
+ *      fetched before a read asks for it. A get is a request through
+ *      loom_ingress (s_get), in its queue order: ref = the window's far
+ *      reference + the offset of the first line, word = {lines [63:48],
+ *      return reference [47:0]}, the return reference being its first
+ *      read's slot: {RRET_EXP, slot * 8 KiB}.
  *   3. The far loom_rx / loom_rd answer as for any get: the lines as rdma
  *      packets to return reference + offset, then the word to return
  *      reference + len (all ones if the far side rejected the request).
@@ -25,20 +31,23 @@ import lynxTypes::*;
  *      buffer (s_land) and the completion to this module (s_cmp): 8 KiB per
  *      slot in the reference space, so return reference + len (len <= 4 KiB)
  *      still names the slot when the word is all ones.
- *   4. R: when the head slot is complete, its beats go out, each the line
- *      its address falls in (the data on the lanes the address selects, as
- *      the AXI data bus carries it).
+ *   4. R: when the head read's get is complete, its beats go out, each the
+ *      line its address falls in, from its get's buffer (the data on the
+ *      lanes the address selects, as the AXI data bus carries it). A get's
+ *      buffer is kept until its last read is answered: a slot is taken only
+ *      when it is not the buffer of a read still waiting.
  *
  * A read that cannot be served - no window, a local window, past the
  * window's end, a burst wider than the bus or crossing its 4 KiB page - or
  * that the far side rejected, is answered OKAY with all ones (the value a
  * failed PCIe read returns), and counted (cnt_fail; cnt_far_err for the far
- * side's). Nothing times out: a read whose answer never comes holds its
- * slot, and the reads behind it, until a reset.
+ * side's, once per get). Nothing times out: a read whose answer never comes
+ * holds its slot, and the reads behind it, until a reset.
  */
 module loom_read #(
     parameter integer UWIN_BITS = 27,
     parameter integer N_SLOTS   = 64,
+    parameter integer CO_WAIT   = 32,       // cycles an open get waits for a continuing read
     parameter         BUF_MEM   = "ultra"
 ) (
     input  logic                        aclk,
@@ -91,7 +100,7 @@ module loom_read #(
     output logic                        cnt_read,      // a read taken (AR)
     output logic                        cnt_done,      // a read answered (its last R beat)
     output logic                        cnt_fail,      // a read answered with all ones
-    output logic                        cnt_far_err,   // ... because the far side rejected its get
+    output logic                        cnt_far_err,   // a get the far side rejected
     output logic                        cnt_slot_wait, // cycles an AR waited for a free slot
     output logic                        cnt_stray      // a completion for a slot with no get out (must be 0)
 );
@@ -102,10 +111,10 @@ localparam integer LINE_W = SLOT_W + 6;
 localparam integer SK     = 4;         // R skid buffer
 
 // ---------------------------------------------------------------------------
-// Slots: [rp, wp) allocated, in AR order
+// Slots: [rp, wp) allocated, in AR order. done / err / sent are per get,
+// at its first read's slot.
 // ---------------------------------------------------------------------------
 logic [SLOT_W:0]        wp, rp;
-wire                    s_full = (wp - rp) == (SLOT_W+1)'(N_SLOTS);
 wire  [SLOT_W-1:0]      h = rp[SLOT_W-1:0];
 logic [N_SLOTS-1:0]     done, err, sent;
 
@@ -115,14 +124,35 @@ logic [7:0]             m_len  [N_SLOTS];
 logic [2:0]             m_size [N_SLOTS];
 logic                   m_fix  [N_SLOTS];
 logic [11:0]            m_addr [N_SLOTS];
+logic [SLOT_W-1:0]      m_get  [N_SLOTS];  // its get's first slot: the buffer its lines are in
+logic [5:0]             m_l0   [N_SLOTS];  // that get's first line in the page
+
+// The head read's get buffer and the slots after it stay taken
+wire  [SLOT_W-1:0]      hg     = m_get[h];
+wire  [SLOT_W+1:0]      s_used = (SLOT_W+2)'(wp - rp) + ((rp != wp) ? (SLOT_W+2)'(SLOT_W'(h - hg)) : '0);
+wire                    s_full = s_used >= (SLOT_W+2)'(N_SLOTS);
 
 // ---------------------------------------------------------------------------
-// AR: take, look up (two cycles), request
+// AR: take, look up (two cycles), join the open get or open one; send it
 // ---------------------------------------------------------------------------
 typedef enum logic [1:0] { A_IDLE, A_L1, A_L2, A_REQ } astate_t;
 astate_t ast;
 
-assign s_arready = (ast == A_IDLE) && !s_full;
+// The open get
+logic                         o_v;
+logic [SLOT_W-1:0]            o_slot;    // its first read's slot
+logic [UWIN_BITS-1:0]         o_win;     // the window (its start in the uwin)
+logic [UWIN_BITS-13:0]        o_page;
+logic [12:0]                  o_next;    // where in the page a continuing read starts; 4096: none can
+logic [5:0]                   o_l0;      // its first line in the page
+logic [6:0]                   o_nl;      // lines
+logic [PID_BITS-1:0]          o_pid;
+logic [VADDR_BITS-1:0]        o_ref;
+logic [$clog2(CO_WAIT+1)-1:0] o_age;     // cycles since a read last joined
+
+wire o_close = o_v && (o_next[12] || (o_age == CO_WAIT));
+
+assign s_arready = (ast == A_IDLE) && !s_full && !o_close;
 wire   ar_hs     = s_arvalid && s_arready;
 
 assign ub_addr = {s_araddr[UWIN_BITS-1:6], 6'b0};
@@ -134,47 +164,90 @@ wire [14:0] ar_lo   = {3'b0, s_araddr[11:0]};
 wire [14:0] ar_al   = ar_lo & ~((15'd1 << s_arsize) - 15'd1);
 wire [14:0] ar_last = (s_arburst == 2'b00) ? ar_lo : ar_al + ({7'd0, s_arlen} << s_arsize);
 wire        ar_bad  = (s_arsize > 3'd6) || (ar_last[14:12] != 3'd0);
+// Where a read continuing this one starts (a fixed burst: none can)
+wire [12:0] ar_next = (s_arburst == 2'b00) ? 13'h1000 : 13'(ar_last + (15'd1 << s_arsize));
 
-logic [UWIN_BITS-1:0] a_line;       // the first line
-logic [6:0]           a_nlines;
+logic [UWIN_BITS-1:0] a_addr;
+logic [5:0]           a_lastl;      // the line of its last beat
+logic [12:0]          a_next;
 logic                 a_bad;
 logic [SLOT_W-1:0]    a_slot;
 
-wire [UWIN_BITS:0]  a_end = {1'b0, a_line} + {{(UWIN_BITS-12){1'b0}}, a_nlines, 6'b0};
-wire                a_ok  = ub_hit && ub_route && !a_bad && ((LEN_BITS+1)'(a_end) <= ub_end);
-wire [LEN_BITS-1:0] a_off = LEN_BITS'(a_line - ub_ustart);
+wire [UWIN_BITS-1:0] a_line   = {a_addr[UWIN_BITS-1:6], 6'b0};    // the first line
+wire [6:0]           a_nlines = 7'(a_lastl) - 7'(a_addr[11:6]) + 7'd1;
+wire [UWIN_BITS:0]   a_end    = {1'b0, a_line} + {{(UWIN_BITS-12){1'b0}}, a_nlines, 6'b0};
+wire                 a_ok     = ub_hit && ub_route && !a_bad && ((LEN_BITS+1)'(a_end) <= ub_end);
+wire [LEN_BITS-1:0]  a_off    = LEN_BITS'(a_line - ub_ustart);
+wire                 a_join   = o_v && a_ok && (ub_ustart == o_win) && (a_addr[UWIN_BITS-1:12] == o_page) &&
+                                ({1'b0, a_addr[11:0]} == o_next);
 
 always_ff @(posedge aclk) begin
     if (!aresetn) begin
         ast <= A_IDLE;
         wp  <= '0;
-    end else case (ast)
-        A_IDLE: if (ar_hs) begin
-            a_line   <= {s_araddr[UWIN_BITS-1:6], 6'b0};
-            a_nlines <= 7'(ar_last[11:6]) - 7'(s_araddr[11:6]) + 7'd1;
-            a_bad    <= ar_bad;
-            a_slot   <= wp[SLOT_W-1:0];
+        o_v <= 1'b0;
+    end else begin
+        if (o_v && (o_age != CO_WAIT)) o_age <= o_age + 1'b1;
+        case (ast)
+        A_IDLE: if (o_close) begin
+            m_get_pid  <= o_pid;
+            m_get_ref  <= o_ref;
+            m_get_word <= {9'd0, o_nl, RRET_EXP, 40'({o_slot, 13'd0})};
+            o_v        <= 1'b0;
+            ast        <= A_REQ;
+        end else if (ar_hs) begin
+            a_addr  <= s_araddr;
+            a_lastl <= ar_last[11:6];
+            a_next  <= ar_next;
+            a_bad   <= ar_bad;
+            a_slot  <= wp[SLOT_W-1:0];
             m_id  [wp[SLOT_W-1:0]] <= s_arid;
             m_len [wp[SLOT_W-1:0]] <= s_arlen;
             m_size[wp[SLOT_W-1:0]] <= s_arsize;
             m_fix [wp[SLOT_W-1:0]] <= (s_arburst == 2'b00);
             m_addr[wp[SLOT_W-1:0]] <= s_araddr[11:0];
+            m_get [wp[SLOT_W-1:0]] <= wp[SLOT_W-1:0];
+            m_l0  [wp[SLOT_W-1:0]] <= s_araddr[11:6];
             wp  <= wp + 1'b1;
             ast <= A_L1;
         end
         A_L1: ast <= A_L2;
-        A_L2: begin
-            m_get_pid  <= ub_pid;
-            m_get_ref  <= ub_base + VADDR_BITS'(a_off);
-            m_get_word <= {9'd0, a_nlines, RRET_EXP, 40'({a_slot, 13'd0})};
-            ast        <= a_ok ? A_REQ : A_IDLE;
+        A_L2: if (a_join) begin
+            m_get[a_slot] <= o_slot;
+            m_l0 [a_slot] <= o_l0;
+            o_next <= a_next;
+            o_nl   <= 7'(a_lastl) - 7'(o_l0) + 7'd1;
+            o_age  <= '0;
+            ast    <= A_IDLE;
+        end else begin
+            // Any other read sends the open get; a good one opens the next
+            if (o_v) begin
+                m_get_pid  <= o_pid;
+                m_get_ref  <= o_ref;
+                m_get_word <= {9'd0, o_nl, RRET_EXP, 40'({o_slot, 13'd0})};
+            end
+            ast <= o_v ? A_REQ : A_IDLE;
+            o_v <= a_ok;
+            if (a_ok) begin
+                o_slot <= a_slot;
+                o_win  <= ub_ustart;
+                o_page <= a_addr[UWIN_BITS-1:12];
+                o_next <= a_next;
+                o_l0   <= a_addr[11:6];
+                o_nl   <= a_nlines;
+                o_pid  <= ub_pid;
+                o_ref  <= ub_base + VADDR_BITS'(a_off);
+                o_age  <= '0;
+            end
         end
         A_REQ: if (m_get_ready) ast <= A_IDLE;
         default: ast <= A_IDLE;
-    endcase
+        endcase
+    end
 end
 
 assign m_get_valid = (ast == A_REQ);
+wire [SLOT_W-1:0] g_slot = m_get_word[13 +: SLOT_W];
 
 // ---------------------------------------------------------------------------
 // Completions and the slot buffer
@@ -183,7 +256,6 @@ wire cmp_take = s_cmp_valid && sent[s_cmp_slot];
 wire a_fail   = (ast == A_L2) && !a_ok;
 
 logic r_act;
-logic r_free;              // the head slot's last beat issued this cycle
 
 always_ff @(posedge aclk) begin
     if (!aresetn) begin
@@ -191,7 +263,8 @@ always_ff @(posedge aclk) begin
         err  <= '0;
         sent <= '0;
     end else begin
-        if (m_get_valid && m_get_ready) sent[a_slot] <= 1'b1;
+        if (ar_hs) done[wp[SLOT_W-1:0]] <= 1'b0;
+        if (m_get_valid && m_get_ready) sent[g_slot] <= 1'b1;
         if (a_fail) begin
             done[a_slot] <= 1'b1;
             err[a_slot]  <= 1'b1;
@@ -201,7 +274,6 @@ always_ff @(posedge aclk) begin
             done[s_cmp_slot] <= 1'b1;
             err[s_cmp_slot]  <= s_cmp_err;
         end
-        if (r_free) done[h] <= 1'b0;
     end
 end
 
@@ -243,14 +315,16 @@ xpm_memory_sdpram #(
 );
 
 // ---------------------------------------------------------------------------
-// R: the head slot's beats, in order, once it is complete. Each beat reads
-// the line its address falls in (2 cycles), then waits in the skid buffer.
+// R: the head read's beats, in order, once its get is complete. Each beat
+// reads the line its address falls in from the get's buffer (2 cycles), then
+// waits in the skid buffer.
 // ---------------------------------------------------------------------------
 logic [7:0]             r_left;
 logic [12:0]            r_cur;       // the beat's address in the page
 logic [2:0]             r_size;
 logic                   r_fix, r_err;
-logic [5:0]             r_l0;        // the read's first line
+logic [SLOT_W-1:0]      r_get;       // its get's buffer
+logic [5:0]             r_l0;        // and that get's first line
 logic [AXI_ID_BITS-1:0] r_id;
 
 // Two read stages, then the skid buffer
@@ -266,12 +340,11 @@ logic [$clog2(SK):0] sk_wp, sk_rp;
 wire  [$clog2(SK):0] sk_cnt = sk_wp - sk_rp;
 wire  sk_empty = (sk_wp == sk_rp);
 
-wire r_start = !r_act && (rp != wp) && done[h];
+wire r_start = !r_act && (rp != wp) && done[hg];
 wire r_room  = ({1'b0, sk_cnt} + 2'(p1_v) + 2'(p2_v)) < ($clog2(SK)+2)'(SK);
 wire r_issue = r_act && r_room;
-assign r_free  = r_issue && (r_left == 8'd0);
 assign rd_en   = r_issue;
-assign rd_line = {h, 6'(r_cur[11:6] - r_l0)};
+assign rd_line = {r_get, 6'(r_cur[11:6] - r_l0)};
 
 wire [12:0] r_step = 13'd1 << r_size;
 wire [12:0] r_next = r_fix ? r_cur : ((r_cur & ~(r_step - 13'd1)) + r_step);
@@ -289,9 +362,10 @@ always_ff @(posedge aclk) begin
             r_cur  <= {1'b0, m_addr[h]};
             r_size <= m_size[h];
             r_fix  <= m_fix[h];
-            r_l0   <= m_addr[h][11:6];
+            r_get  <= hg;
+            r_l0   <= m_l0[h];
             r_id   <= m_id[h];
-            r_err  <= err[h];
+            r_err  <= err[hg];
         end else if (r_issue) begin
             r_left <= r_left - 1'b1;
             r_cur  <= r_next;
@@ -335,11 +409,11 @@ assign s_rlast  = sk_mem[sk_rp[$clog2(SK)-1:0]].last;
 assign s_rid    = sk_mem[sk_rp[$clog2(SK)-1:0]].id;
 assign s_rresp  = 2'b00;
 
-assign busy = (ast != A_IDLE) || r_act || p1_v || p2_v || !sk_empty || ((rp != wp) && done[h]);
+assign busy = (ast != A_IDLE) || o_v || r_act || p1_v || p2_v || !sk_empty || ((rp != wp) && done[hg]);
 
 assign cnt_read      = ar_hs;
 assign cnt_done      = r_pop && s_rlast;
-assign cnt_fail      = r_start && err[h];
+assign cnt_fail      = r_start && err[hg];
 assign cnt_far_err   = cmp_take && s_cmp_err;
 assign cnt_slot_wait = s_arvalid && (ast == A_IDLE) && s_full;
 assign cnt_stray     = s_cmp_valid && !sent[s_cmp_slot];

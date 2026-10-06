@@ -61,7 +61,7 @@ import lynxTypes::*;
  *   192-199 (RO) cnt_y[i] at word 192+i: reads on the uwin (loom_read):
  *          192 reads taken, 193 reads answered, 194 reads answered with all
  *          ones (no rdma window, past its end, a bad burst, or rejected by
- *          the far side), 195 of those rejected by the far side, 196 cycles
+ *          the far side), 195 gets the far side rejected, 196 cycles
  *          a read waited for a free slot, 197 completions for a slot with no
  *          get out (must be 0), 198 answer lines into the read buffer
  *   112-130 (RO) cnt_x[i] at word 112+i, its longest run of consecutive

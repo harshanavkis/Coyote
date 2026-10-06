@@ -406,15 +406,20 @@ on the wire a get is two writes.
 - **The read (reader's U280, `loom_read`).** A read of the window (AXI AR on
   the uwin) takes one of 64 read slots, looks its address up in the window
   table, and works out the 64 B lines its beats fall in (at most 64: a burst
-  stays inside its 4 KiB page). `loom_ingress` sends one 64 B inline message
-  with op `GET_REQ` (3): lane 1 = the window's reference + the first line's
-  offset, lane 2 = the request word `{lines [63:48], {0xFE, slot * 8 KiB}}`.
-  It goes out in the ingress queue's order, after the packet being gathered
-  (closed first), so a read leaves after every write taken before it.
+  stays inside its 4 KiB page). Reads that continue each other share one get
+  (DESIGN 7): a read of the same window and page starting where the last one
+  ended joins the open get, which is sent when a read that does not continue
+  it arrives, at the end of its page, or after 32 cycles with no read
+  joining. `loom_ingress` sends the get as one 64 B inline message with op
+  `GET_REQ` (3): lane 1 = the window's reference + the first line's offset,
+  lane 2 = the request word `{lines [63:48], {0xFE, slot * 8 KiB}}`, the slot
+  being the get's first read's. It goes out in the ingress queue's order,
+  after the packet being gathered (closed first), so a read leaves after
+  every write taken before it.
 - **rose.**
   - `loom_rx` checks the source against its exports: export there, in
     bounds, 64 B-aligned, length not 0. It hands `loom_rd` a job.
-  - `loom_rd` reads the lines (`sq_rd`, host stream 1), up to 4 jobs ahead,
+  - `loom_rd` reads the lines (`sq_rd`, host stream 1), up to 32 jobs ahead,
     and sends them back in PMTU packets, RETH = the return reference +
     offset, each posted once its data is buffered. Then one inline store of
     the request word to return reference + length: the completion.
@@ -423,13 +428,14 @@ on the wire a get is two writes.
     rose's own ingress, in request order.
 - **Back on the reader's U280.** `loom_rx` sees export index 0xFE: the
   answer's lines go into the slot's buffer (URAM, 4 KiB per slot) instead of
-  host memory, and the completion marks the slot done (8 KiB of reference
+  host memory, and the completion marks the get done (8 KiB of reference
   space per slot, so return reference + length still names the slot when
   the word is all ones). `loom_read` answers R in AR order: each beat is the
-  line its address falls in.
+  line its address falls in, from its get's buffer, which is kept until the
+  get's last read is answered.
 - **Failures.** A read with no window, on a local window, past the window's
   end, or rejected by rose returns all ones (what a failed PCIe read
-  returns), counted at words 194/195. Nothing times out: a read whose answer
+  returns), counted at words 194 (per read) and 195 (per get). Nothing times out: a read whose answer
   never comes holds its slot, and the reads behind it, until a reset.
 
 - **A copy engine as the reader (`ce_get`).** The V80's `loom_ce` with DIR

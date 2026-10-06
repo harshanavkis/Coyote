@@ -27,7 +27,11 @@ import lynxTypes::*;
  * replayed into loom_rx as the reader, which answers R: a CPU-sized load,
  * bursts in flight answered out of order (whole, unaligned, narrow, fixed),
  * reads that fail (all ones), a read after an open write packet, and all
- * slots in use, then wrapping, under backpressure.
+ * slots in use, then wrapping, under backpressure. Reads that continue each
+ * other share one get: a page of 256 B reads, the reads that must not join
+ * (a gap, going back, the next page, the next window), the timer, a page
+ * boundary, CPU loads inside lines, a shared get the far side rejects, and
+ * the shared answer kept until its last read is answered.
  */
 module tb_loom_switch_top;
 
@@ -79,6 +83,10 @@ localparam longint      U3 = 64'h020_0000;            // window 3: rdma, QP pid 
 localparam logic [47:0] R3 = {8'd7, 40'h3000};
 localparam longint      U4 = 64'h030_0000;            // window 4: rdma, export 5 here (not programmed)
 localparam logic [47:0] R4 = {8'd5, 40'h0};
+localparam longint      U5 = 64'h040_0000;            // windows 5 and 6: rdma, export 7 here, 2 KiB each,
+localparam logic [47:0] R5 = {8'd7, 40'h10_0000};     // meeting in the middle of one page
+localparam longint      U6 = 64'h040_0800;
+localparam logic [47:0] R6 = {8'd7, 40'h20_0000};
 
 function automatic logic [AXI_DATA_BITS-1:0] pat(input longint uaddr);
     logic [AXI_DATA_BITS-1:0] d;
@@ -186,6 +194,20 @@ always @(posedge aclk) if (aresetn) begin
         r_id.push_back(int'(axi_udata.rid)); r_rs.push_back(axi_udata.rresp);
     end
 end
+
+// loom_read: the cycle of the last AR taken and of the last get request
+// handed to the ingress, the get requests so far, and the head slot pointer
+// when the last AR was taken
+longint cyc = 0, t_ar = 0, t_get = 0;
+int     n_get = 0;
+logic [6:0] rp_at_ar;
+always @(posedge aclk) begin
+    cyc++;
+    if (axi_udata.arvalid && axi_udata.arready) begin t_ar = cyc; rp_at_ar = inst_dut.inst_loom_read.rp; end
+    if (inst_dut.get_valid && inst_dut.get_ready) begin t_get = cyc; n_get++; end
+end
+int CO;     // loom_read's timer
+initial CO = inst_dut.inst_loom_read.CO_WAIT;
 
 // Arbitration invariants: sq_wr carries loom_rx's request whenever it has
 // one, else the ingress's or loom_rd's (whichever is selected, and it has
@@ -507,15 +529,17 @@ function automatic longint beat_addr(input longint a, input int i, input int siz
     return al + (longint'(i) << size);
 endfunction
 
-// The R beats of a read at window-3 offset woff: each the line its address
-// falls in, as the far host reads it (hpat at export 7 + 0x3000 + line), or
-// all ones for a read that fails
+// The R beats of a read at window offset woff: each the line its address
+// falls in, as the far host reads it (hpat at the window's far address
+// fbase + line; window 3: export 7 + 0x3000), or all ones for a read that
+// fails
 task automatic exp_read(input string name, input longint woff, input int arlen, input int size = 6,
-                        input int burst = 1, input int id = 0, input bit fail = 0);
+                        input int burst = 1, input int id = 0, input bit fail = 0,
+                        input logic [47:0] fbase = X7 + 48'h3000);
     for (int i = 0; i <= arlen; i++) begin
         longint line = beat_addr(woff, i, size, burst) & ~64'h3F;
         logic [AXI_DATA_BITS-1:0] want;
-        want = fail ? '1 : hpat(X7 + 48'h3000 + 48'(line));
+        want = fail ? '1 : hpat(fbase + 48'(line));
         `CHECK(r_d.size() != 0, $sformatf("%s: R beat %0d missing", name, i))
         if (r_d.size() == 0) return;
         `CHECK(r_d.pop_front() == want && r_id.pop_front() == id && r_l.pop_front() == (i == arlen) &&
@@ -526,7 +550,9 @@ endtask
 // The far side and the way back, by loopback: the get requests sent so far
 // (other rdma packets' beats skipped) are replayed into loom_rx as the far
 // side; loom_rd's answers, one group per get (packets, then the completion),
-// are replayed into loom_rx as the reader, in order or last get first
+// are replayed into loom_rx as the reader, in order or last get first. The
+// get request messages are kept in lg_reqs.
+logic [AXI_DATA_BITS-1:0] lg_reqs [$];
 task automatic loop_gets(input string name, input int want_gets, input bit reverse = 0);
     logic [AXI_DATA_BITS-1:0] reqs [$], beats [$], b [$];
     logic [47:0] pva [$];
@@ -540,6 +566,7 @@ task automatic loop_gets(input string name, input int want_gets, input bit rever
         end
     end
     `CHECK(reqs.size() == want_gets, $sformatf("%s: %0d get requests out, want %0d", name, reqs.size(), want_gets))
+    lg_reqs = reqs;
     clear_net();
     rx_lock.get();
     foreach (reqs[i]) begin b.delete(); b.push_back(reqs[i]); rx_packet(64, b, {8'hFF, 40'd0}); end
@@ -566,6 +593,17 @@ task automatic loop_gets(input string name, input int want_gets, input bit rever
     end
     rx_lock.put();
     quiesce();
+endtask
+
+// Get request k of the last loop_gets: from far reference fref, lines lines,
+// back to read slot slot (any slot if negative)
+task automatic chk_get(input string name, input int k, input logic [47:0] fref, input int lines, input int slot = -1);
+    `CHECK(lg_reqs.size() > k, $sformatf("%s: no get request %0d", name, k))
+    if (lg_reqs.size() <= k) return;
+    `CHECK(lg_reqs[k][127:64] == 64'(fref) && lg_reqs[k][191:176] == 16'(lines) && lg_reqs[k][175:168] == 8'hFE &&
+           (slot < 0 || lg_reqs[k][167:128] == 40'(slot * 8192)),
+           $sformatf("%s: get from %h, %0d lines, back to %h; want %h, %0d lines, slot %0d", name,
+                     lg_reqs[k][127:64], lg_reqs[k][191:176], lg_reqs[k][167:128], fref, lines, slot))
 endtask
 
 // ---------------------------------------------------------------------------
@@ -1054,13 +1092,14 @@ initial begin
     // --- T15: a read goes out after the writes taken before it: 8 lines
     //     written to window 3, then read at once, while their packet is still
     //     open (the idle timer has not closed it): the read closes it, the
-    //     packet leaves whole, then the get request ---
+    //     packet leaves whole, then the get request. The read runs to the
+    //     page's end, so its get leaves without waiting for a continuing read ---
     begin
         logic [63:0] c0x, c1x;
         clear();
         csr_rd(121, c0x);
         uwr(U3 + 64'h100, 8);
-        uread(U3 + 64'h100, 7, 6, 1, 7);
+        uread(U3 + 64'h100, 59, 6, 1, 7);
         quiesce();
         `CHECK(net_req.size() == 2 && !net_req[0].rd && net_req[0].va == R3 + 48'h100 && net_req[0].beats == 8 &&
                net_req[1].va == {8'hFF, 40'd0} && net_req[1].beats == 1,
@@ -1068,14 +1107,15 @@ initial begin
                          net_req.size() ? net_req[0].va : 48'd0, net_req.size() ? net_req[0].beats : 0))
         csr_rd(121, c1x); `CHECK(c1x - c0x == 1, $sformatf("T15: %0d packets cut", c1x - c0x))
         loop_gets("T15", 1);
-        exp_read("T15", 64'h100, 7, 6, 1, 7);
+        exp_read("T15", 64'h100, 59, 6, 1, 7);
         clear();
     end
     $display("ok   T15 a read after an open write packet");
 
     // --- T16: every slot in use, under backpressure: 64 one-line reads
-    //     take all 64 slots, a 65th waits for one (counted), and gets it once
-    //     the first 64 are answered; the ring wraps ---
+    //     (every other line, so each is a get of its own) take all 64 slots,
+    //     a 65th waits for one (counted), and gets it once the first 64 are
+    //     answered; the ring wraps ---
     $assertoff(0, tb_loom_switch_top.sq_wr);
     bp = 1;
     begin
@@ -1083,14 +1123,14 @@ initial begin
         bit took = 0;
         clear();
         csr_rd(196, w0);
-        for (int k = 0; k < 64; k++) uread(U3 + 64'h4000 + 64*k, 0, 6, 1, k);
+        for (int k = 0; k < 64; k++) uread(U3 + 64'h4000 + 128*k, 0, 6, 1, k);
         fork begin uread(U3 + 64'h8000, 0, 6, 1, 40); took = 1; end join_none
         repeat (300) @(posedge aclk);
         `CHECK(!took, "T16: a 65th read was taken with every slot in use")
         csr_rd(196, w1); `CHECK(w1 - w0 > 100, $sformatf("T16: %0d cycles waiting for a slot", w1 - w0))
         loop_gets("T16", 64);
         wait (took);
-        for (int k = 0; k < 64; k++) exp_read($sformatf("T16 read %0d", k), 64'h4000 + 64*k, 0, 6, 1, k);
+        for (int k = 0; k < 64; k++) exp_read($sformatf("T16 read %0d", k), 64'h4000 + 128*k, 0, 6, 1, k);
         loop_gets("T16 65th", 1);
         exp_read("T16 65th", 64'h8000, 0, 6, 1, 40);
         `CHECK(r_d.size() == 0, $sformatf("T16: %0d extra R beats", r_d.size()))
@@ -1100,6 +1140,176 @@ initial begin
     repeat (50) @(posedge aclk);
     $asserton(0, tb_loom_switch_top.sq_wr);
     $display("ok   T16 every slot in use, then wrapping");
+
+    // --- T17: reads that continue each other share one get: 16 x 256 B (a
+    //     copy engine's reads) over one page of window 3 are one 4 KiB get
+    //     back to the first read's slot, sent as soon as the page is done
+    //     (before the timer); every read is answered from it, exact ---
+    begin
+        logic [63:0] g0, g1, y0, y1;
+        int s0;
+        clear();
+        s0 = int'(inst_dut.inst_loom_read.wp[5:0]);
+        csr_rd(136, g0); csr_rd(192, y0);
+        for (int k = 0; k < 16; k++) uread(U3 + 64'h5000 + 256*k, 3, 6, 1, k);
+        quiesce();
+        `CHECK(t_get - t_ar < CO, $sformatf("T17: the get left %0d cycles after the last read", t_get - t_ar))
+        csr_rd(136, g1); csr_rd(192, y1);
+        `CHECK(g1 - g0 == 1 && y1 - y0 == 16, $sformatf("T17: %0d get requests for %0d reads", g1 - g0, y1 - y0))
+        loop_gets("T17", 1);
+        chk_get("T17", 0, R3 + 48'h5000, 64, s0);
+        for (int k = 0; k < 16; k++) exp_read($sformatf("T17 read %0d", k), 64'h5000 + 256*k, 3, 6, 1, k);
+        `CHECK(r_d.size() == 0, $sformatf("T17: %0d extra R beats", r_d.size()))
+        clear();
+    end
+    $display("ok   T17 a page of reads, one get");
+
+    // --- T18: a read that does not continue the open get starts its own: a
+    //     gap of one line, going back, the same place in the next page, the
+    //     next window inside the same page (windows 5 and 6 meet in the middle
+    //     of a page); each get carries only its read's lines ---
+    begin
+        longint      off [6] = '{64'h6000, 64'h6140, 64'h6040, 64'h7140, 64'h700, 64'h0};
+        longint      ua [6];
+        logic [47:0] fr [6], fb [6];
+        program_win(5, 1, 5, 0, R5, 64'h800, U5);
+        program_win(6, 1, 5, 0, R6, 64'h800, U6);
+        clear();
+        for (int k = 0; k < 6; k++) begin
+            ua[k] = (k < 4) ? U3 : (k == 4) ? U5 : U6;
+            fr[k] = (k < 4) ? R3 : (k == 4) ? R5 : R6;
+            fb[k] = (k < 4) ? X7 + 48'h3000 : (k == 4) ? X7 + 48'h10_0000 : X7 + 48'h20_0000;
+            uread(ua[k] + off[k], 3, 6, 1, k);
+        end
+        loop_gets("T18", 6);
+        for (int k = 0; k < 6; k++) chk_get($sformatf("T18 get %0d", k), k, fr[k] + 48'(off[k]), 4);
+        for (int k = 0; k < 6; k++) exp_read($sformatf("T18 read %0d", k), off[k], 3, 6, 1, k, 0, fb[k]);
+        `CHECK(r_d.size() == 0, $sformatf("T18: %0d extra R beats", r_d.size()))
+        clear();
+    end
+    $display("ok   T18 reads that do not continue, a get each");
+
+    // --- T19: an open get waits for a continuing read up to the timer: 3 x
+    //     256 B, CO/2 cycles apart, are one get of 12 lines, sent only once
+    //     the timer runs out after the third; a 4th read continuing them
+    //     after that is a get of its own ---
+    begin
+        int n0;
+        clear();
+        n0 = n_get;
+        for (int k = 0; k < 3; k++) begin
+            uread(U3 + 64'h8000 + 256*k, 3, 6, 1, k);
+            repeat (CO / 2) @(posedge aclk);
+        end
+        `CHECK(n_get == n0, "T19: the get left before the timer ran out")
+        `CHECK(inst_dut.inst_loom_read.busy, "T19: not busy with a get open")
+        quiesce();
+        `CHECK(n_get == n0 + 1 && t_get - t_ar >= CO,
+               $sformatf("T19: %0d gets, the last %0d cycles after the last read", n_get - n0, t_get - t_ar))
+        uread(U3 + 64'h8300, 3, 6, 1, 3);
+        loop_gets("T19", 2);
+        chk_get("T19 shared", 0, R3 + 48'h8000, 12);
+        chk_get("T19 after the timer", 1, R3 + 48'h8300, 4);
+        for (int k = 0; k < 4; k++) exp_read($sformatf("T19 read %0d", k), 64'h8000 + 256*k, 3, 6, 1, k);
+        `CHECK(r_d.size() == 0, $sformatf("T19: %0d extra R beats", r_d.size()))
+        clear();
+    end
+    $display("ok   T19 the timer closes a get");
+
+    // --- T20: a get stays inside its page: 24 x 256 B from 0x9800 run into
+    //     the next page: a get of the first page's 8 reads (32 lines) and one
+    //     of the next page's 16 (64 lines) ---
+    begin
+        clear();
+        for (int k = 0; k < 24; k++) uread(U3 + 64'h9800 + 256*k, 3, 6, 1, k);
+        loop_gets("T20", 2);
+        chk_get("T20 first page", 0, R3 + 48'h9800, 32);
+        chk_get("T20 next page", 1, R3 + 48'hA000, 64);
+        for (int k = 0; k < 24; k++) exp_read($sformatf("T20 read %0d", k), 64'h9800 + 256*k, 3, 6, 1, k);
+        `CHECK(r_d.size() == 0, $sformatf("T20: %0d extra R beats", r_d.size()))
+        clear();
+    end
+    $display("ok   T20 a page boundary splits");
+
+    // --- T21: CPU loads chain inside lines: 12 x 32 B loads (arsize 5) from
+    //     0xB020, each where the last ended, then two 64 B loads (the first
+    //     unaligned, 0xB1A0): one get of the 8 lines 0xB000-0xB1FF ---
+    begin
+        clear();
+        for (int k = 0; k < 12; k++) uread(U3 + 64'hB020 + 32*k, 0, 5, 1, k);
+        uread(U3 + 64'hB1A0, 0, 6, 1, 12);
+        uread(U3 + 64'hB1C0, 0, 6, 1, 13);
+        loop_gets("T21", 1);
+        chk_get("T21", 0, R3 + 48'hB000, 8);
+        for (int k = 0; k < 12; k++) exp_read($sformatf("T21 load %0d", k), 64'hB020 + 32*k, 0, 5, 1, k);
+        exp_read("T21 load 12", 64'hB1A0, 0, 6, 1, 12);
+        exp_read("T21 load 13", 64'hB1C0, 0, 6, 1, 13);
+        `CHECK(r_d.size() == 0, $sformatf("T21: %0d extra R beats", r_d.size()))
+        clear();
+    end
+    $display("ok   T21 CPU loads inside lines");
+
+    // --- T22: the far side rejects a shared get (window 4: export 5 is not
+    //     there): every read of it is answered all ones, each counted, the
+    //     rejection once. A read that fails here (it continues the open get
+    //     but runs past window 5's end) does not join it; good reads around
+    //     them still complete ---
+    begin
+        logic [63:0] y0 [8], y1 [8];
+        clear();
+        for (int i = 0; i < 8; i++) csr_rd(192 + i, y0[i]);
+        for (int k = 0; k < 4; k++) uread(U4 + 64'h400 + 256*k, 3, 6, 1, k);
+        uread(U5 + 64'h700, 1, 6, 1, 4);
+        uread(U5 + 64'h780, 2, 6, 1, 5);                 // 0x780-0x83F: past 0x800
+        uread(U3 + 64'hB400, 0, 6, 1, 6);
+        loop_gets("T22", 3);
+        chk_get("T22 rejected", 0, R4 + 48'h400, 16);
+        chk_get("T22 window 5", 1, R5 + 48'h700, 2);
+        for (int k = 0; k < 4; k++) exp_read($sformatf("T22 read %0d", k), 0, 3, 6, 1, k, 1);
+        exp_read("T22 window 5", 64'h700, 1, 6, 1, 4, 0, X7 + 48'h10_0000);
+        exp_read("T22 past the end", 0, 2, 6, 1, 5, 1);
+        exp_read("T22 good", 64'hB400, 0, 6, 1, 6);
+        `CHECK(r_d.size() == 0, $sformatf("T22: %0d extra R beats", r_d.size()))
+        for (int i = 0; i < 8; i++) csr_rd(192 + i, y1[i]);
+        `CHECK(y1[0] - y0[0] == 7 && y1[1] - y0[1] == 7 && y1[2] - y0[2] == 5 && y1[3] - y0[3] == 1 && y1[5] == y0[5],
+               $sformatf("T22: reads %0d answered %0d failed %0d far %0d stray %0d",
+                         y1[0] - y0[0], y1[1] - y0[1], y1[2] - y0[2], y1[3] - y0[3], y1[5] - y0[5]))
+        clear();
+    end
+    $display("ok   T22 a shared get rejected");
+
+    // --- T23: a shared get's lines stay in its first slot's buffer until its
+    //     last read is answered: a 16-read get, then 48 one-line reads (every
+    //     other line, a get each) take every slot; under backpressure the 65th
+    //     read, which takes the shared get's first slot, is taken only once
+    //     all 16 of its reads are answered ---
+    $assertoff(0, tb_loom_switch_top.sq_wr);
+    bp = 1;
+    begin
+        logic [6:0] wp0;
+        bit took = 0;
+        clear();
+        wp0 = inst_dut.inst_loom_read.wp;
+        for (int k = 0; k < 16; k++) uread(U3 + 64'hC000 + 256*k, 3, 6, 1, k);
+        for (int k = 0; k < 48; k++) uread(U3 + 64'hD000 + 128*k, 0, 6, 1, 16 + k);
+        fork begin uread(U3 + 64'hF000, 0, 6, 1, 0); took = 1; end join_none
+        repeat (300) @(posedge aclk);
+        `CHECK(!took, "T23: a 65th read was taken with every slot in use")
+        loop_gets("T23", 49);
+        wait (took);
+        `CHECK(7'(rp_at_ar - wp0) >= 16,
+               $sformatf("T23: the 65th read was taken with %0d of the shared get's 16 reads answered", 7'(rp_at_ar - wp0)))
+        for (int k = 0; k < 16; k++) exp_read($sformatf("T23 shared %0d", k), 64'hC000 + 256*k, 3, 6, 1, k);
+        for (int k = 0; k < 48; k++) exp_read($sformatf("T23 own %0d", k), 64'hD000 + 128*k, 0, 6, 1, 16 + k);
+        loop_gets("T23 65th", 1);
+        exp_read("T23 65th", 64'hF000, 0, 6, 1, 0);
+        `CHECK(r_d.size() == 0, $sformatf("T23: %0d extra R beats", r_d.size()))
+        clear();
+    end
+    bp = 0;
+    repeat (50) @(posedge aclk);
+    $asserton(0, tb_loom_switch_top.sq_wr);
+    $display("ok   T23 a shared answer kept until its last read");
 
     if (errors == 0) $display("TB PASS (tb_loom_switch_top)");
     else             $display("TB FAIL (tb_loom_switch_top): %0d errors", errors);

@@ -453,6 +453,18 @@ can be up to 128 MB (a 64 MiB push fits one binding).
   (`rwsem.h:81`, the driver pins pages without the mmap lock), seen on
   every host and every program, not the cause.
 
+- **Reads that continue each other share one get (DESIGN 7):
+  `loom-switch-coalesce`** (build_oct06_coalesce). Shell only, against the
+  static of build_oct05_rd32 (the one the cards run, XDMA at 32 reads),
+  staged as `~/coyote-bitstreams/loom-switch-rd32/static/static_routed_locked_u280.dcp`:
+  `cd /scratch/harshanavkis/loom-proj/Coyote && scripts/fpga/build_bitstream.sh u280 examples/loom_switch/hw build_oct06_coalesce -DACK_GAP_CYCLES=16 -DBUILD_SHELL=1 -DBUILD_STATIC=0 -DSTATIC_PATH=/home/harshanavkis/coyote-bitstreams/loom-switch-rd32/static`
+  Then flash both U280s with `flash_u280.sh` as above (V80s stay on
+  `loom-ce-get`) and measure as for 32 reads in flight: network `ce_get`
+  with `--window 128`, the reads per get (word 192 over word 136, ~16 for
+  the V80's 256 B reads), amy's `cycles waiting for data`, CPU `get_bench`,
+  and the puts. Expected: network gets up to ~1.2 GB/s (32 x 256 B per
+  round trip).
+
 ## Found on the way: `RX_CHUNK` is not wired in `examples/loom`
 
 `examples/loom/hw/src/vfpga_top.svh` connects neither `loom_ctrl`'s
