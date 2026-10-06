@@ -19,7 +19,7 @@
 #   4. gets: copy engine without the network (ce_get --local), each host;
 #      rose's copy engine reading amy over the network (ce_get, window 128)
 #      with reads per get; CPU gets (get_bench)
-#   5. local puts (ce_local) on each host: V80 self-loop, V80 -> host,
+#   5. local puts (ce_local, 7 copies: one slow copy in three is common) on each host: V80 self-loop, V80 -> host,
 #      V80 -> U280 -> host, V80 -> U280 -> V80 HBM (ce_local triggered the
 #      driver's page-pinning oops on 2026-10-05/06)
 #   6. put sizes: rose's V80 -> amy's V80 HBM, 4 KiB .. 64 MiB copies, each
@@ -51,7 +51,39 @@ ns() { on $1 "sudo cat /sys/kernel/coyote_sysfs_0/cyt_attr_nstats" | grep -E "^(
 step() { echo; echo "=== $* ($(date -u +%H:%M:%S))"; }
 # A run that hits its timeout leaves the cards stuck (a copy engine waiting on
 # a dead peer, an ack window that never reopens): stop, the cards need setup
-hung() { echo; echo "ABORT: $1 failed or hit its timeout; the cards need setup_loom_hosts.sh before more runs (logs $OUT)"; exit 3; }
+hung() { echo; echo "ABORT: $1 failed or hit its timeout; the cards need setup_loom_hosts.sh before more runs (logs $OUT)"; finish; exit 3; }
+# The health check and the comparison: at the end, and after an abort
+finish() {
+    step "health after"
+    for h in amy rose; do
+        errs=$(on $h "sudo journalctl -k --since @$T0 --no-pager | grep -ciE '\\bBUG\\b|Oops|\\bAER\\b'")
+        faults=$(on $h "sudo journalctl -k --since @$T0 --no-pager | grep -c 'IO_PAGE_FAULT'")
+        echo "$h: $(on $h "uptime | sed 's/.*up/up/'") kernel BUG/Oops/AER since the start: $errs, IOMMU faults: $faults | $(ns $h)"
+        metric kernel_errors_$h "$errs" 0
+    done
+
+    PREV=${COMPARE:-$(ls -t "$(dirname "$OUT")"/*/metrics.tsv 2>/dev/null | grep -v "^$OUT/metrics.tsv$" | head -1)}
+    if [ -n "$PREV" ] && [ -f "$PREV" ]; then
+        step "compared with $PREV"
+        awk -F'\t' 'NR == FNR { p[$1] = $2; next }
+            {
+                name = $1; cur = $2; tol = $3; prev = (name in p) ? p[name] : "NA"; mark = ""; ch = ""
+                if (cur == "NA") mark = "CHECK (no result)"
+                else if (prev == "NA") mark = "(new)"
+                else if (prev + 0 == 0) { if (cur + 0 != 0) mark = "CHECK" }
+                else {
+                    ch = sprintf("%+.1f%%", (cur - prev) / prev * 100)
+                    if ((cur - prev) / prev * 100 > tol || (cur - prev) / prev * 100 < -tol) mark = "CHECK"
+                }
+                n += (mark ~ /^CHECK/)
+                printf "%-36s %10s %10s %8s  %s\n", name, prev, cur, ch, mark
+            }
+            END { printf "%d metric(s) to CHECK\n", n }' "$PREV" "$METRICS"
+    else
+        step "no earlier metrics.tsv next to $OUT to compare with"
+    fi
+}
+
 # metric <name> <value> [tolerance %, default 5]
 metric() { printf '%s\t%s\t%s\n' "$1" "${2:-NA}" "${3:-5}" >> "$METRICS"; }
 # the median of the numbers on stdin, one per line
@@ -148,7 +180,7 @@ rpg=$(awk -v a=$reads -v b=${reqs:-0} 'BEGIN { if (b) printf "%.1f", a / b; else
 echo "-- rose's copy engine reads amy (window 128): $(grep -E '^(ok|FAIL) +get' $OUT/ceget_net_client.log | awk 'NR % 3 == 0' | sed -nE 's/^(ok|FAIL) +get +([0-9]+) bytes:.*\( *([0-9.]+) GB\/s\).*/\1 \2:\3/p' | tr '\n' ' ')$(grep -oE 'CE GET (PASS|FAIL)' $OUT/ceget_net_client.log)"
 echo "   reads $reads, gets answered ${reqs:-?}, reads per get $rpg; $(grep -oE 'cycles waiting for data [0-9]+' $OUT/ceget_net_server.log)"
 metric ceget_net_16M "$(sed -nE 's/.*get +16777216 bytes:.*\( *([0-9.]+) GB\/s\).*/\1/p' $OUT/ceget_net_client.log | median)"
-metric ceget_net_reads_per_get "$rpg" 10
+metric ceget_net_reads_per_get "$rpg" 50   # flips between ~16 and ~11 (V80 read gaps vs the 32-cycle timer), same rate
 nextport; p=$PORT
 on amy "cd $SW && sudo stdbuf -oL timeout 600 $NUMA ./get_bench --server --port $p --window 128" > $OUT/cpuget_server.log 2>&1 & sp=$!
 sleep 4
@@ -165,11 +197,11 @@ metric cpuget_4threads "$(sed -nE 's/.* 4 threads:.*, +([0-9.]+) GB\/s.*/\1/p' $
 }
 
 [[ $STEPS == *5* ]] && {
-step "5. local puts (ce_local, 16 MiB x 3)"
+step "5. local puts (ce_local, 16 MiB x 7)"
 for h in amy rose; do
     for m in --self --host "" --land-v80; do
         L=$OUT/ce_local_${h}${m:-_u280host}.log
-        on $h "cd $CE && sudo stdbuf -oL timeout 240 $NUMA ./ce_local $m 16777216 3" > $L 2>&1
+        on $h "cd $CE && sudo stdbuf -oL timeout 240 $NUMA ./ce_local $m 16777216 7" > $L 2>&1
         rates=$(sed -nE 's/^(ok|FAIL).*fence (seen )?after [0-9.]+ us \(([0-9.]+) GB\/s\).*/\3/p' $L | tr '\n' ' ')
         echo "-- $h ce_local ${m:-(V80 -> U280 -> host)}: $rates$(grep -oE '\b(PASS|FAIL)\b' $L | tail -1)"
         metric ce_local_${h}${m:-_u280host} "$(echo $rates | words | warm | median)"
@@ -193,32 +225,5 @@ for size in 4096 16384 65536 262144 1048576 4194304 16777216 67108864; do
 done
 }
 
-step "health after"
-for h in amy rose; do
-    errs=$(on $h "sudo journalctl -k --since @$T0 --no-pager | grep -ciE '\\bBUG\\b|Oops|\\bAER\\b'")
-    faults=$(on $h "sudo journalctl -k --since @$T0 --no-pager | grep -c 'IO_PAGE_FAULT'")
-    echo "$h: $(on $h "uptime | sed 's/.*up/up/'") kernel BUG/Oops/AER since the start: $errs, IOMMU faults: $faults | $(ns $h)"
-    metric kernel_errors_$h "$errs" 0
-done
-
-PREV=${COMPARE:-$(ls -t "$(dirname "$OUT")"/*/metrics.tsv 2>/dev/null | grep -v "^$OUT/metrics.tsv$" | head -1)}
-if [ -n "$PREV" ] && [ -f "$PREV" ]; then
-    step "compared with $PREV"
-    awk -F'\t' 'NR == FNR { p[$1] = $2; next }
-        {
-            name = $1; cur = $2; tol = $3; prev = (name in p) ? p[name] : "NA"; mark = ""; ch = ""
-            if (cur == "NA") mark = "CHECK (no result)"
-            else if (prev == "NA") mark = "(new)"
-            else if (prev + 0 == 0) { if (cur + 0 != 0) mark = "CHECK" }
-            else {
-                ch = sprintf("%+.1f%%", (cur - prev) / prev * 100)
-                if ((cur - prev) / prev * 100 > tol || (cur - prev) / prev * 100 < -tol) mark = "CHECK"
-            }
-            n += (mark ~ /^CHECK/)
-            printf "%-36s %10s %10s %8s  %s\n", name, prev, cur, ch, mark
-        }
-        END { printf "%d metric(s) to CHECK\n", n }' "$PREV" "$METRICS"
-else
-    step "no earlier metrics.tsv next to $OUT to compare with"
-fi
+finish
 echo; echo "REGRESS DONE (logs $OUT)"
