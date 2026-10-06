@@ -19,11 +19,56 @@ its aperture was AXI-Lite (at most 8 B per uncached beat), so bulk had to be
 a descriptor and a pull. The CPU maps the uwin write-combining; a full line
 joins packets like bulk, a lone 8 B word becomes one store (below). A flag
 written after data stays behind it (one queue); on the CPU side the data and
-the flag are separated by a store fence, as with GPU peer writes. No loads
-for now: uwin reads return zeros.
+the flag are separated by a store fence, as with GPU peer writes. A load from
+an rdma window is a get (WORKFLOW 6.5).
 
-Hosts: clara ↔ rose (a V80 and a U280 each). Builds go through
-`scripts/fpga/build_bitstream.sh` (U280: Vivado 2023.2; V80: 2025.1).
+Hosts: amy ↔ rose (a V80 and a U280 each, since 2026-10-05). Builds go
+through `scripts/fpga/build_bitstream.sh` (U280: Vivado 2023.2; V80: 2025.1).
+
+## Current state (2026-10-06)
+
+- **Images** on amy and rose: U280
+  `~/coyote-bitstreams/loom-switch-coalesce-clean` (672fd313: 32 reads in
+  flight and the read coalescer, on the static in `hw/static`; timing met;
+  md5 04fdbab5), V80 `~/coyote-bitstreams/loom-ce-get` (ccf9ecfe, md5
+  4ce86b05).
+- **Cards up from any state:**
+  `scripts/fpga/setup_loom_hosts.sh <u280.bit> <v80.pdi> amy rose`.
+- **After every new image:**
+  `examples/loom_switch/regress.sh <outdir> --setup <u280.bit> <v80.pdi>`;
+  it writes `metrics.tsv` and compares it with the previous run.
+- **Builds:** `scripts/fpga/build_bitstream.sh` (tmux); a dead build:
+  `scripts/fpga/resume_build.sh`; a static build that misses timing in the
+  XDMA core: `scripts/fpga/close_static_timing.sh`. Shell builds of this
+  example link against `hw/static` unless `-DSTATIC_PATH` says otherwise.
+- **Baseline** (`~/loom-experiments/regress/20261006_coalesce_clean_r2`, all
+  byte-exact, 0 retransmissions, GB/s): V80 HBM -> peer V80 HBM 10.71 (16 MiB)
+  / 10.44-10.68 (64 MiB, copy engine); V80 -> peer host both ways 11.02 into
+  rose / 10.66 into amy, one way 10.82 / 10.88; `ce_local` self 10.92, ->
+  host 12.3-12.6, -> U280 -> host 10.64, -> V80 HBM 10.62; `uwin_probe`
+  1.1-1.3; gets: copy engine 0.98 over the network (16 reads per get), 6.09
+  without, CPU load 7.41 us; put sizes (64 MiB bursts into host memory) 4 KiB
+  1.21, 16 KiB 4.6, 64 KiB 8.2, 256 KiB 10.1.
+- **Timing a put:** the sender's copy-engine rate is the conservative one
+  (10.71 at 16 MiB = 87% of the link's 12.25). The landing host's clock from
+  the first data overstates a single copy (its first page waits on the
+  receiver's MMU) and cannot be used for a V80 landing (reads through the
+  V80's window wait for its writes).
+- **Open:**
+  1. Back-to-back copies of 1 MiB or more stall for good once the cards have
+     run many jobs (fresh cards pass): a translation miss on an imported
+     (dma-buf) window mapped in 4 KiB pages - the landing U280's for the V80
+     window, the sending V80's for the U280 window - is serviced slowly or
+     never (inferred). `regress.sh` step 6 stops there; the cards then need
+     setup. Repro: `~/loom-experiments/putsize_bug/case.sh`.
+  2. CPU single-thread bulk gets vary 0.025-0.15 GB/s with 266-917 reads per
+     16 KiB (more reads than loads); parallel CPU gets are steady (~0.12).
+  3. The U280 writes to bus address 0: ~100-130 IOMMU page faults per suite
+     on each host, with every image; the data is unaffected.
+  4. The driver's page-pinning warnings (`find_vma` without the mmap lock);
+     `ce_local` oopsed on 2026-10-05/06, not since.
+  5. Host state after a reboot: rose landed 64 MiB at 9.0-9.4 until it was
+     power-cycled; CPU-side numbers are off in the first ~15 min after a boot.
 
 ## Data path
 
