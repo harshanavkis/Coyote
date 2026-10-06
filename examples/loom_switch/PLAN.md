@@ -366,6 +366,14 @@ can be up to 128 MB (a 64 MiB push fits one binding).
   more threads add nothing (~0.045 in total, with free read slots: a cap
   upstream of the switch, not identified). Copy-engine runs unchanged.
 
+- **After every new image: the whole suite** (on clara; `--setup` brings the
+  cards up first, `STEPS=1` etc. runs single steps):
+  `/scratch/harshanavkis/loom-proj/Coyote/examples/loom_switch/regress.sh /home/harshanavkis/loom-experiments/regress/<name> --setup <u280.bit> <v80.pdi>`
+  V80 HBM -> peer V80 HBM both directions (16 and 64 MiB), V80 -> peer host
+  (both ways, one way), `uwin_probe`, gets (local, network with reads per
+  get, CPU), `ce_local` (last). ~6 min plus setup. Compare with the newest
+  results below.
+
 - **The cards from any state** (after a reboot, or another user's images and
   drivers), on clara:
   `cd /scratch/harshanavkis/loom-proj/Coyote && scripts/fpga/setup_loom_hosts.sh /home/harshanavkis/coyote-bitstreams/loom-switch-coalesce/hw/bitstreams/cyt_top.bit /home/harshanavkis/coyote-bitstreams/loom-ce-get/cyt_top.pdi amy rose`
@@ -491,6 +499,18 @@ can be up to 128 MB (a 64 MiB push fits one binding).
     with many slot waits.
   - puts unchanged: both ways 10.1-10.6 into rose / 10.6-11.2 into amy, one
     way 10.9-11.1; `uwin_probe` 1.43 (rose).
+  The whole suite (`regress.sh`, 2026-10-06 15:00, logs
+  `~/loom-experiments/regress/20261006_coalesce`), all byte-exact, 0
+  retransmissions, no kernel BUG/Oops/AER: V80 HBM -> peer V80 HBM 16 MiB CE
+  10.71 both ways, 64 MiB rose -> amy 10.68; V80 -> peer host both ways
+  10.26-10.40 into rose / 10.85-11.01 into amy, one way 10.86-11.02;
+  `uwin_probe` 1.08 / 1.07; `ce_local` self 10.92 / 10.92, -> host 12.58 /
+  12.43, -> U280 -> host 10.64, -> V80 HBM 10.62; gets as above. Only amy ->
+  rose V80 HBM at 64 MiB is lower than on 10-05 (CE 9.0-9.4, was 10.7-11.0):
+  rd32 (8.8-9.7) and the 10-05 image `loom-switch-read` (8.8-9.4) give the
+  same today, so it is rose's state since its reboot, not an image: rose's
+  U280 waits twice as long on its MMU for the V80 landing window (inferred:
+  smaller pages for that window, so 64 MiB overflows the TLB).
   Both hosts had been rebooted by others before the run (rose 11:30, amy
   12:06): drivers were reloaded and the V80s reprogrammed. After a reboot
   the old V80 driver takes `coyote_sysfs_0`, so it must be unloaded before
