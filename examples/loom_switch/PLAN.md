@@ -425,6 +425,34 @@ can be up to 128 MB (a 64 MiB push fits one binding).
   drivers loaded) and came back without its U280 on the bus: JTAG-program
   the U280, warm reboot, then insmod the driver with amy's IP and MAC.
 
+- **32 reads in flight (DESIGN 5): `loom-switch-rd32`** (build_oct05_rd32,
+  a9898fd1, first U280 static rebuild, Vivado 2023.2, md5 bf884794; WNS
+  -0.427 in the XDMA PCIe core's 512b completion interface, which the shipped
+  static meets). Flash both U280s with `flash_u280.sh` as above; the V80s
+  stay on `loom-ce-get`. The tools must be the current builds on both hosts
+  (rsync both `sw/build` directories; `--window` is new). 2026-10-06, all
+  byte-exact, 0 retransmissions:
+  - puts unchanged: rose self-loop 10.92, V80 -> host 12.57, V80 -> U280 ->
+    host 10.64 (amy 10.64), -> V80 HBM 10.62; `uwin_probe` 0.92 / 1.06;
+    `loom_pair` both ways 10.45 into rose / 10.80 into amy, one way 10.8 /
+    10.0-11.2.
+  - copy-engine gets, no network (`ce_get --local`, rose): 6.09 GB/s (5.88
+    at 8); the same at max read request 4096. Not bound by reads in flight:
+    ~42 ns per 256 B read either way.
+  - copy-engine gets over the network (rose reads amy, `--window 128` on
+    both): 0.45 GB/s from 256 KiB (0.31 at 8). amy's responder waits for its
+    host reads most of the time (`cycles waiting for data` ~129 ms of ~150
+    ms): one 256 B host DMA read per get, ~563 ns each.
+  - CPU gets (`get_bench`): 7.28 us a load (same); one thread 0.11 GB/s at
+    16 KiB; 1-32 threads 0.05-0.08 GB/s, no scaling (same far-side cost,
+    one 64 B line per get).
+  The first attempt reset both hosts at 04:51 as `loom_pair` started (no
+  kernel log: the BIOS handles PCIe errors, `_OSC ... [AER LTR]`); the U280s
+  were then off the bus (recovered as above). The second attempt, without
+  `ce_local`, ran everything. The `find_vma` traces in the logs are WARNINGs
+  (`rwsem.h:81`, the driver pins pages without the mmap lock), seen on
+  every host and every program, not the cause.
+
 ## Found on the way: `RX_CHUNK` is not wired in `examples/loom`
 
 `examples/loom/hw/src/vfpga_top.svh` connects neither `loom_ctrl`'s

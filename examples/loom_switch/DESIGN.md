@@ -76,9 +76,12 @@ CPU thread reading the window kept ~8 lines in flight, more threads added
 nothing.
 
 - Safe: more reads open, each still fetched when issued.
-- Expected (inferred): network gets ~1.2 GB/s (32 x 256 B / 6.6 us); a
-  multi-threaded CPU memcpy out of the window ~0.28 GB/s at most
-  (32 x 64 B / 7.3 us); one get's latency unchanged (7.3 us).
+- Measured (2026-10-06, PLAN Running): network copy-engine gets 0.45 GB/s
+  (0.31 at 8), not the ~1.2 GB/s 32 in flight allow: the far responder
+  now waits on its host reads, one 256 B DMA read per get (~563 ns each).
+  Local gets 6.09 GB/s (5.88 at 8): ~42 ns per read either way, not bound
+  by reads in flight. CPU gets do not scale past 2-4 threads (same far-side
+  cost). Latency unchanged (7.3 us), puts unchanged.
 - The XDMA's own declaration of its bypass port stays 8 (its block-design
   script only updates it in another mode); the generated core has
   `C_M_AXI_NUM_READ` = 32. That the parameter governs the bypass master is
@@ -131,8 +134,9 @@ A timer, restarted by each consecutive read that arrives, sends one get for
 all of them when it expires. Safe (nothing fetched before it is asked for),
 but it cannot raise bandwidth: at most 32 reads are open (8 KiB), and read
 33 cannot come before one of them is answered. It cuts get requests and
-completions 32x; build it only if Phase 1's gets fall short of ~1.2 GB/s for
-packet-rate reasons.
+completions 32x and, more to the point, turns 32 small host reads at the far
+responder into one: Phase 1's network gets (0.45 GB/s) are bound by that
+responder's per-get host read, so this is the next step for gets.
 
 ## 8. Bulk data is moved by puts
 
