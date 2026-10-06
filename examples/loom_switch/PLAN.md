@@ -511,6 +511,18 @@ can be up to 128 MB (a 64 MiB push fits one binding).
   same today, so it is rose's state since its reboot, not an image: rose's
   U280 waits twice as long on its MMU for the V80 landing window (inferred:
   smaller pages for that window, so 64 MiB overflows the TLB).
+  After rose was power-cycled (15:50), the suite again (`regress.sh`, logs
+  `~/loom-experiments/regress/20261006_coalesce_r2{,_gets}`): amy -> rose V80
+  HBM at 64 MiB back to CE 10.20-10.44 (rose -> amy 10.44), everything else
+  as before (V80 -> peer host both ways 10.89-11.32 into rose / 10.00-10.36
+  into amy, one way 10.82-11.38; `uwin_probe` 0.89 / 1.12; `ce_local`
+  unchanged; network gets 0.98, 16.0 reads per get) except CPU gets on rose
+  since that boot: 32 B streaming loads 0.04 GB/s from 16 KiB (0.15 before)
+  with about twice the reads per transfer, i.e. the CPU no longer combines
+  its loads into whole-line reads; matching amy's CPU settings (boost off,
+  idle states off) did not change it; cause open. Both hosts log ~60-75
+  IOMMU page faults per suite (the U280 writing to address 0), with every
+  image.
   Both hosts had been rebooted by others before the run (rose 11:30, amy
   12:06): drivers were reloaded and the V80s reprogrammed. After a reboot
   the old V80 driver takes `coyote_sysfs_0`, so it must be unloaded before
