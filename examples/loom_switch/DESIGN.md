@@ -90,6 +90,13 @@ nothing.
 - The shell's 512-deep packet-mode input FIFO (32 KiB of read data in
   flight) is left as is: 32 x 256 B = 8 KiB does not reach it.
 - Needs a U280 static rebuild (`BUILD_STATIC=1`), the first in this repo.
+  It missed timing by 0.427 ns in the XDMA's 512b completion interface (two
+  flip-flops placed far apart); re-placing it with those transceiver-clock
+  crossings over-constrained (`scripts/fpga/close_static_timing.sh`) met it
+  (xclk +0.076 ns). That static, locked, is
+  `hw/static/static_routed_locked_u280.dcp` (md5 7ac672e9), this example's
+  default `STATIC_PATH`: shell builds link against it (the coalescer image
+  on it meets timing, WNS +0.001).
 - Tests: `tb/shell_ctrl_uwin` counts the reads that reach the window while
   none is answered (8 before, 32 after); `tb/static_pci` builds the static
   block design and checks the XDMA's parameter. (a9898fd1)
