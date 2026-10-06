@@ -48,21 +48,25 @@ through `scripts/fpga/build_bitstream.sh` (U280: Vivado 2023.2; V80: 2025.1).
   host 12.3-12.6, -> U280 -> host 10.64, -> V80 HBM 10.62; `uwin_probe`
   1.1-1.3; gets: copy engine 0.98 over the network (16 reads per get), 6.09
   without, CPU load 7.41 us; put sizes (64 MiB bursts into host memory) 4 KiB
-  1.21, 16 KiB 4.6, 64 KiB 8.2, 256 KiB 10.1.
+  1.22, 16 KiB 4.7, 64 KiB 8.3, 256 KiB 10.0, 1 MiB and up 10.3-10.8
+  (`20261006_driver_tlbfix`, with the driver fix below): puts reach the
+  copy engine's plateau from ~1 MiB a copy.
 - **Timing a put:** the sender's copy-engine rate is the conservative one
   (10.71 at 16 MiB = 87% of the link's 12.25). The landing host's clock from
   the first data overstates a single copy (its first page waits on the
   receiver's MMU) and cannot be used for a V80 landing (reads through the
   V80's window wait for its writes).
 - **Open:**
-  1. Back-to-back copies of 1 MiB or more stall for good once the cards have
-     run many jobs (fresh cards pass): a translation miss on an imported
-     (dma-buf) window mapped in 4 KiB pages - the landing U280's for the V80
-     window, the sending V80's for the U280 window - is serviced slowly or
-     never (inferred). `regress.sh` step 6 stops there; the cards then need
-     setup. Repro: `~/loom-experiments/putsize_bug/case.sh`.
-  2. CPU single-thread bulk gets vary 0.025-0.15 GB/s with 266-917 reads per
-     16 KiB (more reads than loads); parallel CPU gets are steady (~0.12).
+  1. FIXED (de45b0c6): back-to-back copies of 1 MiB stalled. The driver
+     mapped an imported window only to its first 256 TLB entries (1 MiB of
+     4 KiB pages); the fence page faulted, and the fault path cannot fill in
+     an import. Whole buffers are now mapped to their end; the suite saw no
+     driver page fault at all.
+  2. CPU single-thread bulk gets varied 0.025-0.15 GB/s with 266-917 reads
+     per 16 KiB (more reads than loads); with the driver fix they were
+     normal (0.153, 276 reads) in the one run so far: possibly the same
+     partial mapping (the far side's buffers), not shown yet. Parallel CPU
+     gets are steady (~0.12).
   3. The U280 writes to bus address 0: ~100-130 IOMMU page faults per suite
      on each host, with every image; the data is unaffected.
   4. The driver's page-pinning warnings (`find_vma` without the mmap lock);

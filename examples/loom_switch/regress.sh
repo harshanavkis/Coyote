@@ -25,9 +25,9 @@
 #      V80 -> U280 -> host, V80 -> U280 -> V80 HBM (ce_local triggered the
 #      driver's page-pinning oops on 2026-10-05/06)
 #   6. put sizes: rose's V80 -> amy's host memory, 4 KiB .. 64 MiB copies,
-#      each measurement a burst of back-to-back copies moving 64 MiB (into
-#      V80 HBM, bursts of 1 MiB copies stall the landing U280's MMU for good:
-#      2026-10-06, open, ~/loom-experiments/putsize_bug)
+#      each measurement a burst of back-to-back copies moving 64 MiB (host
+#      memory, so the landing host can time it; bursts of 1 MiB copies used
+#      to stall, fixed in the driver, de45b0c6)
 # Logs in OUTDIR, one per step; the summary goes to stdout. STEPS=15 (for
 # example) runs only those steps. Every result also goes to OUTDIR/metrics.tsv
 # (name, value, tolerance in %: the median of the warm copies), and at the end
