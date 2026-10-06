@@ -3,17 +3,26 @@
  * (read-only), for diffing around a run: the run-length maxima (since the
  * bitstream was loaded) say whether loom_rx's stalls are short or long.
  *
- * Usage: loom_csr
+ * Usage: loom_csr            (the receive-side list)
+ *        loom_csr WORD...    (those CSR words, raw)
  */
 #include <unistd.h>
 
 #include <cstdio>
+#include <cstdlib>
 
 #include <coyote/cThread.hpp>
 #include "loom_switch.hpp"
 
-int main() {
+int main(int argc, char **argv) {
     coyote::cThread u280(0, getpid(), 0, nullptr, "coyote_fpga");
+    if (argc > 1) {
+        for (int i = 1; i < argc; i++) {
+            const uint32_t w = uint32_t(strtoul(argv[i], nullptr, 0));
+            printf("word %u: %lu\n", w, (unsigned long) loom_switch::csr_read(u280, w));
+        }
+        return 0;
+    }
     const struct { uint32_t w; const char *name; } regs[] = {
         {48, "cycles"}, {36, "rx fwd (writes done)"}, {47, "rx req (rq_wr taken)"}, {41, "rx drop (bad header)"},
         {26, "rx orphan beats"}, {42, "rx move"}, {43, "rx starve"}, {44, "rx stall (host write not ready)"},

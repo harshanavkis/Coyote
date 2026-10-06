@@ -12,7 +12,9 @@
 # tools match this checkout. 16 MiB copies unless noted, every byte checked;
 # put rates are timed on the landing host from the first data to the fence:
 #   1. puts, V80 HBM -> network -> peer V80 HBM (ce_remote --land-v80), each
-#      direction, 16 MiB x 8 and 64 MiB x 4
+#      direction, 16 MiB x 8 and 64 MiB x 4; the rate is the copy engine's
+#      (a V80 landing cannot be timed on the landing host: reads through the
+#      V80's window wait for its writes)
 #   2. puts, V80 HBM -> network -> peer host (ce_remote --bidir): both ways
 #      at once, then one way each direction
 #   3. CPU puts through the window (uwin_probe), each host
@@ -22,10 +24,10 @@
 #   5. local puts (ce_local, 7 copies: one slow copy in three is common) on each host: V80 self-loop, V80 -> host,
 #      V80 -> U280 -> host, V80 -> U280 -> V80 HBM (ce_local triggered the
 #      driver's page-pinning oops on 2026-10-05/06)
-#   6. put sizes: rose's V80 -> amy's V80 HBM, 4 KiB .. 64 MiB copies, each
-#      measurement a burst of back-to-back copies moving 64 MiB. Last: from
-#      1 MiB the landing U280's MMU stalls for good (2026-10-06, open), and
-#      the cards then need setup again
+#   6. put sizes: rose's V80 -> amy's host memory, 4 KiB .. 64 MiB copies,
+#      each measurement a burst of back-to-back copies moving 64 MiB (into
+#      V80 HBM, bursts of 1 MiB copies stall the landing U280's MMU for good:
+#      2026-10-06, open, ~/loom-experiments/putsize_bug)
 # Logs in OUTDIR, one per step; the summary goes to stdout. STEPS=15 (for
 # example) runs only those steps. Every result also goes to OUTDIR/metrics.tsv
 # (name, value, tolerance in %: the median of the warm copies), and at the end
@@ -128,8 +130,7 @@ for pair in "amy rose" "rose amy"; do
         sleep 4
         on $C "cd $CE && sudo stdbuf -oL timeout 280 $NUMA ./ce_remote --client ${IP[$S]} --reps $reps --port $p" > $L.client.log 2>&1 || hung "$L.client"
         wait $sp || hung "$L.server"
-        echo "-- $C -> $S V80 HBM, $((size >> 20)) MiB x $reps: landed $(landed $L.server.log)| CE $(ce_rate $L.client.log $size)"
-        metric hbm_${C}_to_${S}_$((size >> 20))M_landed "$(landed $L.server.log | words | warm | median)"
+        echo "-- $C -> $S V80 HBM, $((size >> 20)) MiB x $reps: CE $(ce_rate $L.client.log $size)$(grep -qE '^FAIL' $L.server.log || echo '(all byte-exact)')"
         metric hbm_${C}_to_${S}_$((size >> 20))M_ce "$(ce_rate $L.client.log $size | words | warm | median)"
         grep -hE '^FAIL' $L.*.log | head -3
     done
@@ -210,10 +211,10 @@ done
 }
 
 [[ $STEPS == *6* ]] && {
-step "6. put sizes: rose's V80 -> amy's V80 HBM, bursts of 64 MiB (landed | issued by the copy engine)"
+step "6. put sizes: rose's V80 -> amy's host memory, bursts of 64 MiB (landed | issued by the copy engine)"
 for size in 4096 16384 65536 262144 1048576 4194304 16777216 67108864; do
     burst=$((67108864 / size)); nextport; p=$PORT; L=$OUT/putsize_$size
-    on amy "cd $CE && sudo stdbuf -oL timeout 300 $NUMA ./ce_remote --server --land-v80 --size $size --port $p" > $L.server.log 2>&1 & sp=$!
+    on amy "cd $CE && sudo stdbuf -oL timeout 300 $NUMA ./ce_remote --server --size $size --port $p" > $L.server.log 2>&1 & sp=$!
     sleep 4
     on rose "cd $CE && sudo stdbuf -oL timeout 280 $NUMA ./ce_remote --client ${IP[amy]} --reps 3 --burst $burst --port $p" > $L.client.log 2>&1 || hung "$L.client"
     wait $sp || hung "$L.server"

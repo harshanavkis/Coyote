@@ -229,10 +229,13 @@ int run_server(uint16_t port, uint64_t size, bool land, uint64_t off, unsigned p
         auto t0 = std::chrono::steady_clock::now();
         if (copies == 0) t_first = t0;
         Verdict v{};
-        // The copy's first data (the buffer was cleared after the last copy;
-        // --no-touch leaves it, and then this is the announce's time)
-        volatile uint64_t *first = land ? L->win + off / 8 : vdst;
-        while (*first == 0 && std::chrono::steady_clock::now() - t0 < std::chrono::seconds(5)) _mm_pause();
+        // The copy's first data in host memory (the buffer was cleared after
+        // the last copy; --no-touch leaves it: then this is the announce's
+        // time). Not for a V80 landing: a read through the V80's window is
+        // answered only once the writes into it have drained, so the first
+        // word shows up at the end; that copy is timed from the announce.
+        if (!land)
+            while (*vdst == 0 && std::chrono::steady_clock::now() - t0 < std::chrono::seconds(5)) _mm_pause();
         const auto t1 = std::chrono::steady_clock::now();
         v.first_us = std::chrono::duration<double, std::micro>(t1 - t0).count();
         if (land) {
@@ -257,11 +260,11 @@ int run_server(uint16_t port, uint64_t size, bool land, uint64_t off, unsigned p
         } else
             v.bad = size / 8;
         const uint64_t bytes = an.bytes ? an.bytes : size;
-        printf("%s copy %lu: %lu B, fence %lu (expected %lu), %lu of %lu words wrong, fence %.1f us after the first data (%.2f GB/s), "
+        printf("%s copy %lu: %lu B, fence %lu (expected %lu), %lu of %lu words wrong, fence %.1f us after %s (%.2f GB/s), "
                "first data %.1f us after the announce, at t=%.1f ms\n",
                (v.bad ? "FAIL" : "ok  "), (unsigned long) an.rep, (unsigned long) bytes, (unsigned long) v.fence,
                (unsigned long) an.fence, (unsigned long) v.bad, (unsigned long) (size / 8),
-               v.wait_us, bytes / v.wait_us / 1e3, v.first_us,
+               v.wait_us, land ? "the announce" : "the first data", bytes / v.wait_us / 1e3, v.first_us,
                std::chrono::duration<double, std::milli>(t0 - t_first).count());
         printf("     loom_rx over %lu cycles: %lu moving, %lu starved (nothing arrived), %lu stalled (host write not ready), rx FIFO full %lu\n",
                (unsigned long) k1.d(k0, C_CYC), (unsigned long) k1.d(k0, C_RX_MOVE), (unsigned long) k1.d(k0, C_RX_STARVE),
