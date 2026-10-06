@@ -464,6 +464,28 @@ can be up to 128 MB (a 64 MiB push fits one binding).
   the V80's 256 B reads), amy's `cycles waiting for data`, CPU `get_bench`,
   and the puts. Expected: network gets up to ~1.2 GB/s (32 x 256 B per
   round trip).
+  2026-10-06, both U280s on `loom-switch-coalesce` (build_oct06_coalesce,
+  md5 edb3dbb6; WNS -0.427 in the old static's XDMA path, -0.135 in the
+  shell's HBM clock), both V80s `loom-ce-get` at Gen4 x16; runner
+  `~/loom-experiments/get/coalesce/run_coalesce.sh` (no `ce_local`). All
+  byte-exact, 0 retransmissions, 0 PSN drops:
+  - copy-engine gets over the network (rose reads amy, window 128): 0.98
+    GB/s from 4 MiB (0.45 before), 0.94 at 256 KiB, 0.38 at 4 KiB; 16.0
+    reads per get (262,128 reads, 16,383 gets); amy waited for host data
+    14 ms of the run (129 ms before). Reads now wait for a free slot (85k
+    cycles at 16 MiB; 0 before).
+  - copy-engine gets, no network: 6.09 GB/s (same).
+  - CPU gets: 7.39 us a load (7.28: the 32-cycle timer); 32 B streaming
+    loads 0.16 GB/s at 16 KiB (0.11), 0.10 from 64 KiB (0.065); 1-8
+    threads 0.08-0.12 GB/s (0.05-0.08), 16-32 threads 0.055-0.06 (same),
+    with many slot waits.
+  - puts unchanged: both ways 10.1-10.6 into rose / 10.6-11.2 into amy, one
+    way 10.9-11.1; `uwin_probe` 1.43 (rose).
+  Both hosts had been rebooted by others before the run (rose 11:30, amy
+  12:06): drivers were reloaded and the V80s reprogrammed. After a reboot
+  the old V80 driver takes `coyote_sysfs_0`, so it must be unloaded before
+  the U280 driver is loaded; `flash_u280.sh` leaves a Vivado 2023.2
+  `hw_server` behind that `program_v80.sh` (2025.1) refuses.
 
 ## Found on the way: `RX_CHUNK` is not wired in `examples/loom`
 

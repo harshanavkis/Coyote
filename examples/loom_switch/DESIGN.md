@@ -159,6 +159,15 @@ read joining.
   join, the timer, a page boundary, CPU loads inside lines, a rejected
   shared get, the buffer kept); 19 mutations of the new logic all caught.
   Out of context at 250 MHz: +0.95 ns, 1,422 LUTs (+240), 8 URAM (same).
+- Measured (2026-10-06, PLAN Running): network copy-engine gets 0.98 GB/s
+  (0.45), 16.0 reads per get, the far responder's wait for host data down
+  from 129 to 14 ms of a run; a CPU load 7.39 us (7.28); puts unchanged.
+- Next limit (inferred): reads now wait for free slots, which they never
+  did before. With 32 reads in flight and 16-read gets, at most ~47 slots
+  could be taken, so more than 32 256 B reads reach the window at once:
+  likely the XDMA's 32 counts PCIe requests and splits the V80's 512 B
+  requests into two 256 B reads (up to 64). Then the 64 slots, with a
+  get's buffer held until its last read, bound gets now.
 
 ## 8. Bulk data is moved by puts
 
