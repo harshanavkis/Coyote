@@ -25,6 +25,11 @@
 #      host's IP and MAC, check the identity and the link
 #   4. V80: off the bus (its root port), JTAG program, rescan, insmod; it
 #      often trains x8 the first time, so up to 3 tries for x16
+#   5. host configuration: both cards' max read request set to 512 B (a
+#      run may leave it changed); max payload and read request checked to be
+#      512 B on every hop (card and root port); the rest that can change a
+#      result logged: IOMMU domain of each card, the kernel's IOMMU and huge
+#      page options, huge pages, BAR addresses
 # A U280 that does not come back after the rescan needs a warm reboot (the
 # programmed image survives it); the script says so and stops.
 set -uo pipefail
@@ -45,7 +50,8 @@ if [ "${1:-}" = --here ]; then
     link() { echo "$(cat $1/current_link_speed 2>/dev/null) x$(cat $1/current_link_width 2>/dev/null)"; }
     jtag() {   # <image> <part pattern> <device>
         local out
-        out=$(xilinx-shell -c "$(vivado_env "$(vivado_version_for $3)") cd $STAGE && vivado -mode batch -nolog -nojournal -notrace -source $STAGE/program_loom.tcl -tclargs $1 '$2'" 2>&1)
+        # a hung JTAG programming (seen 2026-10-06) fails after 10 min
+        out=$(timeout 600 xilinx-shell -c "$(vivado_env "$(vivado_version_for $3)") cd $STAGE && vivado -mode batch -nolog -nojournal -notrace -source $STAGE/program_loom.tcl -tclargs $1 '$2'" 2>&1)
         echo "$out" | grep -E 'SELECTED|PROGRAMMED|ERROR' | sed 's/^/   /'
         echo "$out" | grep -q '^PROGRAMMED:'
     }
@@ -117,6 +123,21 @@ if [ "${1:-}" = --here ]; then
         ls -d /sys/kernel/coyote_versal_sysfs_* >/dev/null 2>&1 || fail "V80 driver up but no coyote_versal_sysfs node (dmesg)"
         pkill -u "$(id -u)" -x hw_server
     fi
+    # 5. host configuration
+    cfg_ok=1
+    for d in $U280_BDF ${V80_BDF[$H]:-}; do
+        sudo setpci -s $d CAP_EXP+08.w=2000:7000          # max read request 512 B
+        port=$(basename "$(dirname "$(readlink -f /sys/bus/pci/devices/$d)")")
+        for x in $port $d; do
+            pl=$(sudo lspci -s $x -vv | grep -oE 'MaxPayload [0-9]+ bytes, MaxReadReq [0-9]+' | head -1)   # DevCtl's (DevCap has no MaxReadReq)
+            echo "   $x: $pl"
+            [[ $pl == "MaxPayload 512 bytes, MaxReadReq 512" ]] || { cfg_ok=0; echo "   $x: want MaxPayload 512 bytes, MaxReadReq 512"; }
+        done
+        g=$(basename "$(readlink -f /sys/bus/pci/devices/$d/iommu_group)")
+        echo "   $d: IOMMU group $g $(cat /sys/kernel/iommu_groups/$g/type), BARs $(sudo lspci -s $d -v | grep -oE 'Memory at [0-9a-f]+ [^[]*\[size=[0-9A-Z]+\]' | sed -E 's/Memory at ([0-9a-f]+) .*size=([0-9A-Z]+)\]/\1(\2)/' | tr '\n' ' ')"
+    done
+    echo "   kernel: $(tr ' ' '\n' < /proc/cmdline | grep -E 'iommu|huge' | tr '\n' ' ')| huge pages $(grep -E 'HugePages_Total' /proc/meminfo | tr -s ' ' | cut -d' ' -f2) x 2 MiB"
+    [ $cfg_ok = 1 ] || fail "PCIe payload / read request not 512 B on every hop (above)"
     echo "SETUP OK $H: U280 ${U280_IP[$H]} $(link $D)${V80_BDF[$H]:+, V80 $(link $V)} ($(date -u +%H:%M:%S))"
     exit 0
 fi

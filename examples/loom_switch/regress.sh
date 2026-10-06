@@ -142,6 +142,6 @@ done
 
 step "health after"
 for h in amy rose; do
-    echo "$h: $(on $h "uptime | sed 's/.*up/up/'; echo 'kernel BUG/Oops/AER since the start:' \$(sudo journalctl -k --since @$T0 --no-pager | grep -ciE '\\bBUG\\b|Oops|\\bAER\\b')" | tr '\n' ' ') | $(ns $h)"
+    echo "$h: $(on $h "uptime | sed 's/.*up/up/'; echo 'kernel BUG/Oops/AER since the start:' \$(sudo journalctl -k --since @$T0 --no-pager | grep -ciE '\\bBUG\\b|Oops|\\bAER\\b'), 'IOMMU faults:' \$(sudo journalctl -k --since @$T0 --no-pager | grep -c 'IO_PAGE_FAULT')" | tr '\n' ' ') | $(ns $h)"
 done
 echo; echo "REGRESS DONE (logs $OUT)"
