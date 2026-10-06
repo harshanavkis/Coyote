@@ -366,6 +366,16 @@ can be up to 128 MB (a 64 MiB push fits one binding).
   more threads add nothing (~0.045 in total, with free read slots: a cap
   upstream of the switch, not identified). Copy-engine runs unchanged.
 
+- **The cards from any state** (after a reboot, or another user's images and
+  drivers), on clara:
+  `cd /scratch/harshanavkis/loom-proj/Coyote && scripts/fpga/setup_loom_hosts.sh /home/harshanavkis/coyote-bitstreams/loom-switch-coalesce/hw/bitstreams/cyt_top.bit /home/harshanavkis/coyote-bitstreams/loom-ce-get/cyt_top.pdi amy rose`
+  Every host at once, each in a tmux session `loom_setup` on that host; logs
+  in `~/.cache/loom-setup/<time>/`. The U280 first (identity and x16 checked),
+  then the V80 (up to 3 tries for x16). 2026-10-06: amy and rose in ~2.5 min,
+  both V80s x16 on the first try, `ce_get --local` 6.09 GB/s on both. A U280
+  that does not come back after the rescan needs a warm reboot, then the
+  script again.
+
 - **amy and rose, both with a V80 and a U280 (since 2026-10-05).** clara's
   V80 moved to amy (`81:00.0`); rose's cards to `e1:00.0` / `c1:00.0`; all on
   socket 1. U280s on `loom-switch-read` (write-combining driver), V80s on
@@ -458,8 +468,8 @@ can be up to 128 MB (a 64 MiB push fits one binding).
   static of build_oct05_rd32 (the one the cards run, XDMA at 32 reads),
   staged as `~/coyote-bitstreams/loom-switch-rd32/static/static_routed_locked_u280.dcp`:
   `cd /scratch/harshanavkis/loom-proj/Coyote && scripts/fpga/build_bitstream.sh u280 examples/loom_switch/hw build_oct06_coalesce -DACK_GAP_CYCLES=16 -DBUILD_SHELL=1 -DBUILD_STATIC=0 -DSTATIC_PATH=/home/harshanavkis/coyote-bitstreams/loom-switch-rd32/static`
-  Then flash both U280s with `flash_u280.sh` as above (V80s stay on
-  `loom-ce-get`) and measure as for 32 reads in flight: network `ce_get`
+  Then set both hosts up with `scripts/fpga/setup_loom_hosts.sh` (U280
+  this image, V80 `loom-ce-get`) and measure as for 32 reads in flight: network `ce_get`
   with `--window 128`, the reads per get (word 192 over word 136, ~16 for
   the V80's 256 B reads), amy's `cycles waiting for data`, CPU `get_bench`,
   and the puts. Expected: network gets up to ~1.2 GB/s (32 x 256 B per
