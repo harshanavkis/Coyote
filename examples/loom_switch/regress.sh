@@ -37,7 +37,7 @@ SW=$REPO/examples/loom_switch/sw/build
 A=amy.dos.cit.tum.de; R=rose.dos.cit.tum.de
 declare -A IP=([amy]=131.159.102.20 [rose]=131.159.102.21)
 PORT=19700
-port() { PORT=$((PORT + 2)); echo $PORT; }
+nextport() { PORT=$((PORT + 2)); }   # in this shell: a $(...) subshell would lose the count
 on() { ssh -o ConnectTimeout=15 -n "$1.dos.cit.tum.de" "$2"; }
 ns() { on $1 "sudo cat /sys/kernel/coyote_sysfs_0/cyt_attr_nstats" | grep -E "^(ROCE TX pkgs|PSN drop cnt|Retrans cnt):" | tr -s ' ' | tr '\n' ' '; }
 step() { echo; echo "=== $* ($(date -u +%H:%M:%S))"; }
@@ -70,7 +70,7 @@ step "1. puts, V80 HBM -> network -> peer V80 HBM (ce_remote --land-v80)"
 for pair in "amy rose" "rose amy"; do
     S=${pair%% *}; C=${pair##* }   # server (lands), client (sends)
     for sz in "16777216 8" "67108864 4"; do
-        size=${sz% *}; reps=${sz#* }; p=$(port); L=$OUT/hbm_${C}_to_${S}_$size
+        size=${sz% *}; reps=${sz#* }; nextport; p=$PORT; L=$OUT/hbm_${C}_to_${S}_$size
         on $S "cd $CE && sudo timeout 300 $NUMA ./ce_remote --server --land-v80 --size $size --port $p" > $L.server.log 2>&1 & sp=$!
         sleep 4
         on $C "cd $CE && sudo timeout 280 $NUMA ./ce_remote --client ${IP[$S]} --reps $reps --port $p" > $L.client.log 2>&1
@@ -84,7 +84,7 @@ done
 [[ $STEPS == *2* ]] && {
 step "2. puts, V80 HBM -> network -> peer host (ce_remote --bidir)"
 for mode in "both::" "rose_to_amy:--no-send:" "amy_to_rose::--no-send"; do
-    name=${mode%%:*}; rest=${mode#*:}; SX=${rest%%:*}; CX=${rest#*:}; p=$(port); L=$OUT/pair_$name
+    name=${mode%%:*}; rest=${mode#*:}; SX=${rest%%:*}; CX=${rest#*:}; nextport; p=$PORT; L=$OUT/pair_$name
     on amy "cd $CE && sudo timeout 120 $NUMA ./ce_remote --bidir-server --size 16777216 --reps 8 --port $p $SX" > $L.server.log 2>&1 & sp=$!
     sleep 3
     on rose "cd $CE && sudo timeout 120 $NUMA ./ce_remote --bidir-client ${IP[amy]} --size 16777216 --reps 8 --port $p $CX" > $L.client.log 2>&1
@@ -109,7 +109,7 @@ for h in amy rose; do
     on $h "cd $CE && sudo timeout 240 $NUMA ./ce_get --local --reps 1" > $OUT/ceget_local_$h.log 2>&1
     echo "-- $h ce_get --local: $(grep -E '^(ok|FAIL) +get' $OUT/ceget_local_$h.log | sed -nE 's/.*get +([0-9]+) bytes:.*\( *([0-9.]+) GB\/s\).*/\1:\2/p' | tail -3 | tr '\n' ' ')$(grep -oE 'CE GET (PASS|FAIL)' $OUT/ceget_local_$h.log)"
 done
-p=$(port); a0=$(ns amy); r0=$(ns rose)
+nextport; p=$PORT; a0=$(ns amy); r0=$(ns rose)
 on amy "cd $SW && sudo timeout 400 $NUMA ./get_bench --server --port $p --window 128" > $OUT/ceget_net_server.log 2>&1 & sp=$!
 sleep 4
 on rose "cd $CE && sudo timeout 380 $NUMA ./ce_get --client ${IP[amy]} --port $p --window 128 --reps 3" > $OUT/ceget_net_client.log 2>&1
@@ -118,7 +118,7 @@ reads=$(grep -E '^(ok|FAIL) +get' $OUT/ceget_net_client.log | sed -nE 's/.*U280 
 reqs=$(grep -oE 'requests [0-9]+' $OUT/ceget_net_server.log | awk '{print $2}')
 echo "-- rose's copy engine reads amy (window 128): $(grep -E '^(ok|FAIL) +get' $OUT/ceget_net_client.log | awk 'NR % 3 == 0' | sed -nE 's/^(ok|FAIL) +get +([0-9]+) bytes:.*\( *([0-9.]+) GB\/s\).*/\1 \2:\3/p' | tr '\n' ' ')$(grep -oE 'CE GET (PASS|FAIL)' $OUT/ceget_net_client.log)"
 echo "   reads $reads, gets answered ${reqs:-?}, reads per get $(awk -v a=$reads -v b=${reqs:-0} 'BEGIN { if (b) printf "%.1f", a / b; else print "?" }'); $(grep -oE 'cycles waiting for data [0-9]+' $OUT/ceget_net_server.log)"
-p=$(port)
+nextport; p=$PORT
 on amy "cd $SW && sudo timeout 600 $NUMA ./get_bench --server --port $p --window 128" > $OUT/cpuget_server.log 2>&1 & sp=$!
 sleep 4
 on rose "cd $SW && sudo timeout 580 $NUMA ./get_bench --client ${IP[amy]} --port $p --window 128" > $OUT/cpuget_client.log 2>&1
