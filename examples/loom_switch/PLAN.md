@@ -67,8 +67,22 @@ through `scripts/fpga/build_bitstream.sh` (U280: Vivado 2023.2; V80: 2025.1).
      normal (0.153, 276 reads) in the one run so far: possibly the same
      partial mapping (the far side's buffers), not shown yet. Parallel CPU
      gets are steady (~0.12).
-  3. The U280 writes to bus address 0: ~100-130 IOMMU page faults per suite
-     on each host, with every image; the data is unaffected.
+  3. The U280 writes to bus address 0 (IOMMU faults, `address=0x0`,
+     write): thousands per suite, not the ~100 logged (the kernel
+     rate-limits them and the IOMMU's event log overflows); every image; the
+     IOMMU drops the writes and every byte checks out. One per Coyote thread
+     close, none for card-local work, ~2,000-4,300 for one `uwin_probe`
+     (15,936 C2H host DMA requests). Ruled out: the completion writeback
+     addresses (`WBACK_REG`, read back live: 0xfffff000/100/200/300), the
+     XDMA engines' poll-mode writeback (never enabled), truncation in the
+     static's writeback FIFO (96-bit request, 12 B FIFO). Lead (inferred):
+     an extra small write per C2H request with a zero address, e.g. the
+     XDMA's C2H stream writeback to a descriptor field the shell leaves 0.
+     Harmless with the IOMMU translating; with the IOMMU off or in
+     passthrough it would write physical address 0. Separately, upstream
+     Coyote's non-AVX `hw/hdl/shell/cnfg_slave.sv` writes register 17 (the
+     local-write writeback address) into register 16; our builds use the
+     AVX slave, so it does not apply here.
   4. The driver's page-pinning warnings (`find_vma` without the mmap lock);
      `ce_local` oopsed on 2026-10-05/06, not since.
   5. Host state after a reboot: rose landed 64 MiB at 9.0-9.4 until it was
