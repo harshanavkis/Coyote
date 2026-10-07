@@ -197,8 +197,8 @@ for every copy: a program of up to 2,048 64 B entries in card memory is
 loaded once into on-chip RAM (8 URAM) and run with one CSR write, as often
 as wanted (`RUN_BASE` shifts every signal value and wait target, so a
 program reruns without a reload). Ops: COPY, SIGNAL, WAIT, REDUCE (int32
-lanes), STAMP. The single-copy CSR mode is kept (it is a one- or two-entry
-program), so every existing tool runs unchanged.
+lanes), STAMP. The single-copy CSR mode is kept, so every existing tool runs
+unchanged; it runs straight from the CSRs (no fetch, no read-ahead).
 
 - Why: a host-started copy costs a CSR round trip each (a 4 KiB put took
   3.4 us of which 0.4 us is data: puts reached 1.22 GB/s at 4 KiB), so small
@@ -209,6 +209,14 @@ program), so every existing tool runs unchanged.
   on the device; REDUCE is the accelerator's own compute (Loom moves data,
   it does not reduce), which makes ReduceScatter/AllReduce possible; STAMP
   gives latency on one clock (the V80's) with no host in the loop.
+- Single copies cycle for cycle as before: the first image ran a START as
+  a two-entry program (COPY, SIGNAL); that cost ~7 cycles a copy and BUSY
+  dropped ~7 cycles later, and 16 KiB host-started puts lost 7% (4.53 ->
+  4.18-4.24 GB/s, A/B with the old V80 image on 2026-10-07: CE cycles 459
+  -> 466, but 0.30 us more per copy - each later BUSY can cost the polling
+  host a whole PCIe read). Every other regression metric was unchanged.
+  Now a START reads its own source and writes the fence right after the
+  data, the old state sequence.
 - Read-ahead: card-memory sources are requested up to 8 entries ahead,
   the card stream returns them in request order. 32 x 1 KiB at 100 cycles
   of read latency: 744 cycles for 512 beats (TB P9), ~4 cycles per entry.
@@ -239,7 +247,7 @@ program), so every existing tool runs unchanged.
 - Tests: `tb_loom_ce` P1-P9 (card memory modelled, writes visible only at
   completion), T1-T8 unchanged; mutations of the barriers caught (P4, P8).
   Out of context
-  (V80, 250 MHz): +0.78 ns after registering the REDUCE chunk arithmetic
-  (-0.83 before), 3,064 LUTs, 8 URAM.
+  (V80, 250 MHz): +0.92 ns (the REDUCE chunk arithmetic registered: -0.83
+  before), 2,997 LUTs, 8 URAM.
 - Software: `sw/src/ce_prog.hpp` (entries, load, run); `ce_prog` tests it on
   one V80 (REDUCE, WAIT, ABORT, rates program vs host-started).

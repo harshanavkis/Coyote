@@ -7,8 +7,12 @@ import lynxTypes::*;
  *
  * SINGLE COPY (START): one copy, then an optional completion fence, as
  * before. A put (get = 0) copies from card memory (HBM) to a destination VA,
- * a get (get = 1) from a source VA into card memory. Internally a program of
- * one or two entries (COPY, then SIGNAL fence_va with the new copy count).
+ * a get (get = 1) from a source VA into card memory. The executor runs it
+ * straight from the CSRs (its own read, then the fence: the new copy count
+ * to fence_va), with no fetch and no read-ahead, so a host-started copy
+ * takes the cycles it took before programs existed (each cycle more delays
+ * BUSY, and a host polling BUSY can lose a whole PCIe read to it: 16 KiB
+ * host-started puts lost 7% to ~10 cycles).
  *
  * PROGRAM (PROG_CMD): a list of up to N_PROG 64 B entries in card memory is
  * loaded into on-chip RAM (load), then executed in order with no host
@@ -185,12 +189,11 @@ always_ff @(posedge aclk) begin
     ram_xq <= prog_x[xpc[PC_BITS-2:0]];
 end
 
-// The single copy's entries: COPY, then the fence as a SIGNAL
-logic                  single;
-ent_t                  sgl [2];
+logic                  single;         // a single copy (START), not a run
+logic [VADDR_BITS-1:0] s_fence;        // its fence VA, 0 = none
 logic [PC_BITS-1:0]    n_ent;
-wire  ent_t            ent_i = single ? sgl[ipc[0]] : decode(ram_iq);
-wire  ent_t            ent_x = single ? sgl[xpc[0]] : decode(ram_xq);
+wire  ent_t            ent_i = decode(ram_iq);
+wire  ent_t            ent_x = decode(ram_xq);
 
 // ---------------------------------------------------------------------------
 // Executor
@@ -228,7 +231,7 @@ always_comb
         red_sum[32*l +: 32] = red_buf[bi[$clog2(CH)-1:0]][32*l +: 32] + s_tdata[32*l +: 32];
 
 // A read-ahead request's data fully taken (one per COPY, one per REDUCE chunk half)
-wire rd_taken = (stream_beat && last_beat && !x.src_host) ||
+wire rd_taken = (stream_beat && last_beat && !x.src_host && !single) ||
                 (red_a_beat && bi == cleft - 1) || (red_b_beat && bi == cleft - 1);
 
 wire [BEATS-1:0] len_beats = x.len[LEN_BITS-1:6];
@@ -247,6 +250,7 @@ always_ff @(posedge aclk) begin
         data_posted <= 1'b0;
         wr_out <= 0;
         single <= 1'b0;
+        s_fence <= 0;
         xpc <= 0;
         ld_idx <= 0;
         n_ent <= 0;
@@ -261,12 +265,12 @@ always_ff @(posedge aclk) begin
                 xpc <= 0;
                 if (start) begin
                     single     <= 1'b1;
-                    sgl[0]     <= '{op: OP_COPY, src_host: get, dst_card: get, len: len,
+                    x          <= '{op: OP_COPY, src_host: get, dst_card: get, len: len,
                                     a: src_va, b: '0, dst: dst_va, val: '0};
-                    sgl[1]     <= '{op: OP_SIGNAL, src_host: 1'b0, dst_card: 1'b0, len: '0,
-                                    a: '0, b: '0, dst: fence_va, val: 64'(copies) + 64'd1};
-                    n_ent      <= (fence_va != 0) ? PC_BITS'(2) : PC_BITS'(1);
-                    xs         <= X_FETCH;
+                    x_val      <= 64'(copies) + 64'd1;         // the fence's value
+                    s_fence    <= fence_va;
+                    left       <= len[LEN_BITS-1:6];
+                    xs         <= X_RD;
                 end else if (prog_run) begin
                     single     <= 1'b0;
                     n_ent      <= (prog_n > N_PROG) ? PC_BITS'(N_PROG) : prog_n[PC_BITS-1:0];
@@ -282,7 +286,7 @@ always_ff @(posedge aclk) begin
             X_FETCH: xs <= X_DEC;                       // the RAM's read
             X_DEC: begin
                 x     <= ent_x;
-                x_val <= (ent_x.op == OP_STAMP) ? now : (single ? ent_x.val : ent_x.val + run_base);
+                x_val <= (ent_x.op == OP_STAMP) ? now : ent_x.val + run_base;
                 left  <= ent_x.len[LEN_BITS-1:6];
                 bi    <= 0;
                 cleft <= (ent_x.len[LEN_BITS-1:6] > CH) ? ($clog2(CH)+1)'(CH) : ent_x.len[6 +: $clog2(CH)+1];
@@ -301,7 +305,11 @@ always_ff @(posedge aclk) begin
                 left <= left - 1'b1;
                 if (last_beat) begin
                     copies <= copies + 1;
-                    xs <= x.dst_card ? X_WDONE : X_NEXT;
+                    if (x.dst_card) xs <= X_WDONE;
+                    else if (single) begin
+                        if (s_fence != 0) begin x.dst <= s_fence; xs <= X_SIG_REQ; end
+                        else xs <= X_IDLE;
+                    end else xs <= X_NEXT;
                 end
             end
             X_RED_A: if (red_a_beat) begin
@@ -321,10 +329,16 @@ always_ff @(posedge aclk) begin
             end
             // Writes into card memory complete before the next entry (this
             // cycle's completion counts)
-            X_WDONE:  if (wr_drained) xs <= X_NEXT;
+            X_WDONE:  if (wr_drained) begin
+                if (single) begin
+                    // a get's fence goes to the host stream, after its data is in HBM
+                    if (s_fence != 0) begin x.dst <= s_fence; x.dst_card <= 1'b0; xs <= X_SIG_REQ; end
+                    else xs <= X_IDLE;
+                end else xs <= X_NEXT;
+            end
             X_SIG_FL: if (wr_drained) xs <= X_SIG_REQ;
             X_SIG_REQ:  if (wr_ready) xs <= X_SIG_DATA;
-            X_SIG_DATA: if (dst_ready) xs <= X_NEXT;
+            X_SIG_DATA: if (dst_ready) xs <= single ? X_IDLE : X_NEXT;
             X_WAIT_RD:  if (rd_ready) xs <= X_WAIT_DATA;
             X_WAIT_DATA: if (s_tvalid) begin
                 if ($signed(wait_word - x_val) >= 0) xs <= X_NEXT;
@@ -421,7 +435,7 @@ always_ff @(posedge aclk) begin
         case (is)
             I_IDLE: begin
                 ipc <= 0;
-                if (xs == X_FETCH && xpc == 0) is <= I_FETCH;     // a run (or single copy) began
+                if (xs == X_FETCH && xpc == 0) is <= I_FETCH;     // a run began (a single copy has no issuer)
             end
             I_FETCH: is <= I_DEC;
             I_DEC: begin
@@ -484,7 +498,7 @@ always_comb begin
         rd_req.vaddr = prog_va;
         rd_req.len   = ((prog_n > N_PROG) ? LEN_BITS'(N_PROG) : prog_n[LEN_BITS-1:0]) << 6;
     end else if (xs == X_RD) begin
-        rd_req.strm  = STRM_HOST;
+        rd_req.strm  = x.src_host ? STRM_HOST : STRM_CARD;
         rd_req.vaddr = x.a;
         rd_req.len   = x.len;
     end else if (xs == X_WAIT_RD) begin
