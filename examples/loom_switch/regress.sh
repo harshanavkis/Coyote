@@ -27,7 +27,9 @@
 #   6. put sizes: rose's V80 -> amy's host memory, 4 KiB .. 64 MiB copies,
 #      each measurement a burst of back-to-back copies moving 64 MiB (host
 #      memory, so the landing host can time it; bursts of 1 MiB copies used
-#      to stall, fixed in the driver, de45b0c6)
+#      to stall, fixed in the driver, de45b0c6). Each copy is started by the
+#      host after polling BUSY, so small sizes move with the BUSY reads a
+#      copy (also recorded): 16 KiB swung 4.2-4.7 GB/s on one image
 # Logs in OUTDIR, one per step; the summary goes to stdout. STEPS=15 (for
 # example) runs only those steps. Every result also goes to OUTDIR/metrics.tsv
 # (name, value, tolerance in %: the median of the warm copies), and at the end
@@ -219,9 +221,14 @@ for size in 4096 16384 65536 262144 1048576 4194304 16777216 67108864; do
     on rose "cd $CE && sudo stdbuf -oL timeout 280 $NUMA ./ce_remote --client ${IP[amy]} --reps 3 --burst $burst --port $p" > $L.client.log 2>&1 || hung "$L.client"
     wait $sp || hung "$L.server"
     issued=$(grep -E '^(ok|FAIL) +copy' $L.client.log | sed -nE 's/.*after the first start \(([0-9.]+) GB\/s\).*/\1/p' | tr '\n' ' ')
-    echo "-- $size B x $burst: landed $(landed $L.server.log)| issued $issued"
+    busy=$(grep -E '^(ok|FAIL) +copy' $L.client.log | sed -nE 's/.* ([0-9.]+) BUSY reads a copy.*/\1/p' | tr '\n' ' ')
+    echo "-- $size B x $burst: landed $(landed $L.server.log)| issued $issued| BUSY reads a copy $busy"
     metric putsize_${size}_landed "$(landed $L.server.log | words | median)"
     metric putsize_${size}_issued "$(echo $issued | words | median)"
+    # the host polls BUSY (~1.5 us a read) before each next copy, so a copy's
+    # time comes in whole reads: where a copy takes about two (16 KiB), a
+    # few ns either way move the rate ~7% with no change on the card
+    metric putsize_${size}_busy_reads "$(echo $busy | words | median)" 3
     grep -hE '^FAIL' $L.*.log | head -3
 done
 }

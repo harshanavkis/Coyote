@@ -8,7 +8,9 @@
  *   3. ABORT: a WAIT that never completes, ended by ABORT
  *   4. rates: N copies of each size from HBM to host memory, in one program
  *      (RUN_CYC) and as single copies started by the host (START, BUSY
- *      polled), for comparison
+ *      polled; BUSY reads per copy), for comparison; `rates_only` runs
+ *      only this, and its host-started column also on an image without
+ *      programs
  *
  *   ce_prog [rates_only]
  */
@@ -45,6 +47,24 @@ void check(bool ok, const char *what) {
 int main(int argc, char **argv) {
     const bool rates_only = (argc > 1 && strcmp(argv[1], "rates_only") == 0);
     coyote::cThread v80(0, getpid(), 0, nullptr, "coyote_versal_fpga");
+
+    // csr: the host's CSR round trip (any loom_ce image, programs or not): a
+    // read of BUSY, and a write (DST_VA) followed by that read
+    if (argc > 1 && strcmp(argv[1], "csr") == 0) {
+        const int n = 20000;
+        uint64_t sink = 0;
+        for (int r = 0; r < 3; r++) {
+            auto t0 = std::chrono::steady_clock::now();
+            for (int i = 0; i < n; i++) sink += v80.getCSR(ce_prog::BUSY);
+            auto t1 = std::chrono::steady_clock::now();
+            for (int i = 0; i < n; i++) { v80.setCSR(uint64_t(i) << 6, DST_VA); sink += v80.getCSR(ce_prog::BUSY); }
+            auto t2 = std::chrono::steady_clock::now();
+            printf("csr: read %.0f ns, write + read %.0f ns\n",
+                   std::chrono::duration<double, std::nano>(t1 - t0).count() / n,
+                   std::chrono::duration<double, std::nano>(t2 - t1).count() / n);
+        }
+        return sink == ~0ULL;
+    }
     ce_prog::Program p(v80);
 
     if (!rates_only) {
@@ -104,13 +124,14 @@ int main(int argc, char **argv) {
     for (uint64_t i = 0; i < src_bytes; i++) src[i] = uint8_t(i * 13);
     to_card(v80, src, src_bytes);
     printf("rates, GB/s, HBM -> host memory:\n");
-    printf("  %10s %6s %12s %12s\n", "size", "copies", "program", "host-started");
-    for (uint64_t size : {256ULL, 1024ULL, 4096ULL, 16384ULL, 65536ULL, 262144ULL, 1048576ULL, 4194304ULL}) {
+    printf("  %10s %6s %12s %12s %12s\n", "size", "copies", "program", "host-started", "BUSY reads");
+    for (uint64_t size : {256ULL, 1024ULL, 4096ULL, 12288ULL, 16384ULL, 20480ULL, 65536ULL, 262144ULL, 1048576ULL,
+                          4194304ULL}) {
         const uint64_t n = std::min<uint64_t>(ce_prog::N_PROG, std::max<uint64_t>(8, (64ULL << 20) / size));
         double gbs = 0;
         p.clear();
         for (uint64_t i = 0; i < n; i++) {
-            const uint64_t off = (i * size) % src_bytes;
+            const uint64_t off = (i % (src_bytes / size)) * size;   // whole copies inside the buffers
             p.add(ce_prog::copy(src + off, hdst + off, size));
         }
         p.load();
@@ -121,17 +142,18 @@ int main(int argc, char **argv) {
         v80.setCSR(size, LEN);
         v80.setCSR(0, FENCE_VA);
         v80.setCSR(0, DIRECTION);
+        uint64_t reads = 0;
         const auto t0 = std::chrono::steady_clock::now();
         for (uint64_t i = 0; i < n; i++) {
-            const uint64_t off = (i * size) % src_bytes;
+            const uint64_t off = (i % (src_bytes / size)) * size;   // whole copies inside the buffers
             v80.setCSR(ce_prog::va(src + off), SRC_VA);
             v80.setCSR(ce_prog::va(hdst + off), DST_VA);
             v80.setCSR(1, START);
-            while (v80.getCSR(ce_prog::BUSY)) _mm_pause();
+            do reads++; while (v80.getCSR(ce_prog::BUSY));
         }
         const double host_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-        printf("  %10lu %6lu %12.2f %12.2f\n", (unsigned long) size, (unsigned long) n, gbs,
-               double(n * size) / host_s / 1e9);
+        printf("  %10lu %6lu %12.2f %12.2f %12.2f\n", (unsigned long) size, (unsigned long) n, gbs,
+               double(n * size) / host_s / 1e9, double(reads) / n);
     }
 
     printf(fails ? "ce_prog: %d FAILED\n" : "ce_prog: all passed\n", fails);

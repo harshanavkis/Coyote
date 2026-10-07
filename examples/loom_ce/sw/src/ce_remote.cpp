@@ -601,8 +601,9 @@ int run_client(const std::string &ip, uint16_t port, int reps, int window, unsig
         // --burst: the next copy as soon as the engine is free (the
         // registers stay; the fence takes each copy's count)
         const auto b0 = std::chrono::steady_clock::now();
+        uint64_t busy_reads = 0;   // BUSY reads per copy: a host-started copy's time is quantized by them
         for (int k = 0; k < burst; k++) {
-            if (k) while (v80.getCSR(BUSY)) _mm_pause();
+            if (k) do busy_reads++; while (v80.getCSR(BUSY));
             v80.setCSR(1, START);
         }
         while (v80.getCSR(BUSY)) _mm_pause();
@@ -614,9 +615,11 @@ int run_client(const std::string &ip, uint16_t port, int reps, int window, unsig
         const Counters k1 = Counters::read(u280);
         const uint64_t bytes = size * uint64_t(burst);
         printf("%s copy %d: %d x %lu bytes, server: fence %.1f us after the first data (%.2f GB/s), %lu words wrong; "
-               "here: copies done %.1f us after the first start (%.2f GB/s); CE %lu cycles (the last copy)\n",
+               "here: copies done %.1f us after the first start (%.2f GB/s); CE %lu cycles (the last copy); "
+               "%.2f BUSY reads a copy\n",
                (v.bad ? "FAIL" : "ok  "), r, burst, (unsigned long) size, v.wait_us, bytes / v.wait_us / 1e3,
-               (unsigned long) v.bad, burst_us, bytes / burst_us / 1e3, (unsigned long) v80.getCSR(CYCLES));
+               (unsigned long) v.bad, burst_us, bytes / burst_us / 1e3, (unsigned long) v80.getCSR(CYCLES),
+               burst > 1 ? double(busy_reads) / (burst - 1) : 0.0);
         printf("     ingress: %lu bursts, %lu rdma packets (%lu closed by the idle timer, %lu cut by a write), "
                "%lu stores, %lu dropped; acks %lu, unacked %lu\n",
                (unsigned long) (c1.v[0] - c0.v[0]), (unsigned long) (c1.v[3] - c0.v[3]),
