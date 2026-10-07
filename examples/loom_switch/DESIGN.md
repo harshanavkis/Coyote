@@ -255,3 +255,31 @@ unchanged; it runs straight from the CSRs (no fetch, no read-ahead).
   before), 2,997 LUTs, 8 URAM.
 - Software: `sw/src/ce_prog.hpp` (entries, load, run); `ce_prog` tests it on
   one V80 (REDUCE, WAIT, ABORT, rates program vs host-started).
+
+## 11. Peers' reads of the V80's window: 8 -> 64 in flight (shell)
+
+The fair RDMA baseline moves V80-resident data: the U280's RDMA engine
+reads its payload peer-to-peer from the V80's window. It ran 3.7 GB/s at
+every write size (2026-10-07), against 11.9 from host memory.
+
+- Peer-to-peer reads reach the V80 as 256 B pieces whatever the requester's
+  max read request (section 3), so their bandwidth is pieces in flight x
+  256 B / round trip. Test (runtime max read request on the sending U280,
+  1 MiB writes): from V80 HBM 512 B 3.73, 256 B 3.72, 128 B 2.34 GB/s; from
+  host memory (control) 11.9, 8.0, 4.0. A bandwidth limit would not fall
+  with smaller reads; a fixed count with a fixed round trip would halve
+  (37% here, the round trip ~20% shorter for smaller pieces): a count.
+- The count, along the window's read path (resolved IP parameters of the
+  built images): the static's NoC entry from the PCIe block 64, its NoC exit
+  and both SmartConnects 32 (its `axi_main` port declaration of 8 is not
+  what the SmartConnect uses); the shell's interconnect 8 (from
+  `cr_ctrl.tcl`'s `axi_main` and `axim_udata` declarations); `uwin_hbm`'s
+  read queue 16. The shell's 8 bound it.
+- Now: the shell's declarations 64, `uwin_hbm` N_RD 64 (TB T8: 64 taken,
+  the 65th held). The static (not rebuilt) caps the path at 32; raising it
+  needs a static build (`cr_pci.tcl`, and its NoC read_bw for the window,
+  1000 MB/s, writes 12800). With 32 x 256 B in flight the round trip
+  allows ~7.4 GB/s at 1.1 us, line rate at <= 0.7 us (unmeasured).
+- The requester's max read request goes to 4 KiB for the baseline (runtime
+  setpci): the U280 has ~32 requests in flight (from host memory: 31 per us
+  of round trip), so larger requests put more 256 B pieces in flight.

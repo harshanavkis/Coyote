@@ -45,7 +45,7 @@ import lynxTypes::*;
 module uwin_hbm #(
     parameter integer          UWIN_BITS = 27,
     parameter logic [63:0]     BASE      = 64'h0,
-    parameter integer          N_RD      = 16      // reads in flight
+    parameter integer          N_RD      = 64      // reads in flight (the shell's axim_udata: 64)
 ) (
     input  logic                aclk,
     input  logic                aresetn,

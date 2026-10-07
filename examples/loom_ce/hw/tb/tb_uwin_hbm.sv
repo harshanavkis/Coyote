@@ -23,7 +23,8 @@ import lynxTypes::*;
  * reads (uwin_hbm makes it: the stripe raises it on a fragment's every beat);
  * DISCARD (T7): switched on and off by counter-page reads, writes answered
  * by uwin_hbm with their own IDs and never reaching memory, a switch held
- * back while a write is in flight.
+ * back while a write is in flight. T8: 64 reads in flight (R held back),
+ * the 65th held until they are answered.
  */
 module tb_uwin_hbm;
 
@@ -480,6 +481,37 @@ initial begin
         `CHECK(c[7] == 0, "T7: back to HBM")
     end
     $display("ok   T7 DISCARD: on/off by counter-page reads, IDs answered, memory untouched, switch held mid-write");
+
+    // --- T8: 64 reads in flight: once the window is idle, with R held back
+    //     it takes exactly 64 single-line reads and holds the 65th, then
+    //     answers all 64 (on the card the static allows 32) ---
+    begin
+        int acc = 0, got = 0, w;
+        repeat (10) @(negedge aclk);       // T7's last read answered
+        win_in.rready = 0;
+        for (int k = 0; k < 70; k++) begin
+            @(negedge aclk); win_in.araddr = BAR + 64'hE_0000 + 64*k; win_in.arlen = 0; win_in.arvalid = 1;
+            w = 0;
+            do begin @(posedge aclk); w++; end while (!win_in.arready && w < 300);
+            if (win_in.arready) acc++;
+            @(negedge aclk); win_in.arvalid = 0;
+            if (w >= 300) break;
+        end
+        `CHECK(acc == 64, $sformatf("T8: %0d reads taken with R held back, want 64", acc))
+        win_in.rready = 1;
+        w = 0;
+        while (got < acc && w < 5000) begin
+            @(posedge aclk); w++;
+            if (win_in.rvalid && win_in.rready) begin
+                `CHECK(win_in.rlast, $sformatf("T8: R %0d without rlast", got))
+                got++;
+            end
+        end
+        `CHECK(got == 64, $sformatf("T8: %0d of 64 reads answered", got))
+        repeat (20) @(negedge aclk);
+        `CHECK(!win_in.rvalid, "T8: an extra R")
+    end
+    $display("ok   T8 64 reads in flight, the 65th held");
 
     if (errors == 0) $display("TB PASS (tb_uwin_hbm)");
     else             $display("TB FAIL (tb_uwin_hbm): %0d errors", errors);
