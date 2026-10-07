@@ -21,3 +21,7 @@ target_link_libraries(uwin_probe PUBLIC Coyote pthread)
 # Gets: the CPU reads a window bound to the far host's export
 add_executable(get_bench ${TARGET_DIR}/get_bench.cpp)
 target_link_libraries(get_bench PUBLIC Coyote pthread)
+
+# E2: one-way latency of CPU stores through Loom, host to host (ping-pong)
+add_executable(uwin_pingpong ${TARGET_DIR}/uwin_pingpong.cpp)
+target_link_libraries(uwin_pingpong PUBLIC Coyote pthread)
