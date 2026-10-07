@@ -32,8 +32,13 @@
 #      copy (also recorded): 16 KiB swung 4.2-4.7 GB/s on one image
 #   7. program puts (ce_remote --prog: the copy engine runs the burst as a
 #      loaded program, no host between copies): rose's V80 -> amy's host
-#      memory (landed, and the engine's rate) and -> amy's V80 HBM (the
-#      engine's rate), 4 KiB .. 64 MiB copies in bursts of 64 MiB
+#      memory and -> amy's V80 HBM, landed (the receiver polls the sender's
+#      start flag and fence: amy's CPU in host memory, amy's V80 copy engine
+#      in its HBM, on its own clock) and the sending engine's rate, 4 KiB ..
+#      64 MiB copies, one program run each (at most 1024 copies: between runs
+#      the host restarts the program, ~15 us). Polling its HBM, the landing
+#      V80's engine costs the landing itself 5-7% (A/B with --no-stamp,
+#      2026-10-07); the RDMA baseline is timed the same way
 # Logs in OUTDIR, one per step; the summary goes to stdout. STEPS=15 (for
 # example) runs only those steps. Every result also goes to OUTDIR/metrics.tsv
 # (name, value, tolerance in %: the median of the warm copies), and at the end
@@ -102,6 +107,8 @@ words() { tr ' ' '\n' | grep .; }
 ce_rate() { grep -E '^(ok|FAIL) +copy' "$1" | sed -nE 's/.*CE ([0-9]+) cycles.*/\1/p' | awk -v s=$2 '{printf "%.2f ", s / ($1 * 4e-9) / 1e9}'; }
 # server-side rate (first data -> fence) per copy, from a ce_remote server log
 landed() { grep -E '^(ok|FAIL) +copy' "$1" | sed -nE 's/.*after the first data \(([0-9.]+) GB\/s\).*/\1/p' | tr '\n' ' '; }
+# a V80 landing timed by that V80's copy engine (ce_remote --prog client): start flag -> fence
+v80landed() { grep -E '^(ok|FAIL) +copy' "$1" | sed -nE 's/.*after the start flag \(V80 stamps\) \(([0-9.]+) GB\/s\).*/\1/p' | tr '\n' ' '; }
 
 echo "regress.sh: $(git -C "$REPO" log --oneline -1), $(date -u +%F)"
 
@@ -238,19 +245,20 @@ done
 }
 
 [[ $STEPS == *7* ]] && {
-step "7. program puts (ce_remote --prog): rose's V80 -> amy's host memory | amy's V80 HBM, bursts of 64 MiB"
+step "7. program puts (ce_remote --prog): rose's V80 -> amy's host memory | amy's V80 HBM, one program run (<= 1024 copies, <= 64 MiB)"
 for dst in host v80; do
     for size in 4096 16384 65536 262144 1048576 4194304 16777216 67108864; do
-        burst=$((67108864 / size)); nextport; p=$PORT; L=$OUT/progput_${dst}_$size
+        burst=$((67108864 / size)); [ $burst -gt 1024 ] && burst=1024; nextport; p=$PORT; L=$OUT/progput_${dst}_$size
         lv=""; [ $dst = v80 ] && lv="--land-v80"
         on amy "cd $CE && sudo stdbuf -oL timeout 300 $NUMA ./ce_remote --server $lv --size $size --port $p" > $L.server.log 2>&1 & sp=$!
         sleep 4
         on rose "cd $CE && sudo stdbuf -oL timeout 280 $NUMA ./ce_remote --client ${IP[amy]} --reps 3 --burst $burst --prog --port $p" > $L.client.log 2>&1 || hung "$L.client"
         wait $sp || hung "$L.server"
         eng=$(sed -nE 's/^ +program: .*\(([0-9.]+) GB\/s\)/\1/p' $L.client.log | tr '\n' ' ')
-        echo "-- -> $dst, $size B x $burst: engine $eng$([ $dst = host ] && echo "| landed $(landed $L.server.log)")$(grep -qE '^FAIL' $L.*.log || echo '(all byte-exact)')"
+        if [ $dst = host ]; then land=$(landed $L.server.log); else land=$(v80landed $L.server.log); fi
+        echo "-- -> $dst, $size B x $burst: landed $land| engine $eng$(grep -qE '^FAIL' $L.*.log || echo '(all byte-exact)')"
         metric progput_${dst}_${size}_engine "$(echo $eng | words | median)"
-        [ $dst = host ] && metric progput_${dst}_${size}_landed "$(landed $L.server.log | words | median)"
+        metric progput_${dst}_${size}_landed "$(echo $land | words | warm | median)"
         grep -hE '^FAIL' $L.*.log | head -3
     done
 done

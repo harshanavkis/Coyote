@@ -22,7 +22,12 @@
  *   memory: the V80's uwin, exported by its driver, is imported into the
  *   data cThread, so loom_rx lands peer-to-peer into the V80's landing
  *   window. The server waits for the copy's fence store to land and every
- *   card write to complete, syncs the buffer back and checks it.
+ *   card write to complete, syncs the buffer back and checks it. Against a
+ *   --prog client the V80's own copy engine times the landing: a program
+ *   (WAIT for the client's start flag, STAMP, WAIT for the fence, STAMP)
+ *   armed before the client runs, its card port polling HBM, so no host
+ *   reads the window during the copy (those reads wait behind the writes);
+ *   the rate is the bytes over the two stamps, on the V80's clock.
  *
  * Client (the sending host; U280 + V80):
  *     ce_remote --client <server_ip> [--port N] [--reps N] [--window P] [--gap-ms G] [--burst B]
@@ -100,7 +105,10 @@ struct Hello {
     uint64_t fence_va;
     uint64_t size;
 };
-struct Announce { uint64_t rep; uint64_t fence; uint64_t bytes; };   // client -> server; rep ~0 = done
+// client -> server; rep ~0 = done. start != 0 (--prog): the client's program
+// writes start into the fence page + 64 before its data, and waits for one
+// byte from the server (armed) before it runs
+struct Announce { uint64_t rep; uint64_t fence; uint64_t bytes; uint64_t start; };
 struct Verdict  { uint64_t bad; uint64_t fence; double wait_us; double first_us; };   // first data -> fence, announce -> first data
 
 // A set of the switch's counters, read before and after a copy
@@ -176,7 +184,7 @@ void snap(coyote::cThread &v80, uint64_t *out, uint32_t first, int n) {
     for (int i = 0; i < n; i++) out[i] = v80.getCSR(first + i);
 }
 
-int run_server(uint16_t port, uint64_t size, bool land, uint64_t off, unsigned poll_us, bool no_touch) {
+int run_server(uint16_t port, uint64_t size, bool land, uint64_t off, unsigned poll_us, bool no_touch, bool no_stamp) {
     coyote::cThread t_qp(0, getpid(), 0, nullptr, "coyote_fpga");     // QP owner
     coyote::cThread t_data(0, getpid(), 0, nullptr, "coyote_fpga");   // owns the landing buffers
     printf("server: waiting for the QP exchange on port %u ...\n", port);
@@ -226,6 +234,15 @@ int run_server(uint16_t port, uint64_t size, bool land, uint64_t off, unsigned p
     volatile uint64_t *vfence = fence;
     volatile uint64_t *vdst = dst;
     int errors = 0, copies = 0;
+    // a --prog client's V80 landing, timed by this V80's copy engine
+    std::optional<ce_prog::Program> sp;
+    uint64_t *st = nullptr;
+    if (land) {
+        sp.emplace(*v80);
+        st = static_cast<uint64_t *>(v80->getMem({coyote::CoyoteAllocType::HPF, 4096}));
+        memset(st, 0, 4096);
+        v80->invoke(coyote::CoyoteOper::LOCAL_OFFLOAD, coyote::syncSg{st, 4096});
+    }
     std::chrono::steady_clock::time_point t_first;
     Announce an;
     while (read_full(c, &an, sizeof(an)) && an.rep != ~0ULL) {
@@ -236,6 +253,20 @@ int run_server(uint16_t port, uint64_t size, bool land, uint64_t off, unsigned p
         auto t0 = std::chrono::steady_clock::now();
         if (copies == 0) t_first = t0;
         Verdict v{};
+        if (an.start) {
+            if (land && !no_stamp) {
+                // RUN_BASE = the fence: the start's target an.start - an.fence wraps
+                sp->clear();
+                sp->add(ce_prog::wait(L->buf + (off + size + 64) / 8, an.start - an.fence));
+                sp->add(ce_prog::stamp(&st[0], true));
+                sp->add(ce_prog::wait(L->buf + (off + size) / 8, 0));
+                sp->add(ce_prog::stamp(&st[1], true));
+                sp->load();
+                sp->start(an.fence);
+            }
+            const char armed = 1;
+            if (!write_full(c, &armed, 1)) break;
+        }
         // The copy's first data in host memory (the buffer was cleared after
         // the last copy; --no-touch leaves it: then this is the announce's
         // time). Not for a V80 landing: a read through the V80's window is
@@ -245,7 +276,18 @@ int run_server(uint16_t port, uint64_t size, bool land, uint64_t off, unsigned p
             while (*vdst == 0 && std::chrono::steady_clock::now() - t0 < std::chrono::seconds(5)) _mm_pause();
         const auto t1 = std::chrono::steady_clock::now();
         v.first_us = std::chrono::duration<double, std::micro>(t1 - t0).count();
-        if (land) {
+        bool stamped = false;
+        if (land && an.start && !no_stamp) {
+            // the engine's program: done when the fence has landed; no window reads meanwhile
+            const bool ok = sp->finish(std::chrono::milliseconds(5000));
+            v80->invoke(coyote::CoyoteOper::LOCAL_SYNC, coyote::syncSg{st, 4096});
+            v.wait_us = ok ? double(st[1] - st[0]) * ce_prog::CLK_NS / 1e3 : 0;
+            stamped = ok;
+            u1 = land_v80::Counters::read(L->win);
+            if (!no_touch) L->pull();
+            vdst = L->buf + off / 8;
+            v.fence = L->buf[(off + size) / 8];
+        } else if (land) {
             // the fence, read through the V80's window, then the data synced back
             (void) L->wait(off + size, an.fence, std::chrono::milliseconds(5000), poll_us);
             v.wait_us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t1).count();
@@ -271,7 +313,8 @@ int run_server(uint16_t port, uint64_t size, bool land, uint64_t off, unsigned p
                "first data %.1f us after the announce, at t=%.1f ms\n",
                (v.bad ? "FAIL" : "ok  "), (unsigned long) an.rep, (unsigned long) bytes, (unsigned long) v.fence,
                (unsigned long) an.fence, (unsigned long) v.bad, (unsigned long) (size / 8),
-               v.wait_us, land ? "the announce" : "the first data", bytes / v.wait_us / 1e3, v.first_us,
+               v.wait_us, stamped ? "the start flag (V80 stamps)" : land ? "the announce" : "the first data",
+               bytes / v.wait_us / 1e3, v.first_us,
                std::chrono::duration<double, std::milli>(t0 - t_first).count());
         printf("     loom_rx over %lu cycles: %lu moving, %lu starved (nothing arrived), %lu stalled (host write not ready), rx FIFO full %lu\n",
                (unsigned long) k1.d(k0, C_CYC), (unsigned long) k1.d(k0, C_RX_MOVE), (unsigned long) k1.d(k0, C_RX_STARVE),
@@ -589,8 +632,9 @@ int run_client(const std::string &ip, uint16_t port, int reps, int window, unsig
     if (prog) {
         if (burst % K) { printf("FAIL: --prog needs the burst a multiple of %d\n", K); return 1; }
         pg.emplace(v80);
+        pg->add(ce_prog::signal(static_cast<uint8_t *>(uva) + size + 64, 0));   // start: ahead of the data
         for (int k = 0; k < K; k++) pg->add(ce_prog::copy(src, uva, size));
-        pg->add(ce_prog::signal(static_cast<uint8_t *>(uva) + size, 0));
+        pg->add(ce_prog::signal(static_cast<uint8_t *>(uva) + size, 0));        // the fence
         pg->load();
         printf("client: program of %d copies and a fence, run %d times a measurement\n", K, burst / K);
     }
@@ -609,8 +653,15 @@ int run_client(const std::string &ip, uint16_t port, int reps, int window, unsig
         const Counters k0 = Counters::read(u280);
         uint64_t e0[3];
         snap(v80, e0, 48, 3);
-        Announce an{no_refill ? 0 : uint64_t(r), fence, size * uint64_t(burst)};
+        // --prog: run i signals start and fence as fence - (R - 1 - i), so run
+        // 0's start is the first start, the last run's fence the fence
+        Announce an{no_refill ? 0 : uint64_t(r), fence, size * uint64_t(burst),
+                    prog ? fence - uint64_t(burst / K - 1) : 0};
         write_full(fd, &an, sizeof(an));
+        if (prog) {
+            char armed;
+            if (!read_full(fd, &armed, 1)) { printf("FAIL: the server did not arm\n"); return 1; }
+        }
 
         v80.setCSR(reinterpret_cast<uint64_t>(src), SRC_VA);
         v80.setCSR(reinterpret_cast<uint64_t>(uva), DST_VA);
@@ -695,7 +746,7 @@ int main(int argc, char **argv) {
     bool no_touch = false, no_refill = false;
     bool passive = false, discard = false;
     int burst = 1;
-    bool prog = false;
+    bool prog = false, no_stamp = false;
     uint64_t msg = 1ULL << 20;
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
@@ -719,6 +770,7 @@ int main(int argc, char **argv) {
         else if (a == "--discard")                discard = true;
         else if (a == "--burst" && i + 1 < argc)  burst = atoi(argv[++i]);
         else if (a == "--prog")                   prog = true;
+        else if (a == "--no-stamp")               no_stamp = true;   // a V80 landing timed as without --prog (A/B)
         else { server = false; ip.clear(); break; }
     }
     if (server == !ip.empty() || burst < 1 || size == 0 || size % 4096 || size > (64ULL << 20) || land_off % 64 || land_off >= 4096) {
@@ -730,5 +782,5 @@ int main(int argc, char **argv) {
     }
     if (passive) return run_passive(port, size, land, msg, reps, discard);
     if (bidir) return run_bidir(server ? std::string() : ip, port, size, reps, window, !no_send);
-    return server ? run_server(port, size, land, land_off, poll_us, no_touch) : run_client(ip, port, reps, window, gap_ms, no_refill, burst, prog);
+    return server ? run_server(port, size, land, land_off, poll_us, no_touch, no_stamp) : run_client(ip, port, reps, window, gap_ms, no_refill, burst, prog);
 }
