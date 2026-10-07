@@ -6,9 +6,9 @@
  *   2. WAIT: COPY into HBM, SIGNAL a flag in HBM, WAIT for it, COPY out;
  *      twice, with RUN_BASE 0 and 1000
  *   3. ABORT: a WAIT that never completes, ended by ABORT
- *   4. rates: N copies of each size from HBM to host memory and to HBM, in
- *      one program (RUN_CYC) and as single copies started by the host
- *      (START, BUSY polled), for comparison
+ *   4. rates: N copies of each size from HBM to host memory, in one program
+ *      (RUN_CYC) and as single copies started by the host (START, BUSY
+ *      polled), for comparison
  *
  *   ce_prog [rates_only]
  */
@@ -101,24 +101,21 @@ int main(int argc, char **argv) {
     const uint64_t src_bytes = 16ULL << 20;
     uint8_t *src = alloc<uint8_t>(v80, src_bytes);
     uint8_t *hdst = alloc<uint8_t>(v80, src_bytes);
-    uint8_t *cdst = alloc<uint8_t>(v80, src_bytes);
     for (uint64_t i = 0; i < src_bytes; i++) src[i] = uint8_t(i * 13);
-    to_card(v80, src, src_bytes); to_card(v80, cdst, src_bytes);
-    printf("rates, GB/s (HBM -> host memory | HBM -> HBM):\n");
-    printf("  %10s %6s %12s %12s %12s\n", "size", "copies", "program", "program", "host-started");
+    to_card(v80, src, src_bytes);
+    printf("rates, GB/s, HBM -> host memory:\n");
+    printf("  %10s %6s %12s %12s\n", "size", "copies", "program", "host-started");
     for (uint64_t size : {256ULL, 1024ULL, 4096ULL, 16384ULL, 65536ULL, 262144ULL, 1048576ULL, 4194304ULL}) {
         const uint64_t n = std::min<uint64_t>(ce_prog::N_PROG, std::max<uint64_t>(8, (64ULL << 20) / size));
-        double gbs[2];
-        for (int card = 0; card < 2; card++) {
-            p.clear();
-            for (uint64_t i = 0; i < n; i++) {
-                const uint64_t off = (i * size) % src_bytes;
-                p.add(ce_prog::copy(src + off, (card ? cdst : hdst) + off, size, card));
-            }
-            p.load();
-            if (!p.run()) { printf("  run failed at %lu B\n", (unsigned long) size); fails++; gbs[card] = 0; continue; }
-            gbs[card] = double(n * size) / (double(p.run_cycles()) * ce_prog::CLK_NS);
+        double gbs = 0;
+        p.clear();
+        for (uint64_t i = 0; i < n; i++) {
+            const uint64_t off = (i * size) % src_bytes;
+            p.add(ce_prog::copy(src + off, hdst + off, size));
         }
+        p.load();
+        if (p.run()) gbs = double(n * size) / (double(p.run_cycles()) * ce_prog::CLK_NS);
+        else { printf("  run failed at %lu B\n", (unsigned long) size); fails++; }
         // single copies, HBM -> host memory, each started when the last is done
         v80.setCSR(v80.getCtid(), ce_prog::PID);
         v80.setCSR(size, LEN);
@@ -133,7 +130,7 @@ int main(int argc, char **argv) {
             while (v80.getCSR(ce_prog::BUSY)) _mm_pause();
         }
         const double host_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-        printf("  %10lu %6lu %12.2f %12.2f %12.2f\n", (unsigned long) size, (unsigned long) n, gbs[0], gbs[1],
+        printf("  %10lu %6lu %12.2f %12.2f\n", (unsigned long) size, (unsigned long) n, gbs,
                double(n * size) / host_s / 1e9);
     }
 
