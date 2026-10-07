@@ -210,13 +210,17 @@ unchanged; it runs straight from the CSRs (no fetch, no read-ahead).
   it does not reduce), which makes ReduceScatter/AllReduce possible; STAMP
   gives latency on one clock (the V80's) with no host in the loop.
 - Single copies cycle for cycle as before: the first image ran a START as
-  a two-entry program (COPY, SIGNAL); that cost ~7 cycles a copy and BUSY
-  dropped ~7 cycles later, and 16 KiB host-started puts lost 7% (4.53 ->
-  4.18-4.24 GB/s, A/B with the old V80 image on 2026-10-07: CE cycles 459
-  -> 466, but 0.30 us more per copy - each later BUSY can cost the polling
-  host a whole PCIe read). Every other regression metric was unchanged.
-  Now a START reads its own source and writes the fence right after the
-  data, the old state sequence.
+  a two-entry program (COPY, SIGNAL), ~7 cycles more a copy (CE cycles 459
+  -> 466) and BUSY ~7 cycles later. Its 16 KiB host-started puts measured
+  4.18-4.30 GB/s against 4.53 for the old image, so a START now reads its
+  own source and writes the fence right after the data, the old state
+  sequence. With that, a back-to-back A/B (2026-10-07) gives the same 4.60-
+  4.68 GB/s and 2.1 BUSY reads a copy on both images. The metric itself
+  swings 4.2-4.7 GB/s on one image: the host polls BUSY (~1.47 us a CSR
+  read, the same on both images) before each next copy, so a copy's time
+  comes in whole reads, and 16 KiB sits where a copy takes about two
+  (12 KiB: 2.00 reads, 16 KiB: 3.00 reads host -> local memory). regress.sh
+  now records BUSY reads a copy next to each put size.
 - Read-ahead: card-memory sources are requested up to 8 entries ahead,
   the card stream returns them in request order. 32 x 1 KiB at 100 cycles
   of read latency: 744 cycles for 512 beats (TB P9), ~4 cycles per entry.

@@ -30,8 +30,10 @@ through `scripts/fpga/build_bitstream.sh` (U280: Vivado 2023.2; V80: 2025.1).
 - **Images** on amy and rose: U280
   `~/coyote-bitstreams/loom-switch-coalesce-clean` (672fd313: 32 reads in
   flight and the read coalescer, on the static in `hw/static`; timing met;
-  md5 04fdbab5), V80 `~/coyote-bitstreams/loom-ce-get` (ccf9ecfe, md5
-  4ce86b05).
+  md5 04fdbab5), V80 `~/coyote-bitstreams/loom-ce-prog2` (programs,
+  82baac51, md5 85d9ae7e; the image before programs: `loom-ce-get`, ccf9ecfe,
+  md5 4ce86b05). Baseline for the next regression:
+  `~/loom-experiments/regress/20261007_loom-ce-prog2`.
 - **Cards up from any state:**
   `scripts/fpga/setup_loom_hosts.sh <u280.bit> <v80.pdi> amy rose`.
 - **After every new image:**
