@@ -40,3 +40,7 @@ target_link_libraries(v80_bisect PUBLIC Coyote pthread)
 # Programs: loom_ce runs a loaded list of copies, signals, waits, reductions and stamps (V80 only)
 add_executable(ce_prog ${TARGET_DIR}/ce_prog.cpp)
 target_link_libraries(ce_prog PUBLIC Coyote pthread)
+
+# E2: one-way latency between two V80s, both copy engines running programs (ping-pong)
+add_executable(ce_pingpong ${TARGET_DIR}/ce_pingpong.cpp)
+target_link_libraries(ce_pingpong PUBLIC Coyote pthread)
