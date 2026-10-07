@@ -114,8 +114,12 @@ echo "regress.sh: $(git -C "$REPO" log --oneline -1), $(date -u +%F)"
 
 if [ "${1:-}" = --setup ]; then
     step "setup: $2 / $3"
-    "$REPO/scripts/fpga/setup_loom_hosts.sh" "$2" "$3" amy rose > "$OUT/setup.log" 2>&1 \
-        || { grep -E '^SETUP|could not|still running' "$OUT/setup.log"; echo "SETUP FAILED, see $OUT/setup.log"; exit 1; }
+    for try in 1 2; do   # once more after a failure (rose's V80 JTAG hangs now and then)
+        "$REPO/scripts/fpga/setup_loom_hosts.sh" "$2" "$3" amy rose > "$OUT/setup.log" 2>&1 && break
+        grep -E '^SETUP|could not|still running' "$OUT/setup.log"
+        [ $try = 2 ] && { echo "SETUP FAILED, see $OUT/setup.log"; exit 1; }
+        cp "$OUT/setup.log" "$OUT/setup.try1.log"; echo "setup failed, trying once more"
+    done
     grep -E '^SETUP' "$OUT/setup.log"
 fi
 

@@ -50,8 +50,9 @@ if [ "${1:-}" = --here ]; then
     link() { echo "$(cat $1/current_link_speed 2>/dev/null) x$(cat $1/current_link_width 2>/dev/null)"; }
     jtag() {   # <image> <part pattern> <device>
         local out
-        # a hung JTAG programming (seen 2026-10-06) fails after 10 min
-        out=$(timeout 600 xilinx-shell -c "$(vivado_env "$(vivado_version_for $3)") cd $STAGE && vivado -mode batch -nolog -nojournal -notrace -source $STAGE/program_loom.tcl -tclargs $1 '$2'" 2>&1)
+        # a hung JTAG programming (rose's V80, 2026-10-06/07) fails after
+        # 3 min; a good one takes about 1
+        out=$(timeout 180 xilinx-shell -c "$(vivado_env "$(vivado_version_for $3)") cd $STAGE && vivado -mode batch -nolog -nojournal -notrace -source $STAGE/program_loom.tcl -tclargs $1 '$2'" 2>&1)
         echo "$out" | grep -E 'SELECTED|PROGRAMMED|ERROR' | sed 's/^/   /'
         echo "$out" | grep -q '^PROGRAMMED:'
     }
