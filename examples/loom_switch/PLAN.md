@@ -55,6 +55,15 @@ through `scripts/fpga/build_bitstream.sh` (U280: Vivado 2023.2; V80: 2025.1).
   1.22, 16 KiB 4.7, 64 KiB 8.3, 256 KiB 10.0, 1 MiB and up 10.3-10.8
   (`20261006_driver_tlbfix`, with the driver fix below): puts reach the
   copy engine's plateau from ~1 MiB a copy.
+- **Latency through the switch's own logic** (zero load, 250 MHz;
+  `tb_loom_switch_top` T24 prints `lat` lines; the shell, the RoCE stack,
+  PCIe and the wire are outside it): put out, an 8 B store 2 cycles W ->
+  rdma request (3 to its first beat out), a 64 B line 18 (it waits 16
+  cycles for a continuing write), 4 KiB store-and-forward (the request 2
+  cycles after its last input beat, then 64 beats out); put in, request ->
+  landing write 4-6 cycles, payload beat in -> landing beat 6-7; get, AR ->
+  request out 38 (32 of them the coalescer's timer), far side request in ->
+  host read 9, host data in -> answer out 2-3, answer in -> R 14.
 - **Timing a put:** the sender's copy-engine rate is the conservative one
   (10.71 at 16 MiB = 87% of the link's 12.25). The landing host's clock from
   the first data overstates a single copy (its first page waits on the

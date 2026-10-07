@@ -251,6 +251,57 @@ initial begin
     end
 end
 
+
+// T24 (latency at zero load): the cycle of every handshake on the switch's
+// edges while lat_on
+bit lat_on = 0;
+longint ev_aw [$], ev_w1 [$], ev_wl [$], ev_ing [$], ev_nb1 [$], ev_nbl [$], ev_rq [$], ev_rr1 [$], ev_rrl [$],
+        ev_rx [$], ev_h1 [$], ev_ar [$], ev_sqrd [$], ev_hr [$], ev_rd [$], ev_r [$];
+bit w_mid = 0, nb_mid = 0, rr_mid = 0;
+always @(posedge aclk) if (aresetn && lat_on) begin
+    if (axi_udata.awvalid && axi_udata.awready) ev_aw.push_back(cyc);
+    if (axi_udata.wvalid && axi_udata.wready) begin
+        if (!w_mid) ev_w1.push_back(cyc);
+        if (axi_udata.wlast) ev_wl.push_back(cyc);
+        w_mid = !axi_udata.wlast;
+    end
+    if (sq_wr.valid && sq_wr.ready) begin
+        if (inst_dut.rx_takes_wr) ev_rx.push_back(cyc);
+        else if (inst_dut.sel_rd) ev_rd.push_back(cyc);
+        else                      ev_ing.push_back(cyc);
+    end
+    if (axis_rreq_send[0].tvalid && axis_rreq_send[0].tready) begin
+        if (!nb_mid) ev_nb1.push_back(cyc);
+        if (axis_rreq_send[0].tlast) ev_nbl.push_back(cyc);
+        nb_mid = !axis_rreq_send[0].tlast;
+    end
+    if (rq_wr.valid && rq_wr.ready) ev_rq.push_back(cyc);
+    if (axis_rrsp_recv[0].tvalid && axis_rrsp_recv[0].tready) begin
+        if (!rr_mid) ev_rr1.push_back(cyc);
+        if (axis_rrsp_recv[0].tlast) ev_rrl.push_back(cyc);
+        rr_mid = !axis_rrsp_recv[0].tlast;
+    end
+    if (axis_host_send[1].tvalid && axis_host_send[1].tready) ev_h1.push_back(cyc);
+    if (axi_udata.arvalid && axi_udata.arready) ev_ar.push_back(cyc);
+    if (sq_rd.valid && sq_rd.ready) ev_sqrd.push_back(cyc);
+    if (axis_host_recv[1].tvalid && axis_host_recv[1].tready) ev_hr.push_back(cyc);
+    if (axi_udata.rvalid && axi_udata.rready) ev_r.push_back(cyc);
+end
+task automatic lat_clear();
+    ev_aw = {}; ev_w1 = {}; ev_wl = {}; ev_ing = {}; ev_nb1 = {}; ev_nbl = {}; ev_rq = {}; ev_rr1 = {}; ev_rrl = {};
+    ev_rx = {}; ev_h1 = {}; ev_ar = {}; ev_sqrd = {}; ev_hr = {}; ev_rd = {}; ev_r = {};
+    w_mid = 0; nb_mid = 0; rr_mid = 0;
+endtask
+// one latency line: cycles (and ns at 250 MHz) from a to b; a missing event is an error
+task automatic lat(input string what, input longint a [$], input int ia, input longint b [$], input int ib);
+    longint d;
+    `CHECK(a.size() > ia && b.size() > ib, $sformatf("T24 %s: event missing (%0d, %0d)", what, a.size(), b.size()))
+    if (a.size() <= ia || b.size() <= ib) return;
+    d = b[ib] - a[ia];
+    `CHECK(d >= 0 && d < 2000, $sformatf("T24 %s: %0d cycles", what, d))
+    $display("lat  %-58s %5d cycles %7.1f ns", what, d, 4.0 * d);
+endtask
+
 // ---------------------------------------------------------------------------
 // AXI-Lite (CSR page) and AXI4 (uwin) masters
 // ---------------------------------------------------------------------------
@@ -1311,13 +1362,67 @@ initial begin
     $asserton(0, tb_loom_switch_top.sq_wr);
     $display("ok   T23 a shared answer kept until its last read");
 
+    // --- T24: latency at zero load, cycles through the switch's own logic
+    //     (the edges: uwin AXI in, sq_wr + the rdma send stream out; rq_wr +
+    //     the receive stream in, the landing write out; the host read and
+    //     R for gets). Printed as "lat" lines for the simulator; the shell,
+    //     the RoCE stack, PCIe and the wire are outside ---
+    bp = 0; acks_on = 1;
+    clear(); quiesce();
+    // sender: a lone 8 B store, one 64 B line, 4 KiB as P2P hands it over (16 x 256 B)
+    lat_clear(); lat_on = 1;
+    uwr(U2 + 64'h3_0000, 1, word(1));
+    quiesce(); lat_on = 0;
+    lat("put out: 8 B store, W -> rdma request", ev_w1, 0, ev_ing, 0);
+    lat("put out: 8 B store, W -> first beat on the send stream", ev_w1, 0, ev_nb1, 0);
+    lat_clear(); lat_on = 1;
+    uwr(U2 + 64'h3_1000, 1);
+    quiesce(); lat_on = 0;
+    lat("put out: 64 B line, W -> rdma request", ev_w1, 0, ev_ing, 0);
+    lat("put out: 64 B line, W -> first beat on the send stream", ev_w1, 0, ev_nb1, 0);
+    lat_clear(); lat_on = 1;
+    for (int k = 0; k < 16; k++) uwr(U2 + 64'h3_2000 + 256*k, 4);
+    quiesce(); lat_on = 0;
+    `CHECK(ev_ing.size() == 1, $sformatf("T24: 4 KiB went out as %0d packets", ev_ing.size()))
+    lat("put out: 4 KiB (16 x 256 B), first W -> rdma request", ev_w1, 0, ev_ing, 0);
+    lat("put out: 4 KiB, first W -> first beat out", ev_w1, 0, ev_nb1, 0);
+    lat("put out: 4 KiB, last W -> last beat out", ev_wl, 15, ev_nbl, 0);
+    clear();
+    // receiver: an inline store message, a 4 KiB packet
+    lat_clear(); lat_on = 1;
+    rx_inline(7, 64'h5008, 64'h1234);
+    quiesce(); lat_on = 0;
+    lat("put in: inline store, request in -> landing write", ev_rq, 0, ev_rx, 0);
+    lat("put in: inline store, payload beat in -> landing beat", ev_rr1, 0, ev_h1, 0);
+    lat_clear(); lat_on = 1;
+    rx_bulk(7, 64'h6000, 4096);
+    quiesce(); lat_on = 0;
+    lat("put in: 4 KiB packet, request in -> landing write", ev_rq, 0, ev_rx, 0);
+    lat("put in: 4 KiB, first beat in -> first landing beat", ev_rr1, 0, ev_h1, 0);
+    lat("put in: 4 KiB, last beat in -> last landing beat", ev_rrl, 0, ev_h1, 63);
+    clear();
+    // gets: an 8 B load on window 3 (export 7 here, by loopback)
+    lat_clear(); lat_on = 1;
+    uread(U3 + 64'hA048, 0, 3, 1, 4);
+    loop_gets("T24", 1);
+    lat_on = 0;
+    lat("get, reader: AR -> get request out (incl. the coalescer timer)", ev_ar, 0, ev_ing, 0);
+    lat("get, reader: AR -> first beat of the request out", ev_ar, 0, ev_nb1, 0);
+    lat("get, far side: request in -> host read", ev_rq, 0, ev_sqrd, 0);
+    lat("get, far side: host data in -> answer request out", ev_hr, 0, ev_rd, 0);
+    lat("get, far side: host data in -> first answer beat out", ev_hr, 0, ev_nb1, 1);
+    lat("get, reader: answer in -> R", ev_rq, 1, ev_r, 0);
+    exp_read("T24", 64'hA048, 0, 3, 1, 4);
+    clear();
+    $display("ok   T24 latency at zero load (lat lines)");
+
     if (errors == 0) $display("TB PASS (tb_loom_switch_top)");
     else             $display("TB FAIL (tb_loom_switch_top): %0d errors", errors);
     $finish;
 end
 
 initial begin
-    #2ms;
+    #3ms;
     $display("TB FAIL (tb_loom_switch_top): timeout");
     $finish;
 end
