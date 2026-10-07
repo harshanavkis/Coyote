@@ -68,6 +68,11 @@ through `scripts/fpga/build_bitstream.sh` (U280: Vivado 2023.2; V80: 2025.1).
   landing write 4-6 cycles, payload beat in -> landing beat 6-7; get, AR ->
   request out 38 (32 of them the coalescer's timer), far side request in ->
   host read 9, host data in -> answer out 2-3, answer in -> R 14.
+- **Program puts** (`ce_remote --prog`, regress step 7, 2026-10-07, warm
+  copies, all byte-exact): rose's V80 -> amy's host memory lands at 10.68-
+  10.80 GB/s from 4 KiB copies up (host-started: 1.22 at 4 KiB, 4.2-4.7 at
+  16 KiB), the engine 10.69-10.98; -> amy's V80 HBM the engine runs 10.37-
+  10.98 from 4 KiB up. The first copy of each size is cold (8.7-10.4).
 - **Timing a put:** the sender's copy-engine rate is the conservative one
   (10.71 at 16 MiB = 87% of the link's 12.25). The landing host's clock from
   the first data overstates a single copy (its first page waits on the

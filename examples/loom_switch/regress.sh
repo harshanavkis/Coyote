@@ -30,13 +30,17 @@
 #      to stall, fixed in the driver, de45b0c6). Each copy is started by the
 #      host after polling BUSY, so small sizes move with the BUSY reads a
 #      copy (also recorded): 16 KiB swung 4.2-4.7 GB/s on one image
+#   7. program puts (ce_remote --prog: the copy engine runs the burst as a
+#      loaded program, no host between copies): rose's V80 -> amy's host
+#      memory (landed, and the engine's rate) and -> amy's V80 HBM (the
+#      engine's rate), 4 KiB .. 64 MiB copies in bursts of 64 MiB
 # Logs in OUTDIR, one per step; the summary goes to stdout. STEPS=15 (for
 # example) runs only those steps. Every result also goes to OUTDIR/metrics.tsv
 # (name, value, tolerance in %: the median of the warm copies), and at the end
 # it is compared with the newest other metrics.tsv next to OUTDIR (or
 # COMPARE=<file>): a change beyond the tolerance is marked CHECK.
 set -u
-STEPS=${STEPS:-123456}
+STEPS=${STEPS:-1234567}
 OUT=${1:?usage: regress.sh OUTDIR [--setup <u280.bit> <v80.pdi>]}; shift
 HERE=$(cd "$(dirname "$0")" && pwd)
 REPO=$(git -C "$HERE" rev-parse --show-toplevel)
@@ -230,6 +234,25 @@ for size in 4096 16384 65536 262144 1048576 4194304 16777216 67108864; do
     # few ns either way move the rate ~7% with no change on the card
     metric putsize_${size}_busy_reads "$(echo $busy | words | median)" 3
     grep -hE '^FAIL' $L.*.log | head -3
+done
+}
+
+[[ $STEPS == *7* ]] && {
+step "7. program puts (ce_remote --prog): rose's V80 -> amy's host memory | amy's V80 HBM, bursts of 64 MiB"
+for dst in host v80; do
+    for size in 4096 16384 65536 262144 1048576 4194304 16777216 67108864; do
+        burst=$((67108864 / size)); nextport; p=$PORT; L=$OUT/progput_${dst}_$size
+        lv=""; [ $dst = v80 ] && lv="--land-v80"
+        on amy "cd $CE && sudo stdbuf -oL timeout 300 $NUMA ./ce_remote --server $lv --size $size --port $p" > $L.server.log 2>&1 & sp=$!
+        sleep 4
+        on rose "cd $CE && sudo stdbuf -oL timeout 280 $NUMA ./ce_remote --client ${IP[amy]} --reps 3 --burst $burst --prog --port $p" > $L.client.log 2>&1 || hung "$L.client"
+        wait $sp || hung "$L.server"
+        eng=$(sed -nE 's/^ +program: .*\(([0-9.]+) GB\/s\)/\1/p' $L.client.log | tr '\n' ' ')
+        echo "-- -> $dst, $size B x $burst: engine $eng$([ $dst = host ] && echo "| landed $(landed $L.server.log)")$(grep -qE '^FAIL' $L.*.log || echo '(all byte-exact)')"
+        metric progput_${dst}_${size}_engine "$(echo $eng | words | median)"
+        [ $dst = host ] && metric progput_${dst}_${size}_landed "$(landed $L.server.log | words | median)"
+        grep -hE '^FAIL' $L.*.log | head -3
+    done
 done
 }
 

@@ -28,6 +28,11 @@
  *     ce_remote --client <server_ip> [--port N] [--reps N] [--window P] [--gap-ms G] [--burst B]
  *   (--burst: each measurement is B copies back to back, the next started
  *   as soon as the copy engine is free: the rate at this size in a stream)
+ *   (--prog: the burst as a copy-engine program instead of host-started
+ *   copies: up to 1024 copies and one fence SIGNAL behind them, loaded once
+ *   and run B / copies times, RUN_BASE making the last run's signal the
+ *   fence the server waits for; no host in the loop between copies. Also
+ *   prints the engine's own rate from the runs' cycles)
  *   (--gap-ms: idle G ms before each copy, to tell time-periodic effects from
  *   data-periodic ones; the server stamps each copy with its time since the
  *   first)
@@ -70,10 +75,12 @@
 #include <cstdlib>
 #include <cstring>
 #include <immintrin.h>
+#include <optional>
 #include <stdexcept>
 #include <string>
 
 #include <coyote/cThread.hpp>
+#include "ce_prog.hpp"
 #include "land_v80.hpp"
 #include "loom_switch.hpp"
 
@@ -537,7 +544,8 @@ int run_bidir(const std::string &ip, uint16_t port, uint64_t size, int reps, int
     return errors ? 1 : 0;
 }
 
-int run_client(const std::string &ip, uint16_t port, int reps, int window, unsigned gap_ms, bool no_refill, int burst) {
+int run_client(const std::string &ip, uint16_t port, int reps, int window, unsigned gap_ms, bool no_refill, int burst,
+               bool prog) {
     coyote::cThread u280(0, getpid(), 0, nullptr, "coyote_fpga");     // QP owner and CSR page
     coyote::cThread v80(0, getpid(), 0, nullptr, "coyote_versal_fpga");
     if (!u280.initRDMA(STAGING_SIZE, port, ip.c_str())) { printf("FAIL: initRDMA\n"); return 1; }
@@ -574,6 +582,18 @@ int run_client(const std::string &ip, uint16_t port, int reps, int window, unsig
 
     uint64_t *src = static_cast<uint64_t *>(v80.getMem({coyote::CoyoteAllocType::HPF, size}));
     int errors = 0;
+
+    // --prog: K copies and the fence, run burst / K times
+    const int K = prog ? std::min(burst, 1024) : 0;
+    std::optional<ce_prog::Program> pg;
+    if (prog) {
+        if (burst % K) { printf("FAIL: --prog needs the burst a multiple of %d\n", K); return 1; }
+        pg.emplace(v80);
+        for (int k = 0; k < K; k++) pg->add(ce_prog::copy(src, uva, size));
+        pg->add(ce_prog::signal(static_cast<uint8_t *>(uva) + size, 0));
+        pg->load();
+        printf("client: program of %d copies and a fence, run %d times a measurement\n", K, burst / K);
+    }
     for (int r = 0; r < reps; r++) {
         if (gap_ms) usleep(gap_ms * 1000);
         // --no-refill: the source is filled and offloaded once (copy 0's
@@ -602,11 +622,21 @@ int run_client(const std::string &ip, uint16_t port, int reps, int window, unsig
         // registers stay; the fence takes each copy's count)
         const auto b0 = std::chrono::steady_clock::now();
         uint64_t busy_reads = 0;   // BUSY reads per copy: a host-started copy's time is quantized by them
-        for (int k = 0; k < burst; k++) {
-            if (k) do busy_reads++; while (v80.getCSR(BUSY));
-            v80.setCSR(1, START);
+        uint64_t run_cyc = 0;      // --prog: the runs' engine cycles
+        if (prog) {
+            const int R = burst / K;
+            for (int i = 0; i < R; i++) {
+                pg->start(fence - uint64_t(R - 1 - i));
+                if (!pg->finish()) { printf("FAIL: program run %d did not finish\n", i); return 1; }
+                run_cyc += pg->run_cycles();
+            }
+        } else {
+            for (int k = 0; k < burst; k++) {
+                if (k) do busy_reads++; while (v80.getCSR(BUSY));
+                v80.setCSR(1, START);
+            }
+            while (v80.getCSR(BUSY)) _mm_pause();
         }
-        while (v80.getCSR(BUSY)) _mm_pause();
         const double burst_us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - b0).count();
 
         Verdict v{};
@@ -620,6 +650,9 @@ int run_client(const std::string &ip, uint16_t port, int reps, int window, unsig
                (v.bad ? "FAIL" : "ok  "), r, burst, (unsigned long) size, v.wait_us, bytes / v.wait_us / 1e3,
                (unsigned long) v.bad, burst_us, bytes / burst_us / 1e3, (unsigned long) v80.getCSR(CYCLES),
                burst > 1 ? double(busy_reads) / (burst - 1) : 0.0);
+        if (prog)
+            printf("     program: %lu engine cycles for the %d runs (%.2f GB/s)\n", (unsigned long) run_cyc, burst / K,
+                   double(bytes) / (double(run_cyc) * ce_prog::CLK_NS));
         printf("     ingress: %lu bursts, %lu rdma packets (%lu closed by the idle timer, %lu cut by a write), "
                "%lu stores, %lu dropped; acks %lu, unacked %lu\n",
                (unsigned long) (c1.v[0] - c0.v[0]), (unsigned long) (c1.v[3] - c0.v[3]),
@@ -662,6 +695,7 @@ int main(int argc, char **argv) {
     bool no_touch = false, no_refill = false;
     bool passive = false, discard = false;
     int burst = 1;
+    bool prog = false;
     uint64_t msg = 1ULL << 20;
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
@@ -684,10 +718,11 @@ int main(int argc, char **argv) {
         else if (a == "--msg" && i + 1 < argc)    msg = strtoull(argv[++i], nullptr, 0);
         else if (a == "--discard")                discard = true;
         else if (a == "--burst" && i + 1 < argc)  burst = atoi(argv[++i]);
+        else if (a == "--prog")                   prog = true;
         else { server = false; ip.clear(); break; }
     }
     if (server == !ip.empty() || burst < 1 || size == 0 || size % 4096 || size > (64ULL << 20) || land_off % 64 || land_off >= 4096) {
-        printf("usage: %s --server [--port N] [--size BYTES] [--land-v80 [--land-offset B] [--poll-us U]] | --client <server_ip> [--port N] [--reps N] [--window P] [--burst B]\n"
+        printf("usage: %s --server [--port N] [--size BYTES] [--land-v80 [--land-offset B] [--poll-us U]] | --client <server_ip> [--port N] [--reps N] [--window P] [--burst B [--prog]]\n"
                "       | --passive [--port N] [--size BYTES] [--msg BYTES] [--reps N] [--land-v80 [--discard]]  (landing for a plain RDMA sender)\n"
                "       | --bidir-server | --bidir-client <server_ip>  [--port N] [--size BYTES] [--reps N] [--window P] [--no-send]\n"
                "       (size: a multiple of 4 KiB, at most 64 MiB)\n", argv[0]);
@@ -695,5 +730,5 @@ int main(int argc, char **argv) {
     }
     if (passive) return run_passive(port, size, land, msg, reps, discard);
     if (bidir) return run_bidir(server ? std::string() : ip, port, size, reps, window, !no_send);
-    return server ? run_server(port, size, land, land_off, poll_us, no_touch) : run_client(ip, port, reps, window, gap_ms, no_refill, burst);
+    return server ? run_server(port, size, land, land_off, poll_us, no_touch) : run_client(ip, port, reps, window, gap_ms, no_refill, burst, prog);
 }
