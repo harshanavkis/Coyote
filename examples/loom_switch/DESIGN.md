@@ -189,3 +189,57 @@ CPU write-combining buffers drain lines out of address order, so CPU puts
 make ~1.5-line packets (~1 GB/s). Copy engines write in order and already
 make 4 KiB packets; gathering would matter only for bulk data made of many
 threads' stores. Deferred; stated as a limitation.
+
+## 10. The copy engine runs programs (V80, for the evaluation)
+
+`loom_ce` stays the emulated accelerator, but it no longer needs the host
+for every copy: a program of up to 2,048 64 B entries in card memory is
+loaded once into on-chip RAM (8 URAM) and run with one CSR write, as often
+as wanted (`RUN_BASE` shifts every signal value and wait target, so a
+program reruns without a reload). Ops: COPY, SIGNAL, WAIT, REDUCE (int32
+lanes), STAMP. The single-copy CSR mode is kept (it is a one- or two-entry
+program), so every existing tool runs unchanged.
+
+- Why: a host-started copy costs a CSR round trip each (a 4 KiB put took
+  3.4 us of which 0.4 us is data: puts reached 1.22 GB/s at 4 KiB), so small
+  puts, a dispatch of many tokens and any multi-step collective were
+  host-driven. The paper's endpoint issues its own stores; a program is
+  that: the kernel's routing output in device memory, executed in order.
+  WAIT gives the kernel's spin on a peer's signal, so ring algorithms run
+  on the device; REDUCE is the accelerator's own compute (Loom moves data,
+  it does not reduce), which makes ReduceScatter/AllReduce possible; STAMP
+  gives latency on one clock (the V80's) with no host in the loop.
+- Read-ahead: card-memory sources are requested up to 8 entries ahead,
+  the card stream returns them in request order. 32 x 1 KiB at 100 cycles
+  of read latency: 744 cycles for 512 beats (TB P9), ~4 cycles per entry.
+- Barriers (the issuer stops until the executor is past the entry): WAIT
+  (later reads may need what it waits for), a write into card memory (later
+  reads may read it; the executor finishes such an entry only once its
+  writes completed), a host-stream read (it would queue behind read-ahead
+  requests whose data is only taken after it). A card SIGNAL waits for all
+  earlier writes' completions; a host-stream SIGNAL is posted behind the data
+  (loom_ingress keeps the order).
+- Landing order, not enforced: a WAIT polls its flag on the copy engine's
+  card channel, while the peer's data and flag land through the window
+  (`uwin_hbm`, one AXI ID, in order) on another HBM port. Bursts to other
+  HBM channels could in principle still be in flight when the flag is
+  visible. A hold in `uwin_hbm` (a single-beat write waits for every earlier
+  write's B) was written and tested, then rolled back (owner, 2026-10-07):
+  a flag ahead of its data has never been seen in practice (every landing
+  checked byte-exact after its fence). If a WAIT ever reads stale data, this
+  is the first suspect.
+- REDUCE reads a and b on the one card stream, alternating 4 KiB chunks
+  (a's chunk held in LUTRAM), so it outputs at most half the card read
+  rate (~8 GB/s), below the link. A second card channel would lift it;
+  not needed for the collectives' rates.
+- Rejected: repeating one descriptor (`--burst` already does, the host
+  round trip per copy stays); a descriptor ring the host keeps feeding (the
+  host stays in the loop); fetching entries from HBM one by one (an HBM read
+  per entry, ~0.5 us); in-network reduction (not Loom's claim).
+- Tests: `tb_loom_ce` P1-P9 (card memory modelled, writes visible only at
+  completion), T1-T8 unchanged; mutations of the barriers caught (P4, P8).
+  Out of context
+  (V80, 250 MHz): +0.78 ns after registering the REDUCE chunk arithmetic
+  (-0.83 before), 3,064 LUTs, 8 URAM.
+- Software: `sw/src/ce_prog.hpp` (entries, load, run); `ce_prog` tests it on
+  one V80 (REDUCE, WAIT, ABORT, rates program vs host-started).

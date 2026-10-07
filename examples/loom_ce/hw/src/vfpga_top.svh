@@ -4,7 +4,8 @@
  * The emulated accelerator's copy engine: loom_ce_ctrl is the CSR page,
  * loom_ce copies between card memory (HBM) and the U280's user data window,
  * imported as a dma-buf (a put writes the window, a get reads it), and
- * releases a fence.
+ * releases a fence; or runs a loaded program of copies, signals, waits,
+ * reductions and time stamps.
  */
 
 logic                  ce_start, ce_busy;
@@ -15,6 +16,10 @@ logic                  ce_get;
 logic [31:0]           ce_copies;
 logic [63:0]           ce_cycles;
 logic                  cnt_ce_in_wait;
+logic                  ce_prog_load, ce_prog_run, ce_abort, ce_aborted;
+logic [VADDR_BITS-1:0] ce_prog_va;
+logic [31:0]           ce_prog_n, ce_runs, ce_pc;
+logic [63:0]           ce_run_base, ce_now, ce_polls, ce_run_cycles;
 
 // Registered streams, as example 07
 AXI4SR axis_card_in (.*);
@@ -30,7 +35,11 @@ loom_ce_ctrl inst_loom_ce_ctrl (
     .aclk(aclk), .aresetn(aresetn), .axi_ctrl(axi_ctrl),
     .start(ce_start), .src_va(ce_src_va), .dst_va(ce_dst_va), .len(ce_len),
     .pid(ce_pid), .fence_va(ce_fence_va), .get(ce_get),
+    .prog_load(ce_prog_load), .prog_run(ce_prog_run), .prog_va(ce_prog_va), .prog_n(ce_prog_n),
+    .run_base(ce_run_base), .abort(ce_abort),
     .busy(ce_busy), .copies(ce_copies), .cycles(ce_cycles),
+    .runs(ce_runs), .pc(ce_pc), .now(ce_now), .aborted(ce_aborted), .polls(ce_polls),
+    .run_cycles(ce_run_cycles),
     .cnt_ce_out_bp((axis_host_out.tvalid && !axis_host_out.tready) ||
                    (axis_card_out.tvalid && !axis_card_out.tready)),
     .cnt_ce_in_wait(cnt_ce_in_wait),
@@ -41,7 +50,11 @@ loom_ce inst_loom_ce (
     .aclk(aclk), .aresetn(aresetn),
     .start(ce_start), .src_va(ce_src_va), .dst_va(ce_dst_va), .len(ce_len),
     .pid(ce_pid), .fence_va(ce_fence_va), .get(ce_get),
+    .prog_load(ce_prog_load), .prog_run(ce_prog_run), .prog_va(ce_prog_va), .prog_n(ce_prog_n),
+    .run_base(ce_run_base), .abort(ce_abort),
     .busy(ce_busy), .copies(ce_copies), .cycles(ce_cycles),
+    .runs(ce_runs), .pc(ce_pc), .now(ce_now), .aborted(ce_aborted), .polls(ce_polls),
+    .run_cycles(ce_run_cycles),
     .rd_req(sq_rd.data), .rd_valid(sq_rd.valid), .rd_ready(sq_rd.ready),
     .wr_req(sq_wr.data), .wr_valid(sq_wr.valid), .wr_ready(sq_wr.ready),
     .wr_done(cq_wr.valid),

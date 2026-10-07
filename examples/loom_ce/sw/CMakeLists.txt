@@ -36,3 +36,7 @@ target_link_libraries(loom_csr PUBLIC Coyote pthread)
 
 add_executable(v80_bisect ${TARGET_DIR}/v80_bisect.cpp)
 target_link_libraries(v80_bisect PUBLIC Coyote pthread)
+
+# Programs: loom_ce runs a loaded list of copies, signals, waits, reductions and stamps (V80 only)
+add_executable(ce_prog ${TARGET_DIR}/ce_prog.cpp)
+target_link_libraries(ce_prog PUBLIC Coyote pthread)

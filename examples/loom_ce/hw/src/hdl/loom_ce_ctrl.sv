@@ -21,6 +21,19 @@ import lynxTypes::*;
  *   8 BUSY     (RO) a copy is in flight
  *   9 COPIES   (RO) copies finished (the fence count)
  *  10 CYCLES   (RO) cycles from START to the data write's completion, last copy
+ *  11 PROG_VA  (RW) the program's VA in card memory (64 B entries, loom_ce.sv)
+ *  12 PROG_N   (RW) its entries, at most loom_ce's N_PROG
+ *  13 PROG_CMD (W)  1 -> load PROG_N entries from PROG_VA into the engine,
+ *                   2 -> run the loaded program (ignored while busy; BUSY
+ *                   covers both)
+ *  14 RUN_BASE (RW) added to every SIGNAL value and WAIT target of a run
+ *  15 ABORT    (W)  write 1 -> a run waiting in a WAIT ends there (ABORTED)
+ *  16 RUNS     (RO) runs completed
+ *  17 PC       (RO) the entry being executed
+ *  18 NOW      (RO) the free-running cycle counter STAMP writes
+ *  19 ABORTED  (RO) the last run ended in an ABORT
+ *  20 POLLS    (RO) WAIT polls that found the word short of its target
+ *  21 RUN_CYC  (RO) cycles from the last run's start to its end
  *  48 CE_OUT_BP  (RO) cycles the copy's write stream was valid and not ready
  *                     (a put: the peer-to-peer writes into the U280 held
  *                     back; a get: the HBM writes)
@@ -43,10 +56,22 @@ module loom_ce_ctrl (
     output logic [PID_BITS-1:0]         pid,
     output logic [VADDR_BITS-1:0]       fence_va,
     output logic                        get,
+    output logic                        prog_load,
+    output logic                        prog_run,
+    output logic [VADDR_BITS-1:0]       prog_va,
+    output logic [31:0]                 prog_n,
+    output logic [63:0]                 run_base,
+    output logic                        abort,
 
     input  logic                        busy,
     input  logic [31:0]                 copies,
     input  logic [63:0]                 cycles,
+    input  logic [31:0]                 runs,
+    input  logic [31:0]                 pc,
+    input  logic [63:0]                 now,
+    input  logic                        aborted,
+    input  logic [63:0]                 polls,
+    input  logic [63:0]                 run_cycles,
 
     input  logic                        cnt_ce_out_bp,
     input  logic                        cnt_ce_in_wait,
@@ -66,6 +91,17 @@ localparam integer R_DIR      = 6;
 localparam integer R_BUSY     = 8;
 localparam integer R_COPIES   = 9;
 localparam integer R_CYCLES   = 10;
+localparam integer R_PROG_VA  = 11;
+localparam integer R_PROG_N   = 12;
+localparam integer R_PROG_CMD = 13;
+localparam integer R_RUN_BASE = 14;
+localparam integer R_ABORT    = 15;
+localparam integer R_RUNS     = 16;
+localparam integer R_PC       = 17;
+localparam integer R_NOW      = 18;
+localparam integer R_ABORTED  = 19;
+localparam integer R_POLLS    = 20;
+localparam integer R_RUN_CYC  = 21;
 localparam integer R_PERF     = 48;   // 48-50, in the order of perf_pulse below
 localparam integer N_PERF     = 3;
 
@@ -79,16 +115,21 @@ wire ctrl_reg_rden = axi_arready && axi_ctrl.arvalid && ~axi_rvalid;
 wire [CSR_BITS-1:0] wr_idx = axi_awaddr[ADDR_LSB +: CSR_BITS];
 wire [CSR_BITS-1:0] rd_idx = axi_araddr[ADDR_LSB +: CSR_BITS];
 
-// START fires on the write pulse and needs wstrb[0] && wdata[0], so the
-// empty-strobe writes around a host ctrl write's line cannot fire it; the
-// other registers take full-strobe writes only (as examples/loom)
-logic [63:0] r_src, r_dst, r_len, r_pid, r_fence;
+// START, PROG_CMD and ABORT fire on the write pulse and need wstrb[0], so
+// the empty-strobe writes around a host ctrl write's line cannot fire them;
+// the other registers take full-strobe writes only (as examples/loom)
+logic [63:0] r_src, r_dst, r_len, r_pid, r_fence, r_prog_va, r_prog_n, r_run_base;
 logic        r_dir;
-assign start = ctrl_reg_wren && (wr_idx == R_START) && axi_ctrl.wstrb[0] && axi_ctrl.wdata[0];
+wire cmd_wr = ctrl_reg_wren && axi_ctrl.wstrb[0];
+assign start     = cmd_wr && (wr_idx == R_START) && axi_ctrl.wdata[0];
+assign prog_load = cmd_wr && (wr_idx == R_PROG_CMD) && axi_ctrl.wdata[1:0] == 2'd1;
+assign prog_run  = cmd_wr && (wr_idx == R_PROG_CMD) && axi_ctrl.wdata[1:0] == 2'd2;
+assign abort     = cmd_wr && (wr_idx == R_ABORT) && axi_ctrl.wdata[0];
 
 always_ff @(posedge aclk) begin
     if (!aresetn) begin
         r_src <= 0; r_dst <= 0; r_len <= 0; r_pid <= 0; r_fence <= 0; r_dir <= 1'b0;
+        r_prog_va <= 0; r_prog_n <= 0; r_run_base <= 0;
     end else if (ctrl_reg_wren && (&axi_ctrl.wstrb)) begin
         case (wr_idx)
             R_SRC_VA:   r_src   <= axi_ctrl.wdata;
@@ -97,6 +138,9 @@ always_ff @(posedge aclk) begin
             R_PID:      r_pid   <= axi_ctrl.wdata;
             R_FENCE_VA: r_fence <= axi_ctrl.wdata;
             R_DIR:      r_dir   <= axi_ctrl.wdata[0];
+            R_PROG_VA:  r_prog_va  <= axi_ctrl.wdata;
+            R_PROG_N:   r_prog_n   <= axi_ctrl.wdata;
+            R_RUN_BASE: r_run_base <= axi_ctrl.wdata;
             default: ;
         endcase
     end
@@ -108,6 +152,9 @@ assign len      = r_len[LEN_BITS-1:0];
 assign pid      = r_pid[PID_BITS-1:0];
 assign fence_va = r_fence[VADDR_BITS-1:0];
 assign get      = r_dir;
+assign prog_va  = r_prog_va[VADDR_BITS-1:0];
+assign prog_n   = r_prog_n[31:0];
+assign run_base = r_run_base;
 
 logic [63:0]       perf_cnt [N_PERF];
 logic [N_PERF-1:0] perf_pulse;
@@ -134,6 +181,15 @@ always_ff @(posedge aclk) begin
             R_BUSY:     axi_rdata <= {63'b0, busy};
             R_COPIES:   axi_rdata <= {32'b0, copies};
             R_CYCLES:   axi_rdata <= cycles;
+            R_PROG_VA:  axi_rdata <= r_prog_va;
+            R_PROG_N:   axi_rdata <= r_prog_n;
+            R_RUN_BASE: axi_rdata <= r_run_base;
+            R_RUNS:     axi_rdata <= {32'b0, runs};
+            R_PC:       axi_rdata <= {32'b0, pc};
+            R_NOW:      axi_rdata <= now;
+            R_ABORTED:  axi_rdata <= {63'b0, aborted};
+            R_POLLS:    axi_rdata <= polls;
+            R_RUN_CYC:  axi_rdata <= run_cycles;
             default:
                 if (rd_idx >= R_PERF && rd_idx < R_PERF + N_PERF)
                     axi_rdata <= perf_cnt[rd_idx - R_PERF];
