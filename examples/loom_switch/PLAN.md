@@ -41,7 +41,9 @@ through `scripts/fpga/build_bitstream.sh` (U280: Vivado 2023.2; V80: 2025.1).
   one in tmux with the standard arguments (U280 loom_switch / V80 loom_ce);
   `scripts/fpga/wait_build.sh <switch|ce> <build_name> [stage_name]` waits,
   reports image md5 and post-route timing, and stages the image to
-  `~/coyote-bitstreams/<stage_name>`. Underneath: `scripts/fpga/build_bitstream.sh`; a dead build:
+  `~/coyote-bitstreams/<stage_name>`; `scripts/fpga/test_build.sh <switch|ce>
+  <build_name> <stage_name> [baseline metrics.tsv]` (tmux) does that, sets
+  both hosts up with the new image, runs `regress.sh` and `ce_prog`. Underneath: `scripts/fpga/build_bitstream.sh`; a dead build:
   `scripts/fpga/resume_build.sh`; a static build that misses timing in the
   XDMA core: `scripts/fpga/close_static_timing.sh`. Shell builds of this
   example link against `hw/static` unless `-DSTATIC_PATH` says otherwise.
