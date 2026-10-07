@@ -7,7 +7,7 @@
 #
 #   u280.bit, v80.pdi  images on the shared home (every host must see them),
 #                      e.g. ~/coyote-bitstreams/loom-switch-coalesce-clean/hw/bitstreams/cyt_top.bit
-#                      and ~/coyote-bitstreams/loom-ce-get/cyt_top.pdi
+#                      and ~/coyote-bitstreams/loom-ce-rd64/cyt_top.pdi
 #   host               amy, rose or clara (clara has no V80)
 #
 # Runs every host at once, each in a tmux session `loom_setup` ON that host
