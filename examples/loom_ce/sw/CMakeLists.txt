@@ -44,3 +44,7 @@ target_link_libraries(ce_prog PUBLIC Coyote pthread)
 # E2: one-way latency between two V80s, both copy engines running programs (ping-pong)
 add_executable(ce_pingpong ${TARGET_DIR}/ce_pingpong.cpp)
 target_link_libraries(ce_pingpong PUBLIC Coyote pthread)
+
+# E4: the Section 2 dispatch / combine from one V80 into another through Loom (sender-side stamps)
+add_executable(ce_dispatch ${TARGET_DIR}/ce_dispatch.cpp)
+target_link_libraries(ce_dispatch PUBLIC Coyote pthread)
