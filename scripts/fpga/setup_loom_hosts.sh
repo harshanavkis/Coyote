@@ -9,6 +9,8 @@
 #                      e.g. ~/coyote-bitstreams/loom-switch-coalesce-clean/hw/bitstreams/cyt_top.bit
 #                      and ~/coyote-bitstreams/loom-ce-rd64/cyt_top.pdi
 #   host               amy, rose or clara (clara has no V80)
+#   v80.pdi = -        the V80s are programmed already (e.g. after a JTAG + warm-reboot recovery, or
+#                      when a V80's JTAG cable is gone): only reload their driver
 #
 # Runs every host at once, each in a tmux session `loom_setup` ON that host
 # (an interrupted ssh cannot leave a half-done or second programming run
@@ -58,8 +60,9 @@ if [ "${1:-}" = --here ]; then
     }
     [ -n "${U280_IP[$H]:-}" ] || fail "unknown host"
     [ -f "$BIT" ] || fail "no U280 image $BIT"
-    [ -z "${V80_BDF[$H]:-}" ] || [ -f "$PDI" ] || fail "no V80 image $PDI"
-    echo "== $H $(date -u +%H:%M:%S): U280 $BIT ($(md5sum < $BIT | cut -c1-8))${V80_BDF[$H]:+, V80 $PDI ($(md5sum < $PDI | cut -c1-8))}"
+    [ -z "${V80_BDF[$H]:-}" ] || [ "$PDI" = - ] || [ -f "$PDI" ] || fail "no V80 image $PDI"
+    PDI_ID=$([ "$PDI" = - ] && echo "as programmed" || echo "$PDI ($(md5sum < $PDI | cut -c1-8))")
+    echo "== $H $(date -u +%H:%M:%S): U280 $BIT ($(md5sum < $BIT | cut -c1-8))${V80_BDF[$H]:+, V80 $PDI_ID}"
 
     # 1, 2
     pkill -u "$(id -u)" -x hw_server && sleep 1
@@ -93,7 +96,16 @@ if [ "${1:-}" = --here ]; then
     pkill -u "$(id -u)" -x hw_server && sleep 1
 
     # 4. V80
-    if [ -n "${V80_BDF[$H]:-}" ]; then
+    if [ -n "${V80_BDF[$H]:-}" ] && [ "$PDI" = - ]; then   # programmed already: the driver only
+        V=/sys/bus/pci/devices/${V80_BDF[$H]}
+        sudo rmmod coyote_driver_versal 2>/dev/null
+        echo 1 | sudo tee /sys/bus/pci/rescan >/dev/null
+        [ -e $V ] && grep -qE '0x(b0|b1|b2|b3)3f' $V/device || fail "no Coyote V80 at ${V80_BDF[$H]} ($(cat $V/device 2>/dev/null))"
+        sudo insmod $STAGE/coyote_driver_versal.ko || fail "V80 driver insmod failed (dmesg)"
+        for i in $(seq 1 30); do ls -d /sys/kernel/coyote_versal_sysfs_* >/dev/null 2>&1 && break; sleep 1; done
+        echo "   V80 (as programmed): driver $(basename "$(readlink -f $V/driver)"), link $(link $V)"
+        ls -d /sys/kernel/coyote_versal_sysfs_* >/dev/null 2>&1 || fail "V80 driver up but no coyote_versal_sysfs node (dmesg)"
+    elif [ -n "${V80_BDF[$H]:-}" ]; then
         V=/sys/bus/pci/devices/${V80_BDF[$H]}
         for try in 1 2 3; do
             sudo rmmod coyote_driver_versal 2>/dev/null
@@ -149,8 +161,8 @@ fi
 [ $# -ge 3 ] || { sed -n '2,13p' "$0" >&2; exit 1; }
 HERE=$(cd "$(dirname "$0")" && pwd)
 REPO=$(git -C "$HERE" rev-parse --show-toplevel)
-BIT=$(readlink -f "$1"); PDI=$(readlink -f "$2"); shift 2
-for f in "$BIT" "$PDI"; do
+BIT=$(readlink -f "$1"); PDI=$([ "$2" = - ] && echo - || readlink -f "$2"); shift 2
+for f in "$BIT" $([ "$PDI" = - ] || echo "$PDI"); do
     case $f in "$HOME"/*) ;; *) echo "$f is not on the shared home; the hosts cannot see it" >&2; exit 1 ;; esac
     [ -f "$f" ] || { echo "no file $f" >&2; exit 1; }
 done

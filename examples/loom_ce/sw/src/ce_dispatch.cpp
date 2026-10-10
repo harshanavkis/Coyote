@@ -278,7 +278,8 @@ int main(int argc, char **argv) {
             if (!read_full(fd, &go, 1)) { printf("FAIL: the server did not arm\n"); return 1; }
             p.start(base);
         }
-        const bool ok = p.finish(std::chrono::milliseconds(5000));
+        // the first run takes the first touches of the landing pages (on rose ~10 s of driver page faults)
+        const bool ok = p.finish(std::chrono::milliseconds(r ? 5000 : 60000));
         if (!ok) { printf("FAIL run %d: the program did not finish (aborted at entry %lu)\n", r,
                           (unsigned long) v80.getCSR(ce_prog::PC)); errors++; break; }
         if (!server) {
