@@ -22,7 +22,7 @@ if [ ! -f "$LYNX_PKG" ]; then
     exit 1
 fi
 
-TBS="${TBS:-tb_loom_ce tb_uwin_hbm}"
+TBS="${TBS:-tb_loom_ce tb_uwin_hbm tb_uwin_ra}"
 # axisr_reg's register slice has a behavioural stand-in in examples/loom's tb
 SRCS="$LYNX_PKG $COYOTE_ROOT/hw/hdl/pkg/axi_intf.sv $COYOTE_ROOT/hw/hdl/pkg/lynx_intf.sv \
       ../src/hdl/loom_ce_ctrl.sv ../src/hdl/loom_ce.sv \
@@ -31,13 +31,14 @@ SRCS="$LYNX_PKG $COYOTE_ROOT/hw/hdl/pkg/axi_intf.sv $COYOTE_ROOT/hw/hdl/pkg/lynx
       $COYOTE_ROOT/hw/hdl/common/regs/axi_reg_array.sv $COYOTE_ROOT/hw/hdl/common/queues/fifo.sv \
       $COYOTE_ROOT/hw/hdl/common/queues/queue_meta.sv $COYOTE_ROOT/hw/hdl/stripe/axi_stripe_rd.sv \
       $COYOTE_ROOT/hw/hdl/stripe/axi_stripe_wr.sv $COYOTE_ROOT/hw/hdl/stripe/axi_stripe.sv \
-      $COYOTE_ROOT/hw/hdl/common/uwin/uwin_hbm.sv $COYOTE_ROOT/hw/hdl/common/uwin/uwin_mon.sv"
+      $COYOTE_ROOT/hw/hdl/common/uwin/uwin_hbm.sv $COYOTE_ROOT/hw/hdl/common/uwin/uwin_mon.sv \
+      $COYOTE_ROOT/hw/hdl/common/uwin/uwin_ra.sv"
 
 mkdir -p work && cd work
 
 echo "== xvlog =="
 xvlog -sv $(for f in $SRCS; do echo ../$f; done) -i ../../src -i ../$COYOTE_ROOT/hw/hdl/pkg \
-    ../tb_loom_ce.sv ../tb_uwin_hbm.sv > xvlog.log 2>&1 || { grep -E 'ERROR' xvlog.log | head -20; echo "COMPILE FAILED"; exit 1; }
+    ../tb_loom_ce.sv ../tb_uwin_hbm.sv ../tb_uwin_ra.sv > xvlog.log 2>&1 || { grep -E 'ERROR' xvlog.log | head -20; echo "COMPILE FAILED"; exit 1; }
 
 fail=0
 for tb in $TBS; do

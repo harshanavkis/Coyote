@@ -14,12 +14,16 @@ import lynxTypes::*;
  *   11 sum of reads outstanding over cycles (/ 9 = mean AR-to-last-R cycles)
  *   12 most reads outstanding at once   13 AR stalled (arvalid, !arready)
  *   14 R stalled (rvalid, !rready: static side slow)
+ * It sits on the static's side of uwin_ra (the axi_main read-ahead): what the
+ * peer sees, ring hits included. uwin_ra's own counters (xclk) ride along:
+ * the snapshot is these N words, then its N_RA.
  * A snapshot is taken every 256 cycles and held, with a toggle that flips
  * after it: the reader (uwin_hbm, aclk) captures the snapshot when the
  * synchronized toggle changes, by which time it has long been stable.
  */
 module uwin_mon #(
-    parameter integer N = 15
+    parameter integer N    = 15,
+    parameter integer N_RA = 13
 ) (
     input  logic                xclk,
     input  logic                xresetn,
@@ -39,7 +43,9 @@ module uwin_mon #(
     input  logic                rready,
     input  logic                rlast,
 
-    output logic [64*N-1:0]     snap,
+    input  logic [64*N_RA-1:0]  ra_ctr,     // uwin_ra's counters
+
+    output logic [64*(N+N_RA)-1:0] snap,
     output logic                snap_tgl
 );
 
@@ -78,8 +84,10 @@ always_ff @(posedge xclk) begin
         ctr[13] <= ctr[13] + (arvalid && !arready);
         ctr[14] <= ctr[14] + (rvalid && !rready);
         tick <= tick + 1;
-        if (tick == 8'd0)
+        if (tick == 8'd0) begin
             for (int i = 0; i < N; i++) snap[64*i +: 64] <= ctr[i];
+            snap[64*N +: 64*N_RA] <= ra_ctr;
+        end
         if (tick == 8'd1)
             snap_tgl <= ~snap_tgl;
     end

@@ -13,8 +13,8 @@
  *
  * The window's last 4 KiB page reads back uwin_hbm's counters instead of HBM
  * (where the peer's writes, and its reads, spend their cycles, and what its
- * read-ahead did); the whole window is mapped for that, and Counters prints
- * what one copy cost.
+ * read-ahead did, and uwin_ra's on axi_main); the whole window is mapped for
+ * that, and Counters prints what one copy cost.
  */
 #include <chrono>
 #include <cstdint>
@@ -43,15 +43,21 @@ struct Counters {
     // words 40-49: uwin_hbm's read-ahead (on/off: counter page line 61/60; RA_MODE says which)
     static constexpr int N_RA = 10;
     enum { RA_HIT, RA_LATE, RA_PASS, RA_AR, RA_FILLED, RA_SERVED, RA_STREAMS, RA_END_JUMP, RA_END_WRITE, RA_END_IDLE };
-    // uwin_hbm counts in the shell's aclk (ACLK_F, 250 MHz), uwin_mon in the static's xclk (SCLK_F, 333 MHz on the V80)
+    // words 64-76: uwin_ra's read-ahead on axi_main, before the clock crossing (xclk; on/off: counter page line
+    // 59/58, X_MODE says which; a snapshot like words 16-30). X_FILL_OUT_SUM / X_AR = cycles a read-ahead AR is out
+    static constexpr int N_X = 13;
+    enum { X_MODE, X_HIT, X_LATE, X_PASS, X_AR, X_FILLED, X_SERVED, X_STREAMS, X_END_JUMP, X_END_WRITE, X_END_IDLE,
+           X_FILL_OUT_SUM, X_NZ_ID };
+    // uwin_hbm counts in the shell's aclk (ACLK_F, 250 MHz), uwin_mon and uwin_ra in the static's xclk (SCLK_F, 333 MHz on the V80)
     static constexpr double ACLK_NS = 1e3 / 250, XCLK_NS = 1e3 / 333;
-    uint64_t v[N], m[N_MAIN], r[N_R], a[N_RA];
+    uint64_t v[N], m[N_MAIN], r[N_R], a[N_RA], x[N_X];
     static Counters read(volatile uint64_t *win) {
         Counters c;
         for (int i = 0; i < N; i++) c.v[i] = win[(UWIN_SIZE - 4096) / 8 + i];
         for (int i = 0; i < N_MAIN; i++) c.m[i] = win[(UWIN_SIZE - 4096) / 8 + 16 + i];
         for (int i = 0; i < N_R; i++) c.r[i] = win[(UWIN_SIZE - 4096) / 8 + 32 + i];
         for (int i = 0; i < N_RA; i++) c.a[i] = win[(UWIN_SIZE - 4096) / 8 + 40 + i];
+        for (int i = 0; i < N_X; i++) c.x[i] = win[(UWIN_SIZE - 4096) / 8 + 64 + i];
         return c;
     }
     // One side's reads: AR, beats per read, completed, mean outstanding while any is, mean AR-to-last-R
@@ -97,6 +103,15 @@ struct Counters {
                    "%lu lines read ahead, %lu served; %lu streams, ended by a jump %lu, a write %lu, idle %lu\n",
                    v[RA_MODE] ? "on" : "off", g(RA_HIT) + g(RA_LATE), g(RA_HIT), g(RA_LATE), g(RA_PASS), g(RA_AR),
                    g(RA_FILLED), g(RA_SERVED), g(RA_STREAMS), g(RA_END_JUMP), g(RA_END_WRITE), g(RA_END_IDLE));
+        // uwin_ra (axi_main): the same, and how long its read-ahead ARs are out (the interconnect, uwin_hbm and HBM)
+        auto h = [&](int i) { return (unsigned long) (x[i] - b.x[i]); };
+        if (x[X_MODE] || h(X_STREAMS) || h(X_PASS) || h(X_NZ_ID))
+            printf("     axi_main read-ahead (now %s): %lu stream reads, %lu hits, %lu late; %lu passed through; %lu ARs "
+                   "(out %.0f ns each), %lu lines read ahead, %lu served; %lu streams, ended by a jump %lu, a write %lu, "
+                   "idle %lu; %lu ARs with a nonzero ID\n",
+                   x[X_MODE] ? "on" : "off", h(X_HIT) + h(X_LATE), h(X_HIT), h(X_LATE), h(X_PASS), h(X_AR),
+                   h(X_AR) ? double(h(X_FILL_OUT_SUM)) / h(X_AR) * XCLK_NS : 0.0, h(X_FILLED), h(X_SERVED), h(X_STREAMS),
+                   h(X_END_JUMP), h(X_END_WRITE), h(X_END_IDLE), h(X_NZ_ID));
     }
 };
 

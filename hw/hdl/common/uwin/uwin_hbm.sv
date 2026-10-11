@@ -34,6 +34,9 @@ import lynxTypes::*;
  *                       15 the mode: 1 while discarding
  * Words 16-30: uwin_mon's counts of the shell's axi_main port (xclk), where
  * the window's writes and reads enter the shell - see uwin_mon.sv.
+ * Words 64-76: uwin_ra's counts (xclk), the read-ahead on axi_main (on/off:
+ * lines 59/58) - see uwin_ra.sv, words 0-12 there. Like 16-30, a snapshot
+ * taken every 256 xclk cycles.
  * Words 32-39: the window's reads (counter-page reads among them)
  *   32 AR bursts        36 sum of reads outstanding over cycles
  *   33 R beats             (/ 34 = mean AR-to-last-R cycles)
@@ -63,7 +66,9 @@ import lynxTypes::*;
  *
  * READ-AHEAD: a peer reading a buffer in order (an RDMA NIC fetching a
  * message: 256 B reads, ~32 in flight across PCIe) waits for HBM on every
- * read. Off at reset (the window then works exactly as without it); a read of
+ * read. uwin_ra does the same before the shell's clock crossing, where it
+ * saves more (lines 59/58); keep this one off while that one is on. Off at
+ * reset (the window then works exactly as without it); a read of
  * the counter page's line 61 (UWIN_SIZE - 4096 + 61*64) turns it on, line 60
  * off, at once; word 14 says which.
  *   Stream: an AR continues the previous one if it starts at the line where
@@ -120,16 +125,17 @@ module uwin_hbm #(
     AXI4.s                      s_axi,
     AXI4.m                      m_axi,
 
-    // uwin_mon's snapshot of axi_main (xclk), and its toggle
-    input  logic [64*15-1:0]    main_snap,
+    // uwin_mon's snapshot of axi_main (xclk): its 15 counters, then uwin_ra's
+    // 13; and its toggle
+    input  logic [64*28-1:0]    main_snap,
     input  logic                main_tgl
 );
 
 // axi_main counters: captured when the synchronized toggle changes (the
 // snapshot has been stable since well before it flipped)
-localparam integer N_MAIN = 15;
+localparam integer N_MAIN = 15, N_XRA = 13;
 (* ASYNC_REG = "TRUE" *) logic [2:0] main_tgl_s;
-logic [64*N_MAIN-1:0] main_ctr;
+logic [64*(N_MAIN+N_XRA)-1:0] main_ctr;
 always_ff @(posedge aclk) begin
     if (!aresetn) begin
         main_tgl_s <= '0;
@@ -485,6 +491,8 @@ always_comb begin
             ctr_data[64*j +: 64] = rctr[8*r_line + j - 32];
         else if (8*r_line + j >= 40 && 8*r_line + j < 40 + N_ACTR)
             ctr_data[64*j +: 64] = actr[8*r_line + j - 40];
+        else if (8*r_line + j >= 64 && 8*r_line + j < 64 + N_XRA)
+            ctr_data[64*j +: 64] = main_ctr[64*(N_MAIN + 8*r_line + j - 64) +: 64];
 end
 
 assign s_axi.rdata    = hd_ring ? ring_q[AXI_DATA_BITS-1:0] : rq_ctr[rp] ? ctr_data : m_axi.rdata;
