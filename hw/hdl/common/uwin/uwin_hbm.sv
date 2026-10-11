@@ -16,10 +16,10 @@ import lynxTypes::*;
  * needs AXI's rlast. So rlast is made here: each accepted read's length is
  * queued (in order: one ID), and rlast is raised on its last beat.
  *
- * COUNTERS: where a peer's writes into the window spend their cycles. A read
- * of the window's last 4 KiB page returns them instead of HBM (the read still
- * goes to HBM, for its beats; only the data is replaced): 64-bit word i at
- * page offset 8*i, free-running, the reader takes deltas.
+ * COUNTERS: where a peer's writes into the window, and its reads of it, spend
+ * their cycles. A read of the window's last 4 KiB page returns them instead of
+ * HBM (the read still goes to HBM, for its beats; only the data is replaced):
+ * 64-bit word i at page offset 8*i, free-running, the reader takes deltas.
  *   0 cycles            6 B responses
  *   1 AW bursts         7 B stalled (bvalid, !bready)
  *   2 W beats           8 cycles with a write outstanding (AW taken, no B yet)
@@ -31,8 +31,16 @@ import lynxTypes::*;
  *                       12 bursts discarded (DISCARD below)
  *                       13 bursts with a nonzero AWID
  *                       15 the mode: 1 while discarding
- * Words 16-22: uwin_mon's counts of the shell's axi_main port (xclk), where
- * the window's writes enter the shell - see uwin_mon.sv.
+ * Words 16-30: uwin_mon's counts of the shell's axi_main port (xclk), where
+ * the window's writes and reads enter the shell - see uwin_mon.sv.
+ * Words 32-39: the window's reads (counter-page reads among them)
+ *   32 AR bursts        36 sum of reads outstanding over cycles
+ *   33 R beats             (/ 34 = mean AR-to-last-R cycles)
+ *   34 reads completed  37 most reads outstanding at once
+ *   35 cycles with a read outstanding (AR taken, last R not yet)
+ *   38 AR stalled (arvalid, !arready: memory side slow, or N_RD in flight)
+ *   39 R stalled (rvalid, !rready: PCIe side slow)
+ * Every other word of the page reads 0.
  *
  * DISCARD (diagnostic): writes are accepted at once, counted, answered here
  * (OKAY) and never reach HBM - the window's own rate with the memory taken
@@ -54,13 +62,13 @@ module uwin_hbm #(
     AXI4.m                      m_axi,
 
     // uwin_mon's snapshot of axi_main (xclk), and its toggle
-    input  logic [64*7-1:0]     main_snap,
+    input  logic [64*15-1:0]    main_snap,
     input  logic                main_tgl
 );
 
 // axi_main counters: captured when the synchronized toggle changes (the
 // snapshot has been stable since well before it flipped)
-localparam integer N_MAIN = 7;
+localparam integer N_MAIN = 15;
 (* ASYNC_REG = "TRUE" *) logic [2:0] main_tgl_s;
 logic [64*N_MAIN-1:0] main_ctr;
 always_ff @(posedge aclk) begin
@@ -143,12 +151,20 @@ logic [15:0]        wr_out;          // AW taken, B not yet
 wire aw_hs = s_axi.awvalid && s_axi.awready;
 wire w_hs  = s_axi.wvalid && s_axi.wready;
 wire b_hs  = s_axi.bvalid && s_axi.bready;
+// reads: words 32-39
+localparam integer N_RCTR = 8;
+logic [63:0] rctr [N_RCTR];
+logic [15:0] rd_out;                 // AR taken, last R not yet
+wire r_hs    = s_axi.rvalid && s_axi.rready;
+wire rd_done = r_hs && s_axi.rlast;
 
 always_ff @(posedge aclk) begin
     if (!aresetn) begin
         for (int i = 0; i < N_CTR; i++) ctr[i] <= '0;
+        for (int i = 0; i < N_RCTR; i++) rctr[i] <= '0;
         w_owed <= '0;
         wr_out <= '0;
+        rd_out <= '0;
     end else begin
         w_owed <= w_owed + (aw_hs ? 16'(s_axi.awlen) + 16'sd1 : 16'sd0) - (w_hs ? 16'sd1 : 16'sd0);
         wr_out <= wr_out + (aw_hs ? 16'd1 : 16'd0) - (b_hs ? 16'd1 : 16'd0);
@@ -167,6 +183,15 @@ always_ff @(posedge aclk) begin
         ctr[12] <= ctr[12] + (aw_hs && discard);
         ctr[13] <= ctr[13] + (aw_hs && (s_axi.awid != '0));
         ctr[15] <= 64'(discard);
+        rd_out  <= rd_out + (ar_hs ? 16'd1 : 16'd0) - (rd_done ? 16'd1 : 16'd0);
+        rctr[0] <= rctr[0] + ar_hs;
+        rctr[1] <= rctr[1] + r_hs;
+        rctr[2] <= rctr[2] + rd_done;
+        rctr[3] <= rctr[3] + (rd_out != 0);
+        rctr[4] <= rctr[4] + rd_out;
+        if (64'(rd_out) > rctr[5]) rctr[5] <= 64'(rd_out);
+        rctr[6] <= rctr[6] + (s_axi.arvalid && !s_axi.arready);
+        rctr[7] <= rctr[7] + (s_axi.rvalid && !s_axi.rready);
     end
 end
 
@@ -208,6 +233,8 @@ always_comb begin
         if (8*r_line + j < N_CTR) ctr_data[64*j +: 64] = ctr[8*r_line + j];
         else if (8*r_line + j >= 16 && 8*r_line + j < 16 + N_MAIN)
             ctr_data[64*j +: 64] = main_ctr[64*(8*r_line + j - 16) +: 64];
+        else if (8*r_line + j >= 32 && 8*r_line + j < 32 + N_RCTR)
+            ctr_data[64*j +: 64] = rctr[8*r_line + j - 32];
 end
 
 assign s_axi.rdata    = rq_ctr[rp] ? ctr_data : m_axi.rdata;

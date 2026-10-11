@@ -24,7 +24,9 @@ import lynxTypes::*;
  * DISCARD (T7): switched on and off by counter-page reads, writes answered
  * by uwin_hbm with their own IDs and never reaching memory, a switch held
  * back while a write is in flight. T8: 64 reads in flight (R held back),
- * the 65th held until they are answered.
+ * the 65th held until they are answered. Counters: T5 the writes' (words
+ * 0-15), T6 uwin_mon's writes and reads across the clock crossing (16-30),
+ * T9 the window's reads (32-39) exact against what its port showed.
  */
 module tb_uwin_hbm;
 
@@ -44,11 +46,14 @@ AXI4 card_mem (.aclk(aclk));
 logic xclk = 0;
 always #1.5 xclk = ~xclk;
 logic m_awvalid = 0, m_awready = 0, m_wvalid = 0, m_wready = 0, m_bvalid = 0, m_bready = 0;
-logic [7:0] m_awlen = 0;
-logic [64*7-1:0] main_snap;
+logic m_arvalid = 0, m_arready = 0, m_rvalid = 0, m_rready = 0, m_rlast = 0;
+logic [7:0] m_awlen = 0, m_arlen = 0;
+logic [64*15-1:0] main_snap;
 logic main_tgl;
 uwin_mon inst_uwin_mon (.xclk(xclk), .xresetn(aresetn), .awvalid(m_awvalid), .awready(m_awready), .awlen(m_awlen),
                         .wvalid(m_wvalid), .wready(m_wready), .bvalid(m_bvalid), .bready(m_bready),
+                        .arvalid(m_arvalid), .arready(m_arready), .arlen(m_arlen),
+                        .rvalid(m_rvalid), .rready(m_rready), .rlast(m_rlast),
                         .snap(main_snap), .snap_tgl(main_tgl));
 uwin_hbm #(.BASE(UWIN_HBM_BASE)) inst_uwin_hbm (.aclk(aclk), .aresetn(aresetn), .s_axi(win_in), .m_axi(win_hbm),
                                                .main_snap(main_snap), .main_tgl(main_tgl));
@@ -237,6 +242,19 @@ always @(posedge aclk) if (t7_on) begin
     end
 end
 
+// T9: the window's reads as its port (s_axi) shows them, from reset: cycles
+// with a read outstanding (AR taken, last R not yet), the sum of reads
+// outstanding, AR and R stalls. Nonblocking, so a value read at a posedge has
+// what uwin_hbm's counters had
+longint rd_out = 0, rd_cyc = 0, rd_sum = 0, rd_ar_stall = 0, rd_r_stall = 0;
+always @(posedge aclk) if (aresetn) begin
+    rd_out      <= rd_out + (win_in.arvalid && win_in.arready) - (win_in.rvalid && win_in.rready && win_in.rlast);
+    rd_cyc      <= rd_cyc + (rd_out != 0);
+    rd_sum      <= rd_sum + rd_out;
+    rd_ar_stall <= rd_ar_stall + (win_in.arvalid && !win_in.arready);
+    rd_r_stall  <= rd_r_stall + (win_in.rvalid && !win_in.rready);
+end
+
 // One beat of the counter page's line `line`: its eight words
 task automatic ctr_line(input int line, output logic [63:0] c [8]);
     int got = 0;
@@ -361,10 +379,13 @@ initial begin
 
     // --- T6: axi_main's counters (uwin_mon, xclk), across the clock crossing:
     //     10 AWs of 4 beats, 40 W beats against a wready low every third
-    //     cycle, 10 Bs; then the page's words 16-22 after a snapshot
+    //     cycle, 10 Bs; reads: 3 cycles AR stalled, 4 ARs of 2 beats, 5 idle
+    //     cycles, then 10 R beats against an rready low every third cycle, a
+    //     5th AR taken with the first read's last beat; then the page's words
+    //     16-30 after a snapshot
     begin
-        int beats = 0, stalls = 0, starve = 0;
-        logic [63:0] c [8];
+        int beats = 0, stalls = 0, starve = 0, rb = 0;
+        logic [63:0] c [8], c2 [8];
         int got = 0;
         @(negedge xclk); m_awvalid = 1; m_awready = 1; m_awlen = 3;
         repeat (10) @(negedge xclk);
@@ -381,6 +402,20 @@ initial begin
         m_bvalid = 1; m_bready = 1;
         repeat (10) @(negedge xclk);
         m_bvalid = 0; m_bready = 0;
+        m_arvalid = 1; m_arlen = 1;
+        repeat (3) @(negedge xclk);     // AR stalled
+        m_arready = 1;
+        repeat (4) @(negedge xclk);     // 4 reads outstanding
+        m_arvalid = 0; m_arready = 0;
+        repeat (5) @(negedge xclk);
+        for (int k = 0; rb < 10; k++) begin
+            m_rvalid = 1; m_rready = (k % 3 != 0); m_rlast = (rb % 2 == 1);
+            m_arvalid = (k == 2); m_arready = (k == 2);
+            @(posedge xclk);
+            if (m_rready) rb++;
+            @(negedge xclk);
+        end
+        m_rvalid = 0; m_rready = 0; m_rlast = 0; m_arvalid = 0; m_arready = 0;
         repeat (700) @(negedge xclk);   // two snapshots later
         @(negedge aclk); win_in.araddr = BAR + UWIN_SIZE - 4096 + 128; win_in.arlen = 0; win_in.arvalid = 1;
         do @(posedge aclk); while (!win_in.arready);
@@ -399,9 +434,21 @@ initial begin
         `CHECK(c[4] == starve,  $sformatf("T6: W starved %0d, want %0d", c[4], starve))
         `CHECK(c[5] == 0,       $sformatf("T6: AW stalled %0d, want 0", c[5]))
         `CHECK(c[6] == 10,      $sformatf("T6: B %0d, want 10", c[6]))
-        `CHECK(c[7] == 0,       $sformatf("T6: word 23 = %0d, want 0", c[7]))
+        // reads outstanding: 1,2,3 behind the first three ARs, 4 for the 5
+        // idle cycles and 6 R cycles (the 5th AR replaces the first read),
+        // then 3,3,3,2,2,2,1,1,1: 23 cycles, sum 6 + 20 + 24 + 18 = 68
+        ctr_line(3, c2);
+        `CHECK(c[7] == 5,       $sformatf("T6: AR %0d, want 5", c[7]))
+        `CHECK(c2[0] == 10,     $sformatf("T6: R beats %0d, want 10", c2[0]))
+        `CHECK(c2[1] == 5,      $sformatf("T6: reads completed %0d, want 5", c2[1]))
+        `CHECK(c2[2] == 23,     $sformatf("T6: cycles with a read outstanding %0d, want 23", c2[2]))
+        `CHECK(c2[3] == 68,     $sformatf("T6: sum of reads outstanding %0d, want 68", c2[3]))
+        `CHECK(c2[4] == 4,      $sformatf("T6: most reads outstanding %0d, want 4", c2[4]))
+        `CHECK(c2[5] == 3,      $sformatf("T6: AR stalled %0d, want 3", c2[5]))
+        `CHECK(c2[6] == 5,      $sformatf("T6: R stalled %0d, want 5", c2[6]))
+        `CHECK(c2[7] == 0,      $sformatf("T6: word 31 = %0d, want 0", c2[7]))
     end
-    $display("ok   T6 axi_main counters (uwin_mon) through the clock crossing");
+    $display("ok   T6 axi_main counters (uwin_mon) through the clock crossing, writes and reads");
 
     // --- T7: DISCARD. On (line 63), 40 bursts with AW running ahead of W (the
     //     ID ring fills: 32), IDs 0-3; nothing reaches memory, each B carries
@@ -512,6 +559,54 @@ initial begin
         `CHECK(!win_in.rvalid, "T8: an extra R")
     end
     $display("ok   T8 64 reads in flight, the 65th held");
+
+    // --- T9: the window's read counters (words 32-39): 16 reads of 4 beats
+    //     taken with R held back for 40 cycles, then answered. Between the
+    //     two counter reads: the 16, the first counter read's R, the second's
+    //     AR. Most outstanding since reset: T8's 64
+    begin
+        logic [63:0] c0 [8], c [8];
+        longint cyc, sum, ars, rs;
+        int acc = 0, got = 0, w = 0;
+        ctr_line(4, c0);
+        @(negedge aclk); win_in.rready = 0;
+        for (int k = 0; k < 16; k++) begin
+            @(negedge aclk); win_in.araddr = BAR + 64'h4_0000 + 256*k; win_in.arlen = 3; win_in.arvalid = 1;
+            do @(posedge aclk); while (!win_in.arready);
+            acc++;
+            @(negedge aclk); win_in.arvalid = 0;
+        end
+        repeat (40) @(negedge aclk);
+        win_in.rready = 1;
+        while (got < 64 && w < 5000) begin
+            @(posedge aclk); w++;
+            if (win_in.rvalid && win_in.rready) begin
+                for (int b = 0; b < 64; b++)
+                    `CHECK(win_in.rdata[8*b +: 8] == val(UWIN_HBM_BASE + 64'h4_0000 + 64*got + b, 4),
+                           $sformatf("T9: byte %0d of beat %0d", b, got))
+                `CHECK(win_in.rlast == (got % 4 == 3), $sformatf("T9: rlast on beat %0d", got))
+                got++;
+            end
+        end
+        `CHECK(acc == 16 && got == 64, $sformatf("T9: %0d reads taken, %0d of 64 beats", acc, got))
+        repeat (10) @(negedge aclk);
+        ctr_line(4, c);
+        cyc = rd_cyc; sum = rd_sum; ars = rd_ar_stall; rs = rd_r_stall;
+        `CHECK(c[0] - c0[0] == 17,  $sformatf("T9: AR bursts %0d, want 17", c[0] - c0[0]))
+        `CHECK(c[1] - c0[1] == 65,  $sformatf("T9: R beats %0d, want 65", c[1] - c0[1]))
+        `CHECK(c[2] - c0[2] == 17,  $sformatf("T9: reads completed %0d, want 17", c[2] - c0[2]))
+        `CHECK(c[3] == cyc,         $sformatf("T9: cycles with a read outstanding %0d, port shows %0d", c[3], cyc))
+        `CHECK(c[4] == sum,         $sformatf("T9: sum of reads outstanding %0d, port shows %0d", c[4], sum))
+        `CHECK(c[3] - c0[3] >= 40 && c[4] - c0[4] >= 16*40,
+               $sformatf("T9: %0d cycles, sum %0d outstanding with 16 held 40 cycles", c[3] - c0[3], c[4] - c0[4]))
+        `CHECK(c[5] == 64,          $sformatf("T9: most reads outstanding %0d, want 64 (T8)", c[5]))
+        `CHECK(c[6] == ars,         $sformatf("T9: AR stalled %0d, port shows %0d", c[6], ars))
+        `CHECK(c[7] == rs && c[7] - c0[7] >= 40,
+               $sformatf("T9: R stalled %0d (%0d here), port shows %0d", c[7], c[7] - c0[7], rs))
+        ctr_line(5, c);
+        for (int j = 0; j < 8; j++) `CHECK(c[j] == 0, $sformatf("T9: word %0d = %0d, want 0", 40 + j, c[j]))
+    end
+    $display("ok   T9 read counters: 16 reads held back then answered, exact against the port");
 
     if (errors == 0) $display("TB PASS (tb_uwin_hbm)");
     else             $display("TB FAIL (tb_uwin_hbm): %0d errors", errors);

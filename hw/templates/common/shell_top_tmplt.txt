@@ -1484,15 +1484,17 @@ module shell_top (
     // ================-----------------------------------------------------------------
 
 {% if cnfg.en_uwin_hbm %}
-    // Where the user data window's writes enter the shell (axi_main, xclk):
-    // counted for the window's counter page (uwin_mon.sv)
-    logic [64*7-1:0] uwin_main_snap;
-    logic            uwin_main_tgl;
+    // Where the user data window's writes and reads enter the shell (axi_main,
+    // xclk): counted for the window's counter page (uwin_mon.sv)
+    logic [64*15-1:0] uwin_main_snap;
+    logic             uwin_main_tgl;
     uwin_mon inst_uwin_mon (
         .xclk(xclk), .xresetn(xresetn),
         .awvalid(s_axi_main_awvalid), .awready(s_axi_main_awready), .awlen(s_axi_main_awlen),
         .wvalid(s_axi_main_wvalid), .wready(s_axi_main_wready),
         .bvalid(s_axi_main_bvalid), .bready(s_axi_main_bready),
+        .arvalid(s_axi_main_arvalid), .arready(s_axi_main_arready), .arlen(s_axi_main_arlen),
+        .rvalid(s_axi_main_rvalid), .rready(s_axi_main_rready), .rlast(s_axi_main_rlast),
         .snap(uwin_main_snap), .snap_tgl(uwin_main_tgl)
     );
 

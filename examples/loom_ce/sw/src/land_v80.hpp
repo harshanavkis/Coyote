@@ -12,8 +12,8 @@
  * through the window itself (reads return HBM), pull() syncs the buffer.
  *
  * The window's last 4 KiB page reads back uwin_hbm's counters instead of HBM
- * (where the peer's writes spend their cycles); the whole window is mapped
- * for that, and Counters prints what one copy cost.
+ * (where the peer's writes, and its reads, spend their cycles); the whole
+ * window is mapped for that, and Counters prints what one copy cost.
  */
 #include <chrono>
 #include <cstdint>
@@ -32,15 +32,33 @@ struct Counters {
     static constexpr int N = 16;
     enum { CYC, AW, W, W_STALL, W_STARVE, AW_STALL, B, B_STALL, OUT_CYC, OUT_SUM, OUT_MAX, PARTIAL,
            DISCARDED, NZ_ID, RSVD14, MODE };
-    // words 16-22: uwin_mon's axi_main counts (xclk), where the writes enter the shell
-    static constexpr int N_MAIN = 7;
-    enum { M_CYC, M_AW, M_W, M_W_STALL, M_W_STARVE, M_AW_STALL, M_B };
-    uint64_t v[N], m[N_MAIN];
+    // words 16-30: uwin_mon's axi_main counts (xclk), where the writes and reads enter the shell
+    static constexpr int N_MAIN = 15;
+    enum { M_CYC, M_AW, M_W, M_W_STALL, M_W_STARVE, M_AW_STALL, M_B,
+           M_AR, M_R, M_RD_DONE, M_RD_OUT_CYC, M_RD_OUT_SUM, M_RD_OUT_MAX, M_AR_STALL, M_R_STALL };
+    // words 32-39: uwin_hbm's own counts of the window's reads (aclk)
+    static constexpr int N_R = 8;
+    enum { RD_AR, RD_R, RD_DONE, RD_OUT_CYC, RD_OUT_SUM, RD_OUT_MAX, RD_AR_STALL, RD_R_STALL };
+    // uwin_hbm counts in the shell's aclk (ACLK_F, 250 MHz), uwin_mon in the static's xclk (SCLK_F, 333 MHz on the V80)
+    static constexpr double ACLK_NS = 1e3 / 250, XCLK_NS = 1e3 / 333;
+    uint64_t v[N], m[N_MAIN], r[N_R];
     static Counters read(volatile uint64_t *win) {
         Counters c;
         for (int i = 0; i < N; i++) c.v[i] = win[(UWIN_SIZE - 4096) / 8 + i];
         for (int i = 0; i < N_MAIN; i++) c.m[i] = win[(UWIN_SIZE - 4096) / 8 + 16 + i];
+        for (int i = 0; i < N_R; i++) c.r[i] = win[(UWIN_SIZE - 4096) / 8 + 32 + i];
         return c;
+    }
+    // One side's reads: AR, beats per read, completed, mean outstanding while any is, mean AR-to-last-R
+    // (cycles, ns), max outstanding since reset, AR stalled, R stalled
+    static void print_reads(const char *side, unsigned long cyc, unsigned long ar, unsigned long beats,
+                            unsigned long done, unsigned long out_cyc, unsigned long out_sum, uint64_t out_max,
+                            unsigned long ar_stall, unsigned long r_stall, double clk_ns) {
+        const double life = done ? double(out_sum) / done : 0.0;
+        printf("     %s reads over %lu cycles: %lu AR (%.1f beats), %lu completed; outstanding %lu cycles, "
+               "mean %.1f, AR->last R %.0f cycles (%.0f ns), max since reset %lu; AR stalled %lu, R stalled %lu\n",
+               side, cyc, ar, ar ? double(beats) / ar : 0.0, done, out_cyc, out_cyc ? double(out_sum) / out_cyc : 0.0,
+               life, life * clk_ns, (unsigned long) out_max, ar_stall, r_stall);
     }
     void print(const Counters &b) const {
         auto d = [&](int i) { return (unsigned long) (v[i] - b.v[i]); };
@@ -58,6 +76,14 @@ struct Counters {
         printf("     axi_main (static -> shell, xclk) over %lu cycles: %lu W beats, %lu stalled (shell not ready), "
                "%lu starved (static side), %lu AW, AW stalled %lu, B %lu (snapshots every 256 cycles)\n",
                e(M_CYC), e(M_W), e(M_W_STALL), e(M_W_STARVE), e(M_AW), e(M_AW_STALL), e(M_B));
+        // reads, counter-page reads among them (read() makes 39): AR stalled = memory side slow (or 64 in
+        // flight) at the window, shell not ready at axi_main; R stalled = PCIe side slow at the window,
+        // static side at axi_main
+        auto f = [&](int i) { return (unsigned long) (r[i] - b.r[i]); };
+        print_reads("V80 window (aclk)", d(CYC), f(RD_AR), f(RD_R), f(RD_DONE), f(RD_OUT_CYC), f(RD_OUT_SUM),
+                    r[RD_OUT_MAX], f(RD_AR_STALL), f(RD_R_STALL), ACLK_NS);
+        print_reads("axi_main (xclk)", e(M_CYC), e(M_AR), e(M_R), e(M_RD_DONE), e(M_RD_OUT_CYC), e(M_RD_OUT_SUM),
+                    m[M_RD_OUT_MAX], e(M_AR_STALL), e(M_R_STALL), XCLK_NS);
     }
 };
 
