@@ -25,3 +25,7 @@ target_link_libraries(get_bench PUBLIC Coyote pthread)
 # E2: one-way latency of CPU stores through Loom, host to host (ping-pong)
 add_executable(uwin_pingpong ${TARGET_DIR}/uwin_pingpong.cpp)
 target_link_libraries(uwin_pingpong PUBLIC Coyote pthread)
+
+# PTDMA (the host CPU's DMA engines) as Loom's copy engine, host DRAM -> window -> far host
+add_executable(uwin_ptdma ${TARGET_DIR}/uwin_ptdma.cpp)
+target_link_libraries(uwin_ptdma PUBLIC Coyote pthread)
