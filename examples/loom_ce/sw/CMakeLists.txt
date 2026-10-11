@@ -48,3 +48,6 @@ target_link_libraries(ce_pingpong PUBLIC Coyote pthread)
 # E4: the Section 2 dispatch / combine from one V80 into another through Loom (sender-side stamps)
 add_executable(ce_dispatch ${TARGET_DIR}/ce_dispatch.cpp)
 target_link_libraries(ce_dispatch PUBLIC Coyote pthread)
+
+add_executable(ce_coll ${TARGET_DIR}/ce_coll.cpp)
+target_link_libraries(ce_coll PUBLIC Coyote pthread)
