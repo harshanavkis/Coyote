@@ -119,7 +119,7 @@ proc cr_bd_design_static { parentCell } {
     CONFIG.HAS_REGION {1} \
     CONFIG.HAS_RRESP {1} \
     CONFIG.HAS_WSTRB {1} \
-    CONFIG.NUM_READ_OUTSTANDING {8} \
+    CONFIG.NUM_READ_OUTSTANDING {64} \
     CONFIG.NUM_WRITE_OUTSTANDING {16} \
     CONFIG.PROTOCOL {AXI4} \
     CONFIG.READ_WRITE_MODE {READ_WRITE} \
@@ -414,9 +414,9 @@ proc cr_bd_design_static { parentCell } {
   ] [get_bd_intf_pins /axi_noc_0/M03_AXI]
 
   # CPM_PCIE_NOC_0 is used for shell and static layer registers,
-  # and (M01, BAR4) for the user data window: peers' bulk writes into the card
+  # and (M01, BAR4) for the user data window: peers' bulk writes into the card and their reads of it
   set_property -dict [ list \
-    CONFIG.CONNECTIONS {M00_AXI {read_bw {8} write_bw {8} read_avg_burst {4} write_avg_burst {4}} M01_AXI {read_bw {1000} write_bw {12800} read_avg_burst {64} write_avg_burst {64}}} \
+    CONFIG.CONNECTIONS {M00_AXI {read_bw {8} write_bw {8} read_avg_burst {4} write_avg_burst {4}} M01_AXI {read_bw {12800} write_bw {12800} read_avg_burst {64} write_avg_burst {64}}} \
     CONFIG.DEST_IDS {M01_AXI:0x0:M00_AXI:0x40} \
     CONFIG.NOC_PARAMS {} \
     CONFIG.CATEGORY {ps_pcie} \
