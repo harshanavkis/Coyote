@@ -22,6 +22,14 @@
  * Both sides need the same --size and --runs. The client prints the one-way
  * latency's percentiles (ns) and writes every counted sample to --out (one
  * per line, ns), and both check the last message that landed.
+ *
+ * --host (both sides): the like-for-like of rdma_pingpong --src-v80 (E2, Fig 8a).
+ * The message still comes from this V80's HBM, but it and its flag land in
+ * the peer's HOST memory and a CPU drives every round, as a CPU posting an
+ * RDMA write does: per round the CPU starts a preloaded two-entry program
+ * (COPY msg -> peer, SIGNAL peer flag; two CSR writes) and polls its own
+ * flag in host memory; the responder's CPU polls, then starts its program.
+ * One-way = round trip / 2 on the client CPU's clock (steady_clock).
  */
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -34,6 +42,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -48,7 +57,7 @@ constexpr uint32_t MAGIC = 0x50494E47;      // "PING"
 constexpr uint64_t STAGING_SIZE = 1ULL << 20;
 constexpr int ROUNDS = 400;                 // initiator: 5 entries a round, 2048 at most
 
-struct Hello { uint32_t magic; uint32_t dst_ctid; uint64_t staging_va, dst_ref, flag_ref, size; int64_t runs; };
+struct Hello { uint32_t magic; uint32_t dst_ctid; uint64_t staging_va, dst_ref, flag_ref, size; int64_t runs; uint64_t host; };
 
 bool write_full(int fd, const void *p, size_t n) {
     const char *c = static_cast<const char *>(p);
@@ -95,13 +104,14 @@ double pct(std::vector<double> v, double p) {
 
 int main(int argc, char **argv) {
     std::string ip, out;
-    bool server = false;
+    bool server = false, host = false;
     uint16_t port = 19800;
     uint64_t size = 64;
     int runs = 6;
     for (int i = 1; i < argc; i++) {
         const std::string a = argv[i];
         if (a == "--server")                       server = true;
+        else if (a == "--host")                    host = true;
         else if (a == "--client" && i + 1 < argc)  ip = argv[++i];
         else if (a == "--port" && i + 1 < argc)    port = uint16_t(atoi(argv[++i]));
         else if (a == "--size" && i + 1 < argc)    size = strtoull(argv[++i], nullptr, 0);
@@ -111,7 +121,7 @@ int main(int argc, char **argv) {
     }
     if (server == !ip.empty() || size % 64 || size > (16ULL << 20) || runs < 2) {
         printf("usage: %s --server | --client <ip>  [--port N] [--size B, a multiple of 64, 0 = the flag only]"
-               " [--runs R >= 2] [--out FILE]\n", argv[0]);
+               " [--runs R >= 2] [--out FILE] [--host]\n", argv[0]);
         return 2;
     }
     const int side = server ? 0 : 1;
@@ -125,20 +135,34 @@ int main(int argc, char **argv) {
     void *staging = server ? t_qp.initRDMA(STAGING_SIZE, port) : t_qp.initRDMA(STAGING_SIZE, port, ip.c_str());
     if (!staging) { printf("FAIL: initRDMA\n"); return 1; }
 
-    // Landing: this V80's window (its HBM), imported into the U280 data thread and exported
-    land_v80::Landing L(v80, mlen + 4096);
-    void *lva = loom_switch::reserve_va(mlen + 4096);
-    t_data.importDmabuf(L.export_fd(), lva);
-    loom_switch::program_export(t_qp, 1, t_data.getCtid(), lva, mlen);
-    loom_switch::program_export(t_qp, 2, t_data.getCtid(), static_cast<uint8_t *>(lva) + mlen, 4096);
-    volatile uint64_t *my_flag = L.buf + mlen / 8;          // card VA, polled by WAIT
+    // Landing: this V80's window (its HBM), imported into the U280 data thread and exported;
+    // --host: host pages of the data thread, exported the same way
+    std::unique_ptr<land_v80::Landing> L;
+    volatile uint64_t *my_flag;            // card VA polled by WAIT, or (--host) host memory polled by the CPU
+    uint64_t *host_msg = nullptr;
+    if (host) {
+        host_msg = static_cast<uint64_t *>(t_data.getMem({coyote::CoyoteAllocType::HPF, mlen}));
+        uint64_t *fl = static_cast<uint64_t *>(t_data.getMem({coyote::CoyoteAllocType::HPF, 4096}));
+        std::memset(host_msg, 0, mlen);
+        std::memset(fl, 0, 4096);
+        loom_switch::program_export(t_qp, 1, t_data.getCtid(), host_msg, mlen);
+        loom_switch::program_export(t_qp, 2, t_data.getCtid(), fl, 4096);
+        my_flag = fl;
+    } else {
+        L.reset(new land_v80::Landing(v80, mlen + 4096));
+        void *lva = loom_switch::reserve_va(mlen + 4096);
+        t_data.importDmabuf(L->export_fd(), lva);
+        loom_switch::program_export(t_qp, 1, t_data.getCtid(), lva, mlen);
+        loom_switch::program_export(t_qp, 2, t_data.getCtid(), static_cast<uint8_t *>(lva) + mlen, 4096);
+        my_flag = L->buf + mlen / 8;
+    }
 
     const int fd = connect_or_accept(server ? std::string() : ip, uint16_t(port + 1));
     Hello mine{MAGIC, uint32_t(t_data.getCtid()), reinterpret_cast<uint64_t>(staging),
-               loom_switch::export_ref(1), loom_switch::export_ref(2), size, runs}, h{};
+               loom_switch::export_ref(1), loom_switch::export_ref(2), size, runs, uint64_t(host)}, h{};
     if (fd < 0 || !write_full(fd, &mine, sizeof(mine)) || !read_full(fd, &h, sizeof(h)) || h.magic != MAGIC ||
-        h.size != size || h.runs != runs) {
-        printf("FAIL: hello (--size and --runs must match on both sides)\n");
+        h.size != size || h.runs != runs || h.host != uint64_t(host)) {
+        printf("FAIL: hello (--size, --runs and --host must match on both sides)\n");
         return 1;
     }
 
@@ -161,7 +185,11 @@ int main(int argc, char **argv) {
     v80.invoke(coyote::CoyoteOper::LOCAL_OFFLOAD, coyote::syncSg{drain, 4096});
 
     ce_prog::Program p(v80);
-    for (int i = 0; i < ROUNDS; i++) {
+    if (host) {   // one round: the message, then the flag (value 1 + RUN_BASE)
+        if (size) p.add(ce_prog::copy(src, peer_msg, size));
+        p.add(ce_prog::signal(peer_flag, 1));
+    }
+    for (int i = 0; i < ROUNDS && !host; i++) {
         const uint64_t v = uint64_t(i) + 1;     // + RUN_BASE
         if (server) {
             p.add(ce_prog::wait(const_cast<uint64_t *>(my_flag), v));
@@ -175,14 +203,49 @@ int main(int argc, char **argv) {
             p.add(ce_prog::stamp(const_cast<uint64_t *>(&st[2 * i + 1])));
         }
     }
-    if (!server) p.add(ce_prog::signal(drain, 0, true));   // after every stamp landed
+    if (!server && !host) p.add(ce_prog::signal(drain, 0, true));   // after every stamp landed
     p.load();
-    printf("%s: up; %lu B messages, %d rounds a run, %d runs (the first a warm-up)\n",
-           server ? "server" : "client", (unsigned long) size, ROUNDS, runs);
+    printf("%s: up; %lu B messages, %d rounds a run, %d runs (the first a warm-up)%s\n",
+           server ? "server" : "client", (unsigned long) size, ROUNDS, runs,
+           host ? "; --host: CPU-started rounds, landing in host memory" : "");
 
     std::vector<double> oneway;   // ns, counted runs
     int errors = 0;
-    for (int r = 0; r < runs; r++) {
+    for (int r = 0; r < runs && host; r++) {
+        char go = 1;   // both sides ready before the run (the server arms by polling)
+        if (server ? !write_full(fd, &go, 1) : !read_full(fd, &go, 1)) { printf("FAIL: run barrier\n"); return 1; }
+        std::vector<double> run_ns;
+        for (int i = 0; i < ROUNDS; i++) {
+            const uint64_t v = uint64_t(r) * ROUNDS + uint64_t(i) + 1;
+            const auto spin = [&](uint64_t want) {
+                const auto t0 = std::chrono::steady_clock::now();
+                while (*my_flag < want) {
+                    if (std::chrono::steady_clock::now() - t0 > std::chrono::seconds(5)) return false;
+                }
+                return true;
+            };
+            if (server) {
+                if (!spin(v)) { printf("FAIL run %d round %d: no flag %lu\n", r, i, (unsigned long) v); return 1; }
+                p.start(v - 1);
+                if (!p.finish(std::chrono::milliseconds(1000))) { printf("FAIL: program\n"); return 1; }   // off the timed path
+            } else {
+                const auto t0 = std::chrono::steady_clock::now();
+                p.start(v - 1);
+                if (!spin(v)) { printf("FAIL run %d round %d: no reply %lu\n", r, i, (unsigned long) v); return 1; }
+                const auto t1 = std::chrono::steady_clock::now();
+                run_ns.push_back(std::chrono::duration<double, std::nano>(t1 - t0).count() / 2);
+                if (!p.finish(std::chrono::milliseconds(1000))) { printf("FAIL: program\n"); return 1; }  // untimed
+            }
+        }
+        if (!server) {
+            printf("%s run %d: one-way median %.0f ns, min %.0f, max %.0f\n", r ? "    " : "warm", r,
+                   pct(run_ns, 50), pct(run_ns, 0), pct(run_ns, 100));
+            if (r) oneway.insert(oneway.end(), run_ns.begin(), run_ns.end());
+        }
+        char done = 1;
+        if (!write_full(fd, &done, 1) || !read_full(fd, &done, 1)) { printf("FAIL: barrier\n"); return 1; }
+    }
+    for (int r = 0; r < runs && !host; r++) {
         const uint64_t base = uint64_t(r) * ROUNDS;
         char go = 1;
         if (server) {
@@ -207,13 +270,15 @@ int main(int argc, char **argv) {
     }
 
     // The last message that landed here, and the flag
-    L.pull();
+    const uint64_t *got = host_msg;
+    if (!host) { L->pull(); got = L->buf; }
     uint64_t bad = 0;
-    for (uint64_t i = 0; i < size / 8; i++) bad += (L.buf[i] != pattern(8 * i, 1 - side));
+    for (uint64_t i = 0; i < size / 8; i++) bad += (got[i] != pattern(8 * i, 1 - side));
     const uint64_t want_flag = uint64_t(runs) * ROUNDS;
-    const bool flag_ok = (L.buf[mlen / 8] == want_flag);
+    const uint64_t flag = *my_flag;
+    const bool flag_ok = (flag == want_flag);
     printf("%s: last message %lu of %lu words wrong, flag %lu (want %lu)\n", server ? "server" : "client",
-           (unsigned long) bad, (unsigned long) (size / 8), (unsigned long) L.buf[mlen / 8], (unsigned long) want_flag);
+           (unsigned long) bad, (unsigned long) (size / 8), (unsigned long) flag, (unsigned long) want_flag);
     errors += (bad != 0) + !flag_ok;
 
     if (!server && !oneway.empty()) {

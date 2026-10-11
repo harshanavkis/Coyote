@@ -23,9 +23,11 @@
  *   amy:   ce_dispatch --server [--port N] [--tokens T] [--H B] [--combine] [--runs R]
  *   rose:  ce_dispatch --client <amy ip> [--port N] [--tokens T] [--H B] [--combine] [--runs R] [--out FILE]
  *
- * --land-host (server): the messages and the flag land in the server's host memory (no V80 needed
- * there); the server checks each run's flag and, at the end, every message, and sends no ack, so the
- * client stops at t2 (no delivery time).
+ * --land-host (server): the messages and the flag land in the server's host memory; the server's CPU
+ * polls the flag and acks it by starting a one-entry program on its V80 (SIGNAL into the client's
+ * flag, as ce_pingpong --host replies), so the client's t3 - t0 = delivery into host memory + that
+ * ack's one-way trip (--tokens 0 gives the round trip). The like-for-like of rdma_dispatch, whose
+ * receiver CPU polls host memory and posts the ack. The server checks every message at the end.
  *
  * Both sides need the same --tokens, --H, --combine and --runs.
  */
@@ -156,8 +158,7 @@ int main(int argc, char **argv) {
 
     coyote::cThread t_qp(0, getpid(), 0, nullptr, "coyote_fpga");     // QP owner, CSR page, rdma windows
     coyote::cThread t_data(0, getpid(), 0, nullptr, "coyote_fpga");   // owns the landing exports
-    std::unique_ptr<coyote::cThread> v80p;   // no V80 on a --land-host server
-    if (!land_host) v80p.reset(new coyote::cThread(0, getpid(), 0, nullptr, "coyote_versal_fpga"));
+    std::unique_ptr<coyote::cThread> v80p(new coyote::cThread(0, getpid(), 0, nullptr, "coyote_versal_fpga"));
     printf("%s: QP exchange on port %u ...\n", server ? "server" : "client", port);
     void *staging = server ? t_qp.initRDMA(STAGING_SIZE, port) : t_qp.initRDMA(STAGING_SIZE, port, ip.c_str());
     if (!staging) { printf("FAIL: initRDMA\n"); return 1; }
@@ -186,14 +187,22 @@ int main(int argc, char **argv) {
 
     const int fd = connect_or_accept(server ? std::string() : ip, uint16_t(port + 1));
     Hello mine{MAGIC, uint32_t(t_data.getCtid()), reinterpret_cast<uint64_t>(staging), loom_switch::export_ref(1),
-               loom_switch::export_ref(2), uint64_t(tokens), H, uint64_t(combine), runs, uint64_t(!land_host)}, h{};
+               loom_switch::export_ref(2), uint64_t(tokens), H, uint64_t(combine), runs, 1}, h{};   // the server always acks
     if (fd < 0 || !write_full(fd, &mine, sizeof(mine)) || !read_full(fd, &h, sizeof(h)) || h.magic != MAGIC ||
         h.tokens != uint64_t(tokens) || h.H != H || h.combine != uint64_t(combine) || h.runs != runs) {
         printf("FAIL: hello (--tokens, --H, --combine and --runs must match on both sides)\n");
         return 1;
     }
 
-    if (land_host) {   // nothing to send: per run, arm, wait for the flag, barrier; then check every message
+    if (land_host) {   // per run: arm, poll the flag in host memory, ack through this V80, barrier; then check every message
+        coyote::cThread &v80 = *v80p;
+        loom_switch::csr_write(t_qp, loom_switch::RDMA_STAGING_VA, h.staging_va);
+        loom_switch::program_window(t_qp, 2, true, t_qp.getCtid(), reinterpret_cast<void *>(h.flag_ref), 4096, mlen, h.dst_ctid);
+        void *uva = loom_switch::reserve_va(mlen + 4096);
+        v80.importDmabuf(t_qp.exportDmabuf(EXPORT_REGION_UWIN, 0, mlen + 4096), uva);
+        ce_prog::Program pa(v80);
+        pa.add(ce_prog::signal(static_cast<uint8_t *>(uva) + mlen, 1));   // the ack: 1 + RUN_BASE
+        pa.load();
         int errors = 0;
         for (int r = 0; r < runs && !errors; r++) {
             char go = 1;
@@ -201,7 +210,11 @@ int main(int argc, char **argv) {
             const auto t0 = std::chrono::steady_clock::now();
             while (*my_flag < uint64_t(r) + 1)
                 if (std::chrono::steady_clock::now() - t0 > std::chrono::seconds(60)) { printf("FAIL run %d: no flag\n", r); errors++; break; }
-            printf("server run %d: flag seen after %.1f ms (armed -> flag)\n", r,
+            if (!errors) {
+                pa.start(uint64_t(r));
+                if (!pa.finish(std::chrono::milliseconds(1000))) { printf("FAIL run %d: ack program\n", r); errors++; }
+            }
+            printf("server run %d: flag seen after %.1f ms (armed -> flag), acked\n", r,
                    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
             char done = 1;
             if (!write_full(fd, &done, 1) || !read_full(fd, &done, 1)) { printf("FAIL: barrier\n"); return 1; }
@@ -213,6 +226,7 @@ int main(int argc, char **argv) {
                (unsigned long) (msgs.size() * H / 8), (unsigned long) *my_flag, runs);
         errors += (bad != 0) + (*my_flag != uint64_t(runs));
         ::close(fd);
+        loom_switch::release_window(t_qp, 2);
         loom_switch::release_export(t_qp, 1);
         loom_switch::release_export(t_qp, 2);
         t_qp.connSync(false);
