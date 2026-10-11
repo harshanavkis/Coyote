@@ -12,8 +12,9 @@
  * through the window itself (reads return HBM), pull() syncs the buffer.
  *
  * The window's last 4 KiB page reads back uwin_hbm's counters instead of HBM
- * (where the peer's writes, and its reads, spend their cycles); the whole
- * window is mapped for that, and Counters prints what one copy cost.
+ * (where the peer's writes, and its reads, spend their cycles, and what its
+ * read-ahead did); the whole window is mapped for that, and Counters prints
+ * what one copy cost.
  */
 #include <chrono>
 #include <cstdint>
@@ -31,7 +32,7 @@ constexpr uint64_t UWIN_SIZE = 1ULL << 27;    // the window (uwin_hbm UWIN_BITS)
 struct Counters {
     static constexpr int N = 16;
     enum { CYC, AW, W, W_STALL, W_STARVE, AW_STALL, B, B_STALL, OUT_CYC, OUT_SUM, OUT_MAX, PARTIAL,
-           DISCARDED, NZ_ID, RSVD14, MODE };
+           DISCARDED, NZ_ID, RA_MODE, MODE };
     // words 16-30: uwin_mon's axi_main counts (xclk), where the writes and reads enter the shell
     static constexpr int N_MAIN = 15;
     enum { M_CYC, M_AW, M_W, M_W_STALL, M_W_STARVE, M_AW_STALL, M_B,
@@ -39,14 +40,18 @@ struct Counters {
     // words 32-39: uwin_hbm's own counts of the window's reads (aclk)
     static constexpr int N_R = 8;
     enum { RD_AR, RD_R, RD_DONE, RD_OUT_CYC, RD_OUT_SUM, RD_OUT_MAX, RD_AR_STALL, RD_R_STALL };
+    // words 40-49: uwin_hbm's read-ahead (on/off: counter page line 61/60; RA_MODE says which)
+    static constexpr int N_RA = 10;
+    enum { RA_HIT, RA_LATE, RA_PASS, RA_AR, RA_FILLED, RA_SERVED, RA_STREAMS, RA_END_JUMP, RA_END_WRITE, RA_END_IDLE };
     // uwin_hbm counts in the shell's aclk (ACLK_F, 250 MHz), uwin_mon in the static's xclk (SCLK_F, 333 MHz on the V80)
     static constexpr double ACLK_NS = 1e3 / 250, XCLK_NS = 1e3 / 333;
-    uint64_t v[N], m[N_MAIN], r[N_R];
+    uint64_t v[N], m[N_MAIN], r[N_R], a[N_RA];
     static Counters read(volatile uint64_t *win) {
         Counters c;
         for (int i = 0; i < N; i++) c.v[i] = win[(UWIN_SIZE - 4096) / 8 + i];
         for (int i = 0; i < N_MAIN; i++) c.m[i] = win[(UWIN_SIZE - 4096) / 8 + 16 + i];
         for (int i = 0; i < N_R; i++) c.r[i] = win[(UWIN_SIZE - 4096) / 8 + 32 + i];
+        for (int i = 0; i < N_RA; i++) c.a[i] = win[(UWIN_SIZE - 4096) / 8 + 40 + i];
         return c;
     }
     // One side's reads: AR, beats per read, completed, mean outstanding while any is, mean AR-to-last-R
@@ -76,7 +81,7 @@ struct Counters {
         printf("     axi_main (static -> shell, xclk) over %lu cycles: %lu W beats, %lu stalled (shell not ready), "
                "%lu starved (static side), %lu AW, AW stalled %lu, B %lu (snapshots every 256 cycles)\n",
                e(M_CYC), e(M_W), e(M_W_STALL), e(M_W_STARVE), e(M_AW), e(M_AW_STALL), e(M_B));
-        // reads, counter-page reads among them (read() makes 39): AR stalled = memory side slow (or 64 in
+        // reads, counter-page reads among them (read() makes 49): AR stalled = memory side slow (or 64 in
         // flight) at the window, shell not ready at axi_main; R stalled = PCIe side slow at the window,
         // static side at axi_main
         auto f = [&](int i) { return (unsigned long) (r[i] - b.r[i]); };
@@ -84,6 +89,14 @@ struct Counters {
                     r[RD_OUT_MAX], f(RD_AR_STALL), f(RD_R_STALL), ACLK_NS);
         print_reads("axi_main (xclk)", e(M_CYC), e(M_AR), e(M_R), e(M_RD_DONE), e(M_RD_OUT_CYC), e(M_RD_OUT_SUM),
                     m[M_RD_OUT_MAX], e(M_AR_STALL), e(M_R_STALL), XCLK_NS);
+        // read-ahead: stream reads (hits: every line already requested), reads passed through while on,
+        // read-ahead ARs and lines (lines - served = fetched, unused), streams and what ended them
+        auto g = [&](int i) { return (unsigned long) (a[i] - b.a[i]); };
+        if (v[RA_MODE] || g(RA_STREAMS) || g(RA_PASS))
+            printf("     V80 read-ahead (now %s): %lu stream reads, %lu hits, %lu late; %lu passed through; %lu ARs, "
+                   "%lu lines read ahead, %lu served; %lu streams, ended by a jump %lu, a write %lu, idle %lu\n",
+                   v[RA_MODE] ? "on" : "off", g(RA_HIT) + g(RA_LATE), g(RA_HIT), g(RA_LATE), g(RA_PASS), g(RA_AR),
+                   g(RA_FILLED), g(RA_SERVED), g(RA_STREAMS), g(RA_END_JUMP), g(RA_END_WRITE), g(RA_END_IDLE));
     }
 };
 
