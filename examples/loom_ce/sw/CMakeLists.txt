@@ -45,6 +45,10 @@ target_link_libraries(ce_prog PUBLIC Coyote pthread)
 add_executable(ce_pingpong ${TARGET_DIR}/ce_pingpong.cpp)
 target_link_libraries(ce_pingpong PUBLIC Coyote pthread)
 
+# The V80's peer-to-peer self-loop latency (out over PCIe and back into its own window), on the V80's clock
+add_executable(ce_selfping ${TARGET_DIR}/ce_selfping.cpp)
+target_link_libraries(ce_selfping PUBLIC Coyote pthread)
+
 # E4: the Section 2 dispatch / combine from one V80 into another through Loom (sender-side stamps)
 add_executable(ce_dispatch ${TARGET_DIR}/ce_dispatch.cpp)
 target_link_libraries(ce_dispatch PUBLIC Coyote pthread)
