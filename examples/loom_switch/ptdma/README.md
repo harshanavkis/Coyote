@@ -113,11 +113,13 @@ CPU stores through the same window (`uwinWrite`, write-combining): 0.17 GB/s.
 - **~10.5 GB/s over Loom, with full packets.** The ingress counters show 4 KiB packets
   for bulk PTDMA (64 MiB x 10: 164,827 packets = 4,071 B each; 64 MiB x 5: 81,960 =
   4,094 B; idle flushes 80-1,900) and almost no backpressure (`W wait: fifo` 35-78k
-  cycles): `loom_ingress` takes the writes as fast as they come. The V80 engine, also
-  4 KiB packets, tops out at the same 10.4-10.7 GB/s (RDMA from host memory: 12.2), so
-  the ceiling is upstream of the ingress, on the way into the U280 - not found yet. The
-  idle timer only splits real gaps: 7 KiB chunks end in a 3 KiB tail each (309,575
-  flushes), followed by the next descriptor ~5.4 us later.
+  cycles). The V80 engine, also 4 KiB packets, tops out at the same 10.4-10.7 GB/s (RDMA
+  from host memory: 12.2). The limit was `loom_ingress` itself: every write arrives as a
+  256 B burst and waited ~2 cycles for its address lookup (`W wait: no aw` 2.0 per burst),
+  6 cycles per 256 B at 250 MHz = 10.67 GB/s. Fixed by a W buffer ahead of the lookup
+  (`loom_ingress.sv`, DESIGN.md section 12; 4 cycles per burst in simulation, not yet
+  measured on hardware). The idle timer only splits real gaps: 7 KiB chunks end in a
+  3 KiB tail each (309,575 flushes), followed by the next descriptor ~5.4 us later.
 - **A lone 1 MiB transfer takes ~347 us (3 GB/s)**, ~240 us more than the model; seen only
   when the whole transfer is 1 MiB. Unexplained.
 - The V80 serves every reader (PTDMA as much as the U280) at ~3.7 GB/s: 8 reads of 256 B
