@@ -53,13 +53,14 @@ proc cr_bd_design_ctrl { parentCell } {
     CONFIG.PROTOCOL {AXI4LITE} \
   ] $axi_cnfg
 
-  # Reads in flight from the XDMA bypass master (xdma c_m_axi_num_write in
-  # cr_pci.tcl): a read of the uwin can wait a network round trip
+  # Reads and writes in flight from the XDMA bypass master (xdma
+  # c_m_axi_num_write 32 in cr_pci.tcl): a read of the uwin can wait a
+  # network round trip; writes: see axim_udata below
   set axi_main [ create_bd_intf_port -mode Slave -vlnv xilinx.com:interface:aximm_rtl:1.0 axi_main ]
   set_property -dict [list \
     CONFIG.MAX_BURST_LENGTH {16} \
     CONFIG.ID_WIDTH {6} \
-    CONFIG.NUM_WRITE_OUTSTANDING {8} \
+    CONFIG.NUM_WRITE_OUTSTANDING {32} \
     CONFIG.NUM_READ_OUTSTANDING {32} \
     CONFIG.SUPPORTS_NARROW_BURST {0} \
     CONFIG.ADDR_WIDTH {64} \
@@ -105,7 +106,12 @@ proc cr_bd_design_ctrl { parentCell } {
     }
   }
 
-  # User data window (uwin): 512-bit AXI4 into each vFPGA
+  # User data window (uwin): 512-bit AXI4 into each vFPGA. Writes in flight
+  # 32 (with axi_main's): the interconnect issues at most this many to the
+  # uwin, and a write's round trip behind it (the dynamic region's six
+  # slices, loom_ingress) is ~41 cycles - at 8 the uwin took 4-beat bursts at
+  # one per 5.1 cycles and 1-beat bursts at one per 4.75 at best (simulated;
+  # 1-beat measured 4.9)
   if {$cnfg(en_uwin) eq 1} {
     for {set i 0}  {$i < $cnfg(n_reg)} {incr i} {
       set cmd "set axim_udata_$i \[ create_bd_intf_port -mode Master -vlnv xilinx.com:interface:aximm_rtl:1.0 axim_udata_$i ]
@@ -122,7 +128,7 @@ proc cr_bd_design_ctrl { parentCell } {
                 CONFIG.HAS_RRESP {1} \
                 CONFIG.HAS_WSTRB {1} \
                 CONFIG.NUM_READ_OUTSTANDING {32} \
-                CONFIG.NUM_WRITE_OUTSTANDING {8} \
+                CONFIG.NUM_WRITE_OUTSTANDING {32} \
                 CONFIG.PROTOCOL {AXI4} \
                 CONFIG.READ_WRITE_MODE {READ_WRITE} \
               ] \$axim_udata_$i"
