@@ -124,8 +124,8 @@ rely on it:
 
 - Here: `loom_ingress` keeps a get behind writes whose beats it has taken,
   not behind a write whose address was accepted but whose beats are still
-  in its lookup stages or behind the previous burst, so the get can leave
-  first.
+  in its lookup stages, in its W buffer (section 12) or behind the
+  previous burst, so the get can leave first.
 - At the far switch: `loom_rx` lands the put with a host write and `loom_rd`
   serves the get with a host read on another DMA engine, which can pass the
   unfinished write.
@@ -283,3 +283,68 @@ every write size (2026-10-07), against 11.9 from host memory.
 - The requester's max read request goes to 4 KiB for the baseline (runtime
   setpci): the U280 has ~32 requests in flight (from host memory: 31 per us
   of round trip), so larger requests put more 256 B pieces in flight.
+
+## 12. W beats are taken ahead of their burst's lookup (W buffer)
+
+`loom_ingress` takes W beats from the bus into an 8-beat buffer whether or
+not their burst has been looked up, and its burst stage takes them from the
+buffer's head. Before, a beat was taken only once its burst was loaded.
+
+- Why: bulk writes reach the ingress as 256 B bursts (4 beats, section 3),
+  and the ingress counter "W wait: no aw" (a beat presented, no burst looked
+  up yet) was ~2.0 cycles per burst in every bulk run: PTDMA 64 MiB x 5
+  2,622,210 cycles for 1,310,725 bursts, chunk sweep 5,358,220 / 2,621,450,
+  the V80 engine 1.85. 4 + 2 cycles per 256 B at 250 MHz is 10.67 GB/s,
+  Loom's put ceiling (V80 engine 10.4-10.9, PTDMA 10.0-10.5) against 12.2
+  for RDMA on the same link; the output-side waits were small and packets
+  full 4 KiB.
+- Cause: an AW reaches the burst stage four cycles after its handshake
+  (three lookup stages, then the load), and wready needed the burst loaded.
+  The shell's interconnect hands AW over about two cycles before the
+  burst's first beat (its S00 data FIFO is in packet mode, so it passes a
+  burst on once it holds all of its data; inferred), so every burst waited
+  about two cycles for its own lookup. The header's "bursts follow each
+  other with no gap" held only for AWs running ahead of their data, as the
+  TB's master sent them.
+- TB (`tb_loom_ingress` rate tests, 64 back-to-back 4-beat bursts, cycles
+  per burst, before -> after): AW with the first beat 8 -> 4, 1 beat ahead
+  7 -> 4, 2 ahead 6 -> 4 (the hardware's case), 4 ahead 4 -> 4; AW only
+  1 / 2 / 4 cycles after the previous burst's last beat was taken 8 / 9 /
+  11 -> 4. With W up to three cycles ahead of its AW the buffer keeps one
+  beat a cycle; further ahead it fills and the bus waits (12 cycles: 6.67).
+- Order and B, as a producer sees them, unchanged: taken now means taken by
+  the burst stage from the head, B is answered there, and a get still goes
+  behind every write whose beats were taken before it, so behind every
+  write answered before it. Beats in the buffer whose burst is still in the
+  lookup are not taken; a get may pass them, as it could pass beats held on
+  the bus before (section 6). A lone burst's beats are taken by the burst
+  stage in the same cycles as before, or one cycle later if its AW led by
+  four cycles or more, and B comes as many cycles after AW as before; in a
+  stream both come earlier (no gaps).
+- Debug counters 98-102 now count cycles the head beat waits; the bus waits
+  only while the buffer is full. T24's "W ->" latencies read 3 cycles more
+  (W is taken on arrival); from AW they are unchanged.
+- The strobes are kept as two bits per 8 B word (529 bits a beat, not 577),
+  which also takes the 64-bit strobe AND off the path into the data FIFO's
+  write enable (before: the critical path).
+- Rejected: a fast path for an AW that continues the previous burst (same
+  binding, next offset) past the table: address and bounds comparators,
+  still a cycle late when AW comes with its data, and nothing for bursts
+  that do not continue. Answering B when the last beat enters the buffer:
+  needs a queue of AW IDs and the get order over the buffer, for no gain
+  (B is not what limits the rate). Fewer lookup stages: still a gap per
+  burst unless the lookup took zero cycles.
+- Tests: the suite runs with the free master, AW with its first W beat, and
+  AW two cycles after the previous last beat (W ahead of AW), each with and
+  without backpressure; new runs: a discarded burst inside a run, get
+  requests in a stream (each checked behind every write answered and every
+  beat taken before it arrived; packets cut only where a get left), the
+  rates. 8 mutations of the new logic all caught (overflow past a full
+  buffer, popping untaken beats, the bus's wlast or wdata for the head's,
+  the B slot on the bus's wlast, the strobe decode, a buffer two short,
+  a get not waiting for the open packet). Out of context at 250 MHz
+  (loom_table + loom_ingress, every port registered, placed and routed):
+  +0.50 ns (+0.61 before; post-synthesis +1.00, +1.46 before), 1,074 LUTs
+  (+324, of them 314 LUTRAM for the buffer), 710 FFs (+15), 9 RAMB36 and
+  0 URAM (same). The critical path is now the buffer's read pointer through
+  the head's take into the lookup stages' enables (8 levels).

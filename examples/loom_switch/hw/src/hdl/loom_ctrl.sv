@@ -47,11 +47,12 @@ import lynxTypes::*;
  *   95-108 (RO) ingress debug (loom_ingress cnt_dbg, bit = word - 95):
  *          95/96 cycles the host / net output was valid and not ready,
  *          97 cycles sending a packet with the data FIFO empty,
- *          98-102 cycles a W beat waited: 98 no burst looked up yet, 99 B slot
- *          busy, 100 data FIFO full, 101 queue full, 102 a partial beat
- *          still sending its stores; 103/104 bursts dropped for no window /
- *          past the window's end; 105-107 bursts of 1, 2-4, more than 4
- *          beats; 108 bursts at a non-64 B-aligned address
+ *          98-102 cycles the beat at the W buffer's head waited (the bus
+ *          waits only while the buffer is full): 98 no burst looked up
+ *          yet, 99 B slot busy, 100 data FIFO full, 101 queue full, 102 a
+ *          partial beat still sending its stores; 103/104 bursts dropped
+ *          for no window / past the window's end; 105-107 bursts of 1,
+ *          2-4, more than 4 beats; 108 bursts at a non-64 B-aligned address
  *   176-181 the export table (loom_exports), staged then committed like
  *          the window table: 176 EXP_IDX, 177 EXP_CFG (bit0 valid), 178
  *          EXP_PID (landing pid), 179 EXP_BASE (landing VA), 180 EXP_LEN

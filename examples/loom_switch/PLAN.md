@@ -61,10 +61,13 @@ through `scripts/fpga/build_bitstream.sh` (U280: Vivado 2023.2; V80: 2025.1).
   copy engine's plateau from ~1 MiB a copy.
 - **Latency through the switch's own logic** (zero load, 250 MHz;
   `tb_loom_switch_top` T24 prints `lat` lines; the shell, the RoCE stack,
-  PCIe and the wire are outside it): put out, an 8 B store 2 cycles W ->
-  rdma request (3 to its first beat out), a 64 B line 18 (it waits 16
-  cycles for a continuing write), 4 KiB store-and-forward (the request 2
-  cycles after its last input beat, then 64 beats out); put in, request ->
+  PCIe and the wire are outside it): put out, an 8 B store 5 cycles W ->
+  rdma request (6 to its first beat out), a 64 B line 21 (it waits 16
+  cycles for a continuing write), 4 KiB store-and-forward (the request 5
+  cycles after its last input beat, then 64 beats out). W is taken on
+  arrival and waits for its burst's lookup in the W buffer (DESIGN 12):
+  from AW these are the same as before it (6 cycles AW -> request for the
+  store), the W handshake just comes 3 cycles earlier; put in, request ->
   landing write 4-6 cycles, payload beat in -> landing beat 6-7; get, AR ->
   request out 38 (32 of them the coalescer's timer), far side request in ->
   host read 9, host data in -> answer out 2-3, answer in -> R 14.

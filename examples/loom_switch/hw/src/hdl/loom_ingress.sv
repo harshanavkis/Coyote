@@ -57,7 +57,12 @@ import lynxTypes::*;
  * stays behind it. A get request joins the queue in a cycle when the write
  * path queues nothing, and after the packet being gathered (closed first
  * if no beat is presented, else when it fills or is cut), so a read is
- * sent after every write whose beats were taken before it.
+ * sent after every write whose beats were taken before it. Taken (and
+ * presented) means by the burst stage, from the W buffer's head (LOOKUP),
+ * and B is answered from there, so a read is also sent after every write
+ * answered before it. Beats still in the W buffer, their burst not looked
+ * up yet, are not taken: a get may pass them, as it may pass beats still
+ * on the bus.
  *
  * CONTRACT. Bursts are INCR bursts of full-width beats (awsize is not
  * looked at). The address is rounded down to 64 B and the strobes say which
@@ -66,12 +71,19 @@ import lynxTypes::*;
  * partial first beat, i.e. stores. Window starts and lengths are 64 B
  * multiples. A burst with no window, or whose lines end past the window's
  * length, is accepted, discarded and counted (cnt_drop). B is answered once
- * the burst's last beat is taken. The read channels are loom_read's.
+ * the burst's last beat is taken. W may come before its AW. The read
+ * channels are loom_read's.
  *
  * LOOKUP. AW goes through three register stages (the table's two, then the
- * offset and bounds), each advancing whenever the next has room, so up to
- * three bursts are looked up ahead of the one being written and bursts
- * follow each other with no gap, at one a cycle for 1-beat bursts.
+ * offset and bounds), each advancing whenever the next has room, and the
+ * burst stage takes it with the previous burst's last beat: a burst's first
+ * beat can be taken four cycles after its AW. The bus hands W beats to an
+ * 8-beat buffer whenever it has room, before or after their AW, and the
+ * burst stage takes them from its head, so a burst is looked up while the
+ * beats ahead of it are taken. Bursts follow each other with no gap, one
+ * beat a cycle (one burst a cycle for 1-beat bursts), as long as each AW
+ * comes no more than three cycles after its burst's first beat; later, the
+ * buffer fills and the bus waits.
  *
  * WINDOW. rdma packets and stores are posted only while win_ok (the ack
  * window); rdma_post pulses on each so the window can count them.
@@ -79,9 +91,10 @@ import lynxTypes::*;
 module loom_ingress #(
     parameter integer UWIN_BITS    = 27,
     // cnt_dbg bits: 0/1 host/net output valid and not ready; 2 sending a
-    // packet with the data FIFO empty; 3-7 a W beat presented and not taken,
-    // by reason: 3 no burst looked up yet, 4 the B slot busy, 5 data FIFO
-    // full, 6 queue full, 7 a partial beat still sending its stores; 8/9 a
+    // packet with the data FIFO empty; 3-7 a beat at the W buffer's head and
+    // not taken, by reason: 3 no burst looked up yet, 4 the B slot busy, 5
+    // data FIFO full, 6 queue full, 7 a partial beat still sending its
+    // stores (the bus waits only while the buffer is full); 8/9 a
     // burst dropped for no window / past the window's end; 10-12 bursts of
     // 1, 2-4, more than 4 beats; 13 a burst whose address is not 64 B-aligned
     parameter integer N_DBG        = 14,
@@ -237,7 +250,53 @@ always_ff @(posedge aclk) begin
 end
 
 // ---------------------------------------------------------------------------
-// Burst stage: the burst whose beats are being accepted
+// W buffer: the bus hands a beat over whenever there is room, looked up or
+// not, and the burst stage takes beats from the head. Strobes are kept as
+// two bits per 8 B word.
+// ---------------------------------------------------------------------------
+localparam integer WB_DEPTH = 8;
+
+typedef struct packed {
+    logic                     last;
+    logic [7:0]               all;        // per 8 B word: all strobes set
+    logic [7:0]               bad;        // some, not all
+    logic [AXI_DATA_BITS-1:0] data;
+} wbeat_t;
+
+wbeat_t wb_mem [WB_DEPTH];
+wbeat_t wb_in, wb;                        // the beat on the bus; the head
+logic [$clog2(WB_DEPTH):0] wb_wp, wb_rp;
+wire  wb_full = (wb_wp - wb_rp) == ($clog2(WB_DEPTH)+1)'(WB_DEPTH);
+wire  w_v     = (wb_wp != wb_rp);         // a beat at the head
+logic w_hs;                               // the burst stage takes it
+
+always_comb begin
+    wb_in.last = axi_udata.wlast;
+    wb_in.data = axi_udata.wdata;
+    for (int l = 0; l < 8; l++) begin
+        wb_in.all[l] = &axi_udata.wstrb[8*l +: 8];
+        wb_in.bad[l] = |axi_udata.wstrb[8*l +: 8] && !wb_in.all[l];
+    end
+end
+
+assign axi_udata.wready = !wb_full;
+assign wb = wb_mem[wb_rp[$clog2(WB_DEPTH)-1:0]];
+
+always_ff @(posedge aclk) begin
+    if (!aresetn) begin
+        wb_wp <= '0;
+        wb_rp <= '0;
+    end else begin
+        if (axi_udata.wvalid && !wb_full) begin
+            wb_mem[wb_wp[$clog2(WB_DEPTH)-1:0]] <= wb_in;
+            wb_wp <= wb_wp + 1'b1;
+        end
+        if (w_hs) wb_rp <= wb_rp + 1'b1;
+    end
+end
+
+// ---------------------------------------------------------------------------
+// Burst stage: the burst whose beats are being taken
 // ---------------------------------------------------------------------------
 logic                  b_act;             // a burst is loaded
 logic                  b_ok;              // its beats are taken, not discarded
@@ -257,17 +316,13 @@ logic   pq_full;
 logic   df_ready;
 logic   pk_open;
 
-wire w_in   = axi_udata.wvalid && b_act;
-wire b_room = !axi_udata.wlast || !bq_valid || axi_udata.bready;
+wire w_in   = w_v && b_act;
+wire b_room = !wb.last || !bq_valid || axi_udata.bready;
 
-// The beat presented: full, or a set of stores
-wire w_full = &axi_udata.wstrb;
-logic [7:0] wd_all, wd_bad;               // per 8 B word: all strobes / some
-always_comb
-    for (int l = 0; l < 8; l++) begin
-        wd_all[l] = &axi_udata.wstrb[8*l +: 8];
-        wd_bad[l] = |axi_udata.wstrb[8*l +: 8] && !wd_all[l];
-    end
+// The beat presented (the head): full, or a set of stores
+wire        w_full = &wb.all;
+wire  [7:0] wd_all = wb.all;
+wire  [7:0] wd_bad = wb.bad;
 
 // Stores of a partial beat go out one word per cycle; st_done holds the words
 // of the presented beat already queued
@@ -289,10 +344,9 @@ wire part_take  = part && !pk_open && (!part_store || !pq_full) && part_last;
 
 wire full_ok    = df_ready && !pq_full;
 
-assign axi_udata.wready = b_act && b_room &&
-                          (!b_ok || (w_full ? full_ok : part_take));
-wire w_hs    = axi_udata.wvalid && axi_udata.wready;
-wire w_end   = w_hs && axi_udata.wlast;
+wire w_take  = b_act && b_room && (!b_ok || (w_full ? full_ok : part_take));
+assign w_hs  = w_v && w_take;
+wire w_end   = w_hs && wb.last;
 
 assign aw_take = s3_v && (!b_act || w_end);
 
@@ -401,7 +455,7 @@ always_comb begin
         pq_push = !pq_full;
         pq_in   = '{store: 1'b1, get: 1'b0, route: b_route, pid: b_pid, dst_pid: b_dst_pid,
                     va: b_base + VADDR_BITS'(b_off) + VADDR_BITS'({st_lane, 3'b0}),
-                    beats: '0, data: axi_udata.wdata[64*st_lane +: 64]};
+                    beats: '0, data: wb.data[64*st_lane +: 64]};
     end else if (flush) begin
         pq_push = 1'b1;
     end
@@ -491,7 +545,7 @@ xpm_fifo_axis #(
 ) inst_data_fifo (
     .s_aresetn(aresetn), .s_aclk(aclk), .m_aclk(aclk),
     .s_axis_tvalid(good_beat), .s_axis_tready(df_ready),
-    .s_axis_tdata(axi_udata.wdata), .s_axis_tstrb('0), .s_axis_tkeep('1),
+    .s_axis_tdata(wb.data), .s_axis_tstrb('0), .s_axis_tkeep('1),
     .s_axis_tlast(1'b0), .s_axis_tid('0), .s_axis_tdest('0), .s_axis_tuser('0),
     .m_axis_tvalid(df_tvalid), .m_axis_tready(df_tready),
     .m_axis_tdata(df_tdata), .m_axis_tstrb(), .m_axis_tkeep(),
@@ -599,7 +653,7 @@ assign cnt_get       = (ostate == O_HDR) && o.get && m_net_tready;
 // ---------------------------------------------------------------------------
 // Debug pulses (bit meanings at N_DBG)
 // ---------------------------------------------------------------------------
-wire w_wait = axi_udata.wvalid && !axi_udata.wready;
+wire w_wait = w_v && !w_take;
 wire w_taking = w_wait && b_act && b_room && b_ok;
 
 assign cnt_dbg[0]  = m_host_tvalid && !m_host_tready;

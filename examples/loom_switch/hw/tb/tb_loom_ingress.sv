@@ -22,8 +22,17 @@ import lynxTypes::*;
  * dropped), writes that start inside a line (32 B half-lines, 8 B stores at
  * their own address, a burst from line+32), backpressure everywhere, the
  * debug counters (drop reasons, burst sizes, misaligned bursts, and every
- * cycle a W beat waits counted under exactly one reason). Reads and get
- * requests are loom_read's (tb_loom_switch_top).
+ * cycle a W beat waits counted under exactly one reason), a discarded burst
+ * inside a run, get requests in a stream (after a burst is answered, after
+ * some beats on the bus, with a packet open; each must leave after every
+ * write answered, and every beat taken, before it arrived).
+ *
+ * The suite runs with three masters: AW and W independent (AW runs ahead),
+ * AW in the same cycle as its burst's first W beat, and AW only two cycles
+ * after the previous burst's last beat was taken (so W runs ahead of its
+ * AW); each without and with backpressure. The rate tests time 64
+ * back-to-back 4-beat bursts against the AW timing and check cycles per
+ * burst. Reads are loom_read's (tb_loom_switch_top).
  */
 module tb_loom_ingress;
 
@@ -65,7 +74,11 @@ logic [AXI_DATA_BITS/8-1:0] m_host_tkeep, m_net_tkeep;
 logic m_host_tvalid, m_host_tready, m_host_tlast;
 logic m_net_tvalid, m_net_tready, m_net_tlast;
 logic cnt_burst, cnt_drop, cnt_pkt_local, cnt_pkt_rdma, cnt_store, cnt_store_drop, cnt_flush;
-logic cnt_rdma_full, cnt_rdma_flush, cnt_rdma_cut;
+logic cnt_rdma_full, cnt_rdma_flush, cnt_rdma_cut, cnt_get;
+logic                  s_get_valid = 0, s_get_ready;
+logic [PID_BITS-1:0]   s_get_pid = 0;
+logic [VADDR_BITS-1:0] s_get_ref = 0;
+logic [63:0]           s_get_word = 0;
 localparam integer N_DBG = 14;
 logic [N_DBG-1:0] cnt_dbg;
 
@@ -90,7 +103,8 @@ loom_ingress #(.UWIN_BITS(UWIN_BITS), .FLUSH_CYCLES(FLUSH)) dut (
     .ua_addr(ua_addr), .ua_hit(ua_hit), .ua_route(ua_route), .ua_pid(ua_pid),
     .ua_dst_pid(ua_dst_pid), .ua_base(ua_base), .ua_ustart(ua_ustart),
     .ua_end(ua_end), .ua_idx(ua_idx),
-    .s_get_valid(1'b0), .s_get_ready(), .s_get_pid('0), .s_get_ref('0), .s_get_word('0),
+    .s_get_valid(s_get_valid), .s_get_ready(s_get_ready), .s_get_pid(s_get_pid),
+    .s_get_ref(s_get_ref), .s_get_word(s_get_word),
     .wr_req(wr_req), .wr_valid(wr_valid), .wr_ready(wr_ready),
     .win_ok(win_ok), .rdma_post(rdma_post),
     .m_host_tdata(m_host_tdata), .m_host_tkeep(m_host_tkeep),
@@ -103,7 +117,7 @@ loom_ingress #(.UWIN_BITS(UWIN_BITS), .FLUSH_CYCLES(FLUSH)) dut (
     .cnt_pkt_rdma(cnt_pkt_rdma), .cnt_store(cnt_store), .cnt_store_drop(cnt_store_drop),
     .cnt_flush(cnt_flush), .cnt_win_wait(), .cnt_req_wait(),
     .cnt_rdma_full(cnt_rdma_full), .cnt_rdma_flush(cnt_rdma_flush), .cnt_rdma_cut(cnt_rdma_cut),
-    .cnt_dbg(cnt_dbg)
+    .cnt_get(cnt_get), .cnt_dbg(cnt_dbg)
 );
 
 int errors = 0;
@@ -164,6 +178,8 @@ typedef struct {
 
 burst_t bursts [$];
 pkt_t   exp_pkts [$];
+longint exp_units [$];   // per burst: packet beats and stores up to and including it
+longint cuts [$];        // where get requests left (packet beats and stores before each)
 int     exp_drops, exp_store_drops;
 int     exp_nowin, exp_oob, exp_b1, exp_b4, exp_bmore, exp_mis;
 
@@ -189,8 +205,10 @@ task automatic model();
     bit     open = 0;
     int     p_win;
     longint p_next;
+    longint units = 0;
     pkt_t   p;
     exp_pkts.delete();
+    exp_units.delete();
     exp_drops = 0;
     exp_store_drops = 0;
     exp_nowin = 0; exp_oob = 0; exp_b1 = 0; exp_b4 = 0; exp_bmore = 0; exp_mis = 0;
@@ -206,6 +224,7 @@ task automatic model();
         if (wi < 0) begin
             exp_drops++;
             if (oob) exp_oob++; else exp_nowin++;
+            exp_units.push_back(units);
             continue;
         end
         for (int j = 0; j < bursts[k].beats; j++) begin
@@ -225,11 +244,15 @@ task automatic model();
                         st.uaddr = W[wi].ustart + o; st.beats = 0;
                         st.data = line[64*l +: 64];
                         exp_pkts.push_back(st);
+                        units++;
                     end else if (sb[8*l +: 8] != 8'h00) bad = 1;
                 end
                 exp_store_drops += bad;
                 continue;
             end
+            // a get request that left here closed the open packet
+            foreach (cuts[c]) if (open && cuts[c] == units) begin exp_pkts.push_back(p); open = 0; end
+            units++;
             if (open && p_win == wi && p_next == o) begin
                 p.beats++;
             end else begin
@@ -242,6 +265,7 @@ task automatic model();
             if (p.beats == cap) begin exp_pkts.push_back(p); open = 0; end
         end
         if (bursts[k].gap_after && open) begin exp_pkts.push_back(p); open = 0; end
+        exp_units.push_back(units);
     end
     if (open) exp_pkts.push_back(p);
 endtask
@@ -297,15 +321,55 @@ always begin
     end
 end
 
-always @(posedge aclk) begin
-    if (axi.bvalid && axi.bready) begin
-        `CHECK(axi.bid == AXI_ID_BITS'(b_expect_id), $sformatf("bid %0d, expected %0d", axi.bid, b_expect_id))
-        `CHECK(axi.bresp == 2'b00, "bresp not OKAY")
-        b_expect_id++;
-        b_seen++;
+// Paced master (pace 1, 2): one process drives AW and W cycle by cycle, W
+// beats back to back (the same bubbles under bp). pace 1: a burst's AW is
+// presented with the W beat `lead` beats before its first one (lead 0: in
+// the same cycle as its first beat); pace 2: only once the previous burst's
+// last beat has been taken, `lag` cycles later (lag 1: the next cycle, in
+// the cycle its first beat can be presented; more sends W ahead of its AW)
+int pace = 0, lead = 0, lag = 1;
+int p_q [$];
+always begin
+    if (p_q.size() == 0) @(posedge aclk);
+    else begin
+        automatic int ks [$], first [$];
+        automatic int n, tot = 0, ai = 0, wi = 0, wj = 0, g = 0, wgap = 0;
+        automatic longint t = 0, wl_at [$];    // the cycle each burst's last beat was taken
+        automatic bit av = 0, wv = 0;
+        ks = p_q; p_q.delete();
+        n = ks.size();
+        foreach (ks[i]) begin first.push_back(tot); tot += bursts[ks[i]].beats; end
+        while (ai < n || wi < n) begin
+            // this cycle (t): a presented beat stays until taken
+            if (!wv && wi < n && wgap == 0) begin
+                axi.wdata  <= pat(line_of(bursts[ks[wi]].uaddr) + 64*wj);
+                axi.wstrb  <= bursts[ks[wi]].strb[wj];
+                axi.wlast  <= (wj == bursts[ks[wi]].beats - 1);
+                axi.wvalid <= 1;
+                wv = 1;
+            end
+            if (!av && ai < n && (pace == 1 ? (g > first[ai] - lead || (g == first[ai] - lead && wv))
+                                            : (ai == 0 || (wi >= ai && t >= wl_at[ai-1] + lag)))) begin
+                axi.awaddr  <= 64'h0800_0000 + bursts[ks[ai]].uaddr;
+                axi.awlen   <= 8'(bursts[ks[ai]].beats - 1);
+                axi.awid    <= AXI_ID_BITS'(ks[ai]);
+                axi.awvalid <= 1;
+                av = 1;
+            end
+            @(posedge aclk);
+            // its handshakes
+            if (av && axi.awready) begin av = 0; ai++; axi.awvalid <= 0; end
+            if (wv && axi.wready) begin
+                wv = 0; axi.wvalid <= 0; g++;
+                if (wj == bursts[ks[wi]].beats - 1) begin
+                    if (bursts[ks[wi]].gap_after || bursts[ks[wi]].gap_held) wgap = 4*FLUSH;
+                    wl_at.push_back(t); wi++; wj = 0;
+                end else wj++;
+                if (bp && wgap == 0) wgap = $urandom_range(0, 1) ? 0 : $urandom_range(1, 3);
+            end else if (!wv && wgap > 0) wgap--;
+            t++;
+        end
     end
-    if (bp) axi.bready <= $urandom_range(0, 3) != 0;
-    else    axi.bready <= 1;
 end
 
 // ---------------------------------------------------------------------------
@@ -319,9 +383,33 @@ int   n_burst = 0, n_drop = 0, n_pkt_local = 0, n_pkt_rdma = 0, n_post = 0;
 int   n_store = 0, n_store_drop = 0;
 int   n_full = 0, n_part = 0;
 int   n_dbg [N_DBG];
+int   n_get = 0;
 bit   check_rate = 0;    // the next run's bursts must go in at one beat a cycle
-// Input rate: W beats taken between the first and the last
+// Input rate: W beats taken between the first and the last; the cycle each
+// burst's first beat was taken
 longint cyc = 0, w_first = -1, w_last = 0, w_beats = 0;
+longint w_starts [$];
+bit     w_mid = 0;
+// For the get order: B answered, and packet beats and stores the write path
+// queued or gathered, so far; a get's snapshot of both when it arrives
+int     b_hs = 0;
+longint units_taken = 0;
+bit     g_armed = 0;
+int     g_snap_b;
+longint g_snap_u;
+// Get requests: their triggers, and what each was when it arrived
+typedef struct { int after_b; int after_w; } gtrig_t;
+typedef struct {
+    logic [PID_BITS-1:0]   pid;
+    logic [VADDR_BITS-1:0] ref_;
+    logic [63:0]           word;
+    int                    bseen;   // bursts answered before it was presented
+    longint                taken;   // packet beats and stores the write path had queued or gathered by then
+} grec_t;
+gtrig_t gtrigs [$];      // the next run's
+gtrig_t g_q [$];
+grec_t  g_rec [$];
+int     g_n = 0;         // gets issued, over all runs (their fields differ)
 always @(posedge aclk) cyc++;
 
 always @(posedge aclk) begin
@@ -350,41 +438,119 @@ always @(posedge aclk) if (aresetn) begin
     n_store_drop += cnt_store_drop;
     n_full      += cnt_rdma_full;
     n_part      += cnt_rdma_flush + cnt_rdma_cut;
+    n_get       += cnt_get;
     for (int i = 0; i < N_DBG; i++) n_dbg[i] += cnt_dbg[i];
     // a W beat that waits is counted under exactly one reason
-    `CHECK((axi.wvalid && !axi.wready) == (cnt_dbg[7:3] != 0) && $onehot0(cnt_dbg[7:3]),
-           $sformatf("W wait reasons %b with wvalid %0d wready %0d", cnt_dbg[7:3], axi.wvalid, axi.wready))
+    `CHECK(dut.w_wait == (cnt_dbg[7:3] != 0) && $onehot0(cnt_dbg[7:3]),
+           $sformatf("W wait reasons %b with a beat waiting %0d", cnt_dbg[7:3], dut.w_wait))
     `CHECK(cnt_dbg[0] == (m_host_tvalid && !m_host_tready) && cnt_dbg[1] == (m_net_tvalid && !m_net_tready),
            "output backpressure pulses")
     if (axi.wvalid && axi.wready) begin
         if (w_first < 0) w_first = cyc;
+        if (!w_mid) w_starts.push_back(cyc);
+        w_mid = !axi.wlast;
         w_last = cyc;
         w_beats++;
     end
+    // a get's snapshot: what was answered and taken in the cycles before
+    // the one it is first presented in
+    if (s_get_valid && !g_armed) begin
+        g_armed  = 1;
+        g_snap_b = b_hs;
+        g_snap_u = units_taken;
+    end
+    if (s_get_valid && s_get_ready) begin
+        g_rec.push_back('{pid: s_get_pid, ref_: s_get_ref, word: s_get_word, bseen: g_snap_b, taken: g_snap_u});
+        g_armed = 0;
+    end
+    b_hs        += axi.bvalid && axi.bready;
+    units_taken += dut.good_beat + (dut.part_store && !dut.pq_full);
     if (wr_valid && wr_req.strm == STRM_RDMA) `CHECK(win_ok, "rdma request presented while the window is shut")
+end
+
+// Get requests: each waits for its trigger - burst after_b answered (B), or
+// after_w W beats taken on the bus - then is presented until taken
+always begin
+    if (g_q.size() == 0) @(posedge aclk);
+    else begin
+        automatic gtrig_t tr = g_q.pop_front();
+        while (tr.after_b >= 0 ? b_seen <= tr.after_b : w_beats < tr.after_w) @(posedge aclk);
+        s_get_valid <= 1;
+        s_get_pid   <= PID_BITS'(20 + g_n % 8);
+        s_get_ref   <= {8'd9, 40'(64'h1000 * g_n + 8)};
+        s_get_word  <= {16'd1, 48'(g_n)};
+        g_n++;
+        do @(posedge aclk); while (!s_get_ready);
+        s_get_valid <= 0;
+    end
+end
+
+always @(posedge aclk) begin
+    if (axi.bvalid && axi.bready) begin
+        `CHECK(axi.bid == AXI_ID_BITS'(b_expect_id), $sformatf("bid %0d, expected %0d", axi.bid, b_expect_id))
+        `CHECK(axi.bresp == 2'b00, "bresp not OKAY")
+        b_expect_id++;
+        b_seen++;
+    end
+    if (bp) axi.bready <= $urandom_range(0, 3) != 0;
+    else    axi.bready <= 1;
 end
 
 // ---------------------------------------------------------------------------
 // Run one test: send, wait for everything to drain, compare
 // ---------------------------------------------------------------------------
+// What left, in order: a packet (its payload beats from `first` in pay), a
+// store, or a get request (va = the far reference, data = the request word)
+typedef struct {
+    int                    kind;    // 0 packet, 1 store, 2 get
+    bit                    route;
+    logic [PID_BITS-1:0]   pid;
+    logic [VADDR_BITS-1:0] va;
+    int                    beats;
+    int                    first;
+    logic [63:0]           data;
+} obs_t;
+
+real cpb;                // the last run's cycles per burst (first beats taken)
+
 task automatic run(input string name);
-    int n_local = 0, n_rdma = 0, n_st = 0, n_st_rdma = 0, n_bursts;
+    int n_local = 0, n_rdma = 0, n_st = 0, n_st_rdma = 0, n_gt = 0, n_bursts, n_gets;
     int e_full = 0, e_part = 0;
     int e0 = errors;
+    obs_t   obs [$], ng [$];
+    longint ng_at [$], g_at [$];          // packet beats and stores before each
+    logic [AXI_DATA_BITS-1:0] pay [$];
     reqs.delete(); host_beats.delete(); net_beats.delete();
     host_last.delete(); net_last.delete(); host_keep.delete();
     n_burst = 0; n_drop = 0; n_pkt_local = 0; n_pkt_rdma = 0; n_post = 0; b_seen = 0;
-    n_store = 0; n_store_drop = 0; n_full = 0; n_part = 0;
+    n_store = 0; n_store_drop = 0; n_full = 0; n_part = 0; n_get = 0;
     for (int i = 0; i < N_DBG; i++) n_dbg[i] = 0;
-    w_first = -1; w_beats = 0;
+    w_first = -1; w_beats = 0; w_starts.delete(); w_mid = 0;
+    b_hs = 0; units_taken = 0; g_rec.delete();
     salt = $urandom();
+    cuts.delete();
     model();
 
     b_expect_id = 0;
-    foreach (bursts[k]) begin aw_q.push_back(k); w_q.push_back(k); end
+    if (pace == 0) foreach (bursts[k]) begin aw_q.push_back(k); w_q.push_back(k); end
+    else           foreach (bursts[k]) p_q.push_back(k);
+    foreach (gtrigs[i]) g_q.push_back(gtrigs[i]);
     n_bursts = bursts.size();
-    // done when every burst answered and the output has gone quiet
-    wait (b_seen == n_bursts);
+    n_gets   = gtrigs.size();
+    // done when every burst answered, every get taken, and the output has
+    // gone quiet; a run that stops short ends the TB, naming it
+    begin
+        longint t0 = cyc;
+        while (b_seen != n_bursts || g_rec.size() != n_gets) begin
+            @(posedge aclk);
+            if (cyc - t0 > 200000) begin
+                $display("FAIL %s: hung, %0d of %0d bursts answered, %0d of %0d gets taken",
+                         name, b_seen, n_bursts, g_rec.size(), n_gets);
+                $display("TB FAIL (tb_loom_ingress): %0d errors", errors + 1);
+                $finish;
+            end
+        end
+    end
     repeat (8*FLUSH + 200) @(posedge aclk);
     win_shut = 0;
     // a packet held open by the shut window flushes once it opens
@@ -393,69 +559,113 @@ task automatic run(input string name);
     wait (dut_ost == 3'd0 && dut.pq_empty);
     repeat (20) @(posedge aclk);
 
-    `CHECK(reqs.size() == exp_pkts.size(),
-           $sformatf("%s: %0d requests, expected %0d", name, reqs.size(), exp_pkts.size()))
-    foreach (exp_pkts[i]) begin
-        pkt_t e = exp_pkts[i];
-        req_t r;
-        if (i >= reqs.size()) break;
-        r = reqs[i];
-        `CHECK(r.pid == e.pid && r.last == 1'b1, $sformatf("%s pkt %0d: pid %0d last %0d", name, i, r.pid, r.last))
-        if (e.store && e.route) begin
-            logic [AXI_DATA_BITS-1:0] h;
-            `CHECK(r.opcode == RC_RDMA_WRITE_ONLY && r.strm == STRM_RDMA && r.mode == 1'b1 &&
-                   r.dest == 0 && r.vaddr == {8'hFF, 40'd0} && r.len == 64,
-                   $sformatf("%s pkt %0d: rdma store request op %0h va %h len %0d", name, i, r.opcode, r.vaddr, r.len))
-            h = net_beats.pop_front();
-            `CHECK(net_last.pop_front(), $sformatf("%s pkt %0d: no tlast on the inline message", name, i))
-            `CHECK(h[63:0] == {28'd0, 28'd8, 8'd2} && h[127:64] == 64'(e.va) &&
-                   h[191:128] == e.data && h[AXI_DATA_BITS-1:192] == '0,
-                   $sformatf("%s pkt %0d: inline message %h %h %h, expected va %h data %h",
-                             name, i, h[191:128], h[127:64], h[63:0], e.va, e.data))
-            n_st++; n_st_rdma++;
-        end else if (e.store) begin
-            logic [AXI_DATA_BITS-1:0] d;
-            `CHECK(r.opcode == LOCAL_WRITE && r.strm == STRM_HOST && r.dest == 0 &&
-                   r.vaddr == e.va && r.len == 8,
-                   $sformatf("%s pkt %0d: local store request va %h len %0d, expected va %h", name, i, r.vaddr, r.len, e.va))
-            d = host_beats.pop_front();
-            `CHECK(d[63:0] == e.data && host_keep.pop_front() == 64'hFF && host_last.pop_front(),
-                   $sformatf("%s pkt %0d: local store beat %h, expected %h", name, i, d[63:0], e.data))
-            n_st++;
-        end else if (e.route) begin
-            logic [AXI_DATA_BITS-1:0] h;
-            // self-describing: the RETH is the binding's remote reference
-            // plus the offset, the payload follows with no header
-            `CHECK(r.opcode == RC_RDMA_WRITE_ONLY && r.strm == STRM_RDMA && r.mode == 1'b1 &&
-                   r.rdma && r.remote && r.dest == 0 && r.vaddr == e.va &&
-                   r.len == LEN_BITS'(64*e.beats),
-                   $sformatf("%s pkt %0d: rdma request op %0h strm %0d dest %0d va %h len %0d, expected va %h len %0d",
-                             name, i, r.opcode, r.strm, r.dest, r.vaddr, r.len, e.va, 64*e.beats))
-            if (e.beats == PKT_BEATS) e_full++; else e_part++;
-            for (int j = 0; j < e.beats; j++) begin
-                `CHECK(net_beats.pop_front() == pat(e.uaddr + 64*j), $sformatf("%s pkt %0d: payload beat %0d", name, i, j))
-                `CHECK(net_last.pop_front() == (j == e.beats - 1), $sformatf("%s pkt %0d: tlast at beat %0d", name, i, j))
-            end
-            n_rdma++;
+    // what left, from the requests and their beats
+    foreach (reqs[i]) begin
+        req_t r = reqs[i];
+        obs_t o;
+        o.route = (r.strm == STRM_RDMA); o.pid = r.pid; o.beats = 0; o.first = pay.size(); o.data = 0;
+        `CHECK(r.last == 1'b1, $sformatf("%s req %0d: last not set", name, i))
+        if (o.route) begin
+            `CHECK(r.opcode == RC_RDMA_WRITE_ONLY && r.mode == 1'b1 && r.rdma && r.remote && r.dest == 0,
+                   $sformatf("%s req %0d: rdma request op %0h mode %0d dest %0d", name, i, r.opcode, r.mode, r.dest))
         end else begin
-            `CHECK(r.opcode == LOCAL_WRITE && r.strm == STRM_HOST && r.dest == 0 &&
-                   r.vaddr == e.va && r.len == LEN_BITS'(64*e.beats),
-                   $sformatf("%s pkt %0d: local request va %h len %0d, expected va %h len %0d",
-                             name, i, r.vaddr, r.len, e.va, 64*e.beats))
-            for (int j = 0; j < e.beats; j++) begin
-                `CHECK(host_beats.pop_front() == pat(e.uaddr + 64*j), $sformatf("%s pkt %0d: payload beat %0d", name, i, j))
-                `CHECK(host_last.pop_front() == (j == e.beats - 1), $sformatf("%s pkt %0d: tlast at beat %0d", name, i, j))
-                `CHECK(host_keep.pop_front() == '1, $sformatf("%s pkt %0d: tkeep at beat %0d", name, i, j))
-            end
-            n_local++;
+            `CHECK(r.opcode == LOCAL_WRITE && r.strm == STRM_HOST && r.dest == 0,
+                   $sformatf("%s req %0d: local request op %0h strm %0d dest %0d", name, i, r.opcode, r.strm, r.dest))
         end
+        if (o.route && r.vaddr == {8'hFF, 40'd0}) begin
+            // inline message: a store (op WRITE_INLINE) or a get (op GET_REQ)
+            logic [AXI_DATA_BITS-1:0] h = net_beats.pop_front();
+            `CHECK(r.len == 64 && net_last.pop_front(), $sformatf("%s req %0d: inline message len %0d / no tlast", name, i, r.len))
+            o.kind = (h[7:0] == 8'd3) ? 2 : 1;
+            `CHECK(h[63:0] == {28'd0, 28'd8, (o.kind == 2) ? 8'd3 : 8'd2} && h[127:64+VADDR_BITS] == '0 &&
+                   h[AXI_DATA_BITS-1:192] == '0,
+                   $sformatf("%s req %0d: inline message %h", name, i, h[191:0]))
+            o.va = h[64 +: VADDR_BITS]; o.data = h[191:128];
+        end else if (!o.route && r.len == 8) begin
+            logic [AXI_DATA_BITS-1:0] d = host_beats.pop_front();
+            `CHECK(host_keep.pop_front() == 64'hFF && host_last.pop_front(),
+                   $sformatf("%s req %0d: local store beat keep / last", name, i))
+            o.kind = 1; o.va = r.vaddr; o.data = d[63:0];
+        end else begin
+            o.kind = 0; o.va = r.vaddr; o.beats = r.len / 64;
+            `CHECK(r.len % 64 == 0 && o.beats > 0 && o.beats <= PKT_BEATS, $sformatf("%s req %0d: packet len %0d", name, i, r.len))
+            for (int j = 0; j < o.beats; j++) begin
+                if (o.route) begin
+                    pay.push_back(net_beats.pop_front());
+                    `CHECK(net_last.pop_front() == (j == o.beats - 1), $sformatf("%s req %0d: tlast at beat %0d", name, i, j))
+                end else begin
+                    pay.push_back(host_beats.pop_front());
+                    `CHECK(host_last.pop_front() == (j == o.beats - 1), $sformatf("%s req %0d: tlast at beat %0d", name, i, j))
+                    `CHECK(host_keep.pop_front() == '1, $sformatf("%s req %0d: tkeep at beat %0d", name, i, j))
+                end
+            end
+        end
+        obs.push_back(o);
     end
     `CHECK(host_beats.size() == 0 && net_beats.size() == 0,
            $sformatf("%s: %0d host / %0d net beats left over", name, host_beats.size(), net_beats.size()))
+
+    // gets: in the order presented, each where it left among the writes
+    begin
+        longint u = 0;
+        int gi = 0;
+        foreach (obs[i]) begin
+            if (obs[i].kind == 2) begin
+                `CHECK(gi < g_rec.size() && obs[i].pid == g_rec[gi].pid && obs[i].va == g_rec[gi].ref_ &&
+                       obs[i].data == g_rec[gi].word,
+                       $sformatf("%s get %0d: pid %0d ref %h word %h", name, gi, obs[i].pid, obs[i].va, obs[i].data))
+                g_at.push_back(u);
+                gi++; n_gt++;
+            end else begin
+                ng.push_back(obs[i]); ng_at.push_back(u);
+                u += (obs[i].kind == 0) ? obs[i].beats : 1;
+                if (obs[i].kind == 1) begin n_st++; n_st_rdma += obs[i].route; end
+                else if (obs[i].route) begin
+                    n_rdma++;
+                    if (obs[i].beats == PKT_BEATS) e_full++; else e_part++;
+                end else n_local++;
+            end
+        end
+        `CHECK(gi == n_gets, $sformatf("%s: %0d get requests, expected %0d", name, gi, n_gets))
+    end
+
+    // the writes, exactly as the model has them, with the open packet
+    // closed wherever a get request left
+    cuts = g_at;
+    model();
+    `CHECK(ng.size() == exp_pkts.size(), $sformatf("%s: %0d writes, expected %0d", name, ng.size(), exp_pkts.size()))
+    foreach (exp_pkts[i]) begin
+        pkt_t e = exp_pkts[i];
+        obs_t o;
+        if (i >= ng.size()) break;
+        o = ng[i];
+        if (e.store) begin
+            `CHECK(o.kind == 1 && o.route == e.route && o.pid == e.pid && o.va == e.va && o.data == e.data,
+                   $sformatf("%s pkt %0d: kind %0d route %0d va %h data %h, expected a store at %h data %h",
+                             name, i, o.kind, o.route, o.va, o.data, e.va, e.data))
+        end else begin
+            `CHECK(o.kind == 0 && o.route == e.route && o.pid == e.pid && o.va == e.va && o.beats == e.beats,
+                   $sformatf("%s pkt %0d: kind %0d route %0d pid %0d va %h x %0d, expected route %0d pid %0d va %h x %0d",
+                             name, i, o.kind, o.route, o.pid, o.va, o.beats, e.route, e.pid, e.va, e.beats))
+            if (o.kind == 0)
+                for (int j = 0; j < o.beats && j < e.beats; j++)
+                    `CHECK(pay[o.first + j] == pat(e.uaddr + 64*j), $sformatf("%s pkt %0d: payload beat %0d", name, i, j))
+        end
+    end
+
+    // each get after every write answered before it was presented, and
+    // after every beat and store the write path had taken by then
+    foreach (g_rec[x]) if (x < g_at.size()) begin
+        longint need = (g_rec[x].bseen > 0) ? exp_units[g_rec[x].bseen - 1] : 0;
+        `CHECK(g_at[x] >= need && g_at[x] >= g_rec[x].taken,
+               $sformatf("%s get %0d: left after %0d beats and stores, but %0d were answered and %0d taken before it",
+                         name, x, g_at[x], need, g_rec[x].taken))
+    end
+
     `CHECK(n_drop == exp_drops && n_burst == n_bursts - exp_drops,
            $sformatf("%s: %0d bursts %0d drops, expected %0d / %0d", name, n_burst, n_drop, n_bursts - exp_drops, exp_drops))
-    `CHECK(n_pkt_local == n_local && n_pkt_rdma == n_rdma && n_post == n_rdma + n_st_rdma,
-           $sformatf("%s: counters local %0d rdma %0d post %0d", name, n_pkt_local, n_pkt_rdma, n_post))
+    `CHECK(n_pkt_local == n_local && n_pkt_rdma == n_rdma && n_post == n_rdma + n_st_rdma + n_gt && n_get == n_gt,
+           $sformatf("%s: counters local %0d rdma %0d post %0d get %0d", name, n_pkt_local, n_pkt_rdma, n_post, n_get))
     `CHECK(n_full == e_full && n_part == e_part,
            $sformatf("%s: rdma packets full %0d partial %0d, expected %0d / %0d", name, n_full, n_part, e_full, e_part))
     `CHECK(n_store == n_st && n_store_drop == exp_store_drops,
@@ -473,10 +683,12 @@ task automatic run(input string name);
                $sformatf("%s: %0d beats in %0d cycles, %0d cycles waiting on a lookup", name,
                          w_beats, w_last - w_first + 1, n_dbg[3]))
     check_rate = 0;
-    $display("%s %s: %0d bursts, %0d local + %0d rdma packets, %0d stores, %0d drops, input %0d beats in %0d cycles",
-             (errors == e0) ? "ok  " : "FAIL", name, n_bursts, n_local, n_rdma, n_st, exp_drops,
-             w_beats, w_last - w_first + 1);
+    cpb = (w_starts.size() > 1) ? real'(w_starts[$] - w_starts[0]) / (w_starts.size() - 1) : 0.0;
+    $display("%s %s: %0d bursts, %0d local + %0d rdma packets, %0d stores, %0d gets, %0d drops, input %0d beats in %0d cycles (%0.2f a burst, %0d waiting on a lookup)",
+             (errors == e0) ? "ok  " : "FAIL", name, n_bursts, n_local, n_rdma, n_st, n_gt, exp_drops,
+             w_beats, w_last - w_first + 1, cpb, n_dbg[3]);
     bursts.delete();
+    gtrigs.delete();
 endtask
 
 function automatic void add(input longint uaddr, input int beats, input bit gap = 0);
@@ -618,6 +830,40 @@ task automatic suite(input string tag);
     add_run(W1 + 64'hDC00 + 9*64, 4, 4);
     add_st(W3 + 512 - 32, HI32);
     run({tag, "inside a line"});
+
+    // a burst with no window inside a run: discarded, and the run around it
+    // stays one packet
+    add_run(W1 + 64'hE800, 16, 4);
+    add(64'h0100_0000, 4);
+    add_run(W1 + 64'hE800 + 16*64, 16, 4);
+    run({tag, "drop inside a run"});
+
+    // get requests in a stream: once burst 3 is answered, after 150 W beats
+    // on the bus and one right behind it, once burst 40 is answered (stores
+    // and a burst from line+32 between); the last with the packet open and
+    // no beat coming, which closes it
+    add_run(W2 + 64'h5_0000, 128, 4);        // bursts 0-31
+    add_st(W2 + 64'h6_0000, word(2));        // 32
+    add(W2 + 64'h6_1000 + 32, 3);            // 33
+    bursts[bursts.size()-1].strb[0] = HI32;
+    add_run(W1 + 64'h5_0000, 64, 4);         // 34-49
+    add_run(W2 + 64'h6_2000, 8, 4);          // 50-51
+    gtrigs = '{'{3, 0}, '{-1, 150}, '{-1, 151}, '{40, 0}, '{51, 0}};
+    run({tag, "gets in a stream"});
+endtask
+
+// Rate: 64 back-to-back 4-beat bursts (four full rdma packets; with drop, a
+// discarded burst between the second and third) from the paced master, AW
+// timed by p (pace) and l (its lead or lag); cycles a burst from the first
+// beats taken, checked against want
+task automatic rate(input string name, input int p, input int l, input real want, input bit drop = 0);
+    pace = p; lead = l; lag = l;
+    add_run(W2 + 64'h4_0000, 128, 4);
+    if (drop) add(64'h0100_0000, 4);
+    add_run(W2 + 64'h4_0000 + 128*64, 128, 4);
+    run(name);
+    if (want > 0) `CHECK(cpb == want, $sformatf("%s: %0.2f cycles a burst, expected %0.2f", name, cpb, want))
+    pace = 0;
 endtask
 
 initial begin
@@ -642,7 +888,26 @@ initial begin
     suite("");
     bp = 1;
     suite("bp: ");
-    bp = 0;
+    // AW in the same cycle as its first W beat; AW two cycles after the
+    // previous burst's last beat was taken (W one cycle ahead of its AW)
+    pace = 1; lead = 0;
+    bp = 0; suite("aw with w: ");
+    bp = 1; suite("aw with w, bp: ");
+    pace = 2; lag = 2;
+    bp = 0; suite("w ahead: ");
+    bp = 1; suite("w ahead, bp: ");
+    bp = 0; pace = 0;
+
+    rate("rate, AW with the first W", 1, 0, 4.0);
+    rate("rate, AW 1 beat ahead", 1, 1, 4.0);
+    rate("rate, AW 2 beats ahead", 1, 2, 4.0);
+    rate("rate, AW 4 beats ahead", 1, 4, 4.0);
+    rate("rate, AW the cycle after the last W", 2, 1, 4.0);
+    rate("rate, AW 2 cycles after the last W", 2, 2, 4.0);
+    rate("rate, AW 4 cycles after the last W", 2, 4, 4.0);
+    rate("rate, AW with the first W, a drop inside", 1, 0, 4.0, 1);
+    // W far ahead of its AW: the W buffer fills, the bus waits (no rate)
+    rate("rate, AW 12 cycles after the last W", 2, 12, 0.0);
 
     if (errors == 0) $display("TB PASS (tb_loom_ingress)");
     else             $display("TB FAIL (tb_loom_ingress): %0d errors", errors);
