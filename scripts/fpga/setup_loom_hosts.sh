@@ -7,7 +7,7 @@
 #
 #   u280.bit, v80.pdi  images on the shared home (every host must see them),
 #                      e.g. ~/coyote-bitstreams/loom-switch-coalesce-clean/hw/bitstreams/cyt_top.bit
-#                      and ~/coyote-bitstreams/loom-ce-rd64/cyt_top.pdi
+#                      and ~/coyote-bitstreams/loom-ce-uwinra/cyt_top.pdi
 #   host               amy, rose or clara (clara has no V80)
 #   v80.pdi = -        the V80s are programmed already (e.g. after a JTAG + warm-reboot recovery, or
 #                      when a V80's JTAG cable is gone): only reload their driver
