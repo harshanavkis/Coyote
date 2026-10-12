@@ -114,12 +114,15 @@ CPU stores through the same window (`uwinWrite`, write-combining): 0.17 GB/s.
   for bulk PTDMA (64 MiB x 10: 164,827 packets = 4,071 B each; 64 MiB x 5: 81,960 =
   4,094 B; idle flushes 80-1,900) and almost no backpressure (`W wait: fifo` 35-78k
   cycles). The V80 engine, also 4 KiB packets, tops out at the same 10.4-10.7 GB/s (RDMA
-  from host memory: 12.2). The limit was `loom_ingress` itself: every write arrives as a
-  256 B burst and waited ~2 cycles for its address lookup (`W wait: no aw` 2.0 per burst),
-  6 cycles per 256 B at 250 MHz = 10.67 GB/s. Fixed by a W buffer ahead of the lookup
-  (`loom_ingress.sv`, DESIGN.md section 12; 4 cycles per burst in simulation, not yet
-  measured on hardware). The idle timer only splits real gaps: 7 KiB chunks end in a
+  from host memory: 12.2). Not `loom_ingress`: its per-burst lookup wait (`W wait: no aw`
+  2.0 per 256 B burst) is gone in the W-buffer image and PTDMA still runs at 10.45-10.52
+  (4 MiB chunks), 10.03-10.13 (1 MiB) - the ceiling is upstream, on the way into the U280
+  (DESIGN.md section 12). The idle timer only splits real gaps: 7 KiB chunks end in a
   3 KiB tail each (309,575 flushes), followed by the next descriptor ~5.4 us later.
+- **64 KiB chunks sometimes drop to ~3.2-3.6 GB/s** after 4-5 iterations (with ~1.5-2x the
+  packets), on the standard and the W-buffer U280 image alike (2026-10-12 A/B: 2 of 4 runs);
+  the other runs stay at 5.9-6.6. The host-side submit time doubles with it (~300 -> ~730 us
+  an iteration), which points at the host side; not investigated.
 - **A lone 1 MiB transfer takes ~347 us (3 GB/s)**, ~240 us more than the model; seen only
   when the whole transfer is 1 MiB. Unexplained.
 - The V80 serves every reader (PTDMA as much as the U280) at ~3.7 GB/s: 8 reads of 256 B

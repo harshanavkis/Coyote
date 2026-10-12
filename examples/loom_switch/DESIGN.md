@@ -306,6 +306,17 @@ buffer's head. Before, a beat was taken only once its burst was loaded.
   about two cycles for its own lookup. The header's "bursts follow each
   other with no gap" held only for AWs running ahead of their data, as the
   TB's master sent them.
+- Hardware (2026-10-12, image loom-switch-wbuf, 36a57a37; full regress
+  passes): the rate did NOT change. ce_local V80 -> U280 -> host 10.64
+  GB/s and -> V80 HBM 10.62 (both before and after), the V80 engine's
+  remote puts 10.71, PTDMA into the window 10.45-10.52 (4 MiB chunks) and
+  10.03-10.13 (1 MiB) as before. The ~2 cycles a burst were real but did not
+  set the pace: the upstream delivers a 256 B burst about every 6 cycles
+  anyway, so 4 + 2 = 6 matched the ceiling by coincidence. Writes into the
+  U280 stop at ~10.5-10.7 GB/s for both senders upstream of loom_ingress
+  (the U280's PCIe receive path, the shell's interconnect or the root
+  complex's peer-to-peer forwarding; not split yet); the V80 writing its own
+  window stops at 10.93 (section 3).
 - TB (`tb_loom_ingress` rate tests, 64 back-to-back 4-beat bursts, cycles
   per burst, before -> after): AW with the first beat 8 -> 4, 1 beat ahead
   7 -> 4, 2 ahead 6 -> 4 (the hardware's case), 4 ahead 4 -> 4; AW only
