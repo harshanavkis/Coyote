@@ -29,3 +29,8 @@ target_link_libraries(uwin_pingpong PUBLIC Coyote pthread)
 # PTDMA (the host CPU's DMA engines) as Loom's copy engine, host DRAM -> window -> far host
 add_executable(uwin_ptdma ${TARGET_DIR}/uwin_ptdma.cpp)
 target_link_libraries(uwin_ptdma PUBLIC Coyote pthread)
+
+# Push ceiling: packets/s of 64 B CPU writes into the uwin (per-packet or per-byte limit?)
+add_executable(uwin_wc64 ${TARGET_DIR}/uwin_wc64.cpp)
+target_link_libraries(uwin_wc64 PUBLIC Coyote pthread)
+target_compile_options(uwin_wc64 PRIVATE -mavx2)
