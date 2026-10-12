@@ -15,8 +15,19 @@ import lynxTypes::*;
  * axi_main carries the window (WIN_BASE, BAR4 offset 0x0800_0000: 2^UWIN_BITS
  * bytes, its last 4 KiB the counter page, answered by uwin_hbm) and the shell's
  * registers below it. Only reads of the window outside the counter page are
- * ever read ahead or answered here; everything else passes through unchanged,
- * and AW, W, B are always wires.
+ * ever read ahead or answered here; everything else passes through unchanged.
+ * AW and B are always wires; W is held W_LAG cycles behind its AW (below).
+ *
+ * W BEHIND AW (W_LAG, writes into the V80): the shell's SmartConnect takes
+ * 4-beat bursts (a peer's 256 B writes) at one per 6-7 cycles when a burst's
+ * AW reaches it with, or one cycle before, its first W beat - as the static
+ * presents them - and at one per 4 cycles (every cycle a beat) once the AW is
+ * 3 or more cycles ahead (simulated, the generated IP: 6.75 / 6.00 / 4.13 /
+ * 4.00 cycles a burst at 0 / 1 / 2 / 3 ahead). W beats wait in a FIFO here
+ * until their burst's AW was taken by m_axi W_LAG cycles ago, then follow it,
+ * one path, in order (+W_LAG cycles a write). The static never waits for W
+ * before AW (AXI), and the SmartConnect takes AW without W, so holding W
+ * cannot deadlock. W_LAG 0: W is wires too.
  *
  * ONE ID, ONE ORDER: the Versal static leaves axi_main's IDs unconnected
  * (static_top: arid/awid not driven, rid/bid not used), so every read is one
@@ -105,7 +116,9 @@ module uwin_ra #(
     parameter integer      RA_BURST  = 16,              // lines per read-ahead AR (1 KiB); 2..16 (axi_main's MAX_BURST_LENGTH), power of 2
     parameter integer      RA_RING   = 512,             // the ring, lines (32 KiB); power of 2, >= 256 + RA_BURST (a peer
                                                         // burst), >= RA_LINES + the peer's reads in flight to keep ahead
-    parameter integer      RA_IDLE   = 1024             // xclk cycles without an AR that end a stream (3.1 us at 333 MHz)
+    parameter integer      RA_IDLE   = 1024,            // xclk cycles without an AR that end a stream (3.1 us at 333 MHz)
+    parameter integer      W_LAG     = 3,               // xclk cycles a burst's first W beat follows its AW at m_axi (0: wires)
+    parameter integer      WQ        = 8                // W beats held here (power of 2)
 ) (
     input  logic                xclk,
     input  logic                xresetn,
@@ -227,7 +240,7 @@ assign s_axi.rlast    = trk ? ro.last : m_axi.rlast;
 assign s_axi.rvalid   = trk ? ro_v    : m_axi.rvalid;
 assign m_axi.rready   = trk ? ri_room : s_axi.rready;
 
-// AW, W, B: wires
+// AW, B: wires; W below
 assign m_axi.awaddr   = s_axi.awaddr;
 assign m_axi.awburst  = s_axi.awburst;
 assign m_axi.awcache  = s_axi.awcache;
@@ -240,11 +253,69 @@ assign m_axi.awregion = s_axi.awregion;
 assign m_axi.awsize   = s_axi.awsize;
 assign m_axi.awvalid  = s_axi.awvalid;
 assign s_axi.awready  = m_axi.awready;
+generate if (W_LAG == 0) begin : g_w_wires
 assign m_axi.wdata    = s_axi.wdata;
 assign m_axi.wlast    = s_axi.wlast;
 assign m_axi.wstrb    = s_axi.wstrb;
 assign m_axi.wvalid   = s_axi.wvalid;
 assign s_axi.wready   = m_axi.wready;
+end else begin : g_w_lag
+// W beats in arrival order: a FIFO, then a skid buffer (registered outputs)
+typedef struct packed {
+    logic [AXI_DATA_BITS-1:0]   data;
+    logic [AXI_DATA_BITS/8-1:0] strb;
+    logic                       last;
+} w_t;
+localparam integer WB = $clog2(WQ);
+w_t             wq_mem [WQ];
+logic [WB-1:0]  wq_wp, wq_rp;
+logic [WB:0]    wq_n;
+logic           wo_room, wo_v, w_go;
+w_t             wo;
+wire wq_push = s_axi.wvalid && s_axi.wready;
+wire wq_pop  = (wq_n != '0) && wo_room;
+assign s_axi.wready = (wq_n != (WB+1)'(WQ));
+always_ff @(posedge xclk) begin
+    if (!xresetn) begin
+        wq_wp <= '0;
+        wq_rp <= '0;
+        wq_n  <= '0;
+    end else begin
+        if (wq_push) wq_wp <= wq_wp + 1'b1;
+        if (wq_pop)  wq_rp <= wq_rp + 1'b1;
+        wq_n <= wq_n + (wq_push ? 1'b1 : 1'b0) - (wq_pop ? 1'b1 : 1'b0);
+    end
+end
+always_ff @(posedge xclk) if (wq_push) wq_mem[wq_wp] <= '{data: s_axi.wdata, strb: s_axi.wstrb, last: s_axi.wlast};
+uwin_ra_skid #(.W($bits(w_t))) inst_w_out (.clk(xclk), .rstn(xresetn),
+    .s_valid(wq_n != '0), .s_ready(wo_room), .s_data(wq_mem[wq_rp]),
+    .m_valid(wo_v), .m_ready(m_axi.wready && w_go), .m_data(wo));
+
+// A burst's first beat goes once its AW was taken W_LAG cycles ago: aw_d
+// delays m_axi's AW handshakes, w_cr counts those not yet followed by a
+// first beat, w_mid is set inside a burst (its first beat gone)
+logic [W_LAG-1:0] aw_d;
+logic [7:0]       w_cr;
+logic             w_mid;
+wire w_hs    = m_axi.wvalid && m_axi.wready;
+wire w_first = w_hs && !w_mid;
+assign w_go  = w_mid || (w_cr != '0) || aw_d[W_LAG-1];
+always_ff @(posedge xclk) begin
+    if (!xresetn) begin
+        aw_d  <= '0;
+        w_cr  <= '0;
+        w_mid <= 1'b0;
+    end else begin
+        aw_d  <= W_LAG'({aw_d, m_axi.awvalid && m_axi.awready});
+        w_cr  <= w_cr + (aw_d[W_LAG-1] ? 8'd1 : 8'd0) - (w_first ? 8'd1 : 8'd0);
+        if (w_hs) w_mid <= !wo.last;
+    end
+end
+assign m_axi.wdata  = wo.data;
+assign m_axi.wstrb  = wo.strb;
+assign m_axi.wlast  = wo.last;
+assign m_axi.wvalid = wo_v && w_go;
+end endgenerate
 assign s_axi.bid      = m_axi.bid;
 assign s_axi.bresp    = m_axi.bresp;
 assign s_axi.bvalid   = m_axi.bvalid;

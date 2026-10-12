@@ -38,8 +38,14 @@ import lynxTypes::*;
  * flight, ds_lat 142 (a read ~441 ns at axi_main off, as measured), 110 ns
  * upstream, 3 beats in 4 cycles (T11); the end of a short stream, the
  * jump's data right behind the fill's last beat (T12); switched on right
- * before a stream, reads still out from PASS when its fill heads mq (T13).
- * Always: ARs and R never drop a valid or change while waiting (both DUT
+ * before a stream, reads still out from PASS when its fill heads mq (T13);
+ * W behind AW: back-to-back 4-beat window writes, AW with the first W beat
+ * (as the static), W first, AW first, then random backpressure and gaps:
+ * one burst every 4 cycles at m_axi, every first beat W_LAG cycles or more
+ * after its AW (T14).
+ * Always: AW and B are wires; W beats leave in order and unchanged, never
+ * dropped or changed while they wait, and a burst's first beat at m_axi
+ * comes W_LAG or more cycles after m_axi took its AW; ARs and R never drop a valid or change while waiting (both DUT
  * outputs); in TRACK every AR reaches the decision unchanged and in order,
  * every AR passed through reaches m_axi unchanged and in order, every fill is
  * a read of 1..RA_BURST window lines inside one RA_BURST block, below the
@@ -358,10 +364,45 @@ always @(posedge xclk) if (xresetn) begin
                && s.rvalid === m.rvalid && m.rready === s.rready, "PASS: R differs between the ports")
     end
     `CHECK(m.awaddr === s.awaddr && m.awid === s.awid && m.awlen === s.awlen && m.awsize === s.awsize
-           && m.awburst === s.awburst && m.awvalid === s.awvalid && s.awready === m.awready && m.wdata === s.wdata
-           && m.wstrb === s.wstrb && m.wlast === s.wlast && m.wvalid === s.wvalid && s.wready === m.wready
+           && m.awburst === s.awburst && m.awvalid === s.awvalid && s.awready === m.awready
            && s.bid === m.bid && s.bresp === m.bresp && s.bvalid === m.bvalid && m.bready === s.bready,
-           "AW/W/B differ between the ports")
+           "AW/B differ between the ports")
+end
+
+// W: every beat taken at s_axi leaves m_axi in order, unchanged; held
+// (valid, data) while it waits; a burst's first beat W_LAG or more cycles
+// after m_axi took its AW (lag_min/lag_max over the run)
+typedef struct packed { logic [511:0] d; logic [63:0] strb; logic last; } wbeat_t;
+wbeat_t w_sb [$];
+longint m_aw_cyc [$];
+bit     m_w_mid = 0, m_w_wait = 0;
+wbeat_t m_w_prev;
+longint w_beats = 0, lag_min = 1 << 30, lag_max = 0, lag_n = 0;
+always @(posedge xclk) if (xresetn) begin
+    if (s.wvalid && s.wready) w_sb.push_back('{s.wdata, s.wstrb, s.wlast});
+    if (m.awvalid && m.awready) m_aw_cyc.push_back(cyc);
+    if (m_w_wait) `CHECK(m.wvalid && wbeat_t'{m.wdata, m.wstrb, m.wlast} == m_w_prev, "W: m_axi dropped or changed a waiting beat")
+    m_w_wait = m.wvalid && !m.wready;
+    m_w_prev = '{m.wdata, m.wstrb, m.wlast};
+    if (m.wvalid && m.wready) begin
+        w_beats++;
+        `CHECK(w_sb.size() > 0, "W: a beat at m_axi that s_axi never took")
+        if (w_sb.size() > 0) begin
+            `CHECK(w_sb[0] == wbeat_t'{m.wdata, m.wstrb, m.wlast}, $sformatf("W: beat %0d differs from s_axi's", w_beats))
+            void'(w_sb.pop_front());
+        end
+        if (!m_w_mid) begin
+            `CHECK(m_aw_cyc.size() > 0, "W: a first beat before m_axi took its AW")
+            if (m_aw_cyc.size() > 0) begin
+                automatic longint g = cyc - m_aw_cyc.pop_front();
+                `CHECK(g >= dut.W_LAG, $sformatf("W: a first beat %0d cycles after its AW (W_LAG %0d)", g, dut.W_LAG))
+                if (g < lag_min) lag_min = g;
+                if (g > lag_max) lag_max = g;
+                lag_n++;
+            end
+        end
+        m_w_mid = !m.wlast;
+    end
 end
 
 // the DUT's outputs never drop a valid or change while it waits
@@ -480,6 +521,55 @@ task automatic ra_set(input bit on);
     `CHECK(cw(MODE) == 64'(on), $sformatf("read-ahead mode %0d, want %0d", cw(MODE), on))
     while (dut.trk != on && w < 5000) begin @(negedge xclk); w++; end
     `CHECK(dut.trk == on, $sformatf("TRACK %0d after the switch, want %0d", dut.trk, on))
+endtask
+
+// T14's writer: st_n bursts of st_beats beats from st_a0, back to back, B not
+// awaited. st_lag >= 0: W runs ahead (up to 2 bursts), AW k presented st_lag
+// cycles after W k's first beat (0: in the same cycle, as the static); < 0:
+// AWs run ahead (up to 4), W k's first beat -st_lag cycles after AW k is taken
+bit      st_on = 0;
+int      st_n, st_beats, st_lag, st_seed, st_aw, st_wk, st_beat, st_b;
+longint  st_a0;
+longint  st_wpres [int], st_awacc [int];
+always @(posedge xclk) if (st_on) begin
+    if (s.awvalid && s.awready) begin st_awacc[st_aw] = cyc; st_aw++; end
+    if (s.wvalid && s.wready) begin
+        if (st_beat == st_beats - 1) begin st_beat = 0; st_wk++; end
+        else st_beat++;
+    end
+    if (s.bvalid && s.bready) st_b++;
+end
+always @(negedge xclk) if (st_on) begin
+    automatic bit w_ok, aw_ok;
+    if (st_lag >= 0) w_ok = (st_wk < st_n) && (st_wk - st_aw < 2);
+    else             w_ok = (st_wk < st_n) && (st_wk < st_aw) && (st_beat > 0 || cyc - st_awacc[st_wk] >= -st_lag);
+    if (w_ok && st_beat == 0 && !st_wpres.exists(st_wk)) st_wpres[st_wk] = cyc;
+    s.wvalid = w_ok;
+    s.wdata  = line_val((st_a0 - WIN) / 64 + st_wk * st_beats + st_beat, st_seed);
+    s.wstrb  = '1;
+    s.wlast  = (st_beat == st_beats - 1);
+    if (st_lag >= 0) aw_ok = (st_aw < st_n) && st_wpres.exists(st_aw) && (cyc - st_wpres[st_aw] >= st_lag);
+    else             aw_ok = (st_aw < st_n) && (st_aw - st_wk < 4);
+    s.awvalid = aw_ok;
+    s.awaddr  = st_a0 + 64 * longint'(st_aw * st_beats);
+    s.awlen   = 8'(st_beats - 1); s.awsize = 6; s.awid = 0; s.awburst = 1;
+end
+// m_axi's first-beat cycles of T14's bursts, in order
+longint st_mfirst [$];
+bit     st_m_mid = 0;
+always @(posedge xclk) if (st_on && m.wvalid && m.wready) begin
+    if (!st_m_mid) st_mfirst.push_back(cyc);
+    st_m_mid = !m.wlast;
+end
+task automatic wr_stream(input string name, input longint a0, input int n, input int beats, input int lag,
+                         input int seed, output real cpb);
+    st_n = n; st_beats = beats; st_lag = lag; st_seed = seed; st_a0 = a0;
+    st_aw = 0; st_wk = 0; st_beat = 0; st_b = 0; st_wpres.delete(); st_awacc.delete(); st_mfirst = {}; st_m_mid = 0;
+    @(negedge xclk); st_on = 1;
+    for (int t = 0; t < 200 * n && st_b < n; t++) @(posedge xclk);
+    @(negedge xclk); st_on = 0; s.awvalid = 0; s.wvalid = 0;
+    `CHECK(st_b == n && st_mfirst.size() == n, $sformatf("%s: %0d of %0d B, %0d bursts at m_axi", name, st_b, n, st_mfirst.size()))
+    cpb = (st_mfirst.size() == n) ? real'(st_mfirst[n - 1] - st_mfirst[16]) / (n - 17) : 0.0;
 endtask
 
 initial begin
@@ -972,6 +1062,31 @@ initial begin
         ds_lat = 20; ds_rand = 1;
     end
     $display("ok   T13 switched on right before a stream: reads still out from PASS answered first");
+
+    // --- T14: W behind AW. 256 window writes of 4 beats, back to back, m_axi
+    //     always ready: one burst every 4 cycles whether AW comes with the
+    //     first W beat (the static), after it, or ahead; then random
+    //     backpressure and gaps on m_axi (the scoreboard checks every beat)
+    begin
+        int lags [5] = '{0, 2, 5, -1, -6};
+        real cpb;
+        ra_set(0);
+        ds_rand = 0;
+        lag_min = 1 << 30; lag_max = 0;
+        foreach (lags[i]) begin
+            wr_stream($sformatf("T14 (AW %0d after W)", lags[i]), WIN + 64'h80_0000 + 64'h4_0000 * i, 256, 4, lags[i], 7 + i, cpb);
+            `CHECK(cpb > 3.99 && cpb < 4.01, $sformatf("T14: AW %0d cycles after W: %.3f cycles a burst at m_axi (want 4.000)", lags[i], cpb))
+            $display("     T14 AW %0d cycles after the first W beat: %.3f cycles a burst at m_axi", lags[i], cpb);
+        end
+        $display("     T14 first beat after its AW at m_axi: %0d..%0d cycles (W_LAG %0d)", lag_min, lag_max, dut.W_LAG);
+        `CHECK(lag_min == dut.W_LAG, $sformatf("T14: shortest AW -> first beat %0d, want W_LAG %0d", lag_min, dut.W_LAG))
+        ds_rand = 1;
+        for (int k = 0; k < 4; k++)
+            wr_stream("T14 (backpressure)", WIN + 64'hA0_0000 + 64'h4_0000 * k, 128, 1 + 5 * (k % 2), k % 2 ? 0 : -2, 20 + k, cpb);
+        `CHECK(w_sb.size() == 0, $sformatf("T14: %0d W beats taken at s_axi never left", w_sb.size()))
+        ds_rand = 1;
+    end
+    $display("ok   T14 W behind AW: 4 cycles a burst, first beats W_LAG after their AW, every beat in order");
 
     `CHECK(m_ctr_ar == s_ctr_ar, $sformatf("m_axi: %0d ARs into the counter page, the peer read it %0d times", m_ctr_ar, s_ctr_ar))
     `CHECK(trk_q.size() == 0 && pas_q.size() == 0, $sformatf("ARs never seen: %0d at the decision, %0d at m_axi", trk_q.size(), pas_q.size()))
