@@ -110,12 +110,17 @@ CPU stores through the same window (`uwinWrite`, write-combining): 0.17 GB/s.
   engine idle: model = ~10.6 GB/s streaming + ~5.4 us per descriptor fits every chunk
   size above. E4-sized pushes (7 KiB) reach only ~1.1 GB/s. Fix: queue many descriptors
   per doorbell (a minimal own driver for the PTDMA queue) - not done.
-- **Short packets on Loom.** `loom_ingress` closes a packet after `FLUSH_CYCLES` (16)
-  idle cycles when its output is idle. PTDMA writes more slowly than the link drains,
-  so packets close at ~407 B (64 MiB -> 164,827 packets; the V80 engine makes 4 KiB
-  packets), and ~82% wire efficiency caps PTDMA over Loom at ~10.2-10.5 GB/s (RDMA with
-  4 KiB packets: 12.2). Fix: a longer flush timer (U280 image change).
+- **~10.5 GB/s over Loom, with full packets.** The ingress counters show 4 KiB packets
+  for bulk PTDMA (64 MiB x 10: 164,827 packets = 4,071 B each; 64 MiB x 5: 81,960 =
+  4,094 B; idle flushes 80-1,900) and almost no backpressure (`W wait: fifo` 35-78k
+  cycles): `loom_ingress` takes the writes as fast as they come. The V80 engine, also
+  4 KiB packets, tops out at the same 10.4-10.7 GB/s (RDMA from host memory: 12.2), so
+  the ceiling is upstream of the ingress, on the way into the U280 - not found yet. The
+  idle timer only splits real gaps: 7 KiB chunks end in a 3 KiB tail each (309,575
+  flushes), followed by the next descriptor ~5.4 us later.
 - **A lone 1 MiB transfer takes ~347 us (3 GB/s)**, ~240 us more than the model; seen only
   when the whole transfer is 1 MiB. Unexplained.
 - The V80 serves every reader (PTDMA as much as the U280) at ~3.7 GB/s: 8 reads of 256 B
   in flight inside the V80 static (see the window counters, `hw/hdl/common/uwin`).
+  uwin_ra's read-ahead (counter page line 59 on) lifts the U280's RDMA reads of V80
+  memory to 11.4-11.6 GB/s.
