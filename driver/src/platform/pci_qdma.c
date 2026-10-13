@@ -517,6 +517,7 @@ int enable_queues(struct bus_driver_data *bd_data) {
     usleep_range(DMA_MIN_SLEEP_CMD, DMA_MIN_SLEEP_CMD);
     dbg_info("initialized function map table");
 
+#ifdef PLATFORM_VERSAL
     // Program host profile (required for MM transfers)
     // For more details, see: https://adaptivesupport.amd.com/s/article/000035811?language=en_US
     iowrite32(0, bd_data->bar[BAR_DMA_CONFIG] + QDMA_GLBL_VCH_HOST_PROFILE_REG);
@@ -552,6 +553,9 @@ int enable_queues(struct bus_driver_data *bd_data) {
     wmb();
     usleep_range(DMA_MIN_SLEEP_CMD, DMA_MIN_SLEEP_CMD);
     dbg_info("host profile set");
+#endif
+    // LOOM LOCAL CHANGE: the soft QDMA (UltraScale+) has no host profiles, no NoC steering and no MM engine
+    // (AXI-ST only); its PR data is an ordinary H2C stream (channel N_SCHAN, a queue of the loop below) to the ICAP.
 
     // Card-to-host (C2H) queues need a prefetch tag to operate in bypass mode
     // The prefetch tag holds up to 6 bits, i.e. 64 different tags can be used
@@ -562,9 +566,11 @@ int enable_queues(struct bus_driver_data *bd_data) {
         goto fail;
     }
 
+#ifdef PLATFORM_VERSAL
     // Set up PR queue
     ret_val = enable_queue(bd_data, QDMA_PR_QUEUE_IDX, false, true, 0); 
     if (ret_val) { goto fail; }
+#endif
 
     // Enable H2C (host-to-card) queues
     for (int32_t qid = QDMA_RD_QUEUE_START_IDX; qid < QDMA_RD_QUEUE_START_IDX + QDMA_N_ACTIVE_QUEUES; qid++) {
@@ -585,13 +591,20 @@ int enable_queues(struct bus_driver_data *bd_data) {
         if (ret_val) { goto fail; }
     }
 
-    if (bd_data->num_queues != (2 * QDMA_N_ACTIVE_QUEUES + 1)) {
-        pr_err("failed to enable all required c2h or h2c queues; got %d, requested %d queues\n", bd_data->num_queues, 2 * QDMA_N_ACTIVE_QUEUES + 1);
+#ifdef PLATFORM_VERSAL
+    const int want_queues = 2 * QDMA_N_ACTIVE_QUEUES + 1;
+#else
+    const int want_queues = 2 * QDMA_N_ACTIVE_QUEUES;
+#endif
+    if (bd_data->num_queues != want_queues) {
+        pr_err("failed to enable all required c2h or h2c queues; got %d, requested %d queues\n", bd_data->num_queues, want_queues);
         return -ENODEV;
     }
 
+#ifdef PLATFORM_VERSAL
     // Enable H2C MM engine by writing to bit 0 (run) of H2C MM control
     iowrite32(1, bd_data->bar[BAR_DMA_CONFIG] + QDMA_H2C_MM_CTRL_REG);
+#endif
 
     // NOTE: If relying on C2H MM transfer, write bit 1 in QDMA_C2H_MM_CTRL_REG
     // iowrite32(1, bd_data->bar[BAR_DMA_CONFIG] + QDMA_C2H_MM_CTRL_REG);
@@ -606,7 +619,9 @@ fail:
     disable_queues(bd_data);
     
     // Disable MM engines
+#ifdef PLATFORM_VERSAL
     iowrite32(0, bd_data->bar[BAR_DMA_CONFIG] + QDMA_H2C_MM_CTRL_REG);
+#endif
     // iowrite32(0, bd_data->bar[BAR_DMA_CONFIG] + QDMA_C2H_MM_CTRL_REG);
 
     return -1;
@@ -910,7 +925,9 @@ err_read_shell_cnfg:
     disable_queues(bd_data);
     
     // Disable MM engines
+#ifdef PLATFORM_VERSAL
     iowrite32(0, bd_data->bar[BAR_DMA_CONFIG] + QDMA_H2C_MM_CTRL_REG);
+#endif
     // iowrite32(0, bd_data->bar[BAR_DMA_CONFIG] + QDMA_C2H_MM_CTRL_REG);
 
 err_queues:
@@ -966,7 +983,9 @@ void pci_remove(struct pci_dev *pdev) {
     dbg_info("queue removed\n");
 
     // Disable QDMA MM engines
+#ifdef PLATFORM_VERSAL
     iowrite32(0, bd_data->bar[BAR_DMA_CONFIG] + QDMA_H2C_MM_CTRL_REG);
+#endif
     // iowrite32(0, bd_data->bar[BAR_DMA_CONFIG] + QDMA_C2H_MM_CTRL_REG);
 
     // Unmap QDMA BARs
@@ -1001,10 +1020,15 @@ void pci_remove(struct pci_dev *pdev) {
 // List of Versal devices which can be used with the Coyote driver
 // 0x10ee is the vendor ID for AMD/Xilinx FPGAs, while the other number represents the device ID, set in the QDMA IP configuration
 static const struct pci_device_id pci_ids[] = {
+#ifdef PLATFORM_VERSAL
     { PCI_DEVICE(0x10ee, 0xB03F), },
     { PCI_DEVICE(0x10ee, 0xB13F), },
     { PCI_DEVICE(0x10ee, 0xB23F), },
     { PCI_DEVICE(0x10ee, 0xB33F), },
+#else
+    // LOOM LOCAL CHANGE: the U280 static with the soft QDMA (STATIC_DMA=qdma, hw/bd/ultrascale_plus/cr_pci_qdma.tcl)
+    { PCI_DEVICE(0x10ee, 0x913F), },
+#endif
     {0,}
 };
 MODULE_DEVICE_TABLE(pci, pci_ids);

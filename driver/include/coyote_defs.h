@@ -1145,14 +1145,14 @@ struct bus_driver_data {
     unsigned long bar_phys_addr[CYT_BARS];  /* Physical address of each BAR */
     unsigned long bar_len[CYT_BARS];        /* Size (in bytes) of each BAR; determined by the QDMA/XDMA configuration; see cr_pci.tcl for more details */
 
-    #ifdef PLATFORM_ULTRASCALE_PLUS
+    #ifdef DMA_XDMA
     // XDMA engines metadata
     int engines_num;                                    /* Number of XDMA engines in the device; typically 6 (3 C2H and 3 H2C); see pci_xdma.c for details */
     struct xdma_engine *engine_h2c[XDMA_MAX_NUM_CHANNELS];   /*  Host-to-card (H2C) engines; see pci_xdma.c for details */
     struct xdma_engine *engine_c2h[XDMA_MAX_NUM_CHANNELS];   /*  Card-to-host (C2H) engines; see pci_xdma.c for details */
     #endif
 
-    #ifdef PLATFORM_VERSAL
+    #ifdef DMA_QDMA
     // QDMA queues metadata
     int num_queues;                                             /* Number of QDMA queues enabled */
     struct qdma_queue *queues[2 * QDMA_N_ACTIVE_QUEUES + 1];    /*  Array of enabled queues, both H2C and C2H */

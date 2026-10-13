@@ -24,7 +24,7 @@
  * @brief Contains functions for loading and setting up the Coyote driver on PCI platforms with the QDMA core.
  */
 
-#ifdef PLATFORM_VERSAL
+#ifdef DMA_QDMA
 
 #ifndef _PCI_QDMA_H_
 #define _PCI_QDMA_H_

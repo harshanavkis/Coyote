@@ -84,13 +84,19 @@ if [ "${1:-}" = --here ]; then
     sleep 2
     [ -e $D ] || fail "the U280 did not come back at $U280_BDF: warm-reboot $H (the image stays programmed) and run this again"
     sudo rmmod coyote_driver 2>/dev/null   # a udev auto-load on the rescan, without identity
-    sudo insmod $STAGE/coyote_driver.ko ip_addr=0x${U280_IP[$H]} mac_addr=${U280_MAC[$H]} || fail "U280 driver insmod failed (dmesg)"
+    # the soft-QDMA static (STATIC_DMA=qdma) is device 913f and needs the driver built with DMA=qdma
+    KO=$STAGE/coyote_driver.ko
+    if [ "$(cat $D/device)" = 0x913f ]; then
+        KO=$STAGE/coyote_driver_qdma.ko
+        [ -f $KO ] || fail "QDMA U280 image (913f) but no driver/build_qdma/coyote_driver.ko staged (make TARGET_PLATFORM=ultrascale_plus DMA=qdma)"
+    fi
+    sudo insmod $KO ip_addr=0x${U280_IP[$H]} mac_addr=${U280_MAC[$H]} || fail "U280 driver insmod failed (dmesg)"
     IP=""
     for i in $(seq 1 20); do
         IP=$(sudo cat /sys/kernel/coyote_sysfs_0/cyt_attr_ip 2>/dev/null | grep -oE '[0-9a-f]{8}' | head -1)
         [ -n "$IP" ] && break; sleep 1
     done
-    echo "   U280: driver $(basename "$(readlink -f $D/driver)"), IP ${IP:-none}, link $(link $D)"
+    echo "   U280: $(cat $D/device) driver $(basename "$(readlink -f $D/driver)") ($(basename $KO)), IP ${IP:-none}, link $(link $D)"
     # NO_U280_IDENTITY=1: an image without the network stack (e.g. example 07, perf_fpga) has no identity
     [ "$IP" = "${U280_IP[$H]}" ] || [ -n "${NO_U280_IDENTITY:-}" ] || fail "U280 identity ${IP:-none}, want ${U280_IP[$H]}"
     [ "$(cat $D/current_link_width)" = 16 ] || fail "U280 link $(link $D), want x16"
@@ -173,6 +179,7 @@ STAGE=$HOME/.cache/loom-setup/$(date -u +%Y%m%d-%H%M%S)
 mkdir -p "$STAGE"
 cp "$0" "$HERE/vivado_env.sh" "$REPO/examples/loom/hw/program_loom.tcl" \
    "$REPO/driver/build/coyote_driver.ko" "$REPO/driver/build_versal/coyote_driver_versal.ko" "$STAGE/" || exit 1
+[ -f "$REPO/driver/build_qdma/coyote_driver.ko" ] && cp "$REPO/driver/build_qdma/coyote_driver.ko" "$STAGE/coyote_driver_qdma.ko"
 echo "commit $(git -C "$REPO" rev-parse --short HEAD), drivers $(cd $STAGE && md5sum *.ko | cut -c1-8 | tr '\n' ' ')" > "$STAGE/INFO.txt"
 echo "staged in $STAGE ($(cat $STAGE/INFO.txt))"
 

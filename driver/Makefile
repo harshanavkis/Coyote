@@ -36,12 +36,19 @@ $(MODNAME)-objs := src/coyote_driver.o
 $(MODNAME)-objs += src/coyote_setup.o 
 $(MODNAME)-objs += src/coyote_sysfs.o 
 
+# LOOM LOCAL CHANGE: DMA=qdma builds the UltraScale+ driver for the soft-QDMA U280 static (STATIC_DMA=qdma,
+# device 913F) from pci_qdma.c, into build_qdma/. DMA_XDMA / DMA_QDMA select the DMA layer, PLATFORM_* the card.
 ifeq ($(TARGET_PLATFORM), versal)
 $(MODNAME)-objs += src/platform/pci_qdma.o
-ccflags-y += -DPLATFORM_VERSAL
+ccflags-y += -DPLATFORM_VERSAL -DDMA_QDMA
 else ifeq ($(TARGET_PLATFORM), ultrascale_plus)
+ifeq ($(DMA), qdma)
+$(MODNAME)-objs += src/platform/pci_qdma.o
+ccflags-y += -DPLATFORM_ULTRASCALE_PLUS -DDMA_QDMA
+else
 $(MODNAME)-objs += src/platform/pci_xdma.o
-ccflags-y += -DPLATFORM_ULTRASCALE_PLUS
+ccflags-y += -DPLATFORM_ULTRASCALE_PLUS -DDMA_XDMA
+endif
 else
 $(error "Unsupported TARGET_PLATFORM specified. Supported options are: ultrascale_plus, versal")
 endif
@@ -66,6 +73,8 @@ KERNELDIR ?= /home/harshanavkis/doctor-cluster-config/result-dev/lib/modules/$(s
 
 ifeq ($(TARGET_PLATFORM), versal)
 BUILD_DIR := $(shell pwd)/build_versal
+else ifeq ($(DMA), qdma)
+BUILD_DIR := $(shell pwd)/build_qdma
 else
 BUILD_DIR := $(shell pwd)/build
 endif
@@ -81,4 +90,4 @@ all:
 	rm -rf $(BUILD_DIR)/src $(BUILD_DIR)/include $(BUILD_DIR)/Makefile
 
 clean:
-	rm -rf build build_versal
+	rm -rf build build_versal build_qdma

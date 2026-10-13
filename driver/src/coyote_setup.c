@@ -249,12 +249,12 @@ static struct kobj_attribute kobj_attr_mac = __ATTR(cyt_attr_mac, 0664, cyt_attr
 static struct kobj_attribute kobj_attr_nstats = __ATTR_RO(cyt_attr_nstats);
 static struct kobj_attribute kobj_attr_hstats = __ATTR_RO(cyt_attr_hstats);
 static struct kobj_attribute kobj_attr_prstats = __ATTR_RO(cyt_attr_prstats);
-#ifdef PLATFORM_ULTRASCALE_PLUS
+#ifdef DMA_XDMA
 static struct kobj_attribute kobj_attr_engines = __ATTR_RO(cyt_attr_engines);
 #endif
 static struct kobj_attribute kobj_attr_cnfg = __ATTR_RO(cyt_attr_cnfg);
 static struct kobj_attribute kobj_attr_eost = __ATTR(cyt_attr_eost, 0664, cyt_attr_eost_show, cyt_attr_eost_store);
-#ifdef PLATFORM_VERSAL
+#ifdef DMA_QDMA
 static struct kobj_attribute kobj_attr_qdma_debug_regs = __ATTR_RO(cyt_attr_qdma_debug_regs);
 #endif
 
@@ -264,12 +264,12 @@ static struct attribute *attrs[] = {
     &kobj_attr_nstats.attr,
     &kobj_attr_hstats.attr,
     &kobj_attr_prstats.attr,
-    #ifdef PLATFORM_ULTRASCALE_PLUS
+    #ifdef DMA_XDMA
     &kobj_attr_engines.attr,
     #endif
     &kobj_attr_cnfg.attr,
     &kobj_attr_eost.attr,
-    #ifdef PLATFORM_VERSAL
+    #ifdef DMA_QDMA
     &kobj_attr_qdma_debug_regs.attr,
     #endif
     NULL,

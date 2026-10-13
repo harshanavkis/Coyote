@@ -200,7 +200,7 @@ ssize_t cyt_attr_prstats_show(struct kobject *kobj, struct kobj_attribute *attr,
     return sw;
 }
 
-#ifdef PLATFORM_ULTRASCALE_PLUS
+#ifdef DMA_XDMA
 ssize_t cyt_attr_engines_show(struct kobject *kobj, struct kobj_attribute *attr, char *buff) {   
     struct bus_driver_data *bus_data = container_of(kobj, struct bus_driver_data, cyt_kobj);
     BUG_ON(!bus_data); 
@@ -283,7 +283,7 @@ ssize_t cyt_attr_cnfg_show(struct kobject *kobj, struct kobj_attribute *attr, ch
     );
 }
 
-#ifdef PLATFORM_VERSAL
+#ifdef DMA_QDMA
 ssize_t cyt_attr_qdma_debug_regs_show(struct kobject *kobj, struct kobj_attribute *attr, char *buff) {   
     struct bus_driver_data *bus_data = container_of(kobj, struct bus_driver_data, cyt_kobj);
     BUG_ON(!bus_data); 

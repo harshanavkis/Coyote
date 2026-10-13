@@ -24,7 +24,7 @@
  * @brief Contains functions for loading and setting up the Coyote driver on PCI platforms with the XDMA core.
  */
 
-#ifdef PLATFORM_ULTRASCALE_PLUS
+#ifdef DMA_XDMA
 
 #ifndef _PCI_XDMA_H_
 #define _PCI_XDMA_H_

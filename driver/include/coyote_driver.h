@@ -27,11 +27,11 @@
 #ifndef _COYOTE_DRIVER_H_
 #define _COYOTE_DRIVER_H_
 
-#ifdef PLATFORM_VERSAL
+#ifdef DMA_QDMA
 #include "pci_qdma.h"
 #endif
 
-#ifdef PLATFORM_ULTRASCALE_PLUS
+#ifdef DMA_XDMA
 #include "pci_xdma.h"
 #endif
 
