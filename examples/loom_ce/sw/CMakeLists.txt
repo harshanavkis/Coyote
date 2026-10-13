@@ -55,3 +55,7 @@ target_link_libraries(ce_dispatch PUBLIC Coyote pthread)
 
 add_executable(ce_coll ${TARGET_DIR}/ce_coll.cpp)
 target_link_libraries(ce_coll PUBLIC Coyote pthread)
+
+# Peer-to-peer writes U280 <-> V80 with example 07 (perf_fpga) on both cards: no Loom anywhere
+add_executable(p2p_pf ${TARGET_DIR}/p2p_pf.cpp)
+target_link_libraries(p2p_pf PUBLIC Coyote pthread)
