@@ -41,13 +41,18 @@ Measured on amy and rose (AMD hosts, cards on socket 1):
   (inferred). Raising MPS or MRRS cannot change it.
 - The V80's max read request decides only below 256 B: at 128 B the reads
   arrive as 128 B; at 512 B or 4096 B they arrive as 256 B.
-- Peer-to-peer writes top out at ~10.9 GB/s (the V80 writing its own window
-  through the root complex), DMA to host memory at ~12.5 GB/s. So for data
-  in accelerator memory Loom runs at the platform's peer-to-peer write rate
-  (V80 -> V80 across the network 11.4-11.8 GB/s at 16 MiB, 10.7-11.0
-  sustained), and RDMA from host memory (12.2 GB/s) is faster because it
-  does no peer-to-peer. The fair baseline is RDMA moving V80-resident data
-  (not measured).
+- Peer-to-peer writes stopped at ~10.9 GB/s into the V80 and ~10.6 GB/s into
+  the U280, DMA to host memory at ~12.5 GB/s. Neither is the root complex:
+  - V80: its shell's interconnect allowed 16 writes in flight (section 13);
+    with 32 the V80 takes what its sender gives (12.35-12.56 GB/s).
+  - U280: a 256 B piece every 6 cycles at 250 MHz from every sender. In
+    simulation (the static's XDMA with AMD's root-port model) XDMA's bypass
+    master holds the request interface one idle cycle per write on top of
+    the 5 cycles a 256 B request occupies (16 B descriptor + 256 B); 6.0
+    cycles, as on hardware. Not fixed: the window path has to leave XDMA's
+    bypass (e.g. QDMA's bridge master).
+  Until the U280 is fixed, Loom V80 -> V80 runs at the U280's receive rate
+  (10.7 GB/s sustained).
 
 ## 4. Writes become 4 KiB packets, reads cannot
 
@@ -359,3 +364,41 @@ buffer's head. Before, a beat was taken only once its burst was loaded.
   (+324, of them 314 LUTRAM for the buffer), 710 FFs (+15), 9 RAMB36 and
   0 URAM (same). The critical path is now the buffer's read pointer through
   the head's take into the lookup stages' enables (8 levels).
+
+## 13. Peers' writes into the V80's window: 16 -> 32 in flight (shell)
+
+The V80 shell's SmartConnect (`axi_main` -> `axim_udata_0`,
+hw/bd/versal/cr_ctrl.tcl) is declared with 32 writes in flight on both
+ports (was 16, 6aad1a7a). The static is unchanged (loom-ce-static_ot16; its
+own SmartConnect already allows 32).
+
+- Why: every write into the V80's window stopped at 10.9-11.0 GB/s (V80
+  self-loop 10.93, RDMA U280 -> V80 11.02, Loom -> V80 HBM 10.6). The window
+  counters (uwin_hbm) showed 9.6 writes in flight on average, at most 16,
+  AW->B 56 cycles; at `axi_main` AW waited 83% and W 46% of the cycles.
+- Cause (simulated, ic_rate_sim v80_path: uwin_ra, the generated
+  SmartConnect, the 3 + 3 register slices before uwin_hbm, B 49 cycles after
+  the last beat = the measured AW->B 56): the SmartConnect issues at most 16
+  writes and each holds its slot ~94 cycles (56 to HBM and back, 12 in the
+  slices, ~25 inside the SmartConnect); 16 x 256 B / 94 cycles = 10.9 GB/s.
+  The model gives the hardware's rate, writes in flight, AW->B and both
+  `axi_main` stalls on the uwin_ra images with W_LAG 0 and 3 alike (with W
+  leading its AW by up to 2 bursts, as the static sends it), so W_LAG (W
+  three cycles behind AW, 0dedea02) could not help: W/AW timing was never
+  the limit. 6aad1a7a's sizing (16 cover ~11 GB/s at 236 ns a write) used too
+  short a round trip. Without the slices the model ran at 12.6 GB/s.
+- Simulated with 32 (and 64): 4.0 cycles a burst (16 GB/s at the window),
+  also with the static limited to 24 or 32 writes in flight.
+- Hardware (2026-10-13, image loom-ce-sc32, 01ff1973, WNS +0.013; full
+  regression passes): V80 self-loop 10.93 -> 12.35 (amy) / 12.56 (rose)
+  GB/s, the same as the engine writing host memory (12.37 / 12.57): the
+  sender now sets the rate. Window: 12.3 writes in flight on average (26 at
+  most), AW->B 62; `axi_main` stalls 0%, waits for the static 25%. That is
+  5.08 cycles per 256 B write through the V80's own QDMA bridge master.
+  Program puts landing in V80 HBM +6-14%; paths through the U280 unchanged
+  (section 3).
+- Rejected: uwin_hbm answering B at a write's last beat (simulated also 16
+  GB/s, even with only 16 writes in flight to HBM): it changes ordering at
+  the window (reads would have to wait for earlier writes' HBM B) for
+  nothing a declaration change does not give. 32 in the static as well
+  (9aad9e58): failed static timing at -1.75 ns and is not needed.
