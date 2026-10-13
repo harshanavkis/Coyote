@@ -91,7 +91,8 @@ if [ "${1:-}" = --here ]; then
         [ -n "$IP" ] && break; sleep 1
     done
     echo "   U280: driver $(basename "$(readlink -f $D/driver)"), IP ${IP:-none}, link $(link $D)"
-    [ "$IP" = "${U280_IP[$H]}" ] || fail "U280 identity ${IP:-none}, want ${U280_IP[$H]}"
+    # NO_U280_IDENTITY=1: an image without the network stack (e.g. example 07, perf_fpga) has no identity
+    [ "$IP" = "${U280_IP[$H]}" ] || [ -n "${NO_U280_IDENTITY:-}" ] || fail "U280 identity ${IP:-none}, want ${U280_IP[$H]}"
     [ "$(cat $D/current_link_width)" = 16 ] || fail "U280 link $(link $D), want x16"
     pkill -u "$(id -u)" -x hw_server && sleep 1
 
@@ -183,7 +184,7 @@ for h in "$@"; do
         echo "$h: a loom_setup session is still running there (tmux attach -t loom_setup); not starting another" >&2
         exit 1
     fi
-    run_on $h "tmux new-session -d -s loom_setup 'bash $STAGE/$(basename $0) --here $STAGE $BIT $PDI > $STAGE/$h.log 2>&1'" \
+    run_on $h "tmux new-session -d -s loom_setup 'NO_U280_IDENTITY=${NO_U280_IDENTITY:-} bash $STAGE/$(basename $0) --here $STAGE $BIT $PDI > $STAGE/$h.log 2>&1'" \
         || { echo "$h: could not start (ssh?)" >&2; exit 1; }
     echo "$h: started (log $STAGE/$h.log)"
 done
