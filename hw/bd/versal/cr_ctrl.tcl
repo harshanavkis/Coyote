@@ -91,11 +91,16 @@ proc cr_bd_design_ctrl { parentCell } {
   # arrive as 256 B pieces (the root complex splits peer-to-peer requests),
   # so their bandwidth is reads in flight x 256 B / round trip: 8 gave 3.7
   # GB/s. The static's NoC exit and SmartConnects allow 32.
+  # Writes in flight: 32 here and on the uwin port (the interconnect sizes
+  # its write issuing from these). A peer's write holds its slot for the
+  # round trip through the clock crossing, the register slices and uwin_hbm
+  # to HBM (~94 cycles at 250 MHz): 16 capped writes into the window at
+  # 10.9 GB/s (ic_rate_sim v80_path, matches the hardware's counters).
   set axi_main [ create_bd_intf_port -mode Slave -vlnv xilinx.com:interface:aximm_rtl:1.0 axi_main ]
   set_property -dict [list \
     CONFIG.MAX_BURST_LENGTH {16} \
     CONFIG.ID_WIDTH {6} \
-    CONFIG.NUM_WRITE_OUTSTANDING {16} \
+    CONFIG.NUM_WRITE_OUTSTANDING {32} \
     CONFIG.NUM_READ_OUTSTANDING {64} \
     CONFIG.SUPPORTS_NARROW_BURST {0} \
     CONFIG.ADDR_WIDTH {64} \
@@ -169,7 +174,7 @@ proc cr_bd_design_ctrl { parentCell } {
                 CONFIG.HAS_RRESP {1} \
                 CONFIG.HAS_WSTRB {1} \
                 CONFIG.NUM_READ_OUTSTANDING {64} \
-                CONFIG.NUM_WRITE_OUTSTANDING {16} \
+                CONFIG.NUM_WRITE_OUTSTANDING {32} \
                 CONFIG.PROTOCOL {AXI4} \
                 CONFIG.READ_WRITE_MODE {READ_WRITE} \
               ] \$axim_udata_$i"
