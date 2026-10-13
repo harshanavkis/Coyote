@@ -402,3 +402,37 @@ own SmartConnect already allows 32).
   the window (reads would have to wait for earlier writes' HBM B) for
   nothing a declaration change does not give. 32 in the static as well
   (9aad9e58): failed static timing at -1.75 ns and is not needed.
+
+## 14. The U280 static on the soft QDMA (STATIC_DMA=qdma)
+
+The U280 static can be built with the soft QDMA 5.0 in place of XDMA 4.1
+(`-DBUILD_STATIC=1 -DSTATIC_DMA=qdma`; hw/bd/ultrascale_plus/cr_pci_qdma.tcl,
+hw/templates/ultrascale_plus/static_top_qdma_tmplt.txt). Same PCIe block,
+quad and link (PCIE4C_X1Y1, Gen3 x16, 512 bit at 250 MHz), same BAR order
+(BAR0 AXI-Lite -> static config, BAR2 DMA, BAR4 256 MB AXI bridge master ->
+`axi_main`, 32 writes and 32 reads in flight), same static -> shell ports, so
+shells link against it unchanged. Device ID 913F; the driver for it is built
+with `make TARGET_PLATFORM=ultrascale_plus DMA=qdma` (driver/build_qdma,
+pci_qdma.c) and setup_loom_hosts.sh loads it when the card shows 913F.
+
+- Why: writes into the U280's window stopped at 10.66 GB/s from every sender
+  (6.0 cycles per 256 B write). Simulated (xdma_sim: the static's exact XDMA
+  4.1 with AMD's root-port model, an always-ready sink on the bypass master):
+  XDMA's bypass intake takes 5 CQ beats per 256 B TLP and holds its tready low
+  one more cycle per TLP = 6.000 cycles; the hard block, link, shell and
+  ingress are not it.
+- Evidence for the QDMA (hardware, 2026-10-13, amy's U280 with the QDMA
+  example design, the bridge master on an always-ready sink with counters,
+  qdma_hw/): PTDMA host -> BAR4 at 12.25 GB/s (8 channels; XDMA image, same
+  runs: 10.61), every write a 256 B burst, 5.19 cycles per burst while busy
+  (81% 5 cycles, 19% 6, the same for 1 and 8 sender channels) = 12.33 GB/s;
+  XDMA 6.00. The V80's CPM5 QDMA bridge took 5.08 (section 13).
+- Data path as on the V80: AXI-ST H2C/C2H queues with descriptor bypass
+  through qdma_rd_wrapper / qdma_wr_wrapper / qdma_reg_slice /
+  qdma_interrupt_wrapper; the PR channel is an ordinary H2C stream channel
+  (queue 3) to the ICAP, so there is no MM engine and no PMC path. The driver
+  skips the CPM5-only host profile, MM PR queue and H2C MM engine on
+  UltraScale+.
+- Not simulated: AMD's soft-QDMA example design hangs at t=0 in xsim 2023.2
+  (unmodified, too), so the static is checked by its block design
+  (tb/static_pci/run.sh qdma), synthesis and hardware.

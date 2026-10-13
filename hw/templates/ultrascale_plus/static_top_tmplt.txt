@@ -1,3 +1,7 @@
+{# LOOM LOCAL CHANGE: STATIC_DMA=qdma selects the soft-QDMA static (static_top_qdma_tmplt.txt) #}
+{% if cnfg.static_dma == 'qdma' %}
+{% include 'static_top_qdma_tmplt.txt' %}
+{% else %}
 /**
  * This file is part of the Coyote <https://github.com/fpgasystems/Coyote>
  *
@@ -490,3 +494,4 @@ module static_top (
     );
 
 endmodule
+{% endif %}

@@ -66,6 +66,11 @@ set(PMTU_BYTES 4096 CACHE STRING "Packetization size [B]")
 # bidirectional traffic at ~6.8 GB/s per direction on 100G. Upstream uses 16 on 200G DCMAC.
 set(ACK_GAP_CYCLES 85 CACHE STRING "Cycles the RoCE RX stream is held after each incoming ACK")
 
+# LOOM LOCAL CHANGE: the U280 static's DMA IP: xdma (XDMA 4.1, cr_pci.tcl) or qdma (soft QDMA 5.0,
+# cr_pci_qdma.tcl, device 913F, driver built with DMA=qdma). Only a static build (BUILD_STATIC=1) uses it;
+# shell-only builds link against a static checkpoint built with it (STATIC_PATH).
+set(STATIC_DMA "xdma" CACHE STRING "U280 static DMA IP: xdma or qdma")
+
 # Unit tests/Simulation
 set(UNIT_TEST_DIR "${CMAKE_SOURCE_DIR}/unit-tests" CACHE STRING "Path to the unit-test folder.")
 set(SIM_DPI_LIB_NAME "coyote_sim" CACHE STRING "Name of the DPI-C library to link for simulation WITHOUT the '.so' extension.")

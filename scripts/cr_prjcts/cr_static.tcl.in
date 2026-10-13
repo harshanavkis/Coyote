@@ -131,7 +131,12 @@ source "$scripts_dir/ip_inst/pci_infrastructure.tcl" -notrace
 #     set_property SYNTH_CHECKPOINT_MODE "Hierarchical" [get_files design_static.bd ]
 # }
 
-source "$hw_dir/bd/$cfg(fpga_arch)/cr_pci.tcl" -notrace
+# LOOM LOCAL CHANGE: STATIC_DMA=qdma -> the soft-QDMA static BD (U280)
+if {$cfg(fpga_arch) eq "ultrascale_plus" && $cfg(static_dma) eq "qdma"} {
+    source "$hw_dir/bd/$cfg(fpga_arch)/cr_pci_qdma.tcl" -notrace
+} else {
+    source "$hw_dir/bd/$cfg(fpga_arch)/cr_pci.tcl" -notrace
+}
 cr_bd_design_static ""
 set_property SYNTH_CHECKPOINT_MODE "Hierarchical" [get_files design_static.bd ]
 

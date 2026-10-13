@@ -15,7 +15,7 @@ set_property -dict [list CONFIG.TDATA_NUM_BYTES {4} CONFIG.REG_CONFIG {8} CONFIG
 create_ip -name axis_register_slice -vendor xilinx.com -library ip -version 1.1 -module_name axis_register_slice_req_static_96
 set_property -dict [list CONFIG.TDATA_NUM_BYTES {12} CONFIG.REG_CONFIG {8} ] [get_ips axis_register_slice_req_static_96]
 
-if {$cfg(fpga_arch) eq "versal"} {
+if {$cfg(fpga_arch) eq "versal" || $cfg(static_dma) eq "qdma"} {
     create_ip -name axis_register_slice -vendor xilinx.com -library ip -version 1.1 -module_name register_slice_qdma_data
     set_property -dict [list CONFIG.TDATA_NUM_BYTES {75} CONFIG.REG_CONFIG {8} CONFIG.HAS_TKEEP {0} CONFIG.HAS_TLAST {1}] [get_ips register_slice_qdma_data]
 
@@ -67,7 +67,7 @@ if {$cfg(fpga_arch) eq "ultrascale_plus"} {
 }
 
 # Error correcting code (ECC) IP for QDMA inputs
-if {$cfg(fpga_arch) eq "versal"} {
+if {$cfg(fpga_arch) eq "versal" || $cfg(static_dma) eq "qdma"} {
     create_ip -name ecc -vendor xilinx.com -library ip -version 2.0 -module_name qdma_ecc
     set_property CONFIG.C_DATA_WIDTH {57} [get_ips qdma_ecc]
 }

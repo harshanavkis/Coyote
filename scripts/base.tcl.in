@@ -110,6 +110,7 @@ set cfg(en_net)                 ${EN_NET}
 set cfg(qsfp)                   ${QSFP}
 set cfg(pmtu)                   ${PMTU_BYTES}
 set cfg(ack_gap)                ${ACK_GAP_CYCLES}
+set cfg(static_dma)             ${STATIC_DMA}
 set cfg(cores)                  ${COMP_CORES}
 set cfg(build_opt)              ${BUILD_OPT}
 set cfg(stat_probe)             ${STATIC_PROBE}
