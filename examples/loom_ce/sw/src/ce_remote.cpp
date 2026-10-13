@@ -6,7 +6,7 @@
  *   route--> RoCE --> server U280 loom_rx --> server host buffer
  *
  * Server (the landing host; U280, and its V80 with --land-v80):
- *     ce_remote --server [--port N] [--size BYTES] [--land-v80 [--land-offset B]]
+ *     ce_remote --server [--port N] [--size BYTES] [--land-v80 [--land-offset B] | --land-self]
  *   (--land-offset: land B bytes into the V80 window, a multiple of 64 below 4096)
  *   1. QP exchange (blocks for the client); the QP owner's staging buffer
  *   2. destination and fence buffers on a data cThread
@@ -28,6 +28,12 @@
  *   armed before the client runs, its card port polling HBM, so no host
  *   reads the window during the copy (those reads wait behind the writes);
  *   the rate is the bytes over the two stamps, on the V80's clock.
+ *   With --land-self the destination is this U280's own uwin (exported and
+ *   imported back, no window programmed): loom_rx's host writes go out to the
+ *   root complex and come back peer-to-peer into this U280, where
+ *   loom_ingress drops and counts them - what size the root complex delivers
+ *   the U280's own (MPS 512) writes in, and at what rate. The fence stays in
+ *   host memory; the data is never read or checked.
  *
  * Client (the sending host; U280 + V80):
  *     ce_remote --client <server_ip> [--port N] [--reps N] [--window P] [--gap-ms G] [--burst B]
@@ -184,7 +190,8 @@ void snap(coyote::cThread &v80, uint64_t *out, uint32_t first, int n) {
     for (int i = 0; i < n; i++) out[i] = v80.getCSR(first + i);
 }
 
-int run_server(uint16_t port, uint64_t size, bool land, uint64_t off, unsigned poll_us, bool no_touch, bool no_stamp) {
+int run_server(uint16_t port, uint64_t size, bool land, uint64_t off, unsigned poll_us, bool no_touch, bool no_stamp,
+               bool self) {
     coyote::cThread t_qp(0, getpid(), 0, nullptr, "coyote_fpga");     // QP owner
     coyote::cThread t_data(0, getpid(), 0, nullptr, "coyote_fpga");   // owns the landing buffers
     printf("server: waiting for the QP exchange on port %u ...\n", port);
@@ -207,6 +214,15 @@ int run_server(uint16_t port, uint64_t size, bool land, uint64_t off, unsigned p
         dst   = static_cast<uint64_t *>(lva) + off / 8;
         fence = dst + size / 8;
         printf("server: V80 uwin imported at %p, landing at card VA %p\n", lva, (void *) L->buf);
+    } else if (self) {
+        // this U280's uwin [0, size), no window programmed: every write into it is dropped
+        for (uint32_t w = 0; w < 16; w++) loom_switch::release_window(t_qp, w);
+        void *sva = loom_switch::reserve_va(size);
+        t_data.importDmabuf(t_qp.exportDmabuf(EXPORT_REGION_UWIN, 0, size), sva);
+        dst   = static_cast<uint64_t *>(sva);
+        fence = static_cast<uint64_t *>(t_data.getMem({coyote::CoyoteAllocType::HPF, 4096}));
+        memset(fence, 0, 4096);
+        printf("server: own uwin imported at %p\n", sva);
     } else {
         dst   = static_cast<uint64_t *>(t_data.getMem({coyote::CoyoteAllocType::HPF, size}));
         fence = static_cast<uint64_t *>(t_data.getMem({coyote::CoyoteAllocType::HPF, 4096}));
@@ -248,6 +264,7 @@ int run_server(uint16_t port, uint64_t size, bool land, uint64_t off, unsigned p
     while (read_full(c, &an, sizeof(an)) && an.rep != ~0ULL) {
         const Counters k0 = Counters::read(t_qp);
         const Shell s0 = Shell::read(t_qp);
+        const loom_switch::IngressCounters i0 = loom_switch::IngressCounters::read(t_qp);
         land_v80::Counters u0{}, u1{};
         if (land) u0 = land_v80::Counters::read(L->win);
         auto t0 = std::chrono::steady_clock::now();
@@ -272,7 +289,7 @@ int run_server(uint16_t port, uint64_t size, bool land, uint64_t off, unsigned p
         // time). Not for a V80 landing: a read through the V80's window is
         // answered only once the writes into it have drained, so the first
         // word shows up at the end; that copy is timed from the announce.
-        if (!land)
+        if (!land && !self)
             while (*vdst == 0 && std::chrono::steady_clock::now() - t0 < std::chrono::seconds(5)) _mm_pause();
         const auto t1 = std::chrono::steady_clock::now();
         v.first_us = std::chrono::duration<double, std::micro>(t1 - t0).count();
@@ -303,8 +320,9 @@ int run_server(uint16_t port, uint64_t size, bool land, uint64_t off, unsigned p
         }
         const Counters k1 = Counters::read(t_qp);
         const Shell s1 = Shell::read(t_qp);
+        const loom_switch::IngressCounters i1 = loom_switch::IngressCounters::read(t_qp);
         if (v.fence == an.fence) {
-            if (!no_touch)
+            if (!no_touch && !self)
                 for (uint64_t i = 0; i < size / 8; i++) v.bad += (vdst[i] != pattern(8 * i, an.rep));
         } else
             v.bad = size / 8;
@@ -321,11 +339,18 @@ int run_server(uint16_t port, uint64_t size, bool land, uint64_t off, unsigned p
                (unsigned long) k1.d(k0, C_RX_STALL), (unsigned long) k1.d(k0, C_RX_FF));
         s1.print(s0);
         if (land) u1.print(u0);
+        if (self) {
+            const uint64_t d = i1.v[1] - i0.v[1];
+            printf("     own uwin: ingress dropped %lu bursts = %.1f B a burst (1 beat %lu, 2-4 %lu, >4 %lu, misaligned %lu)\n",
+                   (unsigned long) d, d ? double(bytes) / d : 0.0, (unsigned long) (i1.v[17] - i0.v[17]),
+                   (unsigned long) (i1.v[18] - i0.v[18]), (unsigned long) (i1.v[19] - i0.v[19]),
+                   (unsigned long) (i1.v[20] - i0.v[20]));
+        }
         errors += (v.bad != 0);
         copies++;
         // the next copy must write every byte again (--no-touch: the
         // buffer is left alone between copies, and not checked)
-        if (!no_touch) {
+        if (!no_touch && !self) {
             if (land) L->clear();
             else      memset(dst, 0, size);
         }
@@ -354,7 +379,7 @@ int run_server(uint16_t port, uint64_t size, bool land, uint64_t off, unsigned p
 // counters are printed for the whole session. Each of the REPS runs is
 // timed here, from its first landed packet to its last (loom_rx's landed
 // count, size / 4 KiB packets per run): the sender's completions are not used.
-int run_passive(uint16_t port, uint64_t size, bool land, uint64_t msg, int reps, bool discard) {
+int run_passive(uint16_t port, uint64_t size, bool land, uint64_t msg, int reps, bool discard, bool self) {
     coyote::cThread t_qp(0, getpid(), 0, nullptr, "coyote_fpga");     // QP owner
     coyote::cThread t_data(0, getpid(), 0, nullptr, "coyote_fpga");   // owns the landing buffer
     printf("passive: waiting for the QP exchange on port %u ...\n", port);
@@ -377,11 +402,20 @@ int run_passive(uint16_t port, uint64_t size, bool land, uint64_t msg, int reps,
             if (!L->set_discard(true)) { printf("FAIL: the V80 window did not switch to DISCARD (image without it?)\n"); return 1; }
             printf("passive: V80 window in DISCARD mode: writes are counted and dropped, not landed\n");
         }
+    } else if (self) {
+        // --land-self: this U280's own uwin, no window programmed - every write is dropped and counted
+        for (uint32_t w = 0; w < 16; w++) loom_switch::release_window(t_qp, w);
+        void *sva = loom_switch::reserve_va(size);
+        t_data.importDmabuf(t_qp.exportDmabuf(EXPORT_REGION_UWIN, 0, size), sva);
+        dst = static_cast<uint64_t *>(sva);
+        printf("passive: own uwin imported at %p\n", sva);
     } else {
         dst = static_cast<uint64_t *>(t_data.getMem({coyote::CoyoteAllocType::HPF, size}));
         memset(dst, 0, size);
     }
     loom_switch::program_export(t_qp, 1, t_data.getCtid(), dst, size);
+    const loom_switch::IngressCounters i0 = loom_switch::IngressCounters::read(t_qp);
+    const uint64_t cyc0 = loom_switch::csr_read(t_qp, loom_switch::CYC);
     const Counters k0 = Counters::read(t_qp);
     const Shell s0 = Shell::read(t_qp);
     land_v80::Counters u0{}, u1{};
@@ -414,6 +448,8 @@ int run_passive(uint16_t port, uint64_t size, bool land, uint64_t msg, int reps,
         landed += per_run;
     }
     t_qp.connSync(false);                 // the sender is done
+    const loom_switch::IngressCounters i1 = loom_switch::IngressCounters::read(t_qp);
+    const uint64_t cyc1 = loom_switch::csr_read(t_qp, loom_switch::CYC);
     const Counters k1 = Counters::read(t_qp);
     const Shell s1 = Shell::read(t_qp);
     if (land) u1 = land_v80::Counters::read(L->win);
@@ -421,6 +457,11 @@ int run_passive(uint16_t port, uint64_t size, bool land, uint64_t msg, int reps,
     uint64_t bad = 0;
     if (land && discard) {
         if (!L->set_discard(false)) printf("WARN: the V80 window did not switch back to HBM\n");
+    } else if (self) {
+        const uint64_t d = i1.v[1] - i0.v[1];
+        printf("passive: own uwin: ingress dropped %lu bursts = %.1f B a burst (1 beat %lu, 2-4 %lu, >4 %lu) over %lu cycles\n",
+               (unsigned long) d, d ? double(size) * reps / d : 0.0, (unsigned long) (i1.v[17] - i0.v[17]),
+               (unsigned long) (i1.v[18] - i0.v[18]), (unsigned long) (i1.v[19] - i0.v[19]), (unsigned long) (cyc1 - cyc0));
     } else {
         const uint32_t *w;
         if (land) { L->pull(); w = reinterpret_cast<const uint32_t *>(L->buf); }
@@ -740,7 +781,7 @@ int main(int argc, char **argv) {
     uint64_t size = 1ULL << 20;
     int reps = 3;
     int window = -1;
-    bool land = false, bidir = false, no_send = false;
+    bool land = false, bidir = false, no_send = false, self = false;
     uint64_t land_off = 0;
     unsigned poll_us = 0, gap_ms = 0;
     bool no_touch = false, no_refill = false;
@@ -760,6 +801,7 @@ int main(int argc, char **argv) {
         else if (a == "--no-touch")              no_touch = true;
         else if (a == "--no-refill")             no_refill = true;
         else if (a == "--land-v80")               land = true;
+        else if (a == "--land-self")              self = true;   // this U280's own uwin, dropped (TLP sizes back from the RC)
         else if (a == "--land-offset" && i + 1 < argc) land_off = strtoull(argv[++i], nullptr, 0);
         else if (a == "--poll-us" && i + 1 < argc) poll_us = unsigned(atoi(argv[++i]));
         else if (a == "--bidir-server")           { bidir = true; server = true; }
@@ -780,7 +822,7 @@ int main(int argc, char **argv) {
                "       (size: a multiple of 4 KiB, at most 64 MiB)\n", argv[0]);
         return 2;
     }
-    if (passive) return run_passive(port, size, land, msg, reps, discard);
+    if (passive) return run_passive(port, size, land, msg, reps, discard, self && !land);
     if (bidir) return run_bidir(server ? std::string() : ip, port, size, reps, window, !no_send);
-    return server ? run_server(port, size, land, land_off, poll_us, no_touch, no_stamp) : run_client(ip, port, reps, window, gap_ms, no_refill, burst, prog);
+    return server ? run_server(port, size, land, land_off, poll_us, no_touch, no_stamp, self && !land) : run_client(ip, port, reps, window, gap_ms, no_refill, burst, prog);
 }
