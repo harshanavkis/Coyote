@@ -180,6 +180,14 @@ extern bool en_hmm;
 // Therefore, QDMA_N_ACTIVE_QUEUES cannot be set to more than 64
 #define QDMA_N_ACTIVE_QUEUES 64
 
+// C2H queues: each holds a prefetch tag. LOOM LOCAL CHANGE: the U280's soft QDMA (prefetch cache 64 deep, cr_pci_qdma.tcl)
+// hands out at most 63 tags, so it gets 32 C2H queues (>= 3 * N_OUTSTANDING); the V80's CPM5 keeps 64
+#ifdef PLATFORM_ULTRASCALE_PLUS
+#define QDMA_N_C2H_QUEUES 32
+#else
+#define QDMA_N_C2H_QUEUES QDMA_N_ACTIVE_QUEUES
+#endif
+
 #define QDMA_N_MAX_IRQ 16   
 
 // QDMA registers, see p301 of the QDMA specification from PG347 (v3.4) 

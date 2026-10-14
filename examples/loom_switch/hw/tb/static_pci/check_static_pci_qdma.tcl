@@ -21,12 +21,13 @@ set q [get_bd_cells qdma_0]
 expect "qdma_0 c_m_axi_num_write" [get_property CONFIG.c_m_axi_num_write $q] 32
 expect "qdma_0 pf0_device_id" [get_property CONFIG.pf0_device_id $q] 913F
 expect "qdma_0 dsc_byp_mode" [get_property CONFIG.dsc_byp_mode $q] Descriptor_bypass_and_internal
+expect "qdma_0 pfch_cache_depth" [get_property CONFIG.pfch_cache_depth $q] 64
 expect "axi_main NUM_READ_OUTSTANDING" [get_property CONFIG.NUM_READ_OUTSTANDING [get_bd_intf_ports axi_main]] 32
 
 generate_target synthesis [get_files design_static.bd]
 set xci [lindex [glob [pwd]/prj/sp.srcs/sources_1/bd/design_static/ip/design_static_qdma_0_0/*.xci] 0]
 set f [open $xci r]; set t [read $f]; close $f
-foreach {p want} {C_M_AXI_NUM_READ 32 C_M_AXI_NUM_WRITE 32 PF0_DEVICE_ID 0x913F DSC_BYPASS_RD 1 DSC_BYPASS_WR 1} {
+foreach {p want} {C_M_AXI_NUM_READ 32 C_M_AXI_NUM_WRITE 32 PF0_DEVICE_ID 0x913F DSC_BYPASS_RD 1 DSC_BYPASS_WR 1 MDMA_PFCH_CACHE_DEPTH 64} {
     if {[regexp "\"$p\": \\\[ \\\{ \"value\": \"(\[^\"\]+)\"" $t -> v]} {
         expect "generated qdma $p" $v $want
     } else { puts "FAIL $p not found in $xci"; incr errs }

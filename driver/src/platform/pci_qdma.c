@@ -408,6 +408,11 @@ int enable_queue(struct bus_driver_data *bd_data, int32_t qid, bool c2h, bool is
         wmb();
         usleep_range(DMA_MIN_SLEEP_CMD, DMA_MIN_SLEEP_CMD);
         int32_t pfch_tag_reg = ioread32(bd_data->bar[BAR_DMA_CONFIG] + QDMA_C2H_PFCH_BYP_TAG_REG);
+        if (((pfch_tag_reg >> 8) & 0xFFF) != qid) {
+            // no tag for this queue (e.g. the prefetch cache is out of tags): writing it would corrupt the static's table
+            pr_err("C2H prefetch tag for qid %d not granted (0x%08x)\n", qid, pfch_tag_reg);
+            goto fail;
+        }
         int32_t pfch_qid = ((pfch_tag_reg >> 8) & 0xFFF) - QDMA_WR_QUEUE_START_IDX; // bits 19:8 are the queue ID; substract starting WR queue index because the HW stores them 0, 1 in pfch_tags in qdma_wr_wrapper                    
         int32_t pfch_tag = pfch_tag_reg & 0x7F;                                     // bits 6:0 are the tag   
         reg_val = (1 << 31) | (pfch_qid << 8) | pfch_tag;
@@ -560,8 +565,8 @@ int enable_queues(struct bus_driver_data *bd_data) {
     // Card-to-host (C2H) queues need a prefetch tag to operate in bypass mode
     // The prefetch tag holds up to 6 bits, i.e. 64 different tags can be used
     // Hence, we can only enable up to 64 C2H queues in bypass mode
-    if (QDMA_N_ACTIVE_QUEUES > 64) {
-        pr_err("cannot enable more than 64 C2H queues in bypass mode, requested %d\n", QDMA_N_ACTIVE_QUEUES);
+    if (QDMA_N_C2H_QUEUES > 64) {
+        pr_err("cannot enable more than 64 C2H queues in bypass mode, requested %d\n", QDMA_N_C2H_QUEUES);
         ret_val = -ENODEV;
         goto fail;
     }
@@ -586,15 +591,15 @@ int enable_queues(struct bus_driver_data *bd_data) {
     dbg_info("initialized C2H buffer size");
 
     // Enable C2H (card-to-host) queues
-    for (int32_t qid = QDMA_WR_QUEUE_START_IDX; qid < QDMA_WR_QUEUE_START_IDX + QDMA_N_ACTIVE_QUEUES; qid++) {
+    for (int32_t qid = QDMA_WR_QUEUE_START_IDX; qid < QDMA_WR_QUEUE_START_IDX + QDMA_N_C2H_QUEUES; qid++) {
         ret_val = enable_queue(bd_data, qid, true, false, 0); 
         if (ret_val) { goto fail; }
     }
 
 #ifdef PLATFORM_VERSAL
-    const int want_queues = 2 * QDMA_N_ACTIVE_QUEUES + 1;
+    const int want_queues = QDMA_N_ACTIVE_QUEUES + QDMA_N_C2H_QUEUES + 1;
 #else
-    const int want_queues = 2 * QDMA_N_ACTIVE_QUEUES;
+    const int want_queues = QDMA_N_ACTIVE_QUEUES + QDMA_N_C2H_QUEUES;
 #endif
     if (bd_data->num_queues != want_queues) {
         pr_err("failed to enable all required c2h or h2c queues; got %d, requested %d queues\n", bd_data->num_queues, want_queues);

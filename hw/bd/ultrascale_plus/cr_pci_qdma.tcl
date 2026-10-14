@@ -11,6 +11,8 @@
 # (the XDMA static is 903F). Data path as on the V80 (CPM5 QDMA): AXI-ST H2C/C2H with descriptor bypass,
 # H2C queue status (qsts_out) and C2H status (axis_c2h_drop) to the qdma_* wrappers in static_top. The
 # completion, credit, descriptor-status and bypass-out interfaces are exported and tied off in static_top.
+# Prefetch cache 64 deep: every C2H queue in simple bypass holds a prefetch tag, and at the default 16 the QDMA
+# hands out 15 (measured 2026-10-14: qid 271+ got no tag, 0x140C read 0, TRQ_ERR 0x8).
 ######################################################################################
 
 proc cr_bd_design_static { parentCell } {
@@ -145,6 +147,7 @@ proc cr_bd_design_static { parentCell } {
     CONFIG.pf0_bar4_size_qdma {256} \
     CONFIG.PF0_MSIX_CAP_TABLE_SIZE_qdma {01F} \
     CONFIG.c_m_axi_num_write {32} \
+    CONFIG.pfch_cache_depth {64} \
     CONFIG.en_ext_ch_gt_drp {true} \
   ] $qdma_0
 
