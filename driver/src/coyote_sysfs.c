@@ -288,7 +288,7 @@ ssize_t cyt_attr_qdma_debug_regs_show(struct kobject *kobj, struct kobj_attribut
     struct bus_driver_data *bus_data = container_of(kobj, struct bus_driver_data, cyt_kobj);
     BUG_ON(!bus_data); 
 
-    return sprintf(buff, "\n -- \033[31m\e[1mQDMA DEBUG REGISTERS\033[0m\e[0m\n\n"
+    ssize_t n = sprintf(buff, "\n -- \033[31m\e[1mQDMA DEBUG REGISTERS\033[0m\e[0m\n\n"
         "QDMA_C2H_ERR_STAT (0xAF0): 0x%x\n"
         "QDMA_C2H_FATAL_ERR_STAT (0xAF8): 0x%x\n"
         "QDMA_RAM_SBE_STS_A (0xF4): 0x%x\n"
@@ -311,5 +311,22 @@ ssize_t cyt_attr_qdma_debug_regs_show(struct kobject *kobj, struct kobj_attribut
         ioread32(bus_data->bar[BAR_DMA_CONFIG] + 0x248),
         ioread32(bus_data->bar[BAR_DMA_CONFIG] + 0x314)
     );
+
+    // LOOM LOCAL CHANGE: raw C2H statistics/error block (0xA80-0xB4C), TRQ error status/mask/log (0x264-0x270)
+    // and H2C error/debug block (0xE00-0xE2C); the DMA BAR cannot be mmapped while the driver holds it.
+    for (uint32_t o = 0xA80; o <= 0xB4C; o += 16) {
+        n += scnprintf(buff + n, PAGE_SIZE - n, "0x%03x: %08x %08x %08x %08x\n", o,
+            ioread32(bus_data->bar[BAR_DMA_CONFIG] + o), ioread32(bus_data->bar[BAR_DMA_CONFIG] + o + 4),
+            ioread32(bus_data->bar[BAR_DMA_CONFIG] + o + 8), ioread32(bus_data->bar[BAR_DMA_CONFIG] + o + 12));
+    }
+    n += scnprintf(buff + n, PAGE_SIZE - n, "0x264: %08x %08x %08x %08x\n",
+        ioread32(bus_data->bar[BAR_DMA_CONFIG] + 0x264), ioread32(bus_data->bar[BAR_DMA_CONFIG] + 0x268),
+        ioread32(bus_data->bar[BAR_DMA_CONFIG] + 0x26C), ioread32(bus_data->bar[BAR_DMA_CONFIG] + 0x270));
+    for (uint32_t o = 0xE00; o <= 0xE2C; o += 16) {
+        n += scnprintf(buff + n, PAGE_SIZE - n, "0x%03x: %08x %08x %08x %08x\n", o,
+            ioread32(bus_data->bar[BAR_DMA_CONFIG] + o), ioread32(bus_data->bar[BAR_DMA_CONFIG] + o + 4),
+            ioread32(bus_data->bar[BAR_DMA_CONFIG] + o + 8), ioread32(bus_data->bar[BAR_DMA_CONFIG] + o + 12));
+    }
+    return n;
 }
 #endif
