@@ -33,6 +33,8 @@ pick_agent() {
 }
 
 "$REPO/scripts/fpga/wait_build.sh" "$WHAT" "$NAME" "$STAGE" || { echo "TEST: no image, stopping"; exit 1; }
+source "$REPO/scripts/fpga/hosthog_loom.sh"
+hog_claim ${HOG_MIN:-45} amy rose || { echo "TEST: no exclusive claim on amy and rose (hosthog), stopping"; exit 1; }
 case $WHAT in
     switch) U280_IMG=$HOME/coyote-bitstreams/$STAGE/hw/bitstreams/cyt_top.bit ;;
     ce)     V80_IMG=$HOME/coyote-bitstreams/$STAGE/cyt_top.pdi ;;

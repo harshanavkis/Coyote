@@ -8,6 +8,10 @@
 #            (scripts/fpga/setup_loom_hosts.sh); without it the cards must
 #            already be up (U280 loom_switch image, V80 loom_ce image)
 #
+# The whole run holds an exclusive hosthog claim on amy and rose
+# (scripts/fpga/hosthog_loom.sh; HOG_MIN, default 30) unless the calling script
+# holds one; it stops at once if someone else holds a claim.
+#
 # The software is rebuilt on clara and copied to both hosts first, so the
 # tools match this checkout. 16 MiB copies unless noted, every byte checked;
 # put rates are timed on the landing host from the first data to the fence:
@@ -49,6 +53,8 @@ STEPS=${STEPS:-1234567}
 OUT=${1:?usage: regress.sh OUTDIR [--setup <u280.bit> <v80.pdi>]}; shift
 HERE=$(cd "$(dirname "$0")" && pwd)
 REPO=$(git -C "$HERE" rev-parse --show-toplevel)
+source "$REPO/scripts/fpga/hosthog_loom.sh"
+hog_claim ${HOG_MIN:-30} amy rose || { echo "ABORT: no exclusive claim on amy and rose (hosthog)"; exit 1; }
 mkdir -p "$OUT"; OUT=$(readlink -f "$OUT")
 METRICS=$OUT/metrics.tsv; : > "$METRICS"
 

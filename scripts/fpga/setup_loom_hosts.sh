@@ -12,6 +12,9 @@
 #   v80.pdi = -        the V80s are programmed already (e.g. after a JTAG + warm-reboot recovery, or
 #                      when a V80's JTAG cable is gone): only reload their driver
 #
+# Exclusive use: amy/rose are claimed with hosthog for the setup (scripts/fpga/hosthog_loom.sh; HOG_MIN, default
+# 20) unless the calling script already holds the claim; it stops if someone else holds one.
+#
 # Drivers: driver/build{,_qdma,_versal} are built against the build tree's kernel. A host on another kernel
 # (e.g. after an OS update on one host only) loads driver/k<its uname -r>/{coyote_driver,coyote_driver_qdma,
 # coyote_driver_versal}.ko instead: build them with KERNELDIR=<that kernel's lib/modules/<ver>/build> and copy
@@ -186,6 +189,8 @@ for f in "$BIT" $([ "$PDI" = - ] || echo "$PDI"); do
     [ -f "$f" ] || { echo "no file $f" >&2; exit 1; }
 done
 for h in "$@"; do [ -n "${U280_IP[$h]:-}" ] || { echo "unknown host $h" >&2; exit 1; }; done
+source "$HERE/hosthog_loom.sh"
+hog_claim ${HOG_MIN:-20} $(printf '%s\n' "$@" | grep -vx clara) || { echo "SETUP FAILED: no exclusive claim on the hosts (hosthog)"; exit 1; }
 
 STAGE=$HOME/.cache/loom-setup/$(date -u +%Y%m%d-%H%M%S)
 mkdir -p "$STAGE"
