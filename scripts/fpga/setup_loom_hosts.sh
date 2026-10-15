@@ -12,6 +12,11 @@
 #   v80.pdi = -        the V80s are programmed already (e.g. after a JTAG + warm-reboot recovery, or
 #                      when a V80's JTAG cable is gone): only reload their driver
 #
+# Drivers: driver/build{,_qdma,_versal} are built against the build tree's kernel. A host on another kernel
+# (e.g. after an OS update on one host only) loads driver/k<its uname -r>/{coyote_driver,coyote_driver_qdma,
+# coyote_driver_versal}.ko instead: build them with KERNELDIR=<that kernel's lib/modules/<ver>/build> and copy
+# them there (they must be rebuilt whenever the driver changes).
+#
 # Runs every host at once, each in a tmux session `loom_setup` ON that host
 # (an interrupted ssh cannot leave a half-done or second programming run
 # behind), and waits for them. The checkouts on amy and rose are older than
@@ -49,6 +54,15 @@ if [ "${1:-}" = --here ]; then
     H=$(hostname)
     source "$STAGE/vivado_env.sh"
     fail() { echo "SETUP FAILED $H: $*"; exit 1; }
+    KREL=$(uname -r)
+    ko() {   # ko <file>: the staged driver built for this host's kernel: the build tree's, else k<uname -r>/<file>
+        local f=$STAGE/$1
+        [ "$(modinfo -F vermagic $f 2>/dev/null | cut -d' ' -f1)" = "$KREL" ] && { echo $f; return 0; }
+        f=$STAGE/k$KREL/$1
+        [ "$(modinfo -F vermagic $f 2>/dev/null | cut -d' ' -f1)" = "$KREL" ] && { echo $f; return 0; }
+        echo "SETUP FAILED $H: no $1 built for kernel $KREL staged (build it against that kernel into driver/k$KREL/)"
+        return 1
+    }
     link() { echo "$(cat $1/current_link_speed 2>/dev/null) x$(cat $1/current_link_width 2>/dev/null)"; }
     jtag() {   # <image> <part pattern> <device>
         local out
@@ -85,11 +99,9 @@ if [ "${1:-}" = --here ]; then
     [ -e $D ] || fail "the U280 did not come back at $U280_BDF: warm-reboot $H (the image stays programmed) and run this again"
     sudo rmmod coyote_driver 2>/dev/null   # a udev auto-load on the rescan, without identity
     # the soft-QDMA static (STATIC_DMA=qdma) is device 913f and needs the driver built with DMA=qdma
-    KO=$STAGE/coyote_driver.ko
-    if [ "$(cat $D/device)" = 0x913f ]; then
-        KO=$STAGE/coyote_driver_qdma.ko
-        [ -f $KO ] || fail "QDMA U280 image (913f) but no driver/build_qdma/coyote_driver.ko staged (make TARGET_PLATFORM=ultrascale_plus DMA=qdma)"
-    fi
+    KOF=coyote_driver.ko
+    [ "$(cat $D/device)" = 0x913f ] && KOF=coyote_driver_qdma.ko   # QDMA image: make TARGET_PLATFORM=ultrascale_plus DMA=qdma
+    KO=$(ko $KOF) || { echo "$KO"; exit 1; }
     sudo insmod $KO ip_addr=0x${U280_IP[$H]} mac_addr=${U280_MAC[$H]} || fail "U280 driver insmod failed (dmesg)"
     IP=""
     for i in $(seq 1 20); do
@@ -108,7 +120,7 @@ if [ "${1:-}" = --here ]; then
         sudo rmmod coyote_driver_versal 2>/dev/null
         echo 1 | sudo tee /sys/bus/pci/rescan >/dev/null
         [ -e $V ] && grep -qE '0x(b0|b1|b2|b3)3f' $V/device || fail "no Coyote V80 at ${V80_BDF[$H]} ($(cat $V/device 2>/dev/null))"
-        sudo insmod $STAGE/coyote_driver_versal.ko || fail "V80 driver insmod failed (dmesg)"
+        VKO=$(ko coyote_driver_versal.ko) || { echo "$VKO"; exit 1; }; sudo insmod $VKO || fail "V80 driver insmod failed (dmesg)"
         for i in $(seq 1 30); do ls -d /sys/kernel/coyote_versal_sysfs_* >/dev/null 2>&1 && break; sleep 1; done
         echo "   V80 (as programmed): driver $(basename "$(readlink -f $V/driver)"), link $(link $V)"
         ls -d /sys/kernel/coyote_versal_sysfs_* >/dev/null 2>&1 || fail "V80 driver up but no coyote_versal_sysfs node (dmesg)"
@@ -134,7 +146,7 @@ if [ "${1:-}" = --here ]; then
             done
             [ -e $V ] || fail "the V80 did not come back at ${V80_BDF[$H]}"
             sudo rmmod coyote_driver_versal 2>/dev/null
-            sudo insmod $STAGE/coyote_driver_versal.ko || fail "V80 driver insmod failed (dmesg)"
+            VKO=$(ko coyote_driver_versal.ko) || { echo "$VKO"; exit 1; }; sudo insmod $VKO || fail "V80 driver insmod failed (dmesg)"
             for i in $(seq 1 30); do ls -d /sys/kernel/coyote_versal_sysfs_* >/dev/null 2>&1 && break; sleep 1; done
             echo "   V80: driver $(basename "$(readlink -f $V/driver)"), link $(link $V)"
             [ "$(cat $V/current_link_width)" = 16 ] && break
@@ -180,7 +192,8 @@ mkdir -p "$STAGE"
 cp "$0" "$HERE/vivado_env.sh" "$REPO/examples/loom/hw/program_loom.tcl" \
    "$REPO/driver/build/coyote_driver.ko" "$REPO/driver/build_versal/coyote_driver_versal.ko" "$STAGE/" || exit 1
 [ -f "$REPO/driver/build_qdma/coyote_driver.ko" ] && cp "$REPO/driver/build_qdma/coyote_driver.ko" "$STAGE/coyote_driver_qdma.ko"
-echo "commit $(git -C "$REPO" rev-parse --short HEAD), drivers $(cd $STAGE && md5sum *.ko | cut -c1-8 | tr '\n' ' ')" > "$STAGE/INFO.txt"
+for d in "$REPO"/driver/k*/; do [ -d "$d" ] && cp -r "$d" "$STAGE/"; done   # drivers for hosts on other kernels
+echo "commit $(git -C "$REPO" rev-parse --short HEAD), drivers $(cd $STAGE && md5sum *.ko k*/*.ko 2>/dev/null | cut -c1-8 | tr '\n' ' ')" > "$STAGE/INFO.txt"
 echo "staged in $STAGE ($(cat $STAGE/INFO.txt))"
 
 run_on() {   # <host> <command>
