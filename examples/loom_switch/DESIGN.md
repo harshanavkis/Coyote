@@ -459,3 +459,47 @@ pci_qdma.c) and setup_loom_hosts.sh loads it when the card shows 913F.
   +8..25%, both directions at once unchanged (~10.8-11.0). Timing: WNS -0.464
   ns, worst paths inside the QDMA IP's PCIe interface (xclk -> PCIe core);
   no errors in either regression.
+
+## 15. Peers' reads of the V80's window may come out of order (uwin_ra WINDOW)
+
+The RDMA baseline pulling from V80 memory (U280 perf_rdma on the QDMA static,
+`landing_client --contig 1 --read-ahead 2`) reached line rate from 256 KiB but
+not below: V80 -> V80 7.1 / 8.5 / 9.7 / 11.5 GB/s at 4 / 8 / 16 / 64 KiB
+(best of 10, Loom 12.2 at every size).
+
+- Cause (measured, e1/20261015_2037_ra_modes and _2043_ra_pace): uwin_ra's
+  stream (and uwin_hbm's) ends on any read that does not continue the
+  previous one, and the U280's reads reach the V80 out of order 0.24 / 0.29 /
+  0.32-0.43 / 0.50-0.56 times per write. Each break costs ~1.2 us (the
+  passed-through reads wait behind the fills in flight; a fill is out ~1.6 us):
+  time per write = size / 12.25 GB/s + breaks x 1.2 us fits the measured
+  rates within ~8% at every size (computed). With one 4 KiB read command in
+  flight at a time (writes paced >= 1.5 us apart) the breaks vanish (0.001
+  per write); with 16 or 64 KiB writes (4 or 16 commands back to back) they
+  stay: the requester's concurrent 4 KiB commands interleave, within a write
+  or across writes. A 4 KiB max read request on the U280 (runtime setpci)
+  cuts the breaks 2.5-4x but caps 64 KiB at 10.5 (e1/20261015_2057_ra_mrrs).
+- WINDOW streams (counter-page line 57; 56 = STRICT, the reset default): a
+  window read of the stream's ID whose lines lie between s_req - RA_LAG (192
+  lines, not below the stream's start) and s_req + RA_AHEAD (256) belongs to
+  the stream in any order (s_req: the furthest end of its reads). The ring is
+  read per read (gq: first line, end, floor; a walker in AR order) instead of
+  as a FIFO; fills land at most RA_RING lines beyond the floor of the oldest
+  read not yet read out (its first line, or the s_lag it was taken against),
+  so a lagging read's lines are never overwritten (TB mutation without it:
+  wrong data in T19) and RA_AHEAD + RA_LAG + RA_BURST <= RA_RING keeps the
+  fills a read waits for always allowed.
+- Counters 77-87 (uwin_ra words 13-23): WINDOW selected; out-of-order stream
+  reads; by distance from s_req (8 bins); taken. They show the real pattern
+  in either mode.
+- TB (tb_uwin_ra T15-T20, model): a NIC's pattern (half the 4 KiB boundaries
+  interleaved, reads up to 20 late) stays one stream in WINDOW; at the V80's
+  latencies with a quarter of the boundaries interleaved STRICT runs 7.8
+  GB/s, WINDOW 14.7 (the 8-in-flight model's ceiling; STRICT sequential 14.7,
+  was 15.7 before the walker: ~2 cycles more a hit).
+- Rejected: STRICT with a longer idle or a larger ring (the break is the
+  order, not the depth); several strict streams (a single stream reordered
+  is not several sequential ones); fewer reads in flight on the U280 (one
+  command at a time = 2.7 GB/s at 4 KiB, measured).
+- Prediction (computed): 4-64 KiB from a V80 source at ~12.2 GB/s best, if the
+  real offsets fit the window (the counters say).

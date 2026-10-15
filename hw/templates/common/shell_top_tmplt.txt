@@ -422,7 +422,7 @@ module shell_top (
     // before the clock-crossing interconnect (uwin_ra.sv): off at reset, a
     // wire then. uwin_mon (below) counts the ports, the peer's side of it
     AXI4 axi_main_ra();
-    logic [64*13-1:0] uwin_ra_ctr;
+    logic [64*24-1:0] uwin_ra_ctr;
     uwin_ra inst_uwin_ra (.xclk(xclk), .xresetn(xresetn), .s_axi(s_axi_main), .m_axi(axi_main_ra), .ctr(uwin_ra_ctr));
 {% endif %}
     AXI4L axi_cnfg ();
@@ -1499,7 +1499,7 @@ module shell_top (
     // Where the user data window's writes and reads enter the shell (axi_main,
     // xclk, the static's side of uwin_ra): counted for the window's counter
     // page with uwin_ra's counters (uwin_mon.sv)
-    logic [64*28-1:0] uwin_main_snap;
+    logic [64*39-1:0] uwin_main_snap;
     logic             uwin_main_tgl;
     uwin_mon inst_uwin_mon (
         .xclk(xclk), .xresetn(xresetn),

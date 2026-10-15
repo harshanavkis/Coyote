@@ -64,11 +64,11 @@ localparam longint UWIN_SIZE = 64'h0800_0000;
 localparam longint CTRP      = WIN + UWIN_SIZE - 4096;
 localparam longint REGR      = 64'h0010_0000;       // registers the peer reads
 localparam longint REGW      = 64'h0010_1000;       // ... and writes (read back only after)
-localparam int     RA_LINES = 256, RA_BURST = 16, RA_IDLE = 1024;
+localparam int     RA_LINES = 256, RA_BURST = 16, RA_IDLE = 1024, RA_LAG = 192;
 
 AXI4 s (.aclk(xclk));               // axi_main from the static
 AXI4 m (.aclk(xclk));               // into the interconnect
-logic [64*13-1:0] ctr;
+logic [64*24-1:0] ctr;
 uwin_ra dut (.xclk(xclk), .xresetn(xresetn), .s_axi(s), .m_axi(m), .ctr(ctr));
 
 int errors = 0;
@@ -489,11 +489,11 @@ function automatic longint cw(input int i);
     return ctr[64*i +: 64];
 endfunction
 localparam int MODE = 0, HIT = 1, LATE = 2, PASS = 3, RA_AR = 4, FILLED = 5, SERVED = 6, STREAMS = 7, END_J = 8,
-               END_W = 9, END_I = 10, FO_SUM = 11, NZ_ID = 12;
-typedef struct { longint w [13]; longint mar, mrb, sar, srb, fill, fo; } snap_t;
+               END_W = 9, END_I = 10, FO_SUM = 11, NZ_ID = 12, WM = 13, OOO = 14, H0 = 15, OOO_ACC = 23;
+typedef struct { longint w [24]; longint mar, mrb, sar, srb, fill, fo; } snap_t;
 task automatic snap(output snap_t x);
     repeat (4) @(negedge xclk);
-    for (int i = 0; i < 13; i++) x.w[i] = cw(i);
+    for (int i = 0; i < 24; i++) x.w[i] = cw(i);
     x.mar = m_ar_n; x.mrb = m_rb; x.sar = s_ar_n; x.srb = s_rb; x.fill = n_fill; x.fo = tb_fo_sum;
 endtask
 // between two snapshots (both quiet): fills and lines read ahead are m_axi's
@@ -522,6 +522,60 @@ task automatic ra_set(input bit on);
     while (dut.trk != on && w < 5000) begin @(negedge xclk); w++; end
     `CHECK(dut.trk == on, $sformatf("TRACK %0d after the switch, want %0d", dut.trk, on))
 endtask
+
+// WINDOW (line 57) / STRICT (line 56): word 13; a stream keeps the kind it started with
+task automatic wm_set(input bit on);
+    rd_t r [$];
+    longint cy;
+    r.push_back('{CTRP + 64*(on ? 57 : 56), 1, 3, 0});
+    peer_rd(on ? "line 57" : "line 56", r, 1, cy);
+    repeat (300) @(negedge xclk);
+    `CHECK(cw(WM) == 64'(on), $sformatf("WINDOW %0d, want %0d", cw(WM), on))
+endtask
+
+// An RDMA NIC's reads of a sequential transfer: 4 KiB commands of 16 x 256 B
+// reads from a, in order, except that at a fraction pct of the command
+// boundaries the previous command's last t1 reads and the next one's first t2
+// (1..8 each) interleave at random (each keeps its own order), and one read in
+// lag_div is issued up to lag_max reads late
+function automatic void nic_rds(ref rd_t rds [$], input longint a, input int ncmd, input int pct,
+                                input int lag_div = 0, input int lag_max = 0);
+    rd_t x [$];
+    for (int k = 0; k < 16 * ncmd; k++) x.push_back('{a + 256*k, 4, 6, 0});
+    for (int c = 1; c < ncmd; c++) begin
+        if ($urandom_range(0, 99) < pct) begin
+            int t1 = $urandom_range(1, 8), t2 = $urandom_range(1, 8);
+            rd_t p [$], q [$];
+            for (int k = 16*c - t1; k < 16*c; k++) p.push_back(x[k]);
+            for (int k = 16*c; k < 16*c + t2; k++) q.push_back(x[k]);
+            for (int k = 16*c - t1; k < 16*c + t2; k++)
+                if (q.size() == 0 || (p.size() > 0 && $urandom_range(0, 1))) x[k] = p.pop_front();
+                else x[k] = q.pop_front();
+        end
+    end
+    if (lag_div > 0)
+        for (int k = 0; k + lag_max < x.size(); k++)
+            if ($urandom_range(0, lag_div - 1) == 0) begin
+                rd_t r = x[k];
+                int d = $urandom_range(1, lag_max);
+                for (int j = k; j < k + d; j++) x[j] = x[j + 1];
+                x[k + d] = r;
+            end
+    foreach (x[k]) rds.push_back(x[k]);
+endfunction
+
+// the out-of-order counters between two snapshots: the bins sum to word 14, those taken (23) at most it
+task automatic ooo_check(input string name, input snap_t a, input snap_t b);
+    longint nb_sum = 0;
+    for (int i = H0; i < H0 + 8; i++) nb_sum += b.w[i] - a.w[i];
+    `CHECK(nb_sum == b.w[OOO] - a.w[OOO] && b.w[OOO_ACC] - a.w[OOO_ACC] <= b.w[OOO] - a.w[OOO],
+           $sformatf("%s: out-of-order %0d, bins sum %0d, taken %0d", name, b.w[OOO] - a.w[OOO], nb_sum, b.w[OOO_ACC] - a.w[OOO_ACC]))
+endtask
+function automatic string ooo_str(input snap_t a, input snap_t b);
+    return $sformatf("out of order %0d (taken %0d): <-LAG %0d, -LAG..-65 %0d, -64..-17 %0d, -16..-1 %0d, 1..16 %0d, 17..64 %0d, 65..AHEAD %0d, >AHEAD %0d",
+                     b.w[OOO] - a.w[OOO], b.w[OOO_ACC] - a.w[OOO_ACC], b.w[H0] - a.w[H0], b.w[H0+1] - a.w[H0+1], b.w[H0+2] - a.w[H0+2],
+                     b.w[H0+3] - a.w[H0+3], b.w[H0+4] - a.w[H0+4], b.w[H0+5] - a.w[H0+5], b.w[H0+6] - a.w[H0+6], b.w[H0+7] - a.w[H0+7]);
+endfunction
 
 // T14's writer: st_n bursts of st_beats beats from st_a0, back to back, B not
 // awaited. st_lag >= 0: W runs ahead (up to 2 bursts), AW k presented st_lag
@@ -602,7 +656,7 @@ initial begin
         for (int k = 0; k < 24; k++) rds.push_back('{REGW + 8*k, 1, 3, 0});
         peer_rd("T1 register read-back", rds, 8, cy);
         repeat (20) @(negedge xclk);
-        for (int i = 0; i < 12; i++) `CHECK(cw(i) == 0, $sformatf("T1: word %0d = %0d while off", i, cw(i)))
+        for (int i = 0; i < 24; i++) if (i != NZ_ID) `CHECK(cw(i) == 0, $sformatf("T1: word %0d = %0d while off", i, cw(i)))
         `CHECK(cw(NZ_ID) == n_nzid, $sformatf("T1: word 12 = %0d, %0d ARs with a nonzero ID", cw(NZ_ID), n_nzid))
         `CHECK(!dut.trk && pass_cyc > 1000, $sformatf("T1: %0d cycles checked in PASS", pass_cyc))
     end
@@ -839,7 +893,7 @@ initial begin
         seq_rds(rds, G + 12288, 32, 4);
         peer_rd("T7 off, then", rds, 8, cy);
         snap(b);
-        for (int i = 1; i < 12; i++) `CHECK(b.w[i] == mm.w[i], $sformatf("T7: word %0d moved while off", i))
+        for (int i = 1; i < 24; i++) if (i != NZ_ID && i != WM) `CHECK(b.w[i] == mm.w[i], $sformatf("T7: word %0d moved while off", i))
         `CHECK(b.mar - mm.mar == b.sar - mm.sar, "T7: m_axi carried more than the peer's reads while off")
         snap(mm);
         rds = {};
@@ -1087,6 +1141,234 @@ initial begin
         ds_rand = 1;
     end
     $display("ok   T14 W behind AW: 4 cycles a burst, first beats W_LAG after their AW, every beat in order");
+
+    // --- T15: WINDOW / STRICT: lines 57 / 56, word 13
+    ra_set(1);
+    wm_set(1);
+    wm_set(0);
+    $display("ok   T15 WINDOW selected (line 57) and STRICT again (line 56): word 13");
+
+    // --- T16: a NIC's reordered reads. 64 x 4 KiB commands, half of the
+    //     boundaries interleaved, one read in 40 up to 12 reads late; 8 in
+    //     flight, R backpressure, model gaps. WINDOW: one stream, exact data,
+    //     nothing passed through, every out-of-order read taken; STRICT on
+    //     the same pattern: the stream breaks
+    begin
+        rd_t rds [$];
+        snap_t a, b;
+        longint cy;
+        ds_lat = 20; ds_slow = 0; ds_rand = 1; up_dly = 0;
+        wm_set(1);
+        repeat (RA_IDLE + 300) @(negedge xclk);
+        nic_rds(rds, R0, 64, 50, 40, 12);
+        snap(a);
+        peer_rbp = 1;
+        peer_rd("T16 WINDOW", rds, 8, cy);
+        peer_rbp = 0; s.rready = 1;
+        repeat (RA_IDLE + 300) @(negedge xclk);
+        snap(b);
+        xcheck("T16 WINDOW", a, b);
+        ooo_check("T16 WINDOW", a, b);
+        `CHECK(b.w[STREAMS] - a.w[STREAMS] == 1 && b.w[END_J] == a.w[END_J] && b.w[END_I] - a.w[END_I] == 1
+               && b.w[PASS] - a.w[PASS] <= 2 && (b.w[HIT] - a.w[HIT]) + (b.w[LATE] - a.w[LATE]) + (b.w[PASS] - a.w[PASS]) == 16 * 64
+               && b.w[OOO] - a.w[OOO] > 20 && b.w[OOO_ACC] - a.w[OOO_ACC] == b.w[OOO] - a.w[OOO],
+               $sformatf("T16 WINDOW: streams %0d, jumps %0d, idle %0d, passed %0d, stream reads %0d, %s", b.w[STREAMS] - a.w[STREAMS],
+                         b.w[END_J] - a.w[END_J], b.w[END_I] - a.w[END_I], b.w[PASS] - a.w[PASS],
+                         (b.w[HIT] - a.w[HIT]) + (b.w[LATE] - a.w[LATE]), ooo_str(a, b)))
+        $display("     T16 WINDOW: %0d stream reads, %0d late; %s", (b.w[HIT] - a.w[HIT]) + (b.w[LATE] - a.w[LATE]),
+                 b.w[LATE] - a.w[LATE], ooo_str(a, b));
+        wm_set(0);
+        repeat (RA_IDLE + 300) @(negedge xclk);
+        rds = {};
+        nic_rds(rds, R0 + 64'h1_0000, 64, 50, 40, 12);
+        snap(a);
+        peer_rd("T16 STRICT", rds, 8, cy);
+        repeat (RA_IDLE + 300) @(negedge xclk);
+        snap(b);
+        xcheck("T16 STRICT", a, b);
+        ooo_check("T16 STRICT", a, b);
+        `CHECK(b.w[END_J] - a.w[END_J] > 20 && b.w[OOO_ACC] == a.w[OOO_ACC],
+               $sformatf("T16 STRICT: jumps %0d, out-of-order taken %0d", b.w[END_J] - a.w[END_J], b.w[OOO_ACC] - a.w[OOO_ACC]))
+        $display("     T16 STRICT: %0d streams, ended by a jump %0d, %0d passed through; %s", b.w[STREAMS] - a.w[STREAMS],
+                 b.w[END_J] - a.w[END_J], b.w[PASS] - a.w[PASS], ooo_str(a, b));
+    end
+    $display("ok   T16 a NIC's interleaved 4 KiB commands: WINDOW keeps one stream, exact data; STRICT breaks");
+
+    // --- T17: WINDOW's edges, each read checked: (a) a read RA_LAG + 4
+    //     lines behind s_req ends the stream; (b) a read below the stream's
+    //     start (inside RA_LAG) ends it; (c) a read ending beyond s_ahd ends
+    //     it; (d) one 16 lines behind and one 16 ahead are taken
+    begin
+        rd_t rds [$];
+        snap_t a, b;
+        longint cy;
+        longint A = R0 + 64'h2_0000;
+        wm_set(1);
+        repeat (RA_IDLE + 300) @(negedge xclk);
+        // (a)
+        snap(a);
+        seq_rds(rds, A, 64, 4);                                 // s_req = 256 lines past A
+        rds.push_back('{A + 64*(256 - RA_LAG - 4), 4, 6, 0});   // starts RA_LAG + 4 lines behind
+        seq_rds(rds, A + 64*256, 8, 4);
+        peer_rd("T17a", rds, 1, cy);
+        repeat (RA_IDLE + 300) @(negedge xclk);
+        snap(b);
+        `CHECK(b.w[END_J] - a.w[END_J] == 1 && b.w[H0] - a.w[H0] == 1,
+               $sformatf("T17a: jumps %0d, %s", b.w[END_J] - a.w[END_J], ooo_str(a, b)))
+        // (b)
+        snap(a);
+        rds = {};
+        seq_rds(rds, A + 64'h4000, 4, 4);
+        rds.push_back('{A + 64'h4000 - 256, 4, 6, 0});           // below the stream's start
+        peer_rd("T17b", rds, 1, cy);
+        repeat (RA_IDLE + 300) @(negedge xclk);
+        snap(b);
+        `CHECK(b.w[END_J] - a.w[END_J] == 1 && b.w[OOO_ACC] == a.w[OOO_ACC],
+               $sformatf("T17b: jumps %0d, taken out of order %0d", b.w[END_J] - a.w[END_J], b.w[OOO_ACC] - a.w[OOO_ACC]))
+        // (c)
+        snap(a);
+        rds = {};
+        seq_rds(rds, A + 64'h8000, 4, 4);                       // s_req = 16 lines past it
+        rds.push_back('{A + 64'h8000 + 64*(16 + 256 - 2), 4, 6, 0});   // ends 2 lines beyond s_ahd
+        peer_rd("T17c", rds, 1, cy);
+        repeat (RA_IDLE + 300) @(negedge xclk);
+        snap(b);
+        `CHECK(b.w[END_J] - a.w[END_J] == 1 && b.w[H0 + 6] - a.w[H0 + 6] == 1,
+               $sformatf("T17c: jumps %0d, %s", b.w[END_J] - a.w[END_J], ooo_str(a, b)))
+        // (d)
+        snap(a);
+        rds = {};
+        seq_rds(rds, A + 64'hC000, 16, 4);                      // s_req = 64 lines past it
+        rds.push_back('{A + 64'hC000 + 64*(64 - 16), 4, 6, 0});
+        rds.push_back('{A + 64'hC000 + 64*(64 + 16), 4, 6, 0});
+        seq_rds(rds, A + 64'hC000 + 64*64, 8, 4);
+        peer_rd("T17d", rds, 1, cy);
+        repeat (RA_IDLE + 300) @(negedge xclk);
+        snap(b);
+        ooo_check("T17", a, b);
+        `CHECK(b.w[END_J] == a.w[END_J] && b.w[STREAMS] - a.w[STREAMS] == 1 && b.w[OOO_ACC] - a.w[OOO_ACC] >= 2
+               && b.w[H0 + 3] - a.w[H0 + 3] >= 1 && b.w[H0 + 4] - a.w[H0 + 4] >= 1,
+               $sformatf("T17d: jumps %0d, streams %0d, %s", b.w[END_J] - a.w[END_J], b.w[STREAMS] - a.w[STREAMS], ooo_str(a, b)))
+    end
+    $display("ok   T17 WINDOW's edges: behind s_lag, below the start, beyond s_ahd end the stream; inside it is taken");
+
+    // --- T18: WINDOW under T4's random mixes (1-64 in flight, register
+    //     writes alongside) and T5's staleness: a window write ends the
+    //     stream, later reads see it
+    begin
+        rd_t rds [$];
+        snap_t a, b;
+        longint cy;
+        longint A = R0 + 64'h1_8000;
+        int nmax [5] = '{1, 4, 8, 32, 64};
+        wm_set(1);
+        snap(a);
+        peer_rbp = 1;
+        foreach (nmax[i]) begin
+            rds = {};
+            mix(rds, 500, 1);
+            fork
+                peer_rd($sformatf("T18 (%0d in flight)", nmax[i]), rds, nmax[i], cy);
+                for (int k = 0; k < 6; k++) begin
+                    repeat ($urandom_range(50, 300)) @(negedge xclk);
+                    wr_reg(REGW + 8*(160 + 8*i + k), {32'(i), 32'(k + 200)});
+                end
+            join
+        end
+        peer_rbp = 0; s.rready = 1;
+        repeat (RA_IDLE + 300) @(negedge xclk);
+        snap(b);
+        xcheck("T18 mixes", a, b);
+        ooo_check("T18 mixes", a, b);
+        `CHECK(b.w[STREAMS] - a.w[STREAMS] > 20 && b.w[OOO_ACC] - a.w[OOO_ACC] > 5,
+               $sformatf("T18: streams %0d, %s", b.w[STREAMS] - a.w[STREAMS], ooo_str(a, b)))
+        $display("     T18 2500 mixed reads: %0d streams, %0d hits, %0d passed; %s", b.w[STREAMS] - a.w[STREAMS],
+                 b.w[HIT] - a.w[HIT], b.w[PASS] - a.w[PASS], ooo_str(a, b));
+        snap(a);
+        rds = {};
+        seq_rds(rds, A, 32, 4);
+        peer_rd("T18 before", rds, 8, cy);
+        for (int k = 0; k < 4; k++) wr_win(A + 8192 + 256*k, 4, 23);
+        rds = {};
+        nic_rds(rds, A + 8192, 4, 100);
+        peer_rd("T18 after", rds, 8, cy);
+        repeat (RA_IDLE + 300) @(negedge xclk);
+        snap(b);
+        `CHECK(b.w[END_W] - a.w[END_W] == 1, $sformatf("T18: ended by a write %0d", b.w[END_W] - a.w[END_W]))
+    end
+    $display("ok   T18 WINDOW under random mixes and a window write: exact data, the write ends the stream");
+
+    // --- T19: WINDOW, lagging reads with R stopped: 80 allowed in flight,
+    //     one read in 6 up to 20 reads (80 lines) late; R stopped until rq is
+    //     full, then released: no deadlock (fills never overrun a read still
+    //     to answer), exact data; then the same with R backpressure and the
+    //     V80's latencies
+    begin
+        rd_t rds [$];
+        snap_t a, b;
+        longint cy;
+        snap(a);
+        nic_rds(rds, R0 + 64'h2_0000, 100, 50, 6, 20);
+        fork
+            peer_rd("T19", rds, 80, cy);
+            begin
+                wait (peer_front >= R0 + 64'h2_0000 + 4096*4);
+                @(negedge xclk); s.rready = 0;
+                repeat (800) @(negedge xclk);
+                `CHECK(dut.rq_full, "T19: rq not full with R stopped")
+                s.rready = 1;
+            end
+        join
+        ds_lat = 142; ds_slow = 1; ds_rand = 0; up_dly = 37;
+        rds = {};
+        nic_rds(rds, R0 + 64'h8_0000, 100, 50, 6, 20);
+        peer_rbp = 1;
+        peer_rd("T19 V80 latencies", rds, 8, cy);
+        peer_rbp = 0; s.rready = 1;
+        ds_lat = 20; ds_slow = 0; ds_rand = 1; up_dly = 0;
+        repeat (RA_IDLE + 300) @(negedge xclk);
+        snap(b);
+        xcheck("T19", a, b);
+        ooo_check("T19", a, b);
+        `CHECK(b.w[STREAMS] - a.w[STREAMS] <= 4 && b.w[OOO_ACC] - a.w[OOO_ACC] > 100,
+               $sformatf("T19: streams %0d, %s", b.w[STREAMS] - a.w[STREAMS], ooo_str(a, b)))
+        $display("     T19: %0d streams, ended by a jump %0d; %s", b.w[STREAMS] - a.w[STREAMS], b.w[END_J] - a.w[END_J], ooo_str(a, b));
+    end
+    $display("ok   T19 WINDOW with lagging reads, R stopped until rq is full: no deadlock, exact data");
+
+    // --- T20: what WINDOW buys on a NIC's pattern at the V80's latencies
+    //     (T11's model): 512 KiB of 4 KiB commands, a quarter of the
+    //     boundaries interleaved (as measured at 4 KiB: ~0.25 breaks a
+    //     command), 8 x 256 B in flight; STRICT, then WINDOW
+    begin
+        rd_t rds [$];
+        snap_t a, b;
+        longint c_s, c_w;
+        ds_lat = 142; ds_slow = 1; ds_rand = 0; up_dly = 37;
+        wm_set(0);
+        repeat (RA_IDLE + 300) @(negedge xclk);
+        nic_rds(rds, R0, 128, 25);
+        snap(a);
+        peer_rd("T20 STRICT", rds, 8, c_s);
+        repeat (RA_IDLE + 300) @(negedge xclk);
+        snap(b);
+        $display("     T20 STRICT: %0d cycles = %.2f GB/s, %0d jumps", c_s, 524288.0 / (c_s * 3.0), b.w[END_J] - a.w[END_J]);
+        wm_set(1);
+        repeat (RA_IDLE + 300) @(negedge xclk);
+        rds = {};
+        nic_rds(rds, R0 + 64'h8_0000, 128, 25);
+        snap(a);
+        peer_rd("T20 WINDOW", rds, 8, c_w);
+        repeat (RA_IDLE + 300) @(negedge xclk);
+        snap(b);
+        xcheck("T20", a, b);
+        $display("     T20 WINDOW: %0d cycles = %.2f GB/s, %0d jumps, %0d late", c_w, 524288.0 / (c_w * 3.0), b.w[END_J] - a.w[END_J],
+                 b.w[LATE] - a.w[LATE]);
+        `CHECK(b.w[END_J] == a.w[END_J] && c_w * 5 < c_s * 4, $sformatf("T20: WINDOW %0d cycles vs STRICT %0d", c_w, c_s))
+        ds_lat = 20; ds_slow = 0; ds_rand = 1; up_dly = 0;
+        wm_set(0);
+    end
+    $display("ok   T20 WINDOW vs STRICT on a NIC's pattern at the V80's latencies");
 
     `CHECK(m_ctr_ar == s_ctr_ar, $sformatf("m_axi: %0d ARs into the counter page, the peer read it %0d times", m_ctr_ar, s_ctr_ar))
     `CHECK(trk_q.size() == 0 && pas_q.size() == 0, $sformatf("ARs never seen: %0d at the decision, %0d at m_axi", trk_q.size(), pas_q.size()))

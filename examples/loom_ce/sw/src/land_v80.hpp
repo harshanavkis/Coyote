@@ -43,11 +43,15 @@ struct Counters {
     // words 40-49: uwin_hbm's read-ahead (on/off: counter page line 61/60; RA_MODE says which)
     static constexpr int N_RA = 10;
     enum { RA_HIT, RA_LATE, RA_PASS, RA_AR, RA_FILLED, RA_SERVED, RA_STREAMS, RA_END_JUMP, RA_END_WRITE, RA_END_IDLE };
-    // words 64-76: uwin_ra's read-ahead on axi_main, before the clock crossing (xclk; on/off: counter page line
-    // 59/58, X_MODE says which; a snapshot like words 16-30). X_FILL_OUT_SUM / X_AR = cycles a read-ahead AR is out
-    static constexpr int N_X = 13;
+    // words 64-87: uwin_ra's read-ahead on axi_main, before the clock crossing (xclk; on/off: counter page line
+    // 59/58, X_MODE says which; WINDOW/STRICT streams: line 57/56, X_WM; a snapshot like words 16-30).
+    // X_FILL_OUT_SUM / X_AR = cycles a read-ahead AR is out. X_OOO: out-of-order window reads in a stream (first
+    // line != the stream's furthest end s_req), X_BIN.. by d = first line - s_req (lines: < -192, -192..-65,
+    // -64..-17, -16..-1, 1..16, 17..64, 65..256, > 256), X_OOO_TAKEN those the stream took (WINDOW). Images
+    // before 2026-10-15 have words 64-76 only (77-87 read 0)
+    static constexpr int N_X = 24;
     enum { X_MODE, X_HIT, X_LATE, X_PASS, X_AR, X_FILLED, X_SERVED, X_STREAMS, X_END_JUMP, X_END_WRITE, X_END_IDLE,
-           X_FILL_OUT_SUM, X_NZ_ID };
+           X_FILL_OUT_SUM, X_NZ_ID, X_WM, X_OOO, X_BIN, X_OOO_TAKEN = X_BIN + 8 };
     // uwin_hbm counts in the shell's aclk (ACLK_F, 250 MHz), uwin_mon and uwin_ra in the static's xclk (SCLK_F, 333 MHz on the V80)
     static constexpr double ACLK_NS = 1e3 / 250, XCLK_NS = 1e3 / 333;
     uint64_t v[N], m[N_MAIN], r[N_R], a[N_RA], x[N_X];
@@ -112,6 +116,11 @@ struct Counters {
                    x[X_MODE] ? "on" : "off", h(X_HIT) + h(X_LATE), h(X_HIT), h(X_LATE), h(X_PASS), h(X_AR),
                    h(X_AR) ? double(h(X_FILL_OUT_SUM)) / h(X_AR) * XCLK_NS : 0.0, h(X_FILLED), h(X_SERVED), h(X_STREAMS),
                    h(X_END_JUMP), h(X_END_WRITE), h(X_END_IDLE), h(X_NZ_ID));
+        if (x[X_WM] || h(X_OOO))
+            printf("     axi_main streams %s: %lu out-of-order reads, %lu taken; by first line - stream end (lines): "
+                   "<-192 %lu, -192..-65 %lu, -64..-17 %lu, -16..-1 %lu, 1..16 %lu, 17..64 %lu, 65..256 %lu, >256 %lu\n",
+                   x[X_WM] ? "WINDOW" : "STRICT", h(X_OOO), h(X_OOO_TAKEN), h(X_BIN), h(X_BIN + 1), h(X_BIN + 2),
+                   h(X_BIN + 3), h(X_BIN + 4), h(X_BIN + 5), h(X_BIN + 6), h(X_BIN + 7));
     }
 };
 

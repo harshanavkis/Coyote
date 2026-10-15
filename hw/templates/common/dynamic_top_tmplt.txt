@@ -50,7 +50,7 @@ module design_dynamic_top #(
 {% if cnfg.en_uwin_hbm %}
     // uwin_mon's counts of axi_main (xclk), then uwin_ra's, read through the
     // window's counter page
-    input  logic [64*28-1:0]                    uwin_main_snap,
+    input  logic [64*39-1:0]                    uwin_main_snap,
     input  logic                                uwin_main_tgl,
 
 {% endif %}

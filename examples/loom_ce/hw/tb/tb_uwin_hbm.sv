@@ -27,7 +27,7 @@ import lynxTypes::*;
  * the 65th held until they are answered. Counters: T5 the writes' (words
  * 0-15), T6 uwin_mon's writes and reads across the clock crossing (16-30),
  * T9 the window's reads (32-39) exact against what its port showed; T6
- * also uwin_ra's counters riding in uwin_mon's snapshot (64-76).
+ * also uwin_ra's counters riding in uwin_mon's snapshot (64-87).
  *
  * READ-AHEAD (T10-T18), through a peer that keeps up to N reads in flight
  * and checks every beat against what each line was last written with: off
@@ -64,10 +64,10 @@ always #1.5 xclk = ~xclk;
 logic m_awvalid = 0, m_awready = 0, m_wvalid = 0, m_wready = 0, m_bvalid = 0, m_bready = 0;
 logic m_arvalid = 0, m_arready = 0, m_rvalid = 0, m_rready = 0, m_rlast = 0;
 logic [7:0] m_awlen = 0, m_arlen = 0;
-logic [64*28-1:0] main_snap;
+logic [64*39-1:0] main_snap;
 logic main_tgl;
-logic [64*13-1:0] ra_ctr;           // uwin_ra's counters (xclk): a known pattern, words 64-76 (T6)
-always_comb for (int i = 0; i < 13; i++) ra_ctr[64*i +: 64] = 64'hC0DE_0000_0000_0000 | (64'(i) << 32) | 64'(i * 7 + 1);
+logic [64*24-1:0] ra_ctr;           // uwin_ra's counters (xclk): a known pattern, words 64-87 (T6)
+always_comb for (int i = 0; i < 24; i++) ra_ctr[64*i +: 64] = 64'hC0DE_0000_0000_0000 | (64'(i) << 32) | 64'(i * 7 + 1);
 uwin_mon inst_uwin_mon (.xclk(xclk), .xresetn(aresetn), .awvalid(m_awvalid), .awready(m_awready), .awlen(m_awlen),
                         .wvalid(m_wvalid), .wready(m_wready), .bvalid(m_bvalid), .bready(m_bready),
                         .arvalid(m_arvalid), .arready(m_arready), .arlen(m_arlen),
@@ -642,15 +642,15 @@ initial begin
         `CHECK(c2[5] == 3,      $sformatf("T6: AR stalled %0d, want 3", c2[5]))
         `CHECK(c2[6] == 5,      $sformatf("T6: R stalled %0d, want 5", c2[6]))
         `CHECK(c2[7] == 0,      $sformatf("T6: word 31 = %0d, want 0", c2[7]))
-        // uwin_ra's counters, in the same snapshot: words 64-76, then zeros
-        ctr_line(8, c2);
-        for (int j = 0; j < 8; j++)
-            `CHECK(c2[j] == ra_ctr[64*j +: 64], $sformatf("T6: word %0d = %h, want uwin_ra's %0d", 64 + j, c2[j], j))
-        ctr_line(9, c2);
-        for (int j = 0; j < 8; j++)
-            `CHECK(c2[j] == ((j < 5) ? ra_ctr[64*(8 + j) +: 64] : 64'd0), $sformatf("T6: word %0d = %h", 72 + j, c2[j]))
+        // uwin_ra's counters, in the same snapshot: words 64-87, then zeros
+        for (int l = 8; l < 12; l++) begin
+            ctr_line(l, c2);
+            for (int j = 0; j < 8; j++)
+                `CHECK(c2[j] == ((8*(l - 8) + j < 24) ? ra_ctr[64*(8*(l - 8) + j) +: 64] : 64'd0),
+                       $sformatf("T6: word %0d = %h, want uwin_ra's %0d", 8*l + j, c2[j], 8*(l - 8) + j))
+        end
     end
-    $display("ok   T6 axi_main counters (uwin_mon) through the clock crossing, writes and reads; uwin_ra's (64-76)");
+    $display("ok   T6 axi_main counters (uwin_mon) through the clock crossing, writes and reads; uwin_ra's (64-87)");
 
     // --- T7: DISCARD. On (line 63), 40 bursts with AW running ahead of W (the
     //     ID ring fills: 32), IDs 0-3; nothing reaches memory, each B carries

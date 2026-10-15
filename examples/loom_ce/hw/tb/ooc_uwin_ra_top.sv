@@ -1,0 +1,174 @@
+`timescale 1ns / 1ps
+import lynxTypes::*;
+
+/**
+ * ooc_uwin_ra_top - synthesis-only wrapper for ooc_uwin_ra.sh: uwin_ra with
+ * both AXI4 ports (s: the static's axi_main, m: into the interconnect) as
+ * plain ports, so it can be placed and routed out of context. Never part of
+ * a build.
+ */
+module ooc_uwin_ra_top (
+    input  logic xclk,
+    input  logic xresetn,
+    input  logic [64-1:0] s_araddr,
+    input  logic [2-1:0] s_arburst,
+    input  logic [4-1:0] s_arcache,
+    input  logic [AXI_ID_BITS-1:0] s_arid,
+    input  logic [8-1:0] s_arlen,
+    input  logic [1-1:0] s_arlock,
+    input  logic [3-1:0] s_arprot,
+    input  logic [4-1:0] s_arqos,
+    input  logic [4-1:0] s_arregion,
+    input  logic [3-1:0] s_arsize,
+    input  logic [1-1:0] s_arvalid,
+    output logic [1-1:0] s_arready,
+    input  logic [64-1:0] s_awaddr,
+    input  logic [2-1:0] s_awburst,
+    input  logic [4-1:0] s_awcache,
+    input  logic [AXI_ID_BITS-1:0] s_awid,
+    input  logic [8-1:0] s_awlen,
+    input  logic [1-1:0] s_awlock,
+    input  logic [3-1:0] s_awprot,
+    input  logic [4-1:0] s_awqos,
+    input  logic [4-1:0] s_awregion,
+    input  logic [3-1:0] s_awsize,
+    input  logic [1-1:0] s_awvalid,
+    output logic [1-1:0] s_awready,
+    output logic [AXI_DATA_BITS-1:0] s_rdata,
+    output logic [AXI_ID_BITS-1:0] s_rid,
+    output logic [1-1:0] s_rlast,
+    output logic [2-1:0] s_rresp,
+    output logic [1-1:0] s_rvalid,
+    input  logic [1-1:0] s_rready,
+    input  logic [AXI_DATA_BITS-1:0] s_wdata,
+    input  logic [AXI_DATA_BITS/8-1:0] s_wstrb,
+    input  logic [1-1:0] s_wlast,
+    input  logic [1-1:0] s_wvalid,
+    output logic [1-1:0] s_wready,
+    output logic [AXI_ID_BITS-1:0] s_bid,
+    output logic [2-1:0] s_bresp,
+    output logic [1-1:0] s_bvalid,
+    input  logic [1-1:0] s_bready,
+    output logic [64-1:0] m_araddr,
+    output logic [2-1:0] m_arburst,
+    output logic [4-1:0] m_arcache,
+    output logic [AXI_ID_BITS-1:0] m_arid,
+    output logic [8-1:0] m_arlen,
+    output logic [1-1:0] m_arlock,
+    output logic [3-1:0] m_arprot,
+    output logic [4-1:0] m_arqos,
+    output logic [4-1:0] m_arregion,
+    output logic [3-1:0] m_arsize,
+    output logic [1-1:0] m_arvalid,
+    input  logic [1-1:0] m_arready,
+    output logic [64-1:0] m_awaddr,
+    output logic [2-1:0] m_awburst,
+    output logic [4-1:0] m_awcache,
+    output logic [AXI_ID_BITS-1:0] m_awid,
+    output logic [8-1:0] m_awlen,
+    output logic [1-1:0] m_awlock,
+    output logic [3-1:0] m_awprot,
+    output logic [4-1:0] m_awqos,
+    output logic [4-1:0] m_awregion,
+    output logic [3-1:0] m_awsize,
+    output logic [1-1:0] m_awvalid,
+    input  logic [1-1:0] m_awready,
+    input  logic [AXI_DATA_BITS-1:0] m_rdata,
+    input  logic [AXI_ID_BITS-1:0] m_rid,
+    input  logic [1-1:0] m_rlast,
+    input  logic [2-1:0] m_rresp,
+    input  logic [1-1:0] m_rvalid,
+    output logic [1-1:0] m_rready,
+    output logic [AXI_DATA_BITS-1:0] m_wdata,
+    output logic [AXI_DATA_BITS/8-1:0] m_wstrb,
+    output logic [1-1:0] m_wlast,
+    output logic [1-1:0] m_wvalid,
+    input  logic [1-1:0] m_wready,
+    input  logic [AXI_ID_BITS-1:0] m_bid,
+    input  logic [2-1:0] m_bresp,
+    input  logic [1-1:0] m_bvalid,
+    output logic [1-1:0] m_bready,
+    output logic [64*24-1:0] ctr
+);
+AXI4 s (.aclk(xclk));
+AXI4 m (.aclk(xclk));
+assign s.araddr = s_araddr;
+assign s.arburst = s_arburst;
+assign s.arcache = s_arcache;
+assign s.arid = s_arid;
+assign s.arlen = s_arlen;
+assign s.arlock = s_arlock;
+assign s.arprot = s_arprot;
+assign s.arqos = s_arqos;
+assign s.arregion = s_arregion;
+assign s.arsize = s_arsize;
+assign s.arvalid = s_arvalid;
+assign s_arready = s.arready;
+assign s.awaddr = s_awaddr;
+assign s.awburst = s_awburst;
+assign s.awcache = s_awcache;
+assign s.awid = s_awid;
+assign s.awlen = s_awlen;
+assign s.awlock = s_awlock;
+assign s.awprot = s_awprot;
+assign s.awqos = s_awqos;
+assign s.awregion = s_awregion;
+assign s.awsize = s_awsize;
+assign s.awvalid = s_awvalid;
+assign s_awready = s.awready;
+assign s_rdata = s.rdata;
+assign s_rid = s.rid;
+assign s_rlast = s.rlast;
+assign s_rresp = s.rresp;
+assign s_rvalid = s.rvalid;
+assign s.rready = s_rready;
+assign s.wdata = s_wdata;
+assign s.wstrb = s_wstrb;
+assign s.wlast = s_wlast;
+assign s.wvalid = s_wvalid;
+assign s_wready = s.wready;
+assign s_bid = s.bid;
+assign s_bresp = s.bresp;
+assign s_bvalid = s.bvalid;
+assign s.bready = s_bready;
+assign m_araddr = m.araddr;
+assign m_arburst = m.arburst;
+assign m_arcache = m.arcache;
+assign m_arid = m.arid;
+assign m_arlen = m.arlen;
+assign m_arlock = m.arlock;
+assign m_arprot = m.arprot;
+assign m_arqos = m.arqos;
+assign m_arregion = m.arregion;
+assign m_arsize = m.arsize;
+assign m_arvalid = m.arvalid;
+assign m.arready = m_arready;
+assign m_awaddr = m.awaddr;
+assign m_awburst = m.awburst;
+assign m_awcache = m.awcache;
+assign m_awid = m.awid;
+assign m_awlen = m.awlen;
+assign m_awlock = m.awlock;
+assign m_awprot = m.awprot;
+assign m_awqos = m.awqos;
+assign m_awregion = m.awregion;
+assign m_awsize = m.awsize;
+assign m_awvalid = m.awvalid;
+assign m.awready = m_awready;
+assign m.rdata = m_rdata;
+assign m.rid = m_rid;
+assign m.rlast = m_rlast;
+assign m.rresp = m_rresp;
+assign m.rvalid = m_rvalid;
+assign m_rready = m.rready;
+assign m_wdata = m.wdata;
+assign m_wstrb = m.wstrb;
+assign m_wlast = m.wlast;
+assign m_wvalid = m.wvalid;
+assign m.wready = m_wready;
+assign m.bid = m_bid;
+assign m.bresp = m_bresp;
+assign m.bvalid = m_bvalid;
+assign m_bready = m.bready;
+uwin_ra inst (.xclk(xclk), .xresetn(xresetn), .s_axi(s), .m_axi(m), .ctr(ctr));
+endmodule

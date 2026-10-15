@@ -39,8 +39,10 @@ import lynxTypes::*;
  *
  * MODES: off at reset; a read of the counter page's line 59 (window offset
  * UWIN_SIZE - 4096 + 59*64) turns read-ahead on, line 58 off (word 0 says
- * which). Lines 61/60 are uwin_hbm's own read-ahead, behind the interconnect:
- * keep that one off while this one is on (it would read ahead of the fills).
+ * which); line 57 selects WINDOW streams, line 56 STRICT ones (the default;
+ * word 13 says which; a stream keeps the kind it started with). Lines 61/60
+ * are uwin_hbm's own read-ahead, behind the interconnect: keep that one off
+ * while this one is on (it would read ahead of the fills).
  *   PASS (off): every AR and R signal is a wire, exactly as without this
  *   module; it only watches (control reads, the previous AR, writes
  *   outstanding, reads outstanding: nb).
@@ -59,6 +61,14 @@ import lynxTypes::*;
  *   that one ended (same ID, 64 B beats, INCR, both window reads outside the
  *   counter page). With read-ahead on and no write outstanding (every AW taken
  *   has had its B, registers' included), the first such AR starts a stream.
+ *   STRICT: the stream's later reads are those that continue the previous AR.
+ *   WINDOW: a peer that keeps several reads of one sequential transfer in
+ *   flight at once (an RDMA NIC: one per 4 KiB packet, each split into 256 B
+ *   reads) may present them slightly out of order; any window read of the
+ *   stream's ID whose lines lie between s_lag (the stream's furthest request
+ *   s_req minus RA_LAG lines, not below its start) and s_ahd (s_req plus
+ *   RA_AHEAD, not into the counter page) belongs to the stream, in any
+ *   order. s_req is the furthest end of its reads.
  *   Every read of the stream is answered from a ring of RA_RING lines on chip
  *   (BRAM), which this module fills with its own ARs (through the interconnect,
  *   uwin_hbm and HBM; the stream's ID; up to RA_BURST lines, never across an
@@ -79,9 +89,19 @@ import lynxTypes::*;
  *   the head of rq. No deadlock: a peer read goes to m_axi only once fills
  *   cover every line of the stream's accepted reads (in DRAIN), so the fills
  *   a stream read waits for are never behind a later read's data. A stream's
- *   lines are filled in order and come back in order, so the ring is a FIFO
- *   indexed by line mod RA_RING (one write port, one read port with its output
- *   register: BRAM), no address lookup.
+ *   lines are filled in order and come back in order into the ring, indexed
+ *   by line mod RA_RING (one write port, one read port with its output
+ *   register: BRAM). The ring's reads: gq holds every accepted stream read's
+ *   first line, end and floor in AR order; the walker reads their lines out
+ *   of the ring in that order (a line once its fill is in: below s_got).
+ *   Room: a fill may land RA_RING lines beyond the floor of the oldest stream
+ *   read not yet read out of the ring, never further (it would overwrite a
+ *   line still to be read). A read's floor is its first line (STRICT) or the
+ *   s_lag it was accepted against (WINDOW): no later read of the stream
+ *   starts below it (s_lag only grows), so the floors only grow. The lines a
+ *   read waits for always fit: its end is at most RA_AHEAD + RA_LAG lines
+ *   above its floor (WINDOW; its length, STRICT), and RA_AHEAD + RA_LAG +
+ *   RA_BURST <= RA_RING.
  *   Staleness: the ring answers only reads of the stream it was filled for,
  *   all accepted before the stream ended. A window write's AW ends the stream
  *   (one cycle later: the read taken in that cycle was issued before the
@@ -107,6 +127,13 @@ import lynxTypes::*;
  *   5 lines read ahead (- 6 =            beat not yet in; / 4 = mean cycles)
  *     fetched, unused)               12 ARs with a nonzero ARID (any address)
  *   6 lines answered from the ring
+ *   13 WINDOW selected (1) or STRICT (0)
+ *   14 out-of-order window reads in a stream: a read of 64 B beats, INCR, the
+ *      stream decided on (taken, or ending it) whose first line is not s_req;
+ *      15-22 by d = first line - s_req (lines): 15 d < -RA_LAG (192), 16 -RA_LAG <=
+ *      d < -64, 17 -64 <= d < -16, 18 -16 <= d < 0, 19 0 < d <= 16, 20 16 < d
+ *      <= 64, 21 64 < d <= RA_AHEAD, 22 d > RA_AHEAD; 23 those of 14 the
+ *      stream took (WINDOW)
  */
 module uwin_ra #(
     parameter logic [63:0] WIN_BASE  = 64'h0800_0000,   // the window on axi_main (BAR4 offset, cr_ctrl.tcl)
@@ -117,6 +144,8 @@ module uwin_ra #(
     parameter integer      RA_RING   = 512,             // the ring, lines (32 KiB); power of 2, >= 256 + RA_BURST (a peer
                                                         // burst), >= RA_LINES + the peer's reads in flight to keep ahead
     parameter integer      RA_IDLE   = 1024,            // xclk cycles without an AR that end a stream (3.1 us at 333 MHz)
+    parameter integer      RA_LAG    = 192,             // WINDOW: lines a stream read may start below s_req (12 KiB)
+    parameter integer      RA_AHEAD  = 256,             // ... and end above it (16 KiB); RA_LAG + RA_AHEAD + RA_BURST <= RA_RING
     parameter integer      W_LAG     = 3,               // xclk cycles a burst's first W beat follows its AW at m_axi (0: wires)
     parameter integer      WQ        = 8                // W beats held here (power of 2)
 ) (
@@ -126,7 +155,7 @@ module uwin_ra #(
     AXI4.s                      s_axi,                  // the static's axi_main: the peer side
     AXI4.m                      m_axi,                  // into the shell's interconnect
 
-    output logic [64*13-1:0]    ctr                     // the counters above, for uwin_mon's snapshot
+    output logic [64*24-1:0]    ctr                     // the counters above, for uwin_mon's snapshot
 );
 
 localparam integer LB = UWIN_BITS - 6;                  // lines: window offset / 64, one bit of headroom
@@ -153,6 +182,7 @@ typedef struct packed {                                 // an AR as the way in s
     logic [LB:0] ln;                                    // its first line
     logic [LB:0] fin;                                   // the line after its last
     logic        seq;                                   // it continues the previous AR
+    logic        cont;                                  // ... could be continued: a window read of 64 B beats, INCR
     logic        wd;                                    // a window read outside the counter page
 } arq_t;
 typedef struct packed {                                 // an AR to m_axi
@@ -168,6 +198,7 @@ typedef struct packed {
 
 logic                   trk;                // TRACK (else PASS: AR and R are wires)
 logic                   ra_on;
+logic                   wm;                 // WINDOW streams (else STRICT)
 
 // THE WAY IN: what an AR is, and whether it continues the previous one (the
 // previous AR taken at s_axi, in either mode)
@@ -198,6 +229,7 @@ always_comb begin
     in_d.ln        = a_ln;
     in_d.fin       = a_fin;
     in_d.seq       = a_seq;
+    in_d.cont      = a_cont;
     in_d.wd        = a_win && !a_ctr;
 end
 uwin_ra_skid #(.W($bits(arq_t))) inst_ar_in (.clk(xclk), .rstn(xresetn),
@@ -352,9 +384,19 @@ ra_st_t                 st;
 logic [LB:0]            s_req;              // the end of the stream's accepted reads
 logic [LB:0]            s_hi;               // the end of its fills issued
 logic [LB:0]            s_got;              // ... returned (written into the ring)
-logic [LB:0]            g_rd;               // the next line read out of the ring
+logic                   s_wm;               // the stream is WINDOW (wm when it started)
+logic [LB:0]            s_st;               // its first line
+logic [LB:0]            s_lag, s_ahd;       // WINDOW: its reads' lines lie in [s_lag, s_ahd) (from s_req, a cycle late)
+logic [LB:0]            fl_room;            // fills land below fl_room + RA_RING (the oldest unread read's floor, a cycle late)
+logic [QB:0]            rr_n;               // stream reads taken, not yet answered in full
 logic [LB:0]            n_old;              // fill beats still to come for a dropped ring: discarded
-logic                   v1, v2;             // the ring's read: the BRAM's latch, its output register (ring_q); lines below g_rd
+// the walker: the ring's reads in AR order (gq: first line, end, floor), the one being read (w_v), its next line g_rd
+logic [LB:0]            gq_ln [N_RD], gq_fin [N_RD], gq_fl [N_RD];
+logic [QB-1:0]          gq_wp, gq_rp;
+logic [QB:0]            gq_n;
+logic                   w_v;
+logic [LB:0]            g_rd, w_fin, w_fl;
+logic                   v1, v2;             // the ring's read: the BRAM's latch, its output register (ring_q)
 logic [AXI_ID_BITS-1:0] s_id;               // the stream's ID and attributes (its first read's)
 logic [3:0]             s_cache, s_qos, s_region;
 logic [2:0]             s_prot;
@@ -372,7 +414,8 @@ logic [15:0]            fo;                 // read-ahead ARs taken by m_axi, la
 // answer goes to m_axi only with no fill waiting and, while the stream drains,
 // once fills cover its accepted reads (dcov: a cycle late, never early - in
 // DRAIN s_req is fixed and s_hi only grows)
-wire ar_ring = q_v && q.seq && (((st == ST_ACT) && !idle_to) || ((st == ST_IDLE) && ra_on && wr_zero));
+wire q_win   = q.cont && (q.ar.id == s_id) && (q.ln >= s_lag) && (q.fin <= s_ahd);   // WINDOW: inside the stream's window
+wire ar_ring = q_v && (((st == ST_ACT) && !idle_to && (s_wm ? q_win : q.seq)) || ((st == ST_IDLE) && ra_on && wr_zero && q.seq));
 wire pass_ok = (st == ST_IDLE) || ((st == ST_DRAIN) && dcov);
 wire ring_hs = ar_ring && !rq_full;
 wire m_peer  = q_v && !ar_ring && pass_ok && !fl_v && o_room && !rq_full && !mq_full;
@@ -406,7 +449,7 @@ wire end_j = (st == ST_ACT) && !aw_ev && !idle_to && q_v && !ar_ring;
 // (never while a peer read may go to m_axi: pass_ok excludes it, so the mq
 // slot checked here is still free when the fill goes)
 wire [LB:0] f_n  = (LB+1)'(RA_BURST) - (LB+1)'(s_hi[$clog2(RA_BURST)-1:0]);
-wire        f_go = !fl_v && !mq_full && (s_hi < CTR_LN) && (s_hi + f_n - g_rd <= (LB+1)'(RA_RING))
+wire        f_go = !fl_v && !mq_full && (s_hi < CTR_LN) && (s_hi + f_n - fl_room <= (LB+1)'(RA_RING))
                 && (((st == ST_ACT) && (s_hi < s_req + (LB+1)'(RA_LINES))) || ((st == ST_DRAIN) && (s_hi < s_req)));
 
 // R: the head of R in is a fill's beat (into the ring, never held), else the
@@ -431,8 +474,9 @@ wire nb_pop  = trk ? (p_take && nb_nz && ri.last) : (m_axi.rvalid && m_axi.rread
 wire mo_fill = trk && o_v && o_q.fill && m_axi.arready;  // m_axi takes a fill
 // the ring's read: BRAM, then its output register (ring_q)
 wire s2_load = v1 && (!v2 || g_take);
-wire s1_load = (st != ST_IDLE) && (g_rd != s_got) && (!v1 || s2_load);
-wire [LB:0] s_lo = g_rd - v1 - v2;                      // the next line the stream's reads take
+wire s1_load = w_v && (g_rd < s_got) && (!v1 || s2_load);
+wire w_last  = s1_load && (g_rd + 1'b1 == w_fin);       // the walker's read: its last line out of the ring
+wire w_ld    = (gq_n != 0) && (!w_v || w_last);         // ... the next one from gq
 // nothing in flight, nothing buffered: TRACK may become PASS
 wire quiet = (st == ST_IDLE) && !fl_v && (rq_n == 0) && (mq_n == 0) && (nb == 0) && !q_v && !o_v && !ri_v && !ro_v;
 
@@ -442,12 +486,18 @@ always_ff @(posedge xclk) begin
         rq_len[rq_wp]  <= q.ar.len;
     end
     if (o_push) mq_fill[mq_wp] <= fl_v;
+    if (ring_hs) begin
+        gq_ln[gq_wp]  <= q.ln;
+        gq_fin[gq_wp] <= q.fin;
+        gq_fl[gq_wp]  <= (st == ST_ACT && s_wm) ? s_lag : q.ln;
+    end
 end
 
 always_ff @(posedge xclk) begin
     if (!xresetn) begin
         trk     <= 1'b0;
         ra_on   <= 1'b0;
+        wm      <= 1'b0;
         p_next  <= '0;
         p_ok    <= 1'b0;
         p_id    <= '0;
@@ -468,7 +518,19 @@ always_ff @(posedge xclk) begin
         s_req   <= '0;
         s_hi    <= '0;
         s_got   <= '0;
+        s_wm    <= 1'b0;
+        s_st    <= '0;
+        s_lag   <= '0;
+        s_ahd   <= '0;
+        fl_room <= '0;
+        rr_n    <= '0;
+        gq_wp   <= '0;
+        gq_rp   <= '0;
+        gq_n    <= '0;
+        w_v     <= 1'b0;
         g_rd    <= '0;
+        w_fin   <= '0;
+        w_fl    <= '0;
         n_old   <= '0;
         v1      <= 1'b0;
         v2      <= 1'b0;
@@ -485,6 +547,7 @@ always_ff @(posedge xclk) begin
             p_ok   <= a_cont;
             p_id   <= s_axi.arid;
             if (a_ctr && (s_axi.araddr[11:7] == 5'h1D)) ra_on <= s_axi.araddr[6];
+            if (a_ctr && (s_axi.araddr[11:7] == 5'h1C)) wm    <= s_axi.araddr[6];
         end
         if (!trk) begin
             if (ra_on && !(s_axi.arvalid && !m_axi.arready) && !(m_axi.rvalid && !s_axi.rready)) trk <= 1'b1;
@@ -544,8 +607,26 @@ always_ff @(posedge xclk) begin
             if (f_wr) s_got <= s_got + 1'b1;
             else      n_old <= n_old - 1'b1;
         end
+        // the walker: gq (in at ring_hs), the read being read out of the ring
+        gq_wp <= gq_wp + ring_hs;
+        gq_rp <= gq_rp + w_ld;
+        gq_n  <= gq_n + ring_hs - w_ld;
+        rr_n  <= rr_n + ring_hs - (g_take && r_lst);
+        if (w_ld) begin
+            w_v   <= 1'b1;
+            g_rd  <= gq_ln[gq_rp];
+            w_fin <= gq_fin[gq_rp];
+            w_fl  <= gq_fl[gq_rp];
+        end else if (s1_load) begin
+            g_rd  <= g_rd + 1'b1;
+            if (w_last) w_v <= 1'b0;
+        end
+        fl_room <= w_v ? w_fl : (gq_n != 0) ? gq_fl[gq_rp] : s_wm ? s_lag : s_req;
+        if (st == ST_ACT) begin
+            s_lag <= (s_req >= s_st + (LB+1)'(RA_LAG)) ? s_req - (LB+1)'(RA_LAG) : s_st;
+            s_ahd <= (s_req + (LB+1)'(RA_AHEAD) >= CTR_LN) ? CTR_LN : s_req + (LB+1)'(RA_AHEAD);
+        end
         // the ring's read
-        if (s1_load) g_rd <= g_rd + 1'b1;
         if (st == ST_IDLE) begin
             v1 <= 1'b0;
             v2 <= 1'b0;
@@ -562,7 +643,11 @@ always_ff @(posedge xclk) begin
                 s_req    <= q.fin;
                 s_hi     <= q.ln;
                 s_got    <= q.ln;
-                g_rd     <= q.ln;
+                s_wm     <= wm;
+                s_st     <= q.ln;
+                s_lag    <= q.ln;
+                s_ahd    <= (q.fin + (LB+1)'(RA_AHEAD) >= CTR_LN) ? CTR_LN : q.fin + (LB+1)'(RA_AHEAD);
+                fl_room  <= q.ln;
                 s_id     <= q.ar.id;
                 s_cache  <= q.ar.cache;
                 s_lock   <= q.ar.lock;
@@ -571,10 +656,10 @@ always_ff @(posedge xclk) begin
                 s_region <= q.ar.region;
             end
             ST_ACT: begin
-                if (ring_hs) s_req <= q.fin;
+                if (ring_hs && (q.fin > s_req)) s_req <= q.fin;
                 if (end_w || end_j || end_i) st <= ST_DRAIN;
             end
-            default: if (s_lo == s_req) begin
+            default: if (rr_n == 0) begin
                 st    <= ST_IDLE;
                 n_old <= n_old + (s_hi - s_got) - f_hs;
                 s_got <= s_hi;
@@ -594,14 +679,33 @@ always_ff @(posedge xclk) begin
 end
 
 // counters (the decision's events a cycle late: off its paths)
-localparam integer N_CTR = 13;
+localparam integer N_CTR = 24;
 logic [63:0] c [N_CTR];
 logic [6:0]  ev;
+logic                ev_o, ev_oa;           // an out-of-order stream read decided on (taken: ev_oa), a cycle late
+logic signed [LB+1:0] ev_d;                 // ... its first line - s_req
 always_ff @(posedge xclk) begin
     if (!xresetn) begin
         for (int i = 0; i < N_CTR; i++) c[i] <= '0;
-        ev <= '0;
+        ev    <= '0;
+        ev_o  <= 1'b0;
+        ev_oa <= 1'b0;
+        ev_d  <= '0;
     end else begin
+        ev_o  <= (st == ST_ACT) && q_v && q.cont && (ring_hs || end_j) && (q.ln != s_req);
+        ev_oa <= (st == ST_ACT) && ring_hs && (q.ln != s_req);
+        ev_d  <= $signed({1'b0, q.ln}) - $signed({1'b0, s_req});
+        c[13] <= 64'(wm);
+        c[14] <= c[14] + ev_o;
+        c[15] <= c[15] + (ev_o && (ev_d < -RA_LAG));
+        c[16] <= c[16] + (ev_o && (ev_d >= -RA_LAG) && (ev_d < -64));
+        c[17] <= c[17] + (ev_o && (ev_d >= -64) && (ev_d < -16));
+        c[18] <= c[18] + (ev_o && (ev_d >= -16) && (ev_d < 0));
+        c[19] <= c[19] + (ev_o && (ev_d > 0) && (ev_d <= 16));
+        c[20] <= c[20] + (ev_o && (ev_d > 16) && (ev_d <= 64));
+        c[21] <= c[21] + (ev_o && (ev_d > 64) && (ev_d <= RA_AHEAD));
+        c[22] <= c[22] + (ev_o && (ev_d > RA_AHEAD));
+        c[23] <= c[23] + ev_oa;
         ev    <= {ring_hs && a_hit, ring_hs && !a_hit, m_peer && ra_on && q.wd, ring_hs && (st == ST_IDLE), end_j, end_w, end_i};
         c[0]  <= 64'(ra_on);
         c[1]  <= c[1] + ev[6];

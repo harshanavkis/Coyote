@@ -23,7 +23,7 @@ import lynxTypes::*;
  */
 module uwin_mon #(
     parameter integer N    = 15,
-    parameter integer N_RA = 13
+    parameter integer N_RA = 24
 ) (
     input  logic                xclk,
     input  logic                xresetn,

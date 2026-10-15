@@ -34,8 +34,8 @@ import lynxTypes::*;
  *                       15 the mode: 1 while discarding
  * Words 16-30: uwin_mon's counts of the shell's axi_main port (xclk), where
  * the window's writes and reads enter the shell - see uwin_mon.sv.
- * Words 64-76: uwin_ra's counts (xclk), the read-ahead on axi_main (on/off:
- * lines 59/58) - see uwin_ra.sv, words 0-12 there. Like 16-30, a snapshot
+ * Words 64-87: uwin_ra's counts (xclk), the read-ahead on axi_main (on/off:
+ * lines 59/58, WINDOW/STRICT 57/56) - see uwin_ra.sv, words 0-23 there. Like 16-30, a snapshot
  * taken every 256 xclk cycles.
  * Words 32-39: the window's reads (counter-page reads among them)
  *   32 AR bursts        36 sum of reads outstanding over cycles
@@ -126,14 +126,14 @@ module uwin_hbm #(
     AXI4.m                      m_axi,
 
     // uwin_mon's snapshot of axi_main (xclk): its 15 counters, then uwin_ra's
-    // 13; and its toggle
-    input  logic [64*28-1:0]    main_snap,
+    // 24; and its toggle
+    input  logic [64*39-1:0]    main_snap,
     input  logic                main_tgl
 );
 
 // axi_main counters: captured when the synchronized toggle changes (the
 // snapshot has been stable since well before it flipped)
-localparam integer N_MAIN = 15, N_XRA = 13;
+localparam integer N_MAIN = 15, N_XRA = 24;
 (* ASYNC_REG = "TRUE" *) logic [2:0] main_tgl_s;
 logic [64*(N_MAIN+N_XRA)-1:0] main_ctr;
 always_ff @(posedge aclk) begin
