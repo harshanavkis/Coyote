@@ -200,14 +200,18 @@ void trace_landing(coyote::cThread &t_qp, land_v80::Landing *L, uint64_t wi, uin
     using clk = std::chrono::steady_clock;
     const auto tz = clk::now();
     const uint64_t f_start = f, w_start = w;
-    double ff = -1, fl = -1, wf = -1, wl = -1, prev = 0, gap = 0;
+    double ff = -1, fl = -1, wf = -1, wl = -1, prev = 0, gap = 0, pause = 0, pause_at = 0;
     uint64_t n = 0;
     for (;;) {
         const uint64_t f1 = loom_switch::csr_read(t_qp, loom_switch::RX_FWD);
         const uint64_t w1 = trace > 1 ? L->win[wi] : w;
         const double t = std::chrono::duration<double, std::micro>(clk::now() - tz).count();
         n++;
-        if (f1 != f) { if (ff < 0) ff = t; fl = t; f = f1; }
+        if (f1 != f) {   // the longest stretch without a forwarded packet, and where it began
+            if (ff < 0) ff = t;
+            else if (t - fl > pause) { pause = t - fl; pause_at = fl; }
+            fl = t; f = f1;
+        }
         if (w1 != w) { if (wf < 0) wf = t; wl = t; w = w1; }
         if (t - prev > gap) gap = t - prev;
         prev = t;
@@ -220,7 +224,9 @@ void trace_landing(coyote::cThread &t_qp, land_v80::Landing *L, uint64_t wi, uin
     if (trace > 1)
         printf("; V80 W beats +%lu, first %.1f us, last %.1f us (%.2f GB/s)", (unsigned long) (w - w_start), wf, wl,
                rate(wf, wl));
-    printf("; %lu samples, largest gap %.1f us\n", (unsigned long) n, gap);
+    printf("; longest RX_FWD pause %.1f us at %.1f us", pause, pause_at);
+    printf("; %lu samples, largest gap %.1f us; mono %.6f s\n", (unsigned long) n, gap,
+           std::chrono::duration<double>(tz.time_since_epoch()).count());
 }
 
 int run_server(uint16_t port, uint64_t size, bool land, uint64_t off, unsigned poll_us, bool no_touch, bool no_stamp,
@@ -767,7 +773,8 @@ int run_client(const std::string &ip, uint16_t port, int reps, int window, unsig
             }
             while (v80.getCSR(BUSY)) _mm_pause();
         }
-        const double burst_us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - b0).count();
+        const auto b1 = std::chrono::steady_clock::now();
+        const double burst_us = std::chrono::duration<double, std::micro>(b1 - b0).count();
 
         Verdict v{};
         if (!read_full(fd, &v, sizeof(v))) { printf("FAIL: the server went away\n"); return 1; }
@@ -783,6 +790,9 @@ int run_client(const std::string &ip, uint16_t port, int reps, int window, unsig
         if (prog)
             printf("     program: %lu engine cycles for the %d runs (%.2f GB/s)\n", (unsigned long) run_cyc, burst / K,
                    double(bytes) / (double(run_cyc) * ce_prog::CLK_NS));
+        // CLOCK_MONOTONIC (steady_clock): to line runs up with kernel traces (ftrace trace_clock mono)
+        printf("     mono: copies started %.6f s, done %.6f s\n", std::chrono::duration<double>(b0.time_since_epoch()).count(),
+               std::chrono::duration<double>(b1.time_since_epoch()).count());
         printf("     ingress: %lu bursts, %lu rdma packets (%lu closed by the idle timer, %lu cut by a write), "
                "%lu stores, %lu dropped; acks %lu, unacked %lu\n",
                (unsigned long) (c1.v[0] - c0.v[0]), (unsigned long) (c1.v[3] - c0.v[3]),
