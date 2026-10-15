@@ -1,0 +1,2 @@
+7cb6023d U280 QDMA: prefetch cache 64 deep, 32 C2H queues, no tag no queue
+lynx_pkg.sv from examples/loom_switch/hw/build_oct13_qdma/example_loom_switch_shell/hdl
