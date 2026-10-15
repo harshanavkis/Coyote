@@ -36,6 +36,17 @@ through `scripts/fpga/build_bitstream.sh` (U280: Vivado 2023.2; V80: 2025.1).
   the next regression: `~/loom-experiments/regress/20261015_loom-switch-qdma64-kmap`.
 - **Cards up from any state:**
   `scripts/fpga/setup_loom_hosts.sh <u280.bit> <v80.pdi> amy rose`.
+- **RDMA baseline and V80 timing (2026-10-15):** the RDMA image is
+  `~/coyote-bitstreams/perf_rdma-qdma` (perf_rdma on the QDMA static, md5
+  fbcf760e; `examples/09_perf_rdma/hw/build_oct15_rdma_qdma`,
+  `-DSTATIC_PATH=~/coyote-bitstreams/loom-switch-qdma64/static -DSTATIC_DMA=qdma
+  -DACK_GAP_CYCLES=16`); its client `landing_client` sends distinct
+  contiguous data per write by default (`--contig 1`; re-sending one buffer
+  defeated the V80's read-ahead). A landing in V80 memory is timed by the V80
+  window's W-beat counter (`ce_remote --land-v80 --no-stamp --trace 2`,
+  `land_server --land-v80 --trace`): the old stamp program polled HBM and
+  slowed the landing it timed to ~10.9 GB/s; regress step 7 now reports
+  `progput_v80_*_wbeat`.
 - **After every new image:**
   `examples/loom_switch/regress.sh <outdir> --setup <u280.bit> <v80.pdi>`;
   it writes `metrics.tsv` and compares it with the previous run.
