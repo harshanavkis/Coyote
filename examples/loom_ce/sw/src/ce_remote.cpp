@@ -80,6 +80,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -190,8 +191,40 @@ void snap(coyote::cThread &v80, uint64_t *out, uint32_t first, int n) {
     for (int i = 0; i < n; i++) out[i] = v80.getCSR(first + i);
 }
 
+// --trace: a V80 landing clocked by counters, neither by reads through the V80's window (answered only after
+// the writes drained) nor by the V80's engine polling HBM (that slows the landing, measured 2026-10-15): the
+// U280's RX_FWD (loom_rx: a packet's write into the V80 has gone out; a U280 CSR) and, --trace 2, the V80
+// window's W beats (its counter page, read through the window). First and last change, until 2 ms quiet.
+void trace_landing(coyote::cThread &t_qp, land_v80::Landing *L, uint64_t wi, uint64_t f, uint64_t w, int trace,
+                   uint64_t bytes) {
+    using clk = std::chrono::steady_clock;
+    const auto tz = clk::now();
+    const uint64_t f_start = f, w_start = w;
+    double ff = -1, fl = -1, wf = -1, wl = -1, prev = 0, gap = 0;
+    uint64_t n = 0;
+    for (;;) {
+        const uint64_t f1 = loom_switch::csr_read(t_qp, loom_switch::RX_FWD);
+        const uint64_t w1 = trace > 1 ? L->win[wi] : w;
+        const double t = std::chrono::duration<double, std::micro>(clk::now() - tz).count();
+        n++;
+        if (f1 != f) { if (ff < 0) ff = t; fl = t; f = f1; }
+        if (w1 != w) { if (wf < 0) wf = t; wl = t; w = w1; }
+        if (t - prev > gap) gap = t - prev;
+        prev = t;
+        const double last = trace > 1 ? std::max(fl, wl) : fl;
+        if ((fl >= 0 && t - last > 2000) || t > 5e6) break;
+    }
+    auto rate = [&](double a, double b) { return b > a ? double(bytes) / (b - a) / 1e3 : 0.0; };
+    printf("     trace: RX_FWD +%lu, first %.1f us, last %.1f us (%.2f GB/s first to last)", (unsigned long) (f - f_start),
+           ff, fl, rate(ff, fl));
+    if (trace > 1)
+        printf("; V80 W beats +%lu, first %.1f us, last %.1f us (%.2f GB/s)", (unsigned long) (w - w_start), wf, wl,
+               rate(wf, wl));
+    printf("; %lu samples, largest gap %.1f us\n", (unsigned long) n, gap);
+}
+
 int run_server(uint16_t port, uint64_t size, bool land, uint64_t off, unsigned poll_us, bool no_touch, bool no_stamp,
-               bool self) {
+               bool self, int trace) {
     coyote::cThread t_qp(0, getpid(), 0, nullptr, "coyote_fpga");     // QP owner
     coyote::cThread t_data(0, getpid(), 0, nullptr, "coyote_fpga");   // owns the landing buffers
     printf("server: waiting for the QP exchange on port %u ...\n", port);
@@ -267,6 +300,10 @@ int run_server(uint16_t port, uint64_t size, bool land, uint64_t off, unsigned p
         const loom_switch::IngressCounters i0 = loom_switch::IngressCounters::read(t_qp);
         land_v80::Counters u0{}, u1{};
         if (land) u0 = land_v80::Counters::read(L->win);
+        // --trace: the counters before the (--prog) client may start
+        const uint64_t wi = (land_v80::UWIN_SIZE - 4096) / 8 + land_v80::Counters::W;
+        const uint64_t f0 = trace ? loom_switch::csr_read(t_qp, loom_switch::RX_FWD) : 0;
+        const uint64_t w0 = trace > 1 && land ? L->win[wi] : 0;
         auto t0 = std::chrono::steady_clock::now();
         if (copies == 0) t_first = t0;
         Verdict v{};
@@ -306,6 +343,7 @@ int run_server(uint16_t port, uint64_t size, bool land, uint64_t off, unsigned p
             v.fence = L->buf[(off + size) / 8];
         } else if (land) {
             // the fence, read through the V80's window, then the data synced back
+            if (trace && an.start) trace_landing(t_qp, L, wi, f0, w0, trace, an.bytes ? an.bytes : size);
             (void) L->wait(off + size, an.fence, std::chrono::milliseconds(5000), poll_us);
             v.wait_us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t1).count();
             u1 = land_v80::Counters::read(L->win);
@@ -788,6 +826,7 @@ int main(int argc, char **argv) {
     bool passive = false, discard = false;
     int burst = 1;
     bool prog = false, no_stamp = false;
+    int trace = 0;
     uint64_t msg = 1ULL << 20;
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
@@ -813,10 +852,11 @@ int main(int argc, char **argv) {
         else if (a == "--burst" && i + 1 < argc)  burst = atoi(argv[++i]);
         else if (a == "--prog")                   prog = true;
         else if (a == "--no-stamp")               no_stamp = true;   // a V80 landing timed as without --prog (A/B)
+        else if (a == "--trace" && i + 1 < argc)  trace = atoi(argv[++i]);   // with --land-v80 --no-stamp: counter clock
         else { server = false; ip.clear(); break; }
     }
     if (server == !ip.empty() || burst < 1 || size == 0 || size % 4096 || size > (64ULL << 20) || land_off % 64 || land_off >= 4096) {
-        printf("usage: %s --server [--port N] [--size BYTES] [--land-v80 [--land-offset B] [--poll-us U]] | --client <server_ip> [--port N] [--reps N] [--window P] [--burst B [--prog]]\n"
+        printf("usage: %s --server [--port N] [--size BYTES] [--land-v80 [--land-offset B] [--poll-us U] [--no-stamp [--trace 1|2]]] | --client <server_ip> [--port N] [--reps N] [--window P] [--burst B [--prog]]\n"
                "       | --passive [--port N] [--size BYTES] [--msg BYTES] [--reps N] [--land-v80 [--discard]]  (landing for a plain RDMA sender)\n"
                "       | --bidir-server | --bidir-client <server_ip>  [--port N] [--size BYTES] [--reps N] [--window P] [--no-send]\n"
                "       (size: a multiple of 4 KiB, at most 64 MiB)\n", argv[0]);
@@ -824,5 +864,5 @@ int main(int argc, char **argv) {
     }
     if (passive) return run_passive(port, size, land, msg, reps, discard, self && !land);
     if (bidir) return run_bidir(server ? std::string() : ip, port, size, reps, window, !no_send);
-    return server ? run_server(port, size, land, land_off, poll_us, no_touch, no_stamp, self && !land) : run_client(ip, port, reps, window, gap_ms, no_refill, burst, prog);
+    return server ? run_server(port, size, land, land_off, poll_us, no_touch, no_stamp, self && !land, trace) : run_client(ip, port, reps, window, gap_ms, no_refill, burst, prog);
 }
