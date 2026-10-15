@@ -8,7 +8,7 @@
 #   scripts/fpga/test_build.sh <switch|ce> <build_name> <stage_name> [baseline metrics.tsv]
 #
 # Standard images (override with U280_IMG / V80_IMG):
-U280_IMG=${U280_IMG:-$HOME/coyote-bitstreams/loom-switch-coalesce-clean/hw/bitstreams/cyt_top.bit}
+U280_IMG=${U280_IMG:-$HOME/coyote-bitstreams/loom-switch-qdma64/hw/bitstreams/cyt_top.bit}
 V80_IMG=${V80_IMG:-$HOME/coyote-bitstreams/loom-ce-sc32/cyt_top.pdi}
 # Results: ~/loom-experiments/regress/<date>_<stage_name>/ (metrics.tsv, logs,
 # ce_prog_<host>.log). ssh to the hosts needs a forwarded agent (VS Code's or

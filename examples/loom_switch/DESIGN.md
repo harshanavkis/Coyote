@@ -436,3 +436,26 @@ pci_qdma.c) and setup_loom_hosts.sh loads it when the card shows 913F.
 - Not simulated: AMD's soft-QDMA example design hangs at t=0 in xsim 2023.2
   (unmodified, too), so the static is checked by its block design
   (tb/static_pci/run.sh qdma), synthesis and hardware.
+- Prefetch cache 64 deep (7cb6023d): every C2H queue the static writes with
+  needs its own prefetch tag (simple bypass); qdma_wr_wrapper uses
+  N_OUTSTANDING (8) queues per host channel, 3 channels = 24 tags. The IP's
+  default 16-entry cache grants 15 (measured), so the first QDMA image never
+  completed a C2H write. The driver now enables 32 C2H queues and refuses to
+  load if a tag is not granted for its own queue.
+- Checked before the static was rebuilt (2026-10-14, qdma_hw/rev2: the
+  static's QDMA configuration and its unchanged wrappers behind a shell
+  stand-in, measured on amy): all 32 tags granted, C2H on all 24 queues with
+  the granted tag, C2H/H2C 64 B / 4 KiB / 100 B byte-exact, C2H 4 KiB 14.8
+  GB/s, H2C 14.2, both at once 13.0 + 13.0, bridge 12.23. C2H costs ~7.4
+  cycles per descriptor: 64 B writes 34 M/s (2.2 GB/s), 256 B 7.3 GB/s.
+- The driver maps only the part of BAR4 below the user data window into the
+  kernel (f8f43110, as pci_xdma.c): an uncached kernel mapping over the window
+  made PAT downgrade the CPU's write-combining window mapping, and CPU stores
+  reached the window as 8 B writes (CPU puts 0.08 GB/s, gets 0.004).
+- Result (loom-switch-qdma64, standard U280 image since 2026-10-15; full
+  regression regress/20261015_loom-switch-qdma64-kmap against the XDMA image,
+  measured): V80 HBM -> peer V80 HBM 10.7 -> 12.26 GB/s, V80 -> peer host one
+  way 10.9-11.2 -> 12.4-12.8, V80 -> U280 -> host 10.64 -> 12.30, program puts
+  +8..25%, both directions at once unchanged (~10.8-11.0). Timing: WNS -0.464
+  ns, worst paths inside the QDMA IP's PCIe interface (xclk -> PCIe core);
+  no errors in either regression.
