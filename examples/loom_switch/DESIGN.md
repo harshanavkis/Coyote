@@ -503,3 +503,16 @@ not below: V80 -> V80 7.1 / 8.5 / 9.7 / 11.5 GB/s at 4 / 8 / 16 / 64 KiB
   command at a time = 2.7 GB/s at 4 KiB, measured).
 - Prediction (computed): 4-64 KiB from a V80 source at ~12.2 GB/s best, if the
   real offsets fit the window (the counters say).
+- Result (loom-ce-rawin, 0fe84ab0, WNS +0.042; full regression
+  regress/20261015_loom-ce-rawin passes, Loom paths unchanged; measured
+  e1/20261015_2354_rawin, U280_RDMA, best / median of 10, byte-exact):
+  V80 -> V80 WINDOW 12.21/12.20, 12.23/12.23, 12.23/12.05, 12.25/12.25 GB/s
+  at 4/8/16/64 KiB (STRICT on the same image 6.22/4.79, 8.86/7.95,
+  9.35/9.28, 11.28/11.22), 12.25-12.32 from 256 KiB (STRICT 12.10-12.26);
+  V80 -> host the same (WINDOW 12.21-12.25 best at every size). The real
+  pattern (counters, 10 x 64 MiB in 4 KiB writes): 154,379 out-of-order
+  reads (0.94 a write), all within 4 KiB of s_req (87,704 at -16..-1
+  lines, 62,008 at 1..16, 4,049 at -64..-17, 618 at 17..64), all taken;
+  2,621,365 of 2,621,412 stream reads hits, axi_main read 36 ns, 1 break
+  in 10 runs (STRICT ~3,500 a run). The pull from V80 memory now runs at
+  line rate at every size, as Loom's push (12.16-12.22).
