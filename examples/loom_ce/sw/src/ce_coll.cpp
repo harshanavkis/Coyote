@@ -222,8 +222,12 @@ int main(int argc, char **argv) {
         while (done[0] < want)
             if (std::chrono::steady_clock::now() - t0 > std::chrono::seconds(r ? 20 : 60)) break;
         const auto t1 = std::chrono::steady_clock::now();
-        if (done[0] < want || !pr.finish(std::chrono::milliseconds(1000))) {
-            printf("FAIL run %d: did not finish (entry %lu)\n", r, (unsigned long) v80.getCSR(ce_prog::PC));
+        // always end the program before its buffers are touched: on a timeout finish() ABORTs it (a WAIT left polling
+        // while L.pull() or the exit drops the card mapping page-faults the V80 and kills its driver, rdma_coll 10-11)
+        const bool fin = pr.finish(std::chrono::milliseconds(done[0] < want ? 10 : 1000));
+        if (done[0] < want || !fin) {
+            printf("FAIL run %d: did not finish (entry %lu, engine %s)\n", r, (unsigned long) v80.getCSR(ce_prog::PC),
+                   v80.getCSR(ce_prog::BUSY) ? "STILL BUSY" : "stopped");
             errors++; break;
         }
         const double us = std::chrono::duration<double, std::micro>(t1 - t0).count() / K;
@@ -233,7 +237,8 @@ int main(int argc, char **argv) {
         if (!write_full(fd, &d, 1) || !read_full(fd, &d, 1)) { printf("FAIL: barrier\n"); return 1; }
     }
 
-    // the last iteration's result on this rank
+    // the last iteration's result on this rank (never while the engine runs: see above)
+    if (v80.getCSR(ce_prog::BUSY)) { printf("FAIL: the engine did not stop; its buffers are left alone\n"); return 1; }
     L.pull();
     const int32_t *o = reinterpret_cast<const int32_t *>(reinterpret_cast<uint8_t *>(L.buf) + OUT);
     uint64_t bad = 0, n = 0;
