@@ -66,6 +66,12 @@
  *   cycles (the outgoing push). --no-send keeps that side's copy engine
  *   idle: the one-way control in the same setup.
  *
+ * --ack (2026-10-19, both sides): the sender waits for the receiver's acknowledgement, as an RDMA sender waits for
+ * its completions and a receiver write-back: the client exports a host ack page (export 3) and sends its reference
+ * after the hello; once a copy's last byte and fence have landed the server stores the copy's number into it
+ * through its own window (one 8 B CPU store), and the client polls it: "ack back" = first program start to the ack
+ * seen on the sender. A V80 landing timed by --trace 2 ends at the expected W-beat count (not 2 ms quiet).
+ *
  * The QP port is N, the hello's TCP port N + 1 (N defaults to Coyote's).
  * --window sets the client's ack window (packets unacked, TX_CTL; 16 after
  * reset). Each side prints where its switch's cycles went during a copy:
@@ -86,6 +92,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <immintrin.h>
 #include <optional>
 #include <stdexcept>
@@ -117,6 +124,8 @@ struct Hello {
 // byte from the server (armed) before it runs
 struct Announce { uint64_t rep; uint64_t fence; uint64_t bytes; uint64_t start; };
 struct Verdict  { uint64_t bad; uint64_t fence; double wait_us; double first_us; };   // first data -> fence, announce -> first data
+// client -> server after the hello (--ack): where the server's acknowledgements land
+struct AckHello { uint32_t magic; uint32_t ack_ctid; uint64_t staging_va; uint64_t ack_ref; };
 
 // A set of the switch's counters, read before and after a copy
 struct Counters {
@@ -196,7 +205,7 @@ void snap(coyote::cThread &v80, uint64_t *out, uint32_t first, int n) {
 // U280's RX_FWD (loom_rx: a packet's write into the V80 has gone out; a U280 CSR) and, --trace 2, the V80
 // window's W beats (its counter page, read through the window). First and last change, until 2 ms quiet.
 void trace_landing(coyote::cThread &t_qp, land_v80::Landing *L, uint64_t wi, uint64_t f, uint64_t w, int trace,
-                   uint64_t bytes) {
+                   uint64_t bytes, uint64_t want_w = 0, const std::function<void()> &on_all = {}) {
     using clk = std::chrono::steady_clock;
     const auto tz = clk::now();
     const uint64_t f_start = f, w_start = w;
@@ -217,6 +226,7 @@ void trace_landing(coyote::cThread &t_qp, land_v80::Landing *L, uint64_t wi, uin
         prev = t;
         const double last = trace > 1 ? std::max(fl, wl) : fl;
         if ((fl >= 0 && t - last > 2000) || t > 5e6) break;
+        if (want_w && trace > 1 && w - w_start >= want_w) { if (on_all) on_all(); break; }   // --ack: every beat is in, answer at once
     }
     auto rate = [&](double a, double b) { return b > a ? double(bytes) / (b - a) / 1e3 : 0.0; };
     printf("     trace: RX_FWD +%lu, first %.1f us, last %.1f us (%.2f GB/s first to last)", (unsigned long) (f - f_start),
@@ -230,7 +240,7 @@ void trace_landing(coyote::cThread &t_qp, land_v80::Landing *L, uint64_t wi, uin
 }
 
 int run_server(uint16_t port, uint64_t size, bool land, uint64_t off, unsigned poll_us, bool no_touch, bool no_stamp,
-               bool self, int trace) {
+               bool self, int trace, bool ack) {
     coyote::cThread t_qp(0, getpid(), 0, nullptr, "coyote_fpga");     // QP owner
     coyote::cThread t_data(0, getpid(), 0, nullptr, "coyote_fpga");   // owns the landing buffers
     printf("server: waiting for the QP exchange on port %u ...\n", port);
@@ -285,6 +295,17 @@ int run_server(uint16_t port, uint64_t size, bool land, uint64_t off, unsigned p
     Hello h{MAGIC, uint32_t(t_data.getCtid()), reinterpret_cast<uint64_t>(staging),
             loom_switch::export_ref(1), loom_switch::export_ref(2), size};
     if (!write_full(c, &h, sizeof(h))) { printf("FAIL: hello\n"); return 1; }
+    // --ack: a window (uwin [0, 4096)) onto the client's ack page, over this QP
+    if (ack) {
+        AckHello ah{};
+        if (!read_full(c, &ah, sizeof(ah)) || ah.magic != MAGIC) { printf("FAIL: no ack hello (client without --ack?)\n"); return 1; }
+        loom_switch::csr_write(t_qp, loom_switch::RDMA_STAGING_VA, ah.staging_va);
+        loom_switch::program_window(t_qp, 1, true, t_qp.getCtid(), reinterpret_cast<void *>(ah.ack_ref), 4096, 0, ah.ack_ctid);
+        t_qp.mapUwin(4096);
+        printf("server: acks go to the client's export %lx (ctid %u)\n", (unsigned long) ah.ack_ref, ah.ack_ctid);
+    }
+    uint64_t acked = 0;   // the copy number (from 1) acknowledged last: one ack per copy
+    auto send_ack = [&](uint64_t v) { if (ack && acked != v) { acked = v; t_qp.uwinWrite(0, &v, 8); } };
 
     volatile uint64_t *vfence = fence;
     volatile uint64_t *vdst = dst;
@@ -340,6 +361,7 @@ int run_server(uint16_t port, uint64_t size, bool land, uint64_t off, unsigned p
         if (land && an.start && !no_stamp) {
             // the engine's program: done when the fence has landed; no window reads meanwhile
             const bool ok = sp->finish(std::chrono::milliseconds(5000));
+            send_ack(copies + 1);
             v80->invoke(coyote::CoyoteOper::LOCAL_SYNC, coyote::syncSg{st, 4096});
             v.wait_us = ok ? double(st[1] - st[0]) * ce_prog::CLK_NS / 1e3 : 0;
             stamped = ok;
@@ -349,8 +371,11 @@ int run_server(uint16_t port, uint64_t size, bool land, uint64_t off, unsigned p
             v.fence = L->buf[(off + size) / 8];
         } else if (land) {
             // the fence, read through the V80's window, then the data synced back
-            if (trace && an.start) trace_landing(t_qp, L, wi, f0, w0, trace, an.bytes ? an.bytes : size);
+            // --ack: the trace ends at the data's beats + a start and a fence per program run
+            const uint64_t want_w = ack && an.start ? (an.bytes ? an.bytes : size) / 64 + 2 * (an.fence - an.start + 1) : 0;
+            if (trace && an.start) trace_landing(t_qp, L, wi, f0, w0, trace, an.bytes ? an.bytes : size, want_w, [&]() { send_ack(copies + 1); });
             (void) L->wait(off + size, an.fence, std::chrono::milliseconds(5000), poll_us);
+            send_ack(copies + 1);   // unless the trace sent it at the last beat (as land_server --ack): the fence has landed
             v.wait_us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t1).count();
             u1 = land_v80::Counters::read(L->win);
             if (!no_touch) L->pull();
@@ -359,6 +384,7 @@ int run_server(uint16_t port, uint64_t size, bool land, uint64_t off, unsigned p
         } else {
             while (*vfence != an.fence && std::chrono::steady_clock::now() - t0 < std::chrono::seconds(5))
                 _mm_pause();
+            send_ack(copies + 1);
             v.fence = *vfence;
             v.wait_us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t1).count();
         }
@@ -407,6 +433,7 @@ int run_server(uint16_t port, uint64_t size, bool land, uint64_t off, unsigned p
     ::close(lfd);
     loom_switch::release_export(t_qp, 1);
     loom_switch::release_export(t_qp, 2);
+    if (ack) loom_switch::release_window(t_qp, 1);
     t_qp.connSync(false);
     delete L;
     delete v80;
@@ -673,11 +700,22 @@ int run_bidir(const std::string &ip, uint16_t port, uint64_t size, int reps, int
 }
 
 int run_client(const std::string &ip, uint16_t port, int reps, int window, unsigned gap_ms, bool no_refill, int burst,
-               bool prog) {
+               bool prog, bool ack) {
     coyote::cThread u280(0, getpid(), 0, nullptr, "coyote_fpga");     // QP owner and CSR page
     coyote::cThread v80(0, getpid(), 0, nullptr, "coyote_versal_fpga");
-    if (!u280.initRDMA(STAGING_SIZE, port, ip.c_str())) { printf("FAIL: initRDMA\n"); return 1; }
+    void *staging = u280.initRDMA(STAGING_SIZE, port, ip.c_str());
+    if (!staging) { printf("FAIL: initRDMA\n"); return 1; }
     printf("client: QP up\n");
+    // --ack: the page the server's acknowledgements land in (export 3, host memory, its own cThread)
+    std::optional<coyote::cThread> t_ack;
+    volatile uint64_t *ackw = nullptr;
+    if (ack) {
+        t_ack.emplace(0, getpid(), 0, nullptr, "coyote_fpga");
+        uint64_t *a = static_cast<uint64_t *>(t_ack->getMem({coyote::CoyoteAllocType::HPF, 4096}));
+        memset(a, 0, 4096);
+        loom_switch::program_export(u280, 3, t_ack->getCtid(), a, 4096);
+        ackw = a;
+    }
 
     int fd = -1;
     for (int i = 0; i < 300 && fd < 0; i++) {
@@ -692,6 +730,10 @@ int run_client(const std::string &ip, uint16_t port, int reps, int window, unsig
     const uint64_t size = h.size;
     printf("client: server dst %lx, fence %lx, %lu bytes, landing ctid %u\n",
            (unsigned long) h.dst_va, (unsigned long) h.fence_va, (unsigned long) size, h.dst_ctid);
+    if (ack) {
+        const AckHello ah{MAGIC, uint32_t(t_ack->getCtid()), reinterpret_cast<uint64_t>(staging), loom_switch::export_ref(3)};
+        if (!write_full(fd, &ah, sizeof(ah))) { printf("FAIL: ack hello\n"); return 1; }
+    }
 
     if (window >= 0) loom_switch::csr_write(u280, loom_switch::TX_CTL, uint64_t(window));
     printf("client: ack window %lu packets\n", (unsigned long) loom_switch::csr_read(u280, loom_switch::TX_CTL));
@@ -775,6 +817,13 @@ int run_client(const std::string &ip, uint16_t port, int reps, int window, unsig
         }
         const auto b1 = std::chrono::steady_clock::now();
         const double burst_us = std::chrono::duration<double, std::micro>(b1 - b0).count();
+        // --ack: the receiver's acknowledgement of this measurement (its number, from 1) in host memory
+        double ack_us = 0;
+        if (ack) {
+            while (*ackw < uint64_t(r + 1) && std::chrono::steady_clock::now() - b0 < std::chrono::seconds(5)) _mm_pause();
+            if (*ackw < uint64_t(r + 1)) { printf("FAIL copy %d: no ack from the server (ack word %lu)\n", r, (unsigned long) *ackw); return 1; }
+            ack_us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - b0).count();
+        }
 
         Verdict v{};
         if (!read_full(fd, &v, sizeof(v))) { printf("FAIL: the server went away\n"); return 1; }
@@ -790,6 +839,8 @@ int run_client(const std::string &ip, uint16_t port, int reps, int window, unsig
         if (prog)
             printf("     program: %lu engine cycles for the %d runs (%.2f GB/s)\n", (unsigned long) run_cyc, burst / K,
                    double(bytes) / (double(run_cyc) * ce_prog::CLK_NS));
+        if (ack)
+            printf("     ack back %.1f us after the first start (%.2f GB/s sender-seen)\n", ack_us, bytes / ack_us / 1e3);
         // CLOCK_MONOTONIC (steady_clock): to line runs up with kernel traces (ftrace trace_clock mono)
         printf("     mono: copies started %.6f s, done %.6f s\n", std::chrono::duration<double>(b0.time_since_epoch()).count(),
                std::chrono::duration<double>(b1.time_since_epoch()).count());
@@ -815,6 +866,7 @@ int run_client(const std::string &ip, uint16_t port, int reps, int window, unsig
     ::close(fd);
     loom_switch::release_window(u280, 1);
     loom_switch::release_window(u280, 2);
+    if (ack) loom_switch::release_export(u280, 3);
     u280.connSync(true);
     printf(errors ? "G4 FAIL (client)\n" : "G4 PASS (client)\n");
     return errors ? 1 : 0;
@@ -835,7 +887,7 @@ int main(int argc, char **argv) {
     bool no_touch = false, no_refill = false;
     bool passive = false, discard = false;
     int burst = 1;
-    bool prog = false, no_stamp = false;
+    bool prog = false, no_stamp = false, ack = false;
     int trace = 0;
     uint64_t msg = 1ULL << 20;
     for (int i = 1; i < argc; i++) {
@@ -863,10 +915,11 @@ int main(int argc, char **argv) {
         else if (a == "--prog")                   prog = true;
         else if (a == "--no-stamp")               no_stamp = true;   // a V80 landing timed as without --prog (A/B)
         else if (a == "--trace" && i + 1 < argc)  trace = atoi(argv[++i]);   // with --land-v80 --no-stamp: counter clock
+        else if (a == "--ack")                    ack = true;   // the sender waits for the receiver's ack (both sides)
         else { server = false; ip.clear(); break; }
     }
     if (server == !ip.empty() || burst < 1 || size == 0 || size % 4096 || size > (64ULL << 20) || land_off % 64 || land_off >= 4096) {
-        printf("usage: %s --server [--port N] [--size BYTES] [--land-v80 [--land-offset B] [--poll-us U] [--no-stamp [--trace 1|2]]] | --client <server_ip> [--port N] [--reps N] [--window P] [--burst B [--prog]]\n"
+        printf("usage: %s --server [--port N] [--size BYTES] [--land-v80 [--land-offset B] [--poll-us U] [--no-stamp [--trace 1|2]]] | --client <server_ip> [--port N] [--reps N] [--window P] [--burst B [--prog]] [--ack]\n"
                "       | --passive [--port N] [--size BYTES] [--msg BYTES] [--reps N] [--land-v80 [--discard]]  (landing for a plain RDMA sender)\n"
                "       | --bidir-server | --bidir-client <server_ip>  [--port N] [--size BYTES] [--reps N] [--window P] [--no-send]\n"
                "       (size: a multiple of 4 KiB, at most 64 MiB)\n", argv[0]);
@@ -874,5 +927,6 @@ int main(int argc, char **argv) {
     }
     if (passive) return run_passive(port, size, land, msg, reps, discard, self && !land);
     if (bidir) return run_bidir(server ? std::string() : ip, port, size, reps, window, !no_send);
-    return server ? run_server(port, size, land, land_off, poll_us, no_touch, no_stamp, self && !land, trace) : run_client(ip, port, reps, window, gap_ms, no_refill, burst, prog);
+    return server ? run_server(port, size, land, land_off, poll_us, no_touch, no_stamp, self && !land, trace, ack)
+                  : run_client(ip, port, reps, window, gap_ms, no_refill, burst, prog, ack);
 }
