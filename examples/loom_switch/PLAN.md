@@ -32,8 +32,9 @@ through `scripts/fpga/build_bitstream.sh` (U280: Vivado 2023.2; V80: 2025.1).
   soft QDMA, DESIGN.md section 14; needs driver/build_qdma from f8f43110 or
   later; WNS -0.464; md5 a797fbd5; the last XDMA image is
   `loom-switch-coalesce-clean`, 672fd313, md5 04fdbab5), V80
-  `~/coyote-bitstreams/loom-ce-sc32` (01ff1973, md5 8d33904f). Baseline for
-  the next regression: `~/loom-experiments/regress/20261015_loom-switch-qdma64-kmap`.
+  `~/coyote-bitstreams/loom-ce-rawin` (0fe84ab0, uwin_ra WINDOW, md5
+  6b6726f5; standard since 2026-10-19, before `loom-ce-sc32` 01ff1973).
+  Baseline for the next regression: `~/loom-experiments/regress/20261015_loom-ce-rawin`.
 - **Cards up from any state:**
   `scripts/fpga/setup_loom_hosts.sh <u280.bit> <v80.pdi> amy rose`.
 - **RDMA baseline and V80 timing (2026-10-15):** the RDMA image is
