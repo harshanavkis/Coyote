@@ -29,7 +29,15 @@
  * ack's one-way trip (--tokens 0 gives the round trip). The like-for-like of rdma_dispatch, whose
  * receiver CPU polls host memory and posts the ack. The server checks every message at the end.
  *
- * Both sides need the same --tokens, --H, --combine and --runs.
+ * --engine ptdma (2026-10-19, both sides): no V80 on either host. Client: the units are in host memory and an AMD
+ * PTDMA engine (ptdma_q, as ce_coll --engine ptdma) pushes every message (batches of up to 64 per submit), then the
+ * 8 B flag behind them on the same queue; the client's flag page is host memory. Times on the client CPU's clock:
+ * copies = data submitted, signal issued = flag submitted (the CPU is free), engine done = the engine finished every
+ * copy (the source may be reused: the counterpart of RDMA's completions), ack back = the server's ack seen.
+ * Server: lands in host memory (as --land-host) and acks with one 8 B CPU store through its window (mapUwin + sfence).
+ * --ptq DEV, --ptq-user (client; amy, rose).
+ *
+ * Both sides need the same --tokens, --H, --combine, --runs and --engine.
  */
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -50,6 +58,7 @@
 #include "ce_prog.hpp"
 #include "land_v80.hpp"
 #include "loom_switch.hpp"
+#include "ptq.hpp"
 
 namespace {
 
@@ -57,7 +66,7 @@ constexpr uint32_t MAGIC = 0x44495350;      // "DISP"
 constexpr uint64_t STAGING_SIZE = 1ULL << 20;
 constexpr int R = 8, E = 256, TOPK = 8;
 
-struct Hello { uint32_t magic; uint32_t dst_ctid; uint64_t staging_va, dst_ref, flag_ref, tokens, H, combine; int64_t runs; uint64_t ack; };
+struct Hello { uint32_t magic; uint32_t dst_ctid; uint64_t staging_va, dst_ref, flag_ref, tokens, H, combine; int64_t runs; uint64_t ack, engine; };
 
 bool write_full(int fd, const void *p, size_t n) {
     const char *c = static_cast<const char *>(p);
@@ -119,8 +128,8 @@ struct Msg { uint64_t unit, slot; };
 }  // namespace
 
 int main(int argc, char **argv) {
-    std::string ip, out;
-    bool server = false, combine = false, land_host = false;
+    std::string ip, out, engine = "v80", ptq_dev = "/dev/ptq_0000_e8_00_2";
+    bool server = false, combine = false, land_host = false, ptq_user = false;
     uint16_t port = 19810;
     int tokens = 1, runs = 22;
     uint64_t H = 7168;
@@ -135,8 +144,13 @@ int main(int argc, char **argv) {
         else if (a == "--land-host")               land_host = true;
         else if (a == "--runs" && i + 1 < argc)    runs = atoi(argv[++i]);
         else if (a == "--out" && i + 1 < argc)     out = argv[++i];
+        else if (a == "--engine" && i + 1 < argc)  engine = argv[++i];
+        else if (a == "--ptq" && i + 1 < argc)     ptq_dev = argv[++i];
+        else if (a == "--ptq-user")                ptq_user = true;
         else { server = false; ip.clear(); break; }
     }
+    const bool pt = engine == "ptdma";
+    if (engine != "v80" && !pt) { server = false; ip.clear(); }
     // messages in dispatch_bd's order: by destination, then slot (= token order within a destination)
     std::vector<Msg> msgs;
     std::vector<uint64_t> cnt(R, 0);
@@ -150,7 +164,7 @@ int main(int argc, char **argv) {
     if (server == !ip.empty() || (land_host && !server) || H % 64 || H == 0 || tokens < 0 || runs < 2 || msgs.size() + 8 > ce_prog::N_PROG ||
         msgs.size() * H > (16ULL << 20)) {
         printf("usage: %s --server | --client <ip>  [--port N] [--tokens T] [--H B, a multiple of 64] [--combine]"
-               " [--runs R >= 2] [--out FILE] [--land-host (server)]   (at most %u messages, 16 MiB)\n", argv[0], ce_prog::N_PROG - 8);
+               " [--runs R >= 2] [--out FILE] [--land-host (server)] [--engine v80|ptdma] [--ptq DEV] [--ptq-user]   (at most %u messages, 16 MiB)\n", argv[0], ce_prog::N_PROG - 8);
         return 2;
     }
     // the message region (whole pages), then the flag page
@@ -158,7 +172,8 @@ int main(int argc, char **argv) {
 
     coyote::cThread t_qp(0, getpid(), 0, nullptr, "coyote_fpga");     // QP owner, CSR page, rdma windows
     coyote::cThread t_data(0, getpid(), 0, nullptr, "coyote_fpga");   // owns the landing exports
-    std::unique_ptr<coyote::cThread> v80p(new coyote::cThread(0, getpid(), 0, nullptr, "coyote_versal_fpga"));
+    std::unique_ptr<coyote::cThread> v80p;                              // not opened for --engine ptdma
+    if (!pt) v80p.reset(new coyote::cThread(0, getpid(), 0, nullptr, "coyote_versal_fpga"));
     printf("%s: QP exchange on port %u ...\n", server ? "server" : "client", port);
     void *staging = server ? t_qp.initRDMA(STAGING_SIZE, port) : t_qp.initRDMA(STAGING_SIZE, port, ip.c_str());
     if (!staging) { printf("FAIL: initRDMA\n"); return 1; }
@@ -168,7 +183,7 @@ int main(int argc, char **argv) {
     std::unique_ptr<land_v80::Landing> L;
     uint64_t *land = nullptr;                               // the messages; the flag follows at land + mlen
     volatile uint64_t *my_flag = nullptr;
-    if (land_host) {
+    if (land_host || pt) {
         land = static_cast<uint64_t *>(t_data.getMem({coyote::CoyoteAllocType::HPF, mlen}));
         uint64_t *fl = static_cast<uint64_t *>(t_data.getMem({coyote::CoyoteAllocType::HPF, 4096}));
         memset(land, 0, mlen); memset(fl, 0, 4096);
@@ -187,22 +202,26 @@ int main(int argc, char **argv) {
 
     const int fd = connect_or_accept(server ? std::string() : ip, uint16_t(port + 1));
     Hello mine{MAGIC, uint32_t(t_data.getCtid()), reinterpret_cast<uint64_t>(staging), loom_switch::export_ref(1),
-               loom_switch::export_ref(2), uint64_t(tokens), H, uint64_t(combine), runs, 1}, h{};   // the server always acks
+               loom_switch::export_ref(2), uint64_t(tokens), H, uint64_t(combine), runs, 1, uint64_t(pt)}, h{};   // the server always acks
     if (fd < 0 || !write_full(fd, &mine, sizeof(mine)) || !read_full(fd, &h, sizeof(h)) || h.magic != MAGIC ||
-        h.tokens != uint64_t(tokens) || h.H != H || h.combine != uint64_t(combine) || h.runs != runs) {
-        printf("FAIL: hello (--tokens, --H, --combine and --runs must match on both sides)\n");
+        h.tokens != uint64_t(tokens) || h.H != H || h.combine != uint64_t(combine) || h.runs != runs || h.engine != uint64_t(pt)) {
+        printf("FAIL: hello (--tokens, --H, --combine, --runs and --engine must match on both sides)\n");
         return 1;
     }
 
-    if (land_host) {   // per run: arm, poll the flag in host memory, ack through this V80, barrier; then check every message
-        coyote::cThread &v80 = *v80p;
+    if (server && (land_host || pt)) {   // per run: arm, poll the flag in host memory, ack (V80 or a CPU store), barrier; then check
         loom_switch::csr_write(t_qp, loom_switch::RDMA_STAGING_VA, h.staging_va);
         loom_switch::program_window(t_qp, 2, true, t_qp.getCtid(), reinterpret_cast<void *>(h.flag_ref), 4096, mlen, h.dst_ctid);
-        void *uva = loom_switch::reserve_va(mlen + 4096);
-        v80.importDmabuf(t_qp.exportDmabuf(EXPORT_REGION_UWIN, 0, mlen + 4096), uva);
-        ce_prog::Program pa(v80);
-        pa.add(ce_prog::signal(static_cast<uint8_t *>(uva) + mlen, 1));   // the ack: 1 + RUN_BASE
-        pa.load();
+        std::unique_ptr<ce_prog::Program> pap;
+        if (pt) t_qp.mapUwin(mlen + 4096);   // --engine ptdma: the ack = an 8 B CPU store through window 2
+        else {
+            coyote::cThread &v80 = *v80p;
+            void *uva = loom_switch::reserve_va(mlen + 4096);
+            v80.importDmabuf(t_qp.exportDmabuf(EXPORT_REGION_UWIN, 0, mlen + 4096), uva);
+            pap = std::make_unique<ce_prog::Program>(v80);
+            pap->add(ce_prog::signal(static_cast<uint8_t *>(uva) + mlen, 1));   // the ack: 1 + RUN_BASE
+            pap->load();
+        }
         int errors = 0;
         for (int r = 0; r < runs && !errors; r++) {
             char go = 1;
@@ -210,9 +229,10 @@ int main(int argc, char **argv) {
             const auto t0 = std::chrono::steady_clock::now();
             while (*my_flag < uint64_t(r) + 1)
                 if (std::chrono::steady_clock::now() - t0 > std::chrono::seconds(60)) { printf("FAIL run %d: no flag\n", r); errors++; break; }
-            if (!errors) {
-                pa.start(uint64_t(r));
-                if (!pa.finish(std::chrono::milliseconds(1000))) { printf("FAIL run %d: ack program\n", r); errors++; }
+            if (!errors && pt) { const uint64_t a = uint64_t(r) + 1; t_qp.uwinWrite(mlen, &a, 8); }
+            else if (!errors) {
+                pap->start(uint64_t(r));
+                if (!pap->finish(std::chrono::milliseconds(1000))) { printf("FAIL run %d: ack program\n", r); errors++; }
             }
             printf("server run %d: flag seen after %.1f ms (armed -> flag), acked\n", r,
                    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
@@ -230,6 +250,74 @@ int main(int argc, char **argv) {
         loom_switch::release_export(t_qp, 1);
         loom_switch::release_export(t_qp, 2);
         t_qp.connSync(false);
+        printf(errors ? "DISPATCH FAIL\n" : "DISPATCH PASS\n");
+        return errors ? 1 : 0;
+    }
+    if (pt) {   // --engine ptdma client: host-memory units, PTDMA pushes, CPU clock
+        loom_switch::csr_write(t_qp, loom_switch::RDMA_STAGING_VA, h.staging_va);
+        loom_switch::program_window(t_qp, 1, true, t_qp.getCtid(), reinterpret_cast<void *>(h.dst_ref), mlen, 0, h.dst_ctid);
+        loom_switch::program_window(t_qp, 2, true, t_qp.getCtid(), reinterpret_cast<void *>(h.flag_ref), 4096, mlen, h.dst_ctid);
+        const uint64_t slen = std::max<uint64_t>(4096, (units * H + 4095) & ~4095ULL);
+        constexpr uint32_t FSLOTS = 512;
+        uint64_t *src = static_cast<uint64_t *>(t_data.getMem({coyote::CoyoteAllocType::HPF, slen}));
+        uint64_t *fsrc = static_cast<uint64_t *>(t_data.getMem({coyote::CoyoteAllocType::HPF, FSLOTS * 8}));
+        if (!src || !fsrc) { printf("FAIL: no host memory\n"); return 1; }
+        for (uint64_t u = 0; u < units; u++)
+            for (uint64_t j = 0; j < H / 8; j++) src[u * H / 8 + j] = pattern(u, j);
+        std::unique_ptr<ptq::Queue> q = std::make_unique<ptq::Queue>(ptq_dev);
+        const uint32_t hs = q->reg_host(src, slen), hf = q->reg_host(fsrc, FSLOTS * 8);
+        uint64_t ulen = 0;
+        const uint32_t hu = q->reg_uwin(&ulen);
+        if (ptq_user && !q->enable_user()) { printf("FAIL: PTDMA user mode refused (no translating IOMMU?)\n"); return 1; }
+        if (ulen < mlen + 4096) { printf("FAIL: the uwin is smaller than messages + flag\n"); return 1; }
+        std::vector<ptq_copy> cs;
+        for (const Msg &m : msgs) cs.push_back({hs, hu, m.unit * H, m.slot * H, H});
+        printf("client: up; %s, %d tokens, %zu messages of %lu B (%.2f MB), %d runs (the first a warm-up); --engine ptdma %s (%s)\n",
+               combine ? "combine" : "dispatch", tokens, msgs.size(), (unsigned long) H, double(msgs.size() * H) / 1e6, runs,
+               ptq_dev.c_str(), ptq_user ? "user mode" : "ioctl");
+        std::vector<double> copies, issued, edone, ack;
+        FILE *of = !out.empty() ? fopen(out.c_str(), "w") : nullptr;
+        if (of) fprintf(of, "op,tokens,msgs,H,run,copies_us,signal_issued_us,engine_done_us,ack_us\n");
+        int errors = 0;
+        using clk = std::chrono::steady_clock;
+        auto us = [](clk::time_point a, clk::time_point b) { return std::chrono::duration<double, std::micro>(b - a).count(); };
+        for (int r = 0; r < runs; r++) {
+            char go = 1;
+            if (!read_full(fd, &go, 1)) { printf("FAIL: the server did not arm\n"); return 1; }
+            const uint64_t v = uint64_t(r) + 1;
+            fsrc[r % FSLOTS] = v;
+            const auto t0 = clk::now();
+            for (size_t k = 0; k < cs.size(); k += PTQ_MAX_BATCH)
+                q->submit(cs.data() + k, uint32_t(std::min<size_t>(PTQ_MAX_BATCH, cs.size() - k)));
+            const auto t1 = clk::now();
+            q->copy(hf, uint64_t(r % FSLOTS) * 8, hu, mlen, 8);           // the flag, behind the data on the same queue
+            const auto t2 = clk::now();
+            while (!q->done(q->seq()) && clk::now() - t0 < std::chrono::seconds(5)) {}
+            const auto td = clk::now();
+            while (*my_flag < v && clk::now() - t0 < std::chrono::seconds(5)) {}
+            const auto t3 = clk::now();
+            if (!q->done(q->seq()) || *my_flag < v) { printf("FAIL run %d: %s\n", r, *my_flag < v ? "no ack" : "the PTDMA queue did not finish"); errors++; break; }
+            const double c = us(t0, t1), i = us(t0, t2), e = us(t0, td), a = us(t0, t3);
+            printf("%s run %d: copies %.2f us, signal issued %.2f us, engine done %.2f us, ack back %.2f us\n", r ? "    " : "warm", r, c, i, e, a);
+            if (r) { copies.push_back(c); issued.push_back(i); edone.push_back(e); ack.push_back(a); }
+            if (of && r) fprintf(of, "%s,%d,%zu,%lu,%d,%.3f,%.3f,%.3f,%.3f\n", combine ? "combine" : "dispatch", tokens, msgs.size(),
+                                 (unsigned long) H, r, c, i, e, a);
+            char done = 1;
+            if (!write_full(fd, &done, 1) || !read_full(fd, &done, 1)) { printf("FAIL: barrier\n"); return 1; }
+        }
+        if (of) fclose(of);
+        if (!issued.empty())
+            printf("%s %d tokens, %zu x %lu B (us, %zu runs, median [min max]): copies %.2f [%.2f %.2f]  signal issued %.2f [%.2f %.2f]"
+                   "  ack back %.2f [%.2f %.2f]  engine done %.2f [%.2f %.2f]\n", combine ? "combine" : "dispatch", tokens, msgs.size(),
+                   (unsigned long) H, issued.size(), pct(copies, 50), pct(copies, 0), pct(copies, 100), pct(issued, 50), pct(issued, 0),
+                   pct(issued, 100), pct(ack, 50), pct(ack, 0), pct(ack, 100), pct(edone, 50), pct(edone, 0), pct(edone, 100));
+        ::close(fd);
+        q.reset();
+        loom_switch::release_window(t_qp, 1);
+        loom_switch::release_window(t_qp, 2);
+        loom_switch::release_export(t_qp, 1);
+        loom_switch::release_export(t_qp, 2);
+        t_qp.connSync(true);
         printf(errors ? "DISPATCH FAIL\n" : "DISPATCH PASS\n");
         return errors ? 1 : 0;
     }

@@ -30,6 +30,11 @@
  * (COPY msg -> peer, SIGNAL peer flag; two CSR writes) and polls its own
  * flag in host memory; the responder's CPU polls, then starts its program.
  * One-way = round trip / 2 on the client CPU's clock (steady_clock).
+ *
+ * --engine ptdma (2026-10-19, both sides; implies --host): no V80. The message is in this host's memory and an AMD
+ * PTDMA engine (ptdma_q, as ce_coll --engine ptdma) pushes it and the 8 B flag behind it in one submit through the
+ * U280's windows into the peer's host memory; the CPU polls its own flag. "post" = the CPU's time to submit a round.
+ * --ptq DEV (default /dev/ptq_0000_e8_00_2), --ptq-user (descriptors written from user space; amy, rose).
  */
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -50,6 +55,7 @@
 #include "ce_prog.hpp"
 #include "land_v80.hpp"
 #include "loom_switch.hpp"
+#include "ptq.hpp"
 
 namespace {
 
@@ -57,7 +63,7 @@ constexpr uint32_t MAGIC = 0x50494E47;      // "PING"
 constexpr uint64_t STAGING_SIZE = 1ULL << 20;
 constexpr int ROUNDS = 400;                 // initiator: 5 entries a round, 2048 at most
 
-struct Hello { uint32_t magic; uint32_t dst_ctid; uint64_t staging_va, dst_ref, flag_ref, size; int64_t runs; uint64_t host; };
+struct Hello { uint32_t magic; uint32_t dst_ctid; uint64_t staging_va, dst_ref, flag_ref, size; int64_t runs; uint64_t host, engine; };
 
 bool write_full(int fd, const void *p, size_t n) {
     const char *c = static_cast<const char *>(p);
@@ -103,8 +109,8 @@ double pct(std::vector<double> v, double p) {
 }  // namespace
 
 int main(int argc, char **argv) {
-    std::string ip, out;
-    bool server = false, host = false;
+    std::string ip, out, engine = "v80", ptq_dev = "/dev/ptq_0000_e8_00_2";
+    bool server = false, host = false, ptq_user = false;
     uint16_t port = 19800;
     uint64_t size = 64;
     int runs = 6;
@@ -117,11 +123,16 @@ int main(int argc, char **argv) {
         else if (a == "--size" && i + 1 < argc)    size = strtoull(argv[++i], nullptr, 0);
         else if (a == "--runs" && i + 1 < argc)    runs = atoi(argv[++i]);
         else if (a == "--out" && i + 1 < argc)     out = argv[++i];
+        else if (a == "--engine" && i + 1 < argc)  engine = argv[++i];
+        else if (a == "--ptq" && i + 1 < argc)     ptq_dev = argv[++i];
+        else if (a == "--ptq-user")                ptq_user = true;
         else { server = false; ip.clear(); break; }
     }
-    if (server == !ip.empty() || size % 64 || size > (16ULL << 20) || runs < 2) {
+    const bool pt = engine == "ptdma";
+    if (pt) host = true;
+    if (server == !ip.empty() || size % 64 || size > (16ULL << 20) || runs < 2 || (engine != "v80" && !pt)) {
         printf("usage: %s --server | --client <ip>  [--port N] [--size B, a multiple of 64, 0 = the flag only]"
-               " [--runs R >= 2] [--out FILE] [--host]\n", argv[0]);
+               " [--runs R >= 2] [--out FILE] [--host] [--engine v80|ptdma] [--ptq DEV] [--ptq-user]\n", argv[0]);
         return 2;
     }
     const int side = server ? 0 : 1;
@@ -130,7 +141,8 @@ int main(int argc, char **argv) {
 
     coyote::cThread t_qp(0, getpid(), 0, nullptr, "coyote_fpga");     // QP owner, CSR page, rdma windows
     coyote::cThread t_data(0, getpid(), 0, nullptr, "coyote_fpga");   // owns the landing exports
-    coyote::cThread v80(0, getpid(), 0, nullptr, "coyote_versal_fpga");
+    std::unique_ptr<coyote::cThread> v80;                                // not opened for --engine ptdma
+    if (!pt) v80 = std::make_unique<coyote::cThread>(0, getpid(), 0, nullptr, "coyote_versal_fpga");
     printf("%s: QP exchange on port %u ...\n", server ? "server" : "client", port);
     void *staging = server ? t_qp.initRDMA(STAGING_SIZE, port) : t_qp.initRDMA(STAGING_SIZE, port, ip.c_str());
     if (!staging) { printf("FAIL: initRDMA\n"); return 1; }
@@ -149,7 +161,7 @@ int main(int argc, char **argv) {
         loom_switch::program_export(t_qp, 2, t_data.getCtid(), fl, 4096);
         my_flag = fl;
     } else {
-        L.reset(new land_v80::Landing(v80, mlen + 4096));
+        L.reset(new land_v80::Landing(*v80, mlen + 4096));
         void *lva = loom_switch::reserve_va(mlen + 4096);
         t_data.importDmabuf(L->export_fd(), lva);
         loom_switch::program_export(t_qp, 1, t_data.getCtid(), lva, mlen);
@@ -159,10 +171,10 @@ int main(int argc, char **argv) {
 
     const int fd = connect_or_accept(server ? std::string() : ip, uint16_t(port + 1));
     Hello mine{MAGIC, uint32_t(t_data.getCtid()), reinterpret_cast<uint64_t>(staging),
-               loom_switch::export_ref(1), loom_switch::export_ref(2), size, runs, uint64_t(host)}, h{};
+               loom_switch::export_ref(1), loom_switch::export_ref(2), size, runs, uint64_t(host), uint64_t(pt)}, h{};
     if (fd < 0 || !write_full(fd, &mine, sizeof(mine)) || !read_full(fd, &h, sizeof(h)) || h.magic != MAGIC ||
-        h.size != size || h.runs != runs || h.host != uint64_t(host)) {
-        printf("FAIL: hello (--size, --runs and --host must match on both sides)\n");
+        h.size != size || h.runs != runs || h.host != uint64_t(host) || h.engine != uint64_t(pt)) {
+        printf("FAIL: hello (--size, --runs, --host and --engine must match on both sides)\n");
         return 1;
     }
 
@@ -170,21 +182,42 @@ int main(int argc, char **argv) {
     loom_switch::csr_write(t_qp, loom_switch::RDMA_STAGING_VA, h.staging_va);
     loom_switch::program_window(t_qp, 1, true, t_qp.getCtid(), reinterpret_cast<void *>(h.dst_ref), mlen, 0, h.dst_ctid);
     loom_switch::program_window(t_qp, 2, true, t_qp.getCtid(), reinterpret_cast<void *>(h.flag_ref), 4096, mlen, h.dst_ctid);
+    volatile uint64_t *st = nullptr;
+    std::unique_ptr<ce_prog::Program> pr;
+    // --engine ptdma: the queue, this host's message (the pattern), the flag sources - destroyed before t_data
+    std::unique_ptr<ptq::Queue> q;
+    constexpr uint32_t FSLOTS = 512;            // > the ring: a flag's source word is not rewritten while it is queued
+    uint64_t *fsrc = nullptr;
+    uint32_t hs = 0, hf = 0, hu = 0, fslot = 0;
+    if (pt) {
+        uint64_t *psrc = static_cast<uint64_t *>(t_data.getMem({coyote::CoyoteAllocType::HPF, mlen}));
+        fsrc = static_cast<uint64_t *>(t_data.getMem({coyote::CoyoteAllocType::HPF, FSLOTS * 8}));
+        if (!psrc || !fsrc) { printf("FAIL: no host memory\n"); return 1; }
+        for (uint64_t i = 0; i < mlen / 8; i++) psrc[i] = pattern(8 * i, side);
+        q = std::make_unique<ptq::Queue>(ptq_dev);
+        hs = q->reg_host(psrc, mlen);
+        hf = q->reg_host(fsrc, FSLOTS * 8);
+        uint64_t ulen = 0;
+        hu = q->reg_uwin(&ulen);
+        if (ptq_user && !q->enable_user()) { printf("FAIL: PTDMA user mode refused (no translating IOMMU?)\n"); return 1; }
+        if (ulen < mlen + 4096) { printf("FAIL: the uwin is smaller than message + flag\n"); return 1; }
+    } else {
     void *uva = loom_switch::reserve_va(mlen + 4096);
-    v80.importDmabuf(t_qp.exportDmabuf(EXPORT_REGION_UWIN, 0, mlen + 4096), uva);
+    v80->importDmabuf(t_qp.exportDmabuf(EXPORT_REGION_UWIN, 0, mlen + 4096), uva);
     uint8_t *peer_msg = static_cast<uint8_t *>(uva), *peer_flag = peer_msg + mlen;
 
-    uint64_t *src = static_cast<uint64_t *>(v80.getMem({coyote::CoyoteAllocType::HPF, mlen}));
+    uint64_t *src = static_cast<uint64_t *>(v80->getMem({coyote::CoyoteAllocType::HPF, mlen}));
     for (uint64_t i = 0; i < mlen / 8; i++) src[i] = pattern(8 * i, side);
-    v80.invoke(coyote::CoyoteOper::LOCAL_OFFLOAD, coyote::syncSg{src, mlen});
+    v80->invoke(coyote::CoyoteOper::LOCAL_OFFLOAD, coyote::syncSg{src, mlen});
     // stamps go to host memory (read here with no sync: a sync would unmap
     // card pages and the next run's first access would fault, ms); a card
     // SIGNAL at the end of the program waits for them to complete
-    volatile uint64_t *st = static_cast<uint64_t *>(v80.getMem({coyote::CoyoteAllocType::HPF, 2 * ROUNDS * 8}));
-    uint64_t *drain = static_cast<uint64_t *>(v80.getMem({coyote::CoyoteAllocType::HPF, 4096}));
-    v80.invoke(coyote::CoyoteOper::LOCAL_OFFLOAD, coyote::syncSg{drain, 4096});
+    st = static_cast<uint64_t *>(v80->getMem({coyote::CoyoteAllocType::HPF, 2 * ROUNDS * 8}));
+    uint64_t *drain = static_cast<uint64_t *>(v80->getMem({coyote::CoyoteAllocType::HPF, 4096}));
+    v80->invoke(coyote::CoyoteOper::LOCAL_OFFLOAD, coyote::syncSg{drain, 4096});
 
-    ce_prog::Program p(v80);
+    pr = std::make_unique<ce_prog::Program>(*v80);
+    ce_prog::Program &p = *pr;
     if (host) {   // one round: the message, then the flag (value 1 + RUN_BASE)
         if (size) p.add(ce_prog::copy(src, peer_msg, size));
         p.add(ce_prog::signal(peer_flag, 1));
@@ -205,11 +238,26 @@ int main(int argc, char **argv) {
     }
     if (!server && !host) p.add(ce_prog::signal(drain, 0, true));   // after every stamp landed
     p.load();
+    }
     printf("%s: up; %lu B messages, %d rounds a run, %d runs (the first a warm-up)%s\n",
            server ? "server" : "client", (unsigned long) size, ROUNDS, runs,
-           host ? "; --host: CPU-started rounds, landing in host memory" : "");
+           pt ? (std::string("; --engine ptdma ") + ptq_dev + (ptq_user ? " (user mode)" : " (ioctl)") + ": host memory, PTDMA push").c_str()
+              : host ? "; --host: CPU-started rounds, landing in host memory" : "");
+    // one round's send: a V80 program run, or one PTDMA submit (message, then the flag v)
+    auto start_round = [&](uint64_t v) {
+        if (!pt) { pr->start(v - 1); return; }
+        fsrc[fslot] = v;
+        ptq_copy cs[2];
+        uint32_t n = 0;
+        if (size) cs[n++] = {hs, hu, 0, 0, size};
+        cs[n++] = {hf, hu, uint64_t(fslot) * 8, mlen, 8};
+        fslot = (fslot + 1) % FSLOTS;
+        q->submit(cs, n);
+    };
+    auto finish_round = [&]() { return pt || pr->finish(std::chrono::milliseconds(1000)); };
 
     std::vector<double> oneway;   // ns, counted runs
+    std::vector<double> post_ns;  // --host client: the CPU's time to start a round (the program start), counted runs
     int errors = 0;
     for (int r = 0; r < runs && host; r++) {
         char go = 1;   // both sides ready before the run (the server arms by polling)
@@ -226,15 +274,17 @@ int main(int argc, char **argv) {
             };
             if (server) {
                 if (!spin(v)) { printf("FAIL run %d round %d: no flag %lu\n", r, i, (unsigned long) v); return 1; }
-                p.start(v - 1);
-                if (!p.finish(std::chrono::milliseconds(1000))) { printf("FAIL: program\n"); return 1; }   // off the timed path
+                start_round(v);
+                if (!finish_round()) { printf("FAIL: program\n"); return 1; }   // off the timed path
             } else {
                 const auto t0 = std::chrono::steady_clock::now();
-                p.start(v - 1);
+                start_round(v);
+                const auto tp = std::chrono::steady_clock::now();
                 if (!spin(v)) { printf("FAIL run %d round %d: no reply %lu\n", r, i, (unsigned long) v); return 1; }
                 const auto t1 = std::chrono::steady_clock::now();
                 run_ns.push_back(std::chrono::duration<double, std::nano>(t1 - t0).count() / 2);
-                if (!p.finish(std::chrono::milliseconds(1000))) { printf("FAIL: program\n"); return 1; }  // untimed
+                if (r) post_ns.push_back(std::chrono::duration<double, std::nano>(tp - t0).count());
+                if (!finish_round()) { printf("FAIL: program\n"); return 1; }  // untimed
             }
         }
         if (!server) {
@@ -248,6 +298,7 @@ int main(int argc, char **argv) {
     for (int r = 0; r < runs && !host; r++) {
         const uint64_t base = uint64_t(r) * ROUNDS;
         char go = 1;
+        ce_prog::Program &p = *pr;
         if (server) {
             p.start(base);                                   // armed: waits for the client's first flag
             if (!write_full(fd, &go, 1)) { printf("FAIL: armed\n"); return 1; }
@@ -257,7 +308,7 @@ int main(int argc, char **argv) {
         }
         const bool ok = p.finish(std::chrono::milliseconds(5000));
         if (!ok) { printf("FAIL run %d: the program did not finish (aborted at entry %lu)\n", r,
-                          (unsigned long) v80.getCSR(ce_prog::PC)); errors++; break; }
+                          (unsigned long) v80->getCSR(ce_prog::PC)); errors++; break; }
         if (!server) {
             std::vector<double> run_ns;
             for (int i = 0; i < ROUNDS; i++) run_ns.push_back(double(st[2 * i + 1] - st[2 * i]) * ce_prog::CLK_NS / 2);
@@ -269,6 +320,11 @@ int main(int argc, char **argv) {
         if (!write_full(fd, &done, 1) || !read_full(fd, &done, 1)) { printf("FAIL: barrier\n"); return 1; }
     }
 
+    if (pt) {   // every push out before the buffers are checked and released
+        const auto tw = std::chrono::steady_clock::now();
+        while (!q->done(q->seq()))
+            if (std::chrono::steady_clock::now() - tw > std::chrono::seconds(2)) { printf("FAIL: the PTDMA queue did not drain\n"); return 1; }
+    }
     // The last message that landed here, and the flag
     const uint64_t *got = host_msg;
     if (!host) { L->pull(); got = L->buf; }
@@ -289,8 +345,13 @@ int main(int argc, char **argv) {
             FILE *f = fopen(out.c_str(), "w");
             if (f) { for (double v : oneway) fprintf(f, "%.1f\n", v); fclose(f); }
         }
+        if (!post_ns.empty())
+            printf("post %lu B (ns, %zu samples): p0 %.0f  p50 %.0f  p90 %.0f  p99 %.0f  max %.0f  (CPU time to start a round)\n",
+                   (unsigned long) size, post_ns.size(), pct(post_ns, 0), pct(post_ns, 50), pct(post_ns, 90), pct(post_ns, 99),
+                   pct(post_ns, 100));
     }
     ::close(fd);
+    q.reset();      // unmaps this host's buffers from the engine before they are freed
     loom_switch::release_window(t_qp, 1);
     loom_switch::release_window(t_qp, 2);
     loom_switch::release_export(t_qp, 1);

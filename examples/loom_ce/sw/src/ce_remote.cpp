@@ -72,6 +72,11 @@
  * through its own window (one 8 B CPU store), and the client polls it: "ack back" = first program start to the ack
  * seen on the sender. A V80 landing timed by --trace 2 ends at the expected W-beat count (not 2 ms quiet).
  *
+ * --engine ptdma (2026-10-19, client only; the server is unchanged): no V80 on the sending host. The source is
+ * this host's memory and an AMD PTDMA engine (ptdma_q, as ce_coll --engine ptdma) pushes the burst (B copies of
+ * the size, batches of up to 64 per submit) and the 8 B fence behind it on the same queue into the server's
+ * buffers; "copies done" = the engine finished, then (--ack) the server's ack. --ptq DEV, --ptq-user (amy, rose).
+ *
  * The QP port is N, the hello's TCP port N + 1 (N defaults to Coyote's).
  * --window sets the client's ack window (packets unacked, TX_CTL; 16 after
  * reset). Each side prints where its switch's cycles went during a copy:
@@ -102,6 +107,7 @@
 #include "ce_prog.hpp"
 #include "land_v80.hpp"
 #include "loom_switch.hpp"
+#include "ptq.hpp"
 
 namespace {
 
@@ -562,12 +568,16 @@ struct BiDone  { uint64_t bad; double wait_us; uint64_t ce_cycles; };
 
 uint64_t bi_pattern(uint64_t off, uint64_t rep, int side) { return pattern(off, rep) ^ (uint64_t(side + 1) << 40); }
 
-int run_bidir(const std::string &ip, uint16_t port, uint64_t size, int reps, int window, bool send) {
+// --engine ptdma (2026-10-20): this side's source is host memory and an AMD PTDMA engine pushes it (one copy of SIZE, then the
+// 8 B fence behind it on the same queue, as run_client --engine ptdma); the sender waits until the engine is done.
+int run_bidir(const std::string &ip, uint16_t port, uint64_t size, int reps, int window, bool send,
+              bool pt = false, const std::string &ptq_dev = "", bool ptq_user = false) {
     const bool server = ip.empty();
     const int me = server ? 0 : 1, peer = 1 - me;
     coyote::cThread t_qp(0, getpid(), 0, nullptr, "coyote_fpga");     // QP owner, CSR page, rdma windows
     coyote::cThread t_data(0, getpid(), 0, nullptr, "coyote_fpga");   // owns the landing buffers
-    coyote::cThread v80(0, getpid(), 0, nullptr, "coyote_versal_fpga");
+    std::optional<coyote::cThread> v80o;                               // not opened for --engine ptdma
+    if (!pt) v80o.emplace(0, getpid(), 0, nullptr, "coyote_versal_fpga");
     printf("%s: QP exchange on port %u ...\n", server ? "server" : "client", port);
     void *staging = server ? t_qp.initRDMA(STAGING_SIZE, port) : t_qp.initRDMA(STAGING_SIZE, port, ip.c_str());
     if (!staging) { printf("FAIL: initRDMA\n"); return 1; }
@@ -615,17 +625,44 @@ int run_bidir(const std::string &ip, uint16_t port, uint64_t size, int reps, int
     loom_switch::program_window(t_qp, 1, true, t_qp.getCtid(), reinterpret_cast<void *>(h.dst_va), size, 0, h.dst_ctid);
     loom_switch::program_window(t_qp, 2, true, t_qp.getCtid(), reinterpret_cast<void *>(h.fence_va), 4096, size, h.dst_ctid);
     const uint64_t win_len = size + 4096;
-    const int dfd = t_qp.exportDmabuf(EXPORT_REGION_UWIN, 0, win_len);
-    void *uva = loom_switch::reserve_va(win_len);
-    v80.importDmabuf(dfd, uva);
-    uint64_t *src = static_cast<uint64_t *>(v80.getMem({coyote::CoyoteAllocType::HPF, size}));
+    void *uva = nullptr;
+    uint64_t *src = nullptr;
+    std::optional<coyote::cThread> t_src;
+    std::unique_ptr<ptq::Queue> q;
+    constexpr uint32_t FSLOTS = 512;
+    uint64_t *fsrc = nullptr;
+    uint32_t hs = 0, hf = 0, hu = 0;
+    if (pt) {
+        t_src.emplace(0, getpid(), 0, nullptr, "coyote_fpga");
+        src = static_cast<uint64_t *>(t_src->getMem({coyote::CoyoteAllocType::HPF, size}));
+        fsrc = static_cast<uint64_t *>(t_src->getMem({coyote::CoyoteAllocType::HPF, FSLOTS * 8}));
+        if (!src || !fsrc) { printf("FAIL: no host memory\n"); return 1; }
+        q = std::make_unique<ptq::Queue>(ptq_dev);
+        hs = q->reg_host(src, size);
+        hf = q->reg_host(fsrc, FSLOTS * 8);
+        uint64_t ulen = 0;
+        hu = q->reg_uwin(&ulen);
+        if (ptq_user && !q->enable_user()) { printf("FAIL: PTDMA user mode refused (no translating IOMMU?)\n"); return 1; }
+        if (ulen < win_len) { printf("FAIL: the uwin is smaller than size + fence page\n"); return 1; }
+        printf("%s: --engine ptdma %s (%s), source in host memory\n", server ? "server" : "client", ptq_dev.c_str(),
+               ptq_user ? "user mode" : "ioctl");
+    } else {
+        const int dfd = t_qp.exportDmabuf(EXPORT_REGION_UWIN, 0, win_len);
+        uva = loom_switch::reserve_va(win_len);
+        v80o->importDmabuf(dfd, uva);
+        src = static_cast<uint64_t *>(v80o->getMem({coyote::CoyoteAllocType::HPF, size}));
+    }
     printf("%s: up; sending %s, receiving from a peer that %s\n", server ? "server" : "client",
            send ? "yes" : "no", "announces per copy");
 
     volatile uint64_t *vfence = fence;
     int errors = 0;
     for (int r = 0; r < reps; r++) {
-        if (send) {
+        if (send && pt) {
+            for (uint64_t i = 0; i < size / 8; i++) src[i] = bi_pattern(8 * i, r, me);
+            fsrc[r % FSLOTS] = uint64_t(r + 1);
+        } else if (send) {
+            coyote::cThread &v80 = *v80o;
             for (uint64_t i = 0; i < size / 8; i++) src[i] = bi_pattern(8 * i, r, me);
             v80.invoke(coyote::CoyoteOper::LOCAL_OFFLOAD, coyote::syncSg{src, size});
             v80.setCSR(reinterpret_cast<uint64_t>(src), SRC_VA);
@@ -639,13 +676,19 @@ int run_bidir(const std::string &ip, uint16_t port, uint64_t size, int reps, int
         const Counters k0 = Counters::read(t_qp);
 
         // Barrier: exchange what each side will do, then both start
-        BiGo g{uint64_t(r), send ? v80.getCSR(COPIES) + 1 : 0, uint32_t(send), 0}, pg{};
+        BiGo g{uint64_t(r), !send ? 0 : pt ? uint64_t(r + 1) : v80o->getCSR(COPIES) + 1, uint32_t(send), 0}, pg{};
         if (!write_full(fd, &g, sizeof(g)) || !read_full(fd, &pg, sizeof(pg)) || pg.rep != uint64_t(r)) {
             printf("FAIL: barrier\n");
             return 1;
         }
         const auto t0 = std::chrono::steady_clock::now();
-        if (send) v80.setCSR(1, START);
+        if (send && pt) {
+            ptq_copy c1{hs, hu, 0, 0, size};
+            q->submit(&c1, 1);
+            q->copy(hf, uint64_t(r % FSLOTS) * 8, hu, size, 8);    // the fence, behind the data on the same queue
+        } else if (send) {
+            v80o->setCSR(1, START);
+        }
 
         BiDone d{0, 0, 0};
         if (pg.send) {
@@ -662,9 +705,13 @@ int run_bidir(const std::string &ip, uint16_t port, uint64_t size, int reps, int
             else
                 d.bad = size / 8;
         }
-        if (send) {
-            while (v80.getCSR(BUSY) && std::chrono::steady_clock::now() - t0 < std::chrono::seconds(5)) _mm_pause();
-            d.ce_cycles = v80.getCSR(CYCLES);
+        if (send && pt) {   // ce_cycles = the engine's time in 4 ns units (as V80 cycles at 250 MHz), on this host's clock
+            while (!q->done(q->seq()) && std::chrono::steady_clock::now() - t0 < std::chrono::seconds(5)) _mm_pause();
+            if (!q->done(q->seq())) { printf("FAIL copy %d: the PTDMA queue did not finish\n", r); return 1; }
+            d.ce_cycles = uint64_t(std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now() - t0).count() / 4);
+        } else if (send) {
+            while (v80o->getCSR(BUSY) && std::chrono::steady_clock::now() - t0 < std::chrono::seconds(5)) _mm_pause();
+            d.ce_cycles = v80o->getCSR(CYCLES);
         }
         const loom_switch::IngressCounters c1 = loom_switch::IngressCounters::read(t_qp);
         const Counters k1 = Counters::read(t_qp);
@@ -676,7 +723,8 @@ int run_bidir(const std::string &ip, uint16_t port, uint64_t size, int reps, int
         printf("%s copy %d: ", bad ? "FAIL" : "ok  ", r);
         if (pg.send) printf("in %lu B landed %.1f us after its first data (%.2f GB/s), %lu words wrong; ",
                             (unsigned long) size, d.wait_us, size / d.wait_us / 1e3, (unsigned long) d.bad);
-        if (send)    printf("out: CE %lu cycles (%.2f GB/s), the peer saw it land %.1f us after its first data (%.2f GB/s), %lu words wrong",
+        if (send)    printf(pt ? "out: PTDMA done after %lu x 4 ns (%.2f GB/s), the peer saw it land %.1f us after its first data (%.2f GB/s), %lu words wrong"
+                               : "out: CE %lu cycles (%.2f GB/s), the peer saw it land %.1f us after its first data (%.2f GB/s), %lu words wrong",
                             (unsigned long) d.ce_cycles, size / (d.ce_cycles * 4e-9) / 1e9, pd.wait_us,
                             pd.wait_us > 0 ? size / pd.wait_us / 1e3 : 0.0, (unsigned long) pd.bad);
         printf("\n");
@@ -690,6 +738,7 @@ int run_bidir(const std::string &ip, uint16_t port, uint64_t size, int reps, int
         *vfence = 0;
     }
     ::close(fd);
+    q.reset();      // unmaps the source from the engine before it is freed
     loom_switch::release_window(t_qp, 1);
     loom_switch::release_window(t_qp, 2);
     loom_switch::release_export(t_qp, 1);
@@ -700,9 +749,10 @@ int run_bidir(const std::string &ip, uint16_t port, uint64_t size, int reps, int
 }
 
 int run_client(const std::string &ip, uint16_t port, int reps, int window, unsigned gap_ms, bool no_refill, int burst,
-               bool prog, bool ack) {
+               bool prog, bool ack, bool pt, const std::string &ptq_dev, bool ptq_user) {
     coyote::cThread u280(0, getpid(), 0, nullptr, "coyote_fpga");     // QP owner and CSR page
-    coyote::cThread v80(0, getpid(), 0, nullptr, "coyote_versal_fpga");
+    std::optional<coyote::cThread> v80;                                // not opened for --engine ptdma
+    if (!pt) v80.emplace(0, getpid(), 0, nullptr, "coyote_versal_fpga");
     void *staging = u280.initRDMA(STAGING_SIZE, port, ip.c_str());
     if (!staging) { printf("FAIL: initRDMA\n"); return 1; }
     printf("client: QP up\n");
@@ -746,11 +796,33 @@ int run_client(const std::string &ip, uint16_t port, int reps, int window, unsig
                                 4096, size, h.dst_ctid);
 
     const uint64_t win_len = size + 4096;
-    const int dfd = u280.exportDmabuf(EXPORT_REGION_UWIN, 0, win_len);
-    void *uva = loom_switch::reserve_va(win_len);
-    v80.importDmabuf(dfd, uva);
-
-    uint64_t *src = static_cast<uint64_t *>(v80.getMem({coyote::CoyoteAllocType::HPF, size}));
+    void *uva = nullptr;
+    uint64_t *src = nullptr;
+    // --engine ptdma: this host's source and fence words, the queue (destroyed before t_data's memory... here u280's)
+    std::optional<coyote::cThread> t_src;
+    std::unique_ptr<ptq::Queue> q;
+    constexpr uint32_t FSLOTS = 512;
+    uint64_t *fsrc = nullptr;
+    uint32_t hs = 0, hf = 0, hu = 0;
+    if (pt) {
+        t_src.emplace(0, getpid(), 0, nullptr, "coyote_fpga");
+        src = static_cast<uint64_t *>(t_src->getMem({coyote::CoyoteAllocType::HPF, size}));
+        fsrc = static_cast<uint64_t *>(t_src->getMem({coyote::CoyoteAllocType::HPF, FSLOTS * 8}));
+        if (!src || !fsrc) { printf("FAIL: no host memory\n"); return 1; }
+        q = std::make_unique<ptq::Queue>(ptq_dev);
+        hs = q->reg_host(src, size);
+        hf = q->reg_host(fsrc, FSLOTS * 8);
+        uint64_t ulen = 0;
+        hu = q->reg_uwin(&ulen);
+        if (ptq_user && !q->enable_user()) { printf("FAIL: PTDMA user mode refused (no translating IOMMU?)\n"); return 1; }
+        if (ulen < win_len) { printf("FAIL: the uwin is smaller than size + fence page\n"); return 1; }
+        printf("client: --engine ptdma %s (%s), source in host memory\n", ptq_dev.c_str(), ptq_user ? "user mode" : "ioctl");
+    } else {
+        const int dfd = u280.exportDmabuf(EXPORT_REGION_UWIN, 0, win_len);
+        uva = loom_switch::reserve_va(win_len);
+        v80->importDmabuf(dfd, uva);
+        src = static_cast<uint64_t *>(v80->getMem({coyote::CoyoteAllocType::HPF, size}));
+    }
     int errors = 0;
 
     // --prog: K copies and the fence, run burst / K times
@@ -758,7 +830,8 @@ int run_client(const std::string &ip, uint16_t port, int reps, int window, unsig
     std::optional<ce_prog::Program> pg;
     if (prog) {
         if (burst % K) { printf("FAIL: --prog needs the burst a multiple of %d\n", K); return 1; }
-        pg.emplace(v80);
+        if (pt) { printf("FAIL: --prog is a V80 program (not with --engine ptdma)\n"); return 1; }
+        pg.emplace(*v80);
         pg->add(ce_prog::signal(static_cast<uint8_t *>(uva) + size + 64, 0));   // start: ahead of the data
         for (int k = 0; k < K; k++) pg->add(ce_prog::copy(src, uva, size));
         pg->add(ce_prog::signal(static_cast<uint8_t *>(uva) + size, 0));        // the fence
@@ -767,19 +840,58 @@ int run_client(const std::string &ip, uint16_t port, int reps, int window, unsig
     }
     for (int r = 0; r < reps; r++) {
         if (gap_ms) usleep(gap_ms * 1000);
+        if (pt) {   // the burst and its fence as PTDMA pushes from host memory
+            if (!no_refill || r == 0) for (uint64_t i = 0; i < size / 8; i++) src[i] = pattern(8 * i, r);
+            const uint64_t fence = uint64_t(r + 1) * uint64_t(burst);
+            fsrc[r % FSLOTS] = fence;
+            Announce an{no_refill ? 0 : uint64_t(r), fence, size * uint64_t(burst), 0};
+            write_full(fd, &an, sizeof(an));
+            const auto b0 = std::chrono::steady_clock::now();
+            ptq_copy cs[PTQ_MAX_BATCH];
+            for (int k = 0; k < burst;) {
+                const int n = std::min(burst - k, int(PTQ_MAX_BATCH));
+                for (int j = 0; j < n; j++) cs[j] = {hs, hu, 0, 0, size};
+                q->submit(cs, uint32_t(n));
+                k += n;
+            }
+            q->copy(hf, uint64_t(r % FSLOTS) * 8, hu, size, 8);    // the fence, behind the data on the same queue
+            const auto bs = std::chrono::steady_clock::now();
+            while (!q->done(q->seq()) && std::chrono::steady_clock::now() - b0 < std::chrono::seconds(5)) _mm_pause();
+            if (!q->done(q->seq())) { printf("FAIL copy %d: the PTDMA queue did not finish\n", r); return 1; }
+            const auto b1 = std::chrono::steady_clock::now();
+            double ack_us = 0;
+            if (ack) {
+                while (*ackw < uint64_t(r + 1) && std::chrono::steady_clock::now() - b0 < std::chrono::seconds(5)) _mm_pause();
+                if (*ackw < uint64_t(r + 1)) { printf("FAIL copy %d: no ack from the server (ack word %lu)\n", r, (unsigned long) *ackw); return 1; }
+                ack_us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - b0).count();
+            }
+            Verdict v{};
+            if (!read_full(fd, &v, sizeof(v))) { printf("FAIL: the server went away\n"); return 1; }
+            const uint64_t bytes = size * uint64_t(burst);
+            const double sub_us = std::chrono::duration<double, std::micro>(bs - b0).count();
+            const double burst_us = std::chrono::duration<double, std::micro>(b1 - b0).count();
+            printf("%s copy %d: %d x %lu bytes, server: fence %.1f us after the first data (%.2f GB/s), %lu words wrong; "
+                   "here: copies done %.1f us after the first start (%.2f GB/s); submitted in %.1f us (PTDMA)\n",
+                   (v.bad ? "FAIL" : "ok  "), r, burst, (unsigned long) size, v.wait_us, bytes / v.wait_us / 1e3,
+                   (unsigned long) v.bad, burst_us, bytes / burst_us / 1e3, sub_us);
+            if (ack)
+                printf("     ack back %.1f us after the first start (%.2f GB/s sender-seen)\n", ack_us, bytes / ack_us / 1e3);
+            errors += (v.bad != 0);
+            continue;
+        }
         // --no-refill: the source is filled and offloaded once (copy 0's
         // pattern every time)
         if (!no_refill || r == 0) {
             for (uint64_t i = 0; i < size / 8; i++) src[i] = pattern(8 * i, r);
-            v80.invoke(coyote::CoyoteOper::LOCAL_OFFLOAD, coyote::syncSg{src, size});
+            v80->invoke(coyote::CoyoteOper::LOCAL_OFFLOAD, coyote::syncSg{src, size});
         }
 
-        const uint64_t fence = v80.getCSR(COPIES) + uint64_t(burst);
+        const uint64_t fence = v80->getCSR(COPIES) + uint64_t(burst);
         loom_switch::IngressCounters c0 = loom_switch::IngressCounters::read(u280);
         const uint64_t cut0 = loom_switch::csr_read(u280, 121);   // partial rdma packets cut by a write
         const Counters k0 = Counters::read(u280);
         uint64_t e0[3];
-        snap(v80, e0, 48, 3);
+        snap(*v80, e0, 48, 3);
         // --prog: run i signals start and fence as fence - (R - 1 - i), so run
         // 0's start is the first start, the last run's fence the fence
         Announce an{no_refill ? 0 : uint64_t(r), fence, size * uint64_t(burst),
@@ -790,12 +902,12 @@ int run_client(const std::string &ip, uint16_t port, int reps, int window, unsig
             if (!read_full(fd, &armed, 1)) { printf("FAIL: the server did not arm\n"); return 1; }
         }
 
-        v80.setCSR(reinterpret_cast<uint64_t>(src), SRC_VA);
-        v80.setCSR(reinterpret_cast<uint64_t>(uva), DST_VA);
-        v80.setCSR(size, LEN);
-        v80.setCSR(v80.getCtid(), PID);
-        v80.setCSR(reinterpret_cast<uint64_t>(uva) + size, FENCE_VA);
-        v80.setCSR(0, DIRECTION);   // a put; DIRECTION outlives a ce_get run
+        v80->setCSR(reinterpret_cast<uint64_t>(src), SRC_VA);
+        v80->setCSR(reinterpret_cast<uint64_t>(uva), DST_VA);
+        v80->setCSR(size, LEN);
+        v80->setCSR(v80->getCtid(), PID);
+        v80->setCSR(reinterpret_cast<uint64_t>(uva) + size, FENCE_VA);
+        v80->setCSR(0, DIRECTION);   // a put; DIRECTION outlives a ce_get run
         // --burst: the next copy as soon as the engine is free (the
         // registers stay; the fence takes each copy's count)
         const auto b0 = std::chrono::steady_clock::now();
@@ -810,10 +922,10 @@ int run_client(const std::string &ip, uint16_t port, int reps, int window, unsig
             }
         } else {
             for (int k = 0; k < burst; k++) {
-                if (k) do busy_reads++; while (v80.getCSR(BUSY));
-                v80.setCSR(1, START);
+                if (k) do busy_reads++; while (v80->getCSR(BUSY));
+                v80->setCSR(1, START);
             }
-            while (v80.getCSR(BUSY)) _mm_pause();
+            while (v80->getCSR(BUSY)) _mm_pause();
         }
         const auto b1 = std::chrono::steady_clock::now();
         const double burst_us = std::chrono::duration<double, std::micro>(b1 - b0).count();
@@ -834,7 +946,7 @@ int run_client(const std::string &ip, uint16_t port, int reps, int window, unsig
                "here: copies done %.1f us after the first start (%.2f GB/s); CE %lu cycles (the last copy); "
                "%.2f BUSY reads a copy\n",
                (v.bad ? "FAIL" : "ok  "), r, burst, (unsigned long) size, v.wait_us, bytes / v.wait_us / 1e3,
-               (unsigned long) v.bad, burst_us, bytes / burst_us / 1e3, (unsigned long) v80.getCSR(CYCLES),
+               (unsigned long) v.bad, burst_us, bytes / burst_us / 1e3, (unsigned long) v80->getCSR(CYCLES),
                burst > 1 ? double(busy_reads) / (burst - 1) : 0.0);
         if (prog)
             printf("     program: %lu engine cycles for the %d runs (%.2f GB/s)\n", (unsigned long) run_cyc, burst / K,
@@ -858,7 +970,7 @@ int run_client(const std::string &ip, uint16_t port, int reps, int window, unsig
         printf("     U280 ingress debug:\n");
         loom_switch::print_ingress_delta(c0, c1, loom_switch::I_DBG, loom_switch::N_ING - loom_switch::I_DBG);
         printf("     V80 copy engine:\n");
-        print_v80_words(v80, e0, 48, 3, CE_NAMES);
+        print_v80_words(*v80, e0, 48, 3, CE_NAMES);
         errors += (v.bad != 0);
     }
     Announce done{~0ULL, 0, 0};
@@ -866,6 +978,7 @@ int run_client(const std::string &ip, uint16_t port, int reps, int window, unsig
     ::close(fd);
     loom_switch::release_window(u280, 1);
     loom_switch::release_window(u280, 2);
+    q.reset();      // unmaps the source from the engine before it is freed
     if (ack) loom_switch::release_export(u280, 3);
     u280.connSync(true);
     printf(errors ? "G4 FAIL (client)\n" : "G4 PASS (client)\n");
@@ -890,6 +1003,8 @@ int main(int argc, char **argv) {
     bool prog = false, no_stamp = false, ack = false;
     int trace = 0;
     uint64_t msg = 1ULL << 20;
+    std::string engine = "v80", ptq_dev = "/dev/ptq_0000_e8_00_2";
+    bool ptq_user = false;
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         if (a == "--server")                     server = true;
@@ -916,17 +1031,21 @@ int main(int argc, char **argv) {
         else if (a == "--no-stamp")               no_stamp = true;   // a V80 landing timed as without --prog (A/B)
         else if (a == "--trace" && i + 1 < argc)  trace = atoi(argv[++i]);   // with --land-v80 --no-stamp: counter clock
         else if (a == "--ack")                    ack = true;   // the sender waits for the receiver's ack (both sides)
+        else if (a == "--engine" && i + 1 < argc) engine = argv[++i];   // client: v80 | ptdma
+        else if (a == "--ptq" && i + 1 < argc)    ptq_dev = argv[++i];
+        else if (a == "--ptq-user")               ptq_user = true;
         else { server = false; ip.clear(); break; }
     }
+    if (engine != "v80" && engine != "ptdma") server = false, ip.clear(), bidir = false;
     if (server == !ip.empty() || burst < 1 || size == 0 || size % 4096 || size > (64ULL << 20) || land_off % 64 || land_off >= 4096) {
-        printf("usage: %s --server [--port N] [--size BYTES] [--land-v80 [--land-offset B] [--poll-us U] [--no-stamp [--trace 1|2]]] | --client <server_ip> [--port N] [--reps N] [--window P] [--burst B [--prog]] [--ack]\n"
+        printf("usage: %s --server [--port N] [--size BYTES] [--land-v80 [--land-offset B] [--poll-us U] [--no-stamp [--trace 1|2]]] | --client <server_ip> [--port N] [--reps N] [--window P] [--burst B [--prog]] [--ack] [--engine v80|ptdma [--ptq DEV] [--ptq-user]]\n"
                "       | --passive [--port N] [--size BYTES] [--msg BYTES] [--reps N] [--land-v80 [--discard]]  (landing for a plain RDMA sender)\n"
                "       | --bidir-server | --bidir-client <server_ip>  [--port N] [--size BYTES] [--reps N] [--window P] [--no-send]\n"
                "       (size: a multiple of 4 KiB, at most 64 MiB)\n", argv[0]);
         return 2;
     }
     if (passive) return run_passive(port, size, land, msg, reps, discard, self && !land);
-    if (bidir) return run_bidir(server ? std::string() : ip, port, size, reps, window, !no_send);
+    if (bidir) return run_bidir(server ? std::string() : ip, port, size, reps, window, !no_send, engine == "ptdma", ptq_dev, ptq_user);
     return server ? run_server(port, size, land, land_off, poll_us, no_touch, no_stamp, self && !land, trace, ack)
-                  : run_client(ip, port, reps, window, gap_ms, no_refill, burst, prog, ack);
+                  : run_client(ip, port, reps, window, gap_ms, no_refill, burst, prog, ack, engine == "ptdma", ptq_dev, ptq_user);
 }
