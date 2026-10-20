@@ -11,6 +11,8 @@
 #   host               amy, rose or clara (clara has no V80)
 #   v80.pdi = -        the V80s are programmed already (e.g. after a JTAG + warm-reboot recovery, or
 #                      when a V80's JTAG cable is gone): only reload their driver
+#   v80.pdi = none     (2026-10-20, owner: the V80s are no longer used) leave the V80s alone: no programming, no driver
+#                      (its driver stays unloaded), no V80 checks; the host is set up as clara is (U280 only)
 #
 # Exclusive use: amy/rose are claimed with hosthog for the setup (scripts/fpga/hosthog_loom.sh; HOG_MIN, default
 # 20) unless the calling script already holds the claim; it stops if someone else holds one.
@@ -55,6 +57,7 @@ U280_BDF=0000:e1:00.0
 if [ "${1:-}" = --here ]; then
     STAGE=$2; BIT=$3; PDI=$4
     H=$(hostname)
+    [ "$PDI" = none ] && unset "V80_BDF[$H]"   # U280 only (2026-10-20)
     source "$STAGE/vivado_env.sh"
     fail() { echo "SETUP FAILED $H: $*"; exit 1; }
     KREL=$(uname -r)
@@ -78,7 +81,7 @@ if [ "${1:-}" = --here ]; then
     [ -n "${U280_IP[$H]:-}" ] || fail "unknown host"
     [ -f "$BIT" ] || fail "no U280 image $BIT"
     [ -z "${V80_BDF[$H]:-}" ] || [ "$PDI" = - ] || [ -f "$PDI" ] || fail "no V80 image $PDI"
-    PDI_ID=$([ "$PDI" = - ] && echo "as programmed" || echo "$PDI ($(md5sum < $PDI | cut -c1-8))")
+    PDI_ID=$([ "$PDI" = - ] && echo "as programmed" || { [ "$PDI" = none ] && echo "not used"; } || echo "$PDI ($(md5sum < $PDI | cut -c1-8))")
     echo "== $H $(date -u +%H:%M:%S): U280 $BIT ($(md5sum < $BIT | cut -c1-8))${V80_BDF[$H]:+, V80 $PDI_ID}"
 
     # 1, 2
@@ -183,8 +186,8 @@ fi
 [ $# -ge 3 ] || { sed -n '2,13p' "$0" >&2; exit 1; }
 HERE=$(cd "$(dirname "$0")" && pwd)
 REPO=$(git -C "$HERE" rev-parse --show-toplevel)
-BIT=$(readlink -f "$1"); PDI=$([ "$2" = - ] && echo - || readlink -f "$2"); shift 2
-for f in "$BIT" $([ "$PDI" = - ] || echo "$PDI"); do
+BIT=$(readlink -f "$1"); PDI=$([ "$2" = - ] || [ "$2" = none ] && echo "$2" || readlink -f "$2"); shift 2
+for f in "$BIT" $([ "$PDI" = - ] || [ "$PDI" = none ] || echo "$PDI"); do
     case $f in "$HOME"/*) ;; *) echo "$f is not on the shared home; the hosts cannot see it" >&2; exit 1 ;; esac
     [ -f "$f" ] || { echo "no file $f" >&2; exit 1; }
 done
