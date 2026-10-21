@@ -15,25 +15,26 @@ import lynxTypes::*;
  * inline path); indices past N_EXP miss.
  */
 module loom_exports #(
-    parameter integer N_EXP = 16
+    parameter integer N_EXP    = 16,
+    parameter integer IDX_BITS = 8
 ) (
     input  logic                        aclk,
     input  logic                        aresetn,
 
     input  logic                        commit,
-    input  logic [7:0]                  prog_idx,
+    input  logic [IDX_BITS-1:0]         prog_idx,
     input  logic                        prog_valid,
     input  logic [PID_BITS-1:0]         prog_pid,
     input  logic [VADDR_BITS-1:0]       prog_base,
     input  logic [39:0]                 prog_len,
 
-    input  logic [7:0]                  a_idx,
+    input  logic [IDX_BITS-1:0]         a_idx,
     output logic                        a_hit,
     output logic [PID_BITS-1:0]         a_pid,
     output logic [VADDR_BITS-1:0]       a_base,
     output logic [39:0]                 a_len,
 
-    input  logic [7:0]                  b_idx,
+    input  logic [IDX_BITS-1:0]         b_idx,
     output logic                        b_hit,
     output logic [PID_BITS-1:0]         b_pid,
     output logic [VADDR_BITS-1:0]       b_base,
@@ -50,7 +51,7 @@ logic [39:0]           e_len   [N_EXP];
 always_ff @(posedge aclk) begin
     if (!aresetn) begin
         for (int i = 0; i < N_EXP; i++) e_valid[i] <= 1'b0;
-    end else if (commit && (prog_idx < 8'(N_EXP))) begin
+    end else if (commit && (int'(prog_idx) < N_EXP)) begin
         e_valid[prog_idx[IW-1:0]] <= prog_valid;
         e_pid  [prog_idx[IW-1:0]] <= prog_pid;
         e_base [prog_idx[IW-1:0]] <= prog_base;
@@ -59,11 +60,11 @@ always_ff @(posedge aclk) begin
 end
 
 always_comb begin
-    a_hit  = (a_idx < 8'(N_EXP)) && e_valid[a_idx[IW-1:0]];
+    a_hit  = (int'(a_idx) < N_EXP) && e_valid[a_idx[IW-1:0]];
     a_pid  = e_pid [a_idx[IW-1:0]];
     a_base = e_base[a_idx[IW-1:0]];
     a_len  = e_len [a_idx[IW-1:0]];
-    b_hit  = (b_idx < 8'(N_EXP)) && e_valid[b_idx[IW-1:0]];
+    b_hit  = (int'(b_idx) < N_EXP) && e_valid[b_idx[IW-1:0]];
     b_pid  = e_pid [b_idx[IW-1:0]];
     b_base = e_base[b_idx[IW-1:0]];
     b_len  = e_len [b_idx[IW-1:0]];

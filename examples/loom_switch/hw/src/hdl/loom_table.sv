@@ -3,7 +3,7 @@ import lynxTypes::*;
 /**
  * loom_table (loom_switch)
  *
- * Window table: one entry per window (1..15; index 0 unused), shared by the
+ * Window table: one entry per window (1..N_WIN-1; index 0 unused), shared by the
  * two ways a producer names a window:
  *   - the AXI-Lite aperture: window = addr[15:12], 4 KB each (lu_* port)
  *   - the ingress window (uwin): a range [ustart, ustart + len) of the uwin,
@@ -27,14 +27,15 @@ import lynxTypes::*;
  * other.
  */
 module loom_table #(
-    parameter integer UWIN_BITS = 27
+    parameter integer UWIN_BITS = 27,
+    parameter integer N_WIN     = 16
 ) (
     input  logic                    aclk,
     input  logic                    aresetn,
 
     // Program port (from loom_ctrl)
     input  logic                    commit,
-    input  logic [3:0]              prog_idx,
+    input  logic [$clog2(N_WIN)-1:0] prog_idx,
     input  logic                    prog_valid,
     input  logic                    prog_route,
     input  logic [PID_BITS-1:0]     prog_pid,
@@ -44,7 +45,7 @@ module loom_table #(
     input  logic [UWIN_BITS-1:0]    prog_ustart,
 
     // Aperture lookup by index (combinational)
-    input  logic [3:0]              lu_idx,
+    input  logic [$clog2(N_WIN)-1:0] lu_idx,
     output logic                    lu_valid,
     output logic                    lu_route,
     output logic [PID_BITS-1:0]     lu_pid,
@@ -58,7 +59,7 @@ module loom_table #(
     input  logic                    ua_ce2,
     input  logic [UWIN_BITS-1:0]    ua_addr,
     output logic                    ua_hit,
-    output logic [3:0]              ua_idx,
+    output logic [$clog2(N_WIN)-1:0] ua_idx,
     output logic                    ua_route,
     output logic [PID_BITS-1:0]     ua_pid,
     output logic [PID_BITS-1:0]     ua_dst_pid,
@@ -78,7 +79,7 @@ module loom_table #(
     output logic [LEN_BITS:0]       ub_end
 );
 
-localparam integer N_WIN    = 16;
+localparam integer IW       = $clog2(N_WIN);
 localparam integer END_BITS = LEN_BITS + 1;
 
 logic                  e_valid [N_WIN];
@@ -120,10 +121,10 @@ always_ff @(posedge aclk) if (ua_ce1)
                      (END_BITS'(ua_addr) < e_end[i]);
 
 // Stage 2: the lowest hit and its entry
-logic [3:0] s1_idx;
+logic [IW-1:0] s1_idx;
 always_comb begin
-    s1_idx = 4'd0;
-    for (int i = N_WIN-1; i >= 1; i--) if (s1_hit[i]) s1_idx = 4'(i);
+    s1_idx = '0;
+    for (int i = N_WIN-1; i >= 1; i--) if (s1_hit[i]) s1_idx = IW'(i);
 end
 
 always_ff @(posedge aclk) if (ua_ce2) begin
@@ -144,10 +145,10 @@ always_ff @(posedge aclk) if (ub_ce1)
         t1_hit[i] <= (i != 0) && e_valid[i] && (ub_addr >= e_ustart[i]) &&
                      (END_BITS'(ub_addr) < e_end[i]);
 
-logic [3:0] t1_idx;
+logic [IW-1:0] t1_idx;
 always_comb begin
-    t1_idx = 4'd0;
-    for (int i = N_WIN-1; i >= 1; i--) if (t1_hit[i]) t1_idx = 4'(i);
+    t1_idx = '0;
+    for (int i = N_WIN-1; i >= 1; i--) if (t1_hit[i]) t1_idx = IW'(i);
 end
 
 always_ff @(posedge aclk) if (ub_ce2) begin
