@@ -6,7 +6,7 @@
 #   U280: ~/coyote-bitstreams/<stage_name>/hw/bitstreams/cyt_top.bit (+ .ltx)
 #   V80:  ~/coyote-bitstreams/<stage_name>/cyt_top.pdi
 #
-#   scripts/fpga/wait_build.sh <switch|ce> <build_name> [stage_name]
+#   scripts/fpga/wait_build.sh <switch|ce|rdma> <build_name> [stage_name]
 #
 # Exits 0 if the image exists. Run it in the background (it polls the tmux
 # session once a minute).
@@ -17,7 +17,8 @@ WHAT=$1 NAME=$2 STAGE=${3:-}
 case $WHAT in
     switch) B=$REPO/examples/loom_switch/hw/$NAME; IMG=$B/bitstreams/cyt_top.bit ;;
     ce)     B=$REPO/examples/loom_ce/hw/$NAME;     IMG=$B/bitstreams/cyt_top.pdi ;;
-    *) echo "first argument: switch or ce" >&2; exit 2 ;;
+    rdma)   B=$REPO/examples/09_perf_rdma/hw/$NAME; IMG=$B/bitstreams/cyt_top.bit ;;
+    *) echo "first argument: switch, ce or rdma" >&2; exit 2 ;;
 esac
 [ -d "$B" ] || { echo "no build directory $B" >&2; exit 2; }
 
@@ -36,7 +37,7 @@ if [ -n "$STAGE" ]; then
     if [ -e "$HOME/coyote-bitstreams/$STAGE" ]; then
         echo "NOT staged: ~/coyote-bitstreams/$STAGE exists (pick a new stage name)"; exit 0
     fi
-    if [ "$WHAT" = switch ]; then
+    if [ "$WHAT" != ce ]; then
         D=$HOME/coyote-bitstreams/$STAGE/hw/bitstreams
         mkdir -p "$D" && cp "$IMG" "$B/bitstreams/cyt_top.ltx" "$D/" && echo "staged: $D/cyt_top.bit"
     else
