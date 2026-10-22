@@ -144,6 +144,14 @@ logic [PID_BITS-1:0]    xa_pid, xb_pid;
 logic [VADDR_BITS-1:0]  xa_base, xb_base;
 logic [39:0]            xa_len, xb_len;
 logic cnt_wr_wait_local, cnt_wr_wait_rdma, cnt_wr_blk_ing, cnt_wr_blk_rx;
+
+// Stamps (stamp_rec, CSR words 224-240; points in loom_ctrl's map)
+localparam integer N_ST = 9, ST_DEPTH = 4096;
+logic                        st_arm;
+logic [3:0]                  st_pt;
+logic [$clog2(ST_DEPTH)-1:0] st_idx;
+logic [31:0]                 st_data, st_now;
+logic [N_ST-1:0][31:0]       st_cnt;
 /* verilator lint_off UNUSED */
 logic rx_busy;
 /* verilator lint_on UNUSED */
@@ -213,7 +221,8 @@ loom_ctrl inst_loom_ctrl (
             cnt_rx_drop, rx_cnt_store, rx_cnt_pkt}),
     // words 192+
     .cnt_y({1'b0, land_valid, cnt_rdw_stray, cnt_rdw_slot_wait, cnt_rdw_far_err, cnt_rdw_fail,
-            cnt_rdw_done, cnt_rdw_read})
+            cnt_rdw_done, cnt_rdw_read}),
+    .st_arm(st_arm), .st_pt(st_pt), .st_idx(st_idx), .st_data(st_data), .st_cnt(st_cnt), .st_now(st_now)
 );
 
 loom_exports inst_loom_exports (
@@ -422,6 +431,67 @@ always_comb begin
     axis_rreq_send[0].tvalid = !no_empty && (no_rd ? rd_tvalid : ing_net_tvalid);
     axis_rreq_send[0].tid    = '0;
 end
+
+// ---------------------------------------------------------------------------
+// Stamps: one event per point and packet (the first beat of a burst or
+// packet), for the per-stage latency breakdown
+// ---------------------------------------------------------------------------
+logic st_w_mid, st_tx_mid, st_rx_mid;
+wire  st_w    = axi_udata.wvalid && axi_udata.wready;
+wire  st_tx   = axis_rreq_send[0].tvalid && axis_rreq_send[0].tready;
+wire  st_rx   = axis_rrsp_recv[0].tvalid && axis_rrsp_recv[0].tready;
+wire  st_h    = axis_host_send[1].tvalid && axis_host_send[1].tready;
+wire  st_land = sq_wr.valid && sq_wr.ready && rx_takes_wr;
+
+always_ff @(posedge aclk) begin
+    if (!aresetn) begin
+        st_w_mid <= 1'b0; st_tx_mid <= 1'b0; st_rx_mid <= 1'b0;
+    end else begin
+        if (st_w)  st_w_mid  <= !axi_udata.wlast;
+        if (st_tx) st_tx_mid <= !axis_rreq_send[0].tlast;
+        if (st_rx) st_rx_mid <= !axis_rrsp_recv[0].tlast;
+    end
+end
+
+// The landing stream carries no tlast: its beats are paired with the landing
+// writes in post order (a write's beats = len / 64, rounded up; loom_rx
+// posts a write before its data and keeps at most 8 posted)
+localparam integer ST_HQ = 16;
+logic [LEN_BITS-1:0]     st_hq [ST_HQ];
+logic [$clog2(ST_HQ):0]  st_hq_wp, st_hq_rp;
+logic [LEN_BITS-1:0]     st_h_seen;
+wire  [LEN_BITS-1:0]     st_h_beats = st_hq[st_hq_rp[$clog2(ST_HQ)-1:0]];
+
+always_ff @(posedge aclk) begin
+    if (!aresetn) begin
+        st_hq_wp <= '0; st_hq_rp <= '0; st_h_seen <= '0;
+    end else begin
+        if (st_land) begin
+            st_hq[st_hq_wp[$clog2(ST_HQ)-1:0]] <= (sq_wr.data.len + 63) >> 6;
+            st_hq_wp <= st_hq_wp + 1'b1;
+        end
+        if (st_h) begin
+            if (st_h_seen + 1'b1 == st_h_beats) begin
+                st_h_seen <= '0;
+                st_hq_rp  <= st_hq_rp + 1'b1;
+            end else st_h_seen <= st_h_seen + 1'b1;
+        end
+    end
+end
+
+stamp_rec #(.N_PTS(N_ST), .DEPTH(ST_DEPTH)) inst_stamp_rec (
+    .aclk(aclk), .aresetn(aresetn),
+    .ev({cq_wr.valid && !cq_wr.data.remote && (cq_wr.data.dest == 1),   // 8 landing write completed
+         st_h && (st_h_seen == '0),                                     // 7 first landing beat out
+         st_land,                                                       // 6 landing write posted
+         st_rx && !st_rx_mid,                                           // 5 first beat from the stack
+         rq_wr.valid && rq_wr.ready,                                    // 4 rq_wr taken
+         ack_valid,                                                     // 3 remote ack
+         st_tx && !st_tx_mid,                                           // 2 first beat to the stack
+         ing_post,                                                      // 1 rdma request posted
+         st_w && !st_w_mid}),                                           // 0 first W beat of a burst
+    .arm(st_arm), .sel_pt(st_pt), .sel_idx(st_idx), .sel_data(st_data), .cnt(st_cnt), .now(st_now)
+);
 
 // ---------------------------------------------------------------------------
 // Tie-offs: no RoCE READs (gets are writes both ways); the host reads'

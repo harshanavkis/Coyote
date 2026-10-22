@@ -516,3 +516,41 @@ not below: V80 -> V80 7.1 / 8.5 / 9.7 / 11.5 GB/s at 4 / 8 / 16 / 64 KiB
   2,621,365 of 2,621,412 stream reads hits, axi_main read 36 ns, 1 break
   in 10 runs (STRICT ~3,500 a run). The pull from V80 memory now runs at
   line rate at every size, as Loom's push (12.16-12.22).
+
+## 16. Per-packet stamps in both U280 images; rdma_flow's window per QP
+
+The 8 B breakdown of 2026-10-22 (e2/20261022_1443_breakdown) split one-way
+times by subtraction of host-side measurements (READ - WRITE = the network,
+an even split of Loom's store write + landing): the U280 only counted events
+and waits, nothing timed a packet. RoCE BALBOA's breakdown (arXiv version,
+Fig 5) times each block first byte in -> first byte out; the same idea at the
+vFPGA's edges:
+
+- stamp_rec (examples/loom_switch/hw/src/hdl, the same file in
+  examples/09_perf_rdma/hw/src/hdl): 9 points, each a ring of 4,096 32-bit
+  cycle counts (since the last arm, aclk 250 MHz) = the point's last 4,096
+  events; counts since the arm; CSR words 224-240 in both images (loom_ctrl
+  here, stamp_csr in perf_rdma). The same points in both: 0 the packet's
+  data enters (Loom: first W beat of a uwin burst; perf_rdma: first beat back
+  from the shell's host read), 1 Loom's rdma request posted (perf_rdma: the
+  post is in the shell, never fires), 2 first beat to the stack, 3 remote
+  ack, 4 rq_wr, 5 first beat from the stack, 6 landing write posted, 7 first
+  landing beat out, 8 landing write completed (cq_wr, local). Landing beats
+  carry no tlast in Loom: they are paired with the landing writes in post
+  order (len / 64 beats each).
+- vFPGA only, no shell change for stamps: the stacks, CMAC and wire are one
+  segment, measured from a ping-pong without a common clock as
+  ((A_rx - A_tx) - (B_tx - B_rx)) / 2; PCIe + CPU stay one residual.
+- TB: tb_stamp_rec (rings wrap, re-arm, events in the same cycle), T25 in
+  tb_loom_switch_top (every stamp difference = the cycles the TB saw, 5
+  landings in a row), tb_perf_rdma_stamp. OOC: 36 BRAM tiles, 138 LUT, WNS
+  +2.0 ns at 250 MHz (post-synthesis).
+- rdma_flow (shell, hw/hdl/network/rdma): its pointer RAM reads one cycle
+  late, and *_LUP_WAIT drove the address to 0, so every QP's lookup used QP
+  entry 0's head / tail / issued (and its offs). TB (xsim, 20 WRITEs, no
+  ACKs): QP 1 alone passed 20 (no window at all while QP 0 is idle), 25 after
+  one ACK; QP 0 16. Fix: hold the looked-up address through *_LUP_WAIT
+  (16 / 17 / 16). QP 0 reads the same entry as before, so every 2-rank result
+  stands; ranks with several QPs per card (3 ranks, 2 per host) need it.
+  RoCE BALBOA's rdma_flow.sv is the same file (its multi-QP figure used
+  32 KiB READs, 8 packets, under the 16-packet window).

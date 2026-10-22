@@ -140,15 +140,23 @@ always @(posedge aclk) begin
     axis_rreq_send[0].tready <= bp ? ($urandom_range(0, 2) != 0) : 1'b1;
 end
 
-// Acks: one per rdma request, some cycles later, while acks_on
+// Acks: one per rdma request, some cycles later, while acks_on. While
+// lcmp_on (T25) also one local completion per landing write (dest 1)
+bit lcmp_on = 0;
+int lcmp_owed = 0;
 always @(posedge aclk) begin
     cq_wr.valid <= 1'b0;
     cq_wr.data  <= '0;
     if (sq_wr.valid && sq_wr.ready && sq_wr.data.strm == STRM_RDMA) acks_owed++;
+    if (lcmp_on && sq_wr.valid && sq_wr.ready && sq_wr.data.strm == STRM_HOST && sq_wr.data.dest == 1) lcmp_owed++;
     if (acks_on && acks_owed > 0 && $urandom_range(0, 3) == 0) begin
         cq_wr.valid       <= 1'b1;
         cq_wr.data.remote <= 1'b1;
         acks_owed--;
+    end else if (lcmp_owed > 0 && $urandom_range(0, 3) == 0) begin
+        cq_wr.valid     <= 1'b1;
+        cq_wr.data.dest <= 1;
+        lcmp_owed--;
     end
 end
 
@@ -1415,6 +1423,66 @@ initial begin
     exp_read("T24", 64'hA048, 0, 3, 1, 4);
     clear();
     $display("ok   T24 latency at zero load (lat lines)");
+
+    // --- T25: stamps (stamp_rec, CSR 224-240): one stamp per point for an
+    //     8 B store out and a 4 KiB packet in, the counts, and the stamps'
+    //     differences equal to the cycles the testbench saw; a second arm
+    //     clears the counts ---
+    begin
+        logic [63:0] v, n [9], s [9];
+        bp = 0; acks_on = 1; lcmp_on = 1;
+        clear(); quiesce();
+        csr_wr(224, 64'd1);
+        lat_clear(); lat_on = 1;
+        uwr(U2 + 64'h3_0000, 1, word(1));
+        quiesce();
+        rx_bulk(7, 64'h6000, 4096);
+        quiesce(); repeat (100) @(posedge aclk);
+        lat_on = 0;
+        csr_rd(224, v);
+        `CHECK(v == {32'd4096, 32'd9}, $sformatf("T25: ST_CTL info %h", v))
+        for (int p = 0; p < 9; p++) begin
+            csr_rd(232 + p, n[p]);
+            csr_wr(225, 64'(p) << 16);
+            csr_rd(226, s[p]);
+            `CHECK(n[p] == 1, $sformatf("T25: point %0d counted %0d events, want 1", p, n[p]))
+            `CHECK(!$isunknown(s[p]), $sformatf("T25: point %0d stamp unknown", p))
+        end
+        `CHECK(s[1] - s[0] == 64'(ev_ing[0] - ev_w1[0]), $sformatf("T25: W -> post %0d, tb %0d", s[1] - s[0], ev_ing[0] - ev_w1[0]))
+        `CHECK(s[2] - s[0] == 64'(ev_nb1[0] - ev_w1[0]), $sformatf("T25: W -> beat out %0d, tb %0d", s[2] - s[0], ev_nb1[0] - ev_w1[0]))
+        `CHECK(s[3] > s[2], "T25: ack before the packet")
+        `CHECK(s[5] - s[4] == 64'(ev_rr1[0] - ev_rq[0]), $sformatf("T25: rq -> beat in %0d, tb %0d", s[5] - s[4], ev_rr1[0] - ev_rq[0]))
+        `CHECK(s[6] - s[4] == 64'(ev_rx[0] - ev_rq[0]), $sformatf("T25: rq -> landing write %0d, tb %0d", s[6] - s[4], ev_rx[0] - ev_rq[0]))
+        `CHECK(s[7] - s[4] == 64'(ev_h1[0] - ev_rq[0]), $sformatf("T25: rq -> landing beat %0d, tb %0d", s[7] - s[4], ev_h1[0] - ev_rq[0]))
+        `CHECK(s[8] > s[6], "T25: landing completion before the landing write")
+        `CHECK(s[4] - s[0] == 64'(ev_rq[0] - ev_w1[0]), $sformatf("T25: one clock for both %0d, tb %0d", s[4] - s[0], ev_rq[0] - ev_w1[0]))
+        for (int p = 0; p < 9; p++) $display("st   point %0d: cycle %0d", p, s[p]);
+        // a 16 KiB message (4 packets) and an inline store: one stamp per landing at points 6 and 7
+        csr_wr(224, 64'd1);
+        lat_clear(); lat_on = 1;
+        rx_bulk(7, 64'h8000, 16384);
+        rx_inline(7, 64'h5010, 64'h55);
+        quiesce(); lat_on = 0;
+        for (int p = 6; p <= 7; p++) begin
+            csr_rd(232 + p, v);
+            `CHECK(v == 5, $sformatf("T25: point %0d counted %0d landings, want 5", p, v))
+        end
+        for (int k = 0; k < 5; k++) begin
+            logic [63:0] a, b;
+            csr_wr(225, (64'd6 << 16) | 64'(k)); csr_rd(226, a);
+            csr_wr(225, (64'd7 << 16) | 64'(k)); csr_rd(226, b);
+            `CHECK(b - a == 64'(ev_h1[k == 4 ? 256 : 64*k] - ev_rx[k]),
+                   $sformatf("T25: landing %0d write -> first beat %0d, tb %0d", k, b - a, ev_h1[k == 4 ? 256 : 64*k] - ev_rx[k]))
+        end
+        csr_wr(224, 64'd1);
+        csr_rd(232, v);
+        `CHECK(v == 0, $sformatf("T25: count after the second arm %0d", v))
+        csr_rd(227, v);
+        `CHECK(v > 0 && v < 100, $sformatf("T25: ST_NOW %0d after the second arm", v))
+        lcmp_on = 0;
+        clear();
+    end
+    $display("ok   T25 stamps");
 
     if (errors == 0) $display("TB PASS (tb_loom_switch_top)");
     else             $display("TB FAIL (tb_loom_switch_top): %0d errors", errors);

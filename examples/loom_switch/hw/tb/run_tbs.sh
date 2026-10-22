@@ -22,11 +22,11 @@ if [ ! -f "$LYNX_PKG" ]; then
     exit 1
 fi
 
-TBS="${TBS:-tb_loom_ingress tb_loom_switch_top}"
+TBS="${TBS:-tb_stamp_rec tb_loom_ingress tb_loom_switch_top}"
 # The shell primitives vfpga_top uses have behavioural stand-ins in
 # examples/loom's tb directory (the register slice and the rx FIFO IPs)
 SRCS="$LYNX_PKG $COYOTE_ROOT/hw/hdl/pkg/axi_intf.sv $COYOTE_ROOT/hw/hdl/pkg/lynx_intf.sv \
-      ../src/hdl/loom_table.sv ../src/hdl/loom_ingress.sv ../src/hdl/loom_ctrl.sv ../src/hdl/loom_rx.sv ../src/hdl/loom_rd.sv ../src/hdl/loom_read.sv ../src/hdl/loom_exports.sv \
+      ../src/hdl/stamp_rec.sv ../src/hdl/loom_table.sv ../src/hdl/loom_ingress.sv ../src/hdl/loom_ctrl.sv ../src/hdl/loom_rx.sv ../src/hdl/loom_rd.sv ../src/hdl/loom_read.sv ../src/hdl/loom_exports.sv \
       $LOOM_TB/sim_axisr_register_slice_512.sv $LOOM_TB/sim_axis_data_fifo_512.sv sim_axis_data_fifo_rx4096.sv \
       $COYOTE_ROOT/hw/hdl/common/regs/axisr_reg.sv $USER_LOGIC"
 
@@ -39,7 +39,7 @@ GLBL=/share/xilinx/Vivado/2023.2/data/verilog/src/glbl.v
 echo "== xvlog =="
 xvlog $GLBL > xvlog_glbl.log 2>&1 || { tail -5 xvlog_glbl.log; echo "COMPILE FAILED (glbl)"; exit 1; }
 xvlog -sv $(for f in $SRCS; do echo ../$f; done) -i ../../src -i ../$COYOTE_ROOT/hw/hdl/pkg \
-    ../tb_loom_ingress.sv ../tb_loom_switch_top.sv \
+    ../tb_stamp_rec.sv ../tb_loom_ingress.sv ../tb_loom_switch_top.sv \
     > xvlog.log 2>&1 || { tail -30 xvlog.log; echo "COMPILE FAILED"; exit 1; }
 
 fail=0

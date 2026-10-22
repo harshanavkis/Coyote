@@ -65,6 +65,17 @@ import lynxTypes::*;
  *          the far side), 195 gets the far side rejected, 196 cycles
  *          a read waited for a free slot, 197 completions for a slot with no
  *          get out (must be 0), 198 answer lines into the read buffer
+ *   224-240 per-packet stamps (stamp_rec; the same words in perf_rdma's
+ *          vFPGA): 224 ST_CTL (W) arm = clear the counts, restart the cycle
+ *          count, record from now on; (R) {DEPTH [63:32], N_ST [31:0]};
+ *          225 ST_SEL (RW) [19:16] point, [15:0] ring index; 226 ST_DATA
+ *          (RO) the selected stamp (cycles since the arm); 227 ST_NOW (RO)
+ *          cycles since the arm; 232+p (RO) events at point p since the arm.
+ *          Points (vfpga_top): 0 first W beat of a uwin burst, 1 rdma
+ *          request posted by the ingress, 2 first beat of a packet to the
+ *          stack, 3 remote ack, 4 rq_wr taken, 5 first beat of a packet
+ *          from the stack, 6 landing write posted, 7 first landing beat
+ *          out, 8 landing write completed (cq_wr, local, dest 1)
  *   112-130 (RO) cnt_x[i] at word 112+i, its longest run of consecutive
  *          cycles at 144+i (since the bitstream was loaded):
  *     loom_rx:  112 bulk packets landed (writes posted), 113 stores landed,
@@ -101,7 +112,9 @@ import lynxTypes::*;
 module loom_ctrl #(
     parameter integer N_DBG = 14,
     parameter integer N_X   = 32,
-    parameter integer N_Y   = 8
+    parameter integer N_Y   = 8,
+    parameter integer N_ST  = 9,
+    parameter integer ST_DEPTH = 4096
 ) (
     input  logic                        aclk,
     input  logic                        aresetn,
@@ -173,7 +186,15 @@ module loom_ctrl #(
 
     // Further pulses, word 112+i and 192+i (lists in the map above)
     input  logic [N_X-1:0]              cnt_x,
-    input  logic [N_Y-1:0]              cnt_y
+    input  logic [N_Y-1:0]              cnt_y,
+
+    // Stamps (stamp_rec), words 224-240
+    output logic                        st_arm,
+    output logic [3:0]                  st_pt,
+    output logic [$clog2(ST_DEPTH)-1:0] st_idx,
+    input  logic [31:0]                 st_data,
+    input  logic [N_ST-1:0][31:0]       st_cnt,
+    input  logic [31:0]                 st_now
 );
 
 localparam integer ADDR_LSB = $clog2(AXIL_DATA_BITS/8);   // 3
@@ -230,6 +251,11 @@ localparam integer R_EXP_COMMIT    = 181;
 localparam integer R_RD_CTL        = 184;
 localparam integer R_XMAX_BASE     = 144;
 localparam integer R_Y_BASE        = 192;
+localparam integer R_ST_CTL        = 224;
+localparam integer R_ST_SEL        = 225;
+localparam integer R_ST_DATA       = 226;
+localparam integer R_ST_NOW        = 227;
+localparam integer R_ST_CNT_BASE   = 232;
 
 // -------------------------------------------------------------------------
 // AXI4-Lite handshake (single outstanding write and read, as examples/loom)
@@ -256,6 +282,7 @@ wire csr_rd  = (axi_araddr[15:12] == 4'd0);
 logic [63:0] r_tbl_idx, r_tbl_cfg, r_tbl_pid, r_tbl_base, r_tbl_len, r_tbl_ustart;
 logic [63:0] r_rdma_staging, r_tx_ctl, r_rx_chunk, r_rd_ctl;
 logic [63:0] r_exp_idx, r_exp_cfg, r_exp_pid, r_exp_base, r_exp_len;
+logic [63:0] r_st_sel;
 
 wire commit_pulse = csr_wr && (wr_idx == R_TBL_COMMIT) && axi_ctrl.wstrb[0] && axi_ctrl.wdata[0];
 wire exp_pulse    = csr_wr && (wr_idx == R_EXP_COMMIT) && axi_ctrl.wstrb[0] && axi_ctrl.wdata[0];
@@ -268,6 +295,7 @@ always_ff @(posedge aclk) begin
         r_tx_ctl   <= 64'd16;
         r_rx_chunk <= 64'd1;
         r_rd_ctl   <= 64'd0;
+        r_st_sel   <= 64'd0;
     end else if (csr_wr && (&axi_ctrl.wstrb)) begin
         case (wr_idx)
             R_TBL_IDX:      r_tbl_idx      <= axi_ctrl.wdata;
@@ -285,6 +313,7 @@ always_ff @(posedge aclk) begin
             R_EXP_PID:      r_exp_pid      <= axi_ctrl.wdata;
             R_EXP_BASE:     r_exp_base     <= axi_ctrl.wdata;
             R_EXP_LEN:      r_exp_len      <= axi_ctrl.wdata;
+            R_ST_SEL:       r_st_sel       <= axi_ctrl.wdata;
             default: ;
         endcase
     end
@@ -309,6 +338,9 @@ assign exp_valid       = r_exp_cfg[0];
 assign exp_pid         = r_exp_pid[PID_BITS-1:0];
 assign exp_base        = r_exp_base[VADDR_BITS-1:0];
 assign exp_len         = r_exp_len[39:0];
+assign st_arm          = csr_wr && (&axi_ctrl.wstrb) && (wr_idx == R_ST_CTL);
+assign st_pt           = r_st_sel[19:16];
+assign st_idx          = r_st_sel[$clog2(ST_DEPTH)-1:0];
 
 // -------------------------------------------------------------------------
 // Counters
@@ -466,6 +498,10 @@ always_ff @(posedge aclk) begin
             R_EXP_BASE:         axi_rdata <= r_exp_base;
             R_EXP_LEN:          axi_rdata <= r_exp_len;
             R_RD_CTL:           axi_rdata <= r_rd_ctl;
+            R_ST_CTL:           axi_rdata <= {32'(ST_DEPTH), 32'(N_ST)};
+            R_ST_SEL:           axi_rdata <= r_st_sel;
+            R_ST_DATA:          axi_rdata <= {32'b0, st_data};
+            R_ST_NOW:           axi_rdata <= {32'b0, st_now};
             default:
                 if (rd_idx >= R_ING_BASE && rd_idx < R_ING_BASE + N_ING)
                     axi_rdata <= ing[rd_idx - R_ING_BASE];
@@ -477,6 +513,8 @@ always_ff @(posedge aclk) begin
                     axi_rdata <= {32'b0, xmax[rd_idx - R_XMAX_BASE]};
                 else if (rd_idx >= R_Y_BASE && rd_idx < R_Y_BASE + N_Y)
                     axi_rdata <= yc[rd_idx - R_Y_BASE];
+                else if (rd_idx >= R_ST_CNT_BASE && rd_idx < R_ST_CNT_BASE + N_ST)
+                    axi_rdata <= {32'b0, st_cnt[rd_idx - R_ST_CNT_BASE]};
         endcase
     end
 end
