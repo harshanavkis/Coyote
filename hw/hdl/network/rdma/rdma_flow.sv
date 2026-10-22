@@ -129,9 +129,10 @@ always_comb begin: DP
     req_out.data = s_req.data;
     req_out.data.req_1.offs = head;
 
-    // Table
+    // Table: hold the looked-up QP's entry through *_LUP_WAIT (the RAM reads
+    // one cycle late; address 0 there made every QP use QP 0's pointers)
     ssn_wr = 0;
-    ssn_addr = 0;
+    ssn_addr = addr_C;
     
     // Pointers
     head_next = 0;
