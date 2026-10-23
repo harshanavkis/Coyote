@@ -172,28 +172,3 @@ stamp_rec #(.N_PTS(N_ST), .DEPTH(ST_DEPTH)) inst_stamp_rec (
 always_comb notify.tie_off_m();
 always_comb cq_rd.tie_off_s();
 always_comb cq_wr.tie_off_s();
-
-// ILA for debugging
-ila_perf_rdma inst_ila_perf_rdma (
-    .clk(aclk),
-    .probe0(axis_host_recv[0].tvalid),      // 1
-    .probe1(axis_host_recv[0].tready),      // 1
-    .probe2(axis_host_recv[0].tlast),       // 1
-
-    .probe3(axis_host_recv[1].tvalid),      // 1
-    .probe4(axis_host_recv[1].tready),      // 1
-    .probe5(axis_host_recv[1].tlast),       // 1
-
-    .probe6(axis_host_send[0].tvalid),      // 1
-    .probe7(axis_host_send[0].tready),      // 1
-    .probe8(axis_host_send[0].tlast),       // 1
-
-    .probe9(axis_host_send[1].tvalid),      // 1
-    .probe10(axis_host_send[1].tready),     // 1
-    .probe11(axis_host_send[1].tlast),      // 1
-
-    .probe12(sq_wr.valid),                  // 1
-    .probe13(sq_wr.ready),                  // 1
-    .probe14(sq_rd.valid),                  // 1
-    .probe15(sq_rd.ready)                   // 1
-);

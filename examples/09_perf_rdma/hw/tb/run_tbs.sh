@@ -12,7 +12,7 @@ BUILD=${BUILD:-../build_oct15_rdma_qdma}
 GEN=$BUILD/example_09_perf_rdma_config_0/user_c0_0/hdl
 [ -f "$GEN/lynx_pkg.sv" ] || { echo "ERROR: $GEN/lynx_pkg.sv not found (BUILD=<a perf_rdma build dir>)"; exit 1; }
 SRCS="$GEN/lynx_pkg.sv $COYOTE_ROOT/hw/hdl/pkg/axi_intf.sv $COYOTE_ROOT/hw/hdl/pkg/lynx_intf.sv \
-      ../src/hdl/stamp_rec.sv ../src/hdl/stamp_csr.sv sim_ila_perf_rdma.sv $GEN/wrappers/user_logic_c0_0.sv"
+      ../src/hdl/stamp_rec.sv ../src/hdl/stamp_csr.sv $GEN/wrappers/user_logic_c0_0.sv"
 mkdir -p work && cd work
 xvlog -sv $(for f in $SRCS; do echo ../$f; done) ../tb_perf_rdma_stamp.sv -i ../../src -i ../$COYOTE_ROOT/hw/hdl/pkg \
     > xvlog.log 2>&1 || { tail -30 xvlog.log; echo "COMPILE FAILED"; exit 1; }
