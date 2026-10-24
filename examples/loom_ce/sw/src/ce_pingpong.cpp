@@ -139,10 +139,10 @@ int main(int argc, char **argv) {
     // the message region (whole pages), then the flag page
     const uint64_t mlen = std::max<uint64_t>(4096, (size + 4095) & ~4095ULL);
 
-    coyote::cThread t_qp(0, getpid(), 0, nullptr, "coyote_fpga");     // QP owner, CSR page, rdma windows
-    coyote::cThread t_data(0, getpid(), 0, nullptr, "coyote_fpga");   // owns the landing exports
+    coyote::cThread t_qp(0, getpid(), 0, nullptr, "loom_fpga");     // QP owner, CSR page, rdma windows
+    coyote::cThread t_data(0, getpid(), 0, nullptr, "loom_fpga");   // owns the landing exports
     std::unique_ptr<coyote::cThread> v80;                                // not opened for --engine ptdma
-    if (!pt) v80 = std::make_unique<coyote::cThread>(0, getpid(), 0, nullptr, "coyote_versal_fpga");
+    if (!pt) v80 = std::make_unique<coyote::cThread>(0, getpid(), 0, nullptr, "loom_versal_fpga");
     printf("%s: QP exchange on port %u ...\n", server ? "server" : "client", port);
     void *staging = server ? t_qp.initRDMA(STAGING_SIZE, port) : t_qp.initRDMA(STAGING_SIZE, port, ip.c_str());
     if (!staging) { printf("FAIL: initRDMA\n"); return 1; }

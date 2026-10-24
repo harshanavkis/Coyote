@@ -65,8 +65,8 @@ uint64_t pattern(uint64_t off) { return 0x5EED000000000000ULL ^ (off * 0x9E3779B
 // local: no window bound, every read answered with all ones on the card
 int run_client(const std::string &ip, uint16_t port, uint64_t size, int reps, int window) {
     const bool local = ip.empty();
-    coyote::cThread u280(0, getpid(), 0, nullptr, "coyote_fpga");     // QP owner, CSR page
-    coyote::cThread v80(0, getpid(), 0, nullptr, "coyote_versal_fpga");
+    coyote::cThread u280(0, getpid(), 0, nullptr, "loom_fpga");     // QP owner, CSR page
+    coyote::cThread v80(0, getpid(), 0, nullptr, "loom_versal_fpga");
     if (local) {
         for (int w = 1; w <= 2; w++) release_window(u280, w);
     } else {

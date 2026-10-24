@@ -98,8 +98,8 @@ uint64_t check(const char *d, uint64_t off, uint64_t len) {
 double median(std::vector<double> v) { std::sort(v.begin(), v.end()); return v[v.size() / 2]; }
 
 int run_server(uint16_t port, uint64_t size, int window) {
-    coyote::cThread t_qp(0, getpid(), 0, nullptr, "coyote_fpga");     // QP owner, CSR page
-    coyote::cThread t_data(0, getpid(), 0, nullptr, "coyote_fpga");   // owns the source
+    coyote::cThread t_qp(0, getpid(), 0, nullptr, "loom_fpga");     // QP owner, CSR page
+    coyote::cThread t_data(0, getpid(), 0, nullptr, "loom_fpga");   // owns the source
     printf("server: QP exchange on port %u ...\n", port);
     if (!t_qp.initRDMA(STAGING_SIZE, port)) { printf("FAIL: initRDMA\n"); return 1; }
     if (window >= 0) csr_write(t_qp, TX_CTL, uint64_t(window));
@@ -124,7 +124,7 @@ int run_server(uint16_t port, uint64_t size, int window) {
 }
 
 int run_client(const std::string &ip, uint16_t port, uint64_t size, int reps, int window) {
-    coyote::cThread t_qp(0, getpid(), 0, nullptr, "coyote_fpga");
+    coyote::cThread t_qp(0, getpid(), 0, nullptr, "loom_fpga");
     printf("client: QP exchange with %s on port %u ...\n", ip.c_str(), port);
     if (!t_qp.initRDMA(STAGING_SIZE, port, ip.c_str())) { printf("FAIL: initRDMA\n"); return 1; }
     if (window >= 0) csr_write(t_qp, TX_CTL, uint64_t(window));

@@ -69,8 +69,8 @@ int main(int argc, char **argv) {
     uint64_t max_len = 4096;
     for (auto &r : runs) max_len = r.first > max_len ? r.first : max_len;
 
-    coyote::cThread u280(0, getpid(), 0, nullptr, "coyote_fpga");
-    coyote::cThread v80(0, getpid(), 0, nullptr, "coyote_versal_fpga");
+    coyote::cThread u280(0, getpid(), 0, nullptr, "loom_fpga");
+    coyote::cThread v80(0, getpid(), 0, nullptr, "loom_versal_fpga");
 
     void *host = u280.getMem({coyote::CoyoteAllocType::HPF, max_len});
 

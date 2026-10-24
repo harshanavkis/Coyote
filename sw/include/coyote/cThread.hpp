@@ -199,7 +199,7 @@ protected:
 	 * @param uisr User interrupt (notifications) service routine, called when an interrupt from the vFPGA is received
 	 */
 	cThread(int32_t vfid, pid_t hpid, uint32_t device = 0, std::function<void(int)> uisr = nullptr,
-	        const std::string &dev_prefix = "coyote_fpga");
+	        const std::string &dev_prefix = "loom_fpga");
 	
 	/**
 	 * @brief Default destructor for the cThread

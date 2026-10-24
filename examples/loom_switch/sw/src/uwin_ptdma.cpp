@@ -194,8 +194,8 @@ int main(int argc, char **argv) {
     }
     if (!server) unlink(done.c_str());
 
-    coyote::cThread t_qp(0, getpid(), 0, nullptr, "coyote_fpga");     // QP owner, rdma windows, the uwin mapping
-    coyote::cThread t_data(0, getpid(), 0, nullptr, "coyote_fpga");   // owns the landing buffers
+    coyote::cThread t_qp(0, getpid(), 0, nullptr, "loom_fpga");     // QP owner, rdma windows, the uwin mapping
+    coyote::cThread t_data(0, getpid(), 0, nullptr, "loom_fpga");   // owns the landing buffers
     printf("%s: QP exchange on port %u ...\n", server ? "server" : "client", port);
     void *staging = server ? t_qp.initRDMA(STAGING_SIZE, port) : t_qp.initRDMA(STAGING_SIZE, port, ip.c_str());
     if (!staging) { printf("FAIL: initRDMA\n"); return 1; }

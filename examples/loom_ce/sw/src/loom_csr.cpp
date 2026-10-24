@@ -15,7 +15,7 @@
 #include "loom_switch.hpp"
 
 int main(int argc, char **argv) {
-    coyote::cThread u280(0, getpid(), 0, nullptr, "coyote_fpga");
+    coyote::cThread u280(0, getpid(), 0, nullptr, "loom_fpga");
     if (argc > 1) {
         for (int i = 1; i < argc; i++) {
             const uint32_t w = uint32_t(strtoul(argv[i], nullptr, 0));

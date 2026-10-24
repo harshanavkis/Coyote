@@ -1,8 +1,8 @@
 // G1: can a V80 vFPGA write into a U280 vFPGA's BAR, peer-to-peer?
 //
 // Needs, in the same host: the U280 running a Loom bitstream (driver
-// coyote_driver, /dev/coyote_fpga_*) and the V80 running Coyote example 07,
-// FPGA-initiated DMA (driver coyote_driver_versal, /dev/coyote_versal_fpga_*).
+// coyote_driver, /dev/loom_fpga_*) and the V80 running Coyote example 07,
+// FPGA-initiated DMA (driver coyote_driver_versal, /dev/loom_versal_fpga_*).
 //
 // 1. The host presets Loom's RDMA_STAGING_VA register (CSR word 16, byte 0x80)
 //    to a marker and reads it back.
@@ -39,8 +39,8 @@ constexpr uint64_t START_WR = 0x2;
 }  // namespace
 
 int main() {
-    coyote::cThread u280(0, getpid(), 0, nullptr, "coyote_fpga");
-    coyote::cThread v80(0, getpid(), 0, nullptr, "coyote_versal_fpga");
+    coyote::cThread u280(0, getpid(), 0, nullptr, "loom_fpga");
+    coyote::cThread v80(0, getpid(), 0, nullptr, "loom_versal_fpga");
 
     // 1. preset the target register
     u280.setCSR(MARKER, STAGING_WORD);

@@ -62,8 +62,8 @@ int main(int argc, char **argv) {
     for (auto &r : runs) if (r.first > max_len) max_len = r.first;
     max_len = (max_len + (2ULL << 20) - 1) & ~((2ULL << 20) - 1);
 
-    coyote::cThread u280(0, getpid(), 0, nullptr, "coyote_fpga");
-    coyote::cThread v80(0, getpid(), 0, nullptr, "coyote_versal_fpga");
+    coyote::cThread u280(0, getpid(), 0, nullptr, "loom_fpga");
+    coyote::cThread v80(0, getpid(), 0, nullptr, "loom_versal_fpga");
     void *u_host = u280.getMem({coyote::CoyoteAllocType::HPF, max_len});
     void *v_host = v80.getMem({coyote::CoyoteAllocType::HPF, max_len});
 

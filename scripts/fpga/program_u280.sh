@@ -10,7 +10,7 @@
 # Steps: unload coyote_driver, remove the card from PCIe, program it over JTAG
 # (Vivado 2023.2, device selected by part xcu280), let the link retrain, then
 # setup_coyote.sh (PCI remove/rescan, insmod with this host's FPGA IP/MAC), and
-# check the identity the driver reports. The V80 (coyote_driver_versal) is not
+# check the identity the driver reports. The V80 (loom_coyote_versal) is not
 # touched. run_two_host.py has its own, more defensive, flash for Loom runs.
 set -euo pipefail
 
@@ -26,16 +26,16 @@ DEV=/sys/bus/pci/devices/$BDF
 declare -A WANT_IP=([clara]=0a000002 [amy]=0a000001 [rose]=0a000003)
 
 [ -f "$IMG" ] || { echo "no image at $IMG" >&2; exit 1; }
-[ -f "$REPO/driver/build/coyote_driver.ko" ] || { echo "no driver/build/coyote_driver.ko; build the driver first" >&2; exit 1; }
+[ -f "$REPO/driver/build/loom_coyote.ko" ] || { echo "no driver/build/loom_coyote.ko; build the driver first" >&2; exit 1; }
 case $IMG in *.bit) ;; *) echo "$IMG is not a .bit" >&2; exit 1 ;; esac
 
 echo "== U280 at $BDF: $IMG"
 
 # 1. driver out, card off the bus
 # grep -q under pipefail: lsmod dies of SIGPIPE and the test reads false
-if lsmod | grep '^coyote_driver ' >/dev/null; then
-    echo "   unloading coyote_driver"
-    sudo rmmod coyote_driver
+if lsmod | grep '^loom_coyote ' >/dev/null; then
+    echo "   unloading loom_coyote"
+    sudo rmmod loom_coyote
 fi
 if [ -e "$DEV" ]; then
     echo "   removing $BDF from PCIe (was $(cat $DEV/vendor):$(cat $DEV/device))"
@@ -56,13 +56,13 @@ sleep 15
 
 # 4. check what the driver reports
 for i in $(seq 1 20); do
-    IP=$(sudo cat /sys/kernel/coyote_sysfs_*/cyt_attr_ip 2>/dev/null | grep -o -E '[0-9a-f]{8}' | head -1 || true)
+    IP=$(sudo cat /sys/kernel/loom_sysfs_*/cyt_attr_ip 2>/dev/null | grep -o -E '[0-9a-f]{8}' | head -1 || true)
     [ -n "$IP" ] && break
     sleep 1
 done
 WANT=${WANT_IP[$(hostname)]:-}
 echo "   driver up: $(basename $(readlink -f $DEV/driver 2>/dev/null) 2>/dev/null), FPGA IP ${IP:-none}, link $(cat $DEV/current_link_speed 2>/dev/null) x$(cat $DEV/current_link_width 2>/dev/null)"
 if [ -n "$WANT" ] && [ "$IP" != "$WANT" ]; then
-    echo "WRONG IDENTITY: FPGA IP ${IP:-none}, want $WANT - reload with: sudo rmmod coyote_driver && sudo bash setup_coyote.sh" >&2
+    echo "WRONG IDENTITY: FPGA IP ${IP:-none}, want $WANT - reload with: sudo rmmod loom_coyote && sudo bash setup_coyote.sh" >&2
     exit 1
 fi

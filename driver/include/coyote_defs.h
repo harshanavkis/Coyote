@@ -102,15 +102,17 @@ extern bool en_hmm;
 // Driver constants
 // A Versal build is its own module with its own device, class and sysfs
 // names, so it can be loaded next to an UltraScale+ build in the same host
-// (e.g. a V80 and a U280 in one server).
+// (e.g. a V80 and a U280 in one server). Loom's names (2026-10-22) differ from
+// stock Coyote's (coyote_driver, coyote_fpga, coyote_sysfs), so another user's
+// stock driver on the same host never unloads or collides with ours.
 #ifdef PLATFORM_VERSAL
-#define COYOTE_DRIVER_NAME "coyote_driver_versal"
-#define DEV_FPGA_NAME "coyote_versal_fpga"
-#define COYOTE_SYSFS_NAME "coyote_versal_sysfs"
+#define COYOTE_DRIVER_NAME "loom_coyote_versal"
+#define DEV_FPGA_NAME "loom_versal_fpga"
+#define COYOTE_SYSFS_NAME "loom_versal_sysfs"
 #else
-#define COYOTE_DRIVER_NAME "coyote_driver"
-#define DEV_FPGA_NAME "coyote_fpga"
-#define COYOTE_SYSFS_NAME "coyote_sysfs"
+#define COYOTE_DRIVER_NAME "loom_coyote"
+#define DEV_FPGA_NAME "loom_fpga"
+#define COYOTE_SYSFS_NAME "loom_sysfs"
 #endif
 
 // Debug prints

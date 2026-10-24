@@ -46,7 +46,7 @@ void check(bool ok, const char *what) {
 
 int main(int argc, char **argv) {
     const bool rates_only = (argc > 1 && strcmp(argv[1], "rates_only") == 0);
-    coyote::cThread v80(0, getpid(), 0, nullptr, "coyote_versal_fpga");
+    coyote::cThread v80(0, getpid(), 0, nullptr, "loom_versal_fpga");
 
     // csr: the host's CSR round trip (any loom_ce image, programs or not): a
     // read of BUSY, and a write (DST_VA) followed by that read

@@ -61,8 +61,8 @@ int main() {
     const uint64_t sizes[] = {4096, 65536, 1 << 20, 16 << 20};
     const uint64_t max_len = 16 << 20;
 
-    coyote::cThread u280(0, getpid(), 0, nullptr, "coyote_fpga");
-    coyote::cThread v80(0, getpid(), 0, nullptr, "coyote_versal_fpga");
+    coyote::cThread u280(0, getpid(), 0, nullptr, "loom_fpga");
+    coyote::cThread v80(0, getpid(), 0, nullptr, "loom_versal_fpga");
 
     void *host = v80.getMem({coyote::CoyoteAllocType::HPF, max_len});
 

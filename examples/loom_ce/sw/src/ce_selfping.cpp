@@ -59,7 +59,7 @@ int main(int argc, char **argv) {
     if (size % 8 || size > (1ULL << 20) || runs < 2) { fprintf(stderr, "--size: a multiple of 8, at most 1 MiB; --runs >= 2\n"); return 2; }
     const uint64_t mlen = std::max<uint64_t>(4096, (size + 4095) & ~4095ULL);
 
-    coyote::cThread v80(0, getpid(), 0, nullptr, "coyote_versal_fpga");
+    coyote::cThread v80(0, getpid(), 0, nullptr, "loom_versal_fpga");
 
     // The window's HBM: message at [0, mlen), flag at mlen; the same window
     // imported into the V80's own MMU is the way out over PCIe and back in

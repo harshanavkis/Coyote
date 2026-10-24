@@ -38,7 +38,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "usage: %s csr SECONDS | host BYTES REPS\n", argv[0]);
         return 2;
     }
-    coyote::cThread v80(0, getpid(), 0, nullptr, "coyote_versal_fpga");
+    coyote::cThread v80(0, getpid(), 0, nullptr, "loom_versal_fpga");
 
     if (strcmp(argv[1], "csr") == 0) {
         const double secs = atof(argv[2]);

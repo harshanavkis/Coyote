@@ -158,10 +158,10 @@ int main(int argc, char **argv) {
     const int k = server ? 0 : 1, p = 1 - k;
     const uint64_t half = S / 2;
 
-    coyote::cThread t_qp(0, getpid(), 0, nullptr, "coyote_fpga");
-    coyote::cThread t_data(0, getpid(), 0, nullptr, "coyote_fpga");
+    coyote::cThread t_qp(0, getpid(), 0, nullptr, "loom_fpga");
+    coyote::cThread t_data(0, getpid(), 0, nullptr, "loom_fpga");
     std::unique_ptr<coyote::cThread> v80;
-    if (!cpu) v80 = std::make_unique<coyote::cThread>(0, getpid(), 0, nullptr, "coyote_versal_fpga");
+    if (!cpu) v80 = std::make_unique<coyote::cThread>(0, getpid(), 0, nullptr, "loom_versal_fpga");
     void *staging = server ? t_qp.initRDMA(STAGING_SIZE, port) : t_qp.initRDMA(STAGING_SIZE, port, ip.c_str());
     if (!staging) { printf("FAIL: initRDMA\n"); return 1; }
 

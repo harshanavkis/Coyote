@@ -106,8 +106,8 @@ int main(int argc, char **argv) {
         return 2;
     }
 
-    coyote::cThread u280(0, getpid(), 0, nullptr, "coyote_fpga");
-    coyote::cThread v80(0, getpid(), 0, nullptr, "coyote_versal_fpga");
+    coyote::cThread u280(0, getpid(), 0, nullptr, "loom_fpga");
+    coyote::cThread v80(0, getpid(), 0, nullptr, "loom_versal_fpga");
 
     if (discard_s > 0) {
         for (int w = 1; w <= 2; w++) loom_switch::release_window(u280, w);

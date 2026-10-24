@@ -247,8 +247,8 @@ void trace_landing(coyote::cThread &t_qp, land_v80::Landing *L, uint64_t wi, uin
 
 int run_server(uint16_t port, uint64_t size, bool land, uint64_t off, unsigned poll_us, bool no_touch, bool no_stamp,
                bool self, int trace, bool ack) {
-    coyote::cThread t_qp(0, getpid(), 0, nullptr, "coyote_fpga");     // QP owner
-    coyote::cThread t_data(0, getpid(), 0, nullptr, "coyote_fpga");   // owns the landing buffers
+    coyote::cThread t_qp(0, getpid(), 0, nullptr, "loom_fpga");     // QP owner
+    coyote::cThread t_data(0, getpid(), 0, nullptr, "loom_fpga");   // owns the landing buffers
     printf("server: waiting for the QP exchange on port %u ...\n", port);
     void *staging = t_qp.initRDMA(STAGING_SIZE, port);
     if (!staging) { printf("FAIL: initRDMA\n"); return 1; }
@@ -258,7 +258,7 @@ int run_server(uint16_t port, uint64_t size, bool land, uint64_t off, unsigned p
     coyote::cThread *v80 = nullptr;
     land_v80::Landing *L = nullptr;
     if (land) {
-        v80 = new coyote::cThread(0, getpid(), 0, nullptr, "coyote_versal_fpga");
+        v80 = new coyote::cThread(0, getpid(), 0, nullptr, "loom_versal_fpga");
         // --land-offset: the copy lands off bytes into the window (64: each
         // message's packets then end on 4 KiB pages, the U280 splits none)
         const uint64_t llen = size + 8192;
@@ -457,8 +457,8 @@ int run_server(uint16_t port, uint64_t size, bool land, uint64_t off, unsigned p
 // timed here, from its first landed packet to its last (loom_rx's landed
 // count, size / 4 KiB packets per run): the sender's completions are not used.
 int run_passive(uint16_t port, uint64_t size, bool land, uint64_t msg, int reps, bool discard, bool self) {
-    coyote::cThread t_qp(0, getpid(), 0, nullptr, "coyote_fpga");     // QP owner
-    coyote::cThread t_data(0, getpid(), 0, nullptr, "coyote_fpga");   // owns the landing buffer
+    coyote::cThread t_qp(0, getpid(), 0, nullptr, "loom_fpga");     // QP owner
+    coyote::cThread t_data(0, getpid(), 0, nullptr, "loom_fpga");   // owns the landing buffer
     printf("passive: waiting for the QP exchange on port %u ...\n", port);
     void *staging = t_qp.initRDMA(STAGING_SIZE, port);
     if (!staging) { printf("FAIL: initRDMA\n"); return 1; }
@@ -467,7 +467,7 @@ int run_passive(uint16_t port, uint64_t size, bool land, uint64_t msg, int reps,
     coyote::cThread *v80 = nullptr;
     land_v80::Landing *L = nullptr;
     if (land) {
-        v80 = new coyote::cThread(0, getpid(), 0, nullptr, "coyote_versal_fpga");
+        v80 = new coyote::cThread(0, getpid(), 0, nullptr, "loom_versal_fpga");
         L = new land_v80::Landing(*v80, size + 8192);
         void *lva = loom_switch::reserve_va(size + 8192);
         t_data.importDmabuf(L->export_fd(), lva);
@@ -574,10 +574,10 @@ int run_bidir(const std::string &ip, uint16_t port, uint64_t size, int reps, int
               bool pt = false, const std::string &ptq_dev = "", bool ptq_user = false) {
     const bool server = ip.empty();
     const int me = server ? 0 : 1, peer = 1 - me;
-    coyote::cThread t_qp(0, getpid(), 0, nullptr, "coyote_fpga");     // QP owner, CSR page, rdma windows
-    coyote::cThread t_data(0, getpid(), 0, nullptr, "coyote_fpga");   // owns the landing buffers
+    coyote::cThread t_qp(0, getpid(), 0, nullptr, "loom_fpga");     // QP owner, CSR page, rdma windows
+    coyote::cThread t_data(0, getpid(), 0, nullptr, "loom_fpga");   // owns the landing buffers
     std::optional<coyote::cThread> v80o;                               // not opened for --engine ptdma
-    if (!pt) v80o.emplace(0, getpid(), 0, nullptr, "coyote_versal_fpga");
+    if (!pt) v80o.emplace(0, getpid(), 0, nullptr, "loom_versal_fpga");
     printf("%s: QP exchange on port %u ...\n", server ? "server" : "client", port);
     void *staging = server ? t_qp.initRDMA(STAGING_SIZE, port) : t_qp.initRDMA(STAGING_SIZE, port, ip.c_str());
     if (!staging) { printf("FAIL: initRDMA\n"); return 1; }
@@ -633,7 +633,7 @@ int run_bidir(const std::string &ip, uint16_t port, uint64_t size, int reps, int
     uint64_t *fsrc = nullptr;
     uint32_t hs = 0, hf = 0, hu = 0;
     if (pt) {
-        t_src.emplace(0, getpid(), 0, nullptr, "coyote_fpga");
+        t_src.emplace(0, getpid(), 0, nullptr, "loom_fpga");
         src = static_cast<uint64_t *>(t_src->getMem({coyote::CoyoteAllocType::HPF, size}));
         fsrc = static_cast<uint64_t *>(t_src->getMem({coyote::CoyoteAllocType::HPF, FSLOTS * 8}));
         if (!src || !fsrc) { printf("FAIL: no host memory\n"); return 1; }
@@ -750,9 +750,9 @@ int run_bidir(const std::string &ip, uint16_t port, uint64_t size, int reps, int
 
 int run_client(const std::string &ip, uint16_t port, int reps, int window, unsigned gap_ms, bool no_refill, int burst,
                bool prog, bool ack, bool pt, const std::string &ptq_dev, bool ptq_user) {
-    coyote::cThread u280(0, getpid(), 0, nullptr, "coyote_fpga");     // QP owner and CSR page
+    coyote::cThread u280(0, getpid(), 0, nullptr, "loom_fpga");     // QP owner and CSR page
     std::optional<coyote::cThread> v80;                                // not opened for --engine ptdma
-    if (!pt) v80.emplace(0, getpid(), 0, nullptr, "coyote_versal_fpga");
+    if (!pt) v80.emplace(0, getpid(), 0, nullptr, "loom_versal_fpga");
     void *staging = u280.initRDMA(STAGING_SIZE, port, ip.c_str());
     if (!staging) { printf("FAIL: initRDMA\n"); return 1; }
     printf("client: QP up\n");
@@ -760,7 +760,7 @@ int run_client(const std::string &ip, uint16_t port, int reps, int window, unsig
     std::optional<coyote::cThread> t_ack;
     volatile uint64_t *ackw = nullptr;
     if (ack) {
-        t_ack.emplace(0, getpid(), 0, nullptr, "coyote_fpga");
+        t_ack.emplace(0, getpid(), 0, nullptr, "loom_fpga");
         uint64_t *a = static_cast<uint64_t *>(t_ack->getMem({coyote::CoyoteAllocType::HPF, 4096}));
         memset(a, 0, 4096);
         loom_switch::program_export(u280, 3, t_ack->getCtid(), a, 4096);
@@ -805,7 +805,7 @@ int run_client(const std::string &ip, uint16_t port, int reps, int window, unsig
     uint64_t *fsrc = nullptr;
     uint32_t hs = 0, hf = 0, hu = 0;
     if (pt) {
-        t_src.emplace(0, getpid(), 0, nullptr, "coyote_fpga");
+        t_src.emplace(0, getpid(), 0, nullptr, "loom_fpga");
         src = static_cast<uint64_t *>(t_src->getMem({coyote::CoyoteAllocType::HPF, size}));
         fsrc = static_cast<uint64_t *>(t_src->getMem({coyote::CoyoteAllocType::HPF, FSLOTS * 8}));
         if (!src || !fsrc) { printf("FAIL: no host memory\n"); return 1; }

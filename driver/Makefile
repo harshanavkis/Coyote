@@ -24,10 +24,12 @@ TARGET_PLATFORM ?= ultrascale_plus
 
 # Target output name: a Versal build is a separate module (coyote_driver_versal)
 # so that both can be loaded in one host
+# Loom builds are named loom_coyote[_versal] (owner 2026-10-22): another user's stock coyote_driver on the same host must not
+# unload, shadow or collide with ours (module, PCI driver, device and sysfs names all differ; coyote_defs.h)
 ifeq ($(TARGET_PLATFORM), versal)
-MODNAME := coyote_driver_versal
+MODNAME := loom_coyote_versal
 else
-MODNAME := coyote_driver
+MODNAME := loom_coyote
 endif
 obj-m := $(MODNAME).o
 
