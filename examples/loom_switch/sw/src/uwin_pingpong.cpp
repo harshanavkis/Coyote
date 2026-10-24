@@ -10,6 +10,9 @@
  *
  * One-way = round trip / 2 on the client's clock. --size 0: the flag only
  * (one 8 B store each way). ROUNDS rounds, the first WARM not counted.
+ * The client also prints the CPU's time to store a round (its stores and the
+ * sfence of uwinWrite): when a Loom sender may reuse its buffer; and, before
+ * the rounds, the round trip of an MMIO read of a switch CSR (PCIe from the CPU).
  *
  *   amy:   uwin_pingpong --server [--port N] [--size B] [--rounds R]
  *   rose:  uwin_pingpong --client <amy ip> [--port N] [--size B] [--rounds R] [--out FILE]
@@ -104,8 +107,8 @@ int main(int argc, char **argv) {
     const int side = server ? 0 : 1;
     const uint64_t mlen = std::max<uint64_t>(4096, (size + 4095) & ~4095ULL);
 
-    coyote::cThread t_qp(0, getpid(), 0, nullptr, "coyote_fpga");     // QP owner, rdma windows, the uwin mapping
-    coyote::cThread t_data(0, getpid(), 0, nullptr, "coyote_fpga");   // owns the landing buffers
+    coyote::cThread t_qp(0, getpid(), 0, nullptr, "loom_fpga");     // QP owner, rdma windows, the uwin mapping
+    coyote::cThread t_data(0, getpid(), 0, nullptr, "loom_fpga");   // owns the landing buffers
     printf("%s: QP exchange on port %u ...\n", server ? "server" : "client", port);
     void *staging = server ? t_qp.initRDMA(STAGING_SIZE, port) : t_qp.initRDMA(STAGING_SIZE, port, ip.c_str());
     if (!staging) { printf("FAIL: initRDMA\n"); return 1; }
@@ -135,8 +138,19 @@ int main(int argc, char **argv) {
     char go = 1;
     if (!write_full(fd, &go, 1) || !read_full(fd, &go, 1)) { printf("FAIL: barrier\n"); return 1; }
 
+    if (!server) {   // the U280's PCIe round trip from this CPU: 2000 MMIO reads of a switch CSR (the first 100 not counted)
+        std::vector<double> rt;
+        for (int i = 0; i < 2100; i++) {
+            const auto a0 = std::chrono::steady_clock::now();
+            (void) loom_switch::csr_read(t_qp, loom_switch::TBL_IDX);
+            const auto a1 = std::chrono::steady_clock::now();
+            if (i >= 100) rt.push_back(std::chrono::duration<double, std::nano>(a1 - a0).count());
+        }
+        printf("csr read round trip (ns, %zu samples): p0 %.0f  p50 %.0f  p90 %.0f  p99 %.0f  max %.0f\n", rt.size(), pct(rt, 0),
+               pct(rt, 50), pct(rt, 90), pct(rt, 99), pct(rt, 100));
+    }
     volatile uint64_t *vflag = flag;
-    std::vector<double> oneway;
+    std::vector<double> oneway, post_ns;   // client: one-way, and the CPU's time to store a round
     bool timeout = false;
     for (int i = 1; i <= rounds && !timeout; i++) {
         const uint64_t v = uint64_t(i);
@@ -150,6 +164,8 @@ int main(int argc, char **argv) {
             const auto t0 = std::chrono::steady_clock::now();
             if (size) t_qp.uwinWrite(0, msg.data(), size);
             t_qp.uwinWrite(mlen, &v, 8);
+            const auto tp = std::chrono::steady_clock::now();
+            if (i > WARM) post_ns.push_back(std::chrono::duration<double, std::nano>(tp - t0).count());
             while (*vflag != v) if (std::chrono::steady_clock::now() - t0 > std::chrono::seconds(5)) { timeout = true; break; }
             const auto t1 = std::chrono::steady_clock::now();
             if (i > WARM) oneway.push_back(std::chrono::duration<double, std::nano>(t1 - t0).count() / 2);
@@ -170,6 +186,9 @@ int main(int argc, char **argv) {
             FILE *f = fopen(out.c_str(), "w");
             if (f) { for (double x : oneway) fprintf(f, "%.1f\n", x); fclose(f); }
         }
+        printf("post %lu B (ns, %zu samples): p0 %.0f  p50 %.0f  p90 %.0f  p99 %.0f  max %.0f  (CPU time to store a round)\n",
+               (unsigned long) size, post_ns.size(), pct(post_ns, 0), pct(post_ns, 50), pct(post_ns, 90), pct(post_ns, 99),
+               pct(post_ns, 100));
     }
     if (!write_full(fd, &go, 1) || !read_full(fd, &go, 1)) printf("(final barrier lost)\n");
     ::close(fd);

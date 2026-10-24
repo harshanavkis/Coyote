@@ -34,3 +34,7 @@ target_link_libraries(uwin_ptdma PUBLIC Coyote pthread)
 add_executable(uwin_wc64 ${TARGET_DIR}/uwin_wc64.cpp)
 target_link_libraries(uwin_wc64 PUBLIC Coyote pthread)
 target_compile_options(uwin_wc64 PRIVATE -mavx2)
+
+# Per-packet stamps (stamp_rec, CSR 224-240): arm / counts / dump, Loom and perf_rdma images
+add_executable(stamps ${TARGET_DIR}/stamps.cpp)
+target_link_libraries(stamps PUBLIC Coyote pthread)
