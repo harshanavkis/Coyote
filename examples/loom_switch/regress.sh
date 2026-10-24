@@ -46,14 +46,22 @@
 #      slows the landing to ~10.9 GB/s (A/B 2026-10-15), so the metric is now
 #      progput_v80_*_wbeat; the RDMA baseline uses the same counter
 #      (land_server --trace)
+# Without the V80s (v80.pdi = none, owner 2026-10-22: the V80s are not used any more) the default steps are the U280's
+# host-memory paths instead (STEPS=3GLPCS):
+#   3. CPU puts through the window (uwin_probe), each host
+#   G. CPU gets (get_bench), rose reads amy
+#   L. CPU-store latency host -> host (uwin_pingpong 0 / 64 / 4096 B, 4100 rounds, one-way p50)
+#   P. PTDMA puts host -> network -> peer host, acked (ce_remote --engine ptdma --ptq-user --ack; 4 KiB, 1 MiB, 16 MiB)
+#   C. collectives at two ranks over PTDMA (ce_coll --engine ptdma --ptq-user --acked): --verify points + timed points
+#   S. stamps (stamp_rec, CSR 224-240, images from Coyote c9112aca on): every point once per round of a uwin_pingpong
 # Logs in OUTDIR, one per step; the summary goes to stdout. STEPS=15 (for
 # example) runs only those steps. Every result also goes to OUTDIR/metrics.tsv
 # (name, value, tolerance in %: the median of the warm copies), and at the end
 # it is compared with the newest other metrics.tsv next to OUTDIR (or
 # COMPARE=<file>): a change beyond the tolerance is marked CHECK.
 set -u
-STEPS=${STEPS:-1234567}
-OUT=${1:?usage: regress.sh OUTDIR [--setup <u280.bit> <v80.pdi>]}; shift
+OUT=${1:?usage: regress.sh OUTDIR [--setup <u280.bit> <v80.pdi|none>]}; shift
+if [ "${3:-}" = none ] || [ -n "${NOV80:-}" ]; then STEPS=${STEPS:-3GLPCS}; else STEPS=${STEPS:-1234567}; fi
 HERE=$(cd "$(dirname "$0")" && pwd)
 REPO=$(git -C "$HERE" rev-parse --show-toplevel)
 source "$REPO/scripts/fpga/hosthog_loom.sh"
@@ -69,13 +77,17 @@ declare -A IP=([amy]=131.159.102.20 [rose]=131.159.102.21)
 PORT=19700
 nextport() { PORT=$((PORT + 2)); }   # in this shell: a $(...) subshell would lose the count
 on() { ssh -o ConnectTimeout=15 -n "$1.dos.cit.tum.de" "$2"; }
-ns() { on $1 "sudo cat /sys/kernel/coyote_sysfs_0/cyt_attr_nstats" | grep -E "^(ROCE TX pkgs|PSN drop cnt|Retrans cnt):" | tr -s ' ' | tr '\n' ' '; }
+ns() { on $1 "sudo cat /sys/kernel/loom_sysfs_0/cyt_attr_nstats" | grep -E "^(ROCE TX pkgs|PSN drop cnt|Retrans cnt):" | tr -s ' ' | tr '\n' ' '; }
 step() { echo; echo "=== $* ($(date -u +%H:%M:%S))"; }
 # A run that hits its timeout leaves the cards stuck (a copy engine waiting on
 # a dead peer, an ack window that never reopens): stop, the cards need setup
 hung() { echo; echo "ABORT: $1 failed or hit its timeout; the cards need setup_loom_hosts.sh before more runs (logs $OUT)"; finish; exit 3; }
 # The health check and the comparison: at the end, and after an abort
+PQ=/home/harshanavkis/loom-experiments/ptdma_q; PTQ_BDF=0000:e8:00.2; PTQ_DEV=/dev/ptq_0000_e8_00_2; PTQ=0
+ptq() { for h in amy rose; do on $h "$PQ/ptq_claim.sh $1 $PTQ_BDF" | sed "s/^/   $h: /"; done; }
+U="--engine ptdma --ptq $PTQ_DEV --ptq-user"
 finish() {
+    [ $PTQ = 1 ] && { step "PTDMA engines back to the stock driver"; ptq release; PTQ=0; }
     step "health after"
     for h in amy rose; do
         errs=$(on $h "sudo journalctl -k --since @$T0 --no-pager | grep -ciE '\\bBUG\\b|Oops|\\bAER\\b'")
@@ -141,7 +153,7 @@ done
 step "health"
 T0=$(date +%s)
 for h in amy rose; do
-    echo "$h: $(on $h 'uptime | sed "s/.*up/up/"; echo "U280 IP $(sudo cat /sys/kernel/coyote_sysfs_0/cyt_attr_ip | grep -oE "[0-9a-f]{8}" | head -1),"; echo "V80 driver nodes $(ls -d /sys/kernel/coyote_versal_sysfs_* 2>/dev/null | wc -l)"' | tr '\n' ' ') | $(ns $h)"
+    echo "$h: $(on $h 'uptime | sed "s/.*up/up/"; echo "U280 IP $(sudo cat /sys/kernel/loom_sysfs_0/cyt_attr_ip | grep -oE "[0-9a-f]{8}" | head -1),"; echo "V80 driver nodes $(ls -d /sys/kernel/loom_versal_sysfs_* 2>/dev/null | wc -l)"' | tr '\n' ' ') | $(ns $h)"
     up=$(on $h "cut -d. -f1 /proc/uptime")
     [ "${up:-0}" -lt 900 ] && echo "WARNING: $h booted $((up / 60)) min ago: CPU-side numbers (uwin_probe, CPU gets) have been off in the first ~15 min after a boot"
 done
@@ -275,6 +287,88 @@ for dst in host v80; do
         grep -hE '^FAIL' $L.*.log | head -3
     done
 done
+}
+
+[[ $STEPS == *G* ]] && {
+step "G. CPU gets (get_bench, rose reads amy)"
+nextport; p=$PORT
+on amy "cd $SW && sudo stdbuf -oL timeout 600 $NUMA ./get_bench --server --port $p --window 128" > $OUT/cpuget_server.log 2>&1 & sp=$!
+sleep 4
+on rose "cd $SW && sudo stdbuf -oL timeout 580 $NUMA ./get_bench --client ${IP[amy]} --port $p --window 128" > $OUT/cpuget_client.log 2>&1
+wait $sp
+echo "-- CPU gets (rose reads amy): $(grep -E '8 B load' $OUT/cpuget_client.log | sed -E 's/ +/ /g'); $(grep -E '16384 B:' $OUT/cpuget_client.log | sed -E 's/ +/ /g' | cut -c1-70)"
+echo "   $(grep -oE 'GET BENCH (PASS|FAIL)' $OUT/cpuget_client.log)"
+metric cpuget_load8_us "$(sed -nE 's/.*8 B load: median +([0-9.]+) us.*/\1/p' $OUT/cpuget_client.log)" 5
+metric cpuget_16K "$(sed -nE 's/.*16384 B:.*, +([0-9.]+) GB\/s.*/\1/p' $OUT/cpuget_client.log)" 40
+grep -q 'GET BENCH PASS' $OUT/cpuget_client.log || hung "get_bench"
+}
+
+[[ $STEPS == *L* ]] && {
+step "L. CPU-store latency, host -> host (uwin_pingpong, 4100 rounds, one-way p50)"
+for sz in 0 64 4096; do
+    nextport; p=$PORT; L=$OUT/pingpong_$sz
+    on amy "cd $SW && sudo stdbuf -oL timeout 300 $NUMA ./uwin_pingpong --server --port $p --size $sz --rounds 4100" > $L.server.log 2>&1 & sp=$!
+    sleep 4
+    on rose "cd $SW && sudo stdbuf -oL timeout 290 $NUMA ./uwin_pingpong --client ${IP[amy]} --port $p --size $sz --rounds 4100" > $L.client.log 2>&1
+    wait $sp
+    p50=$(sed -nE 's/^one-way .* p50 ([0-9]+) .*/\1/p' $L.client.log)
+    echo "-- $sz B: one-way p50 ${p50:-NA} ns $(grep -hoE 'UWIN PINGPONG (PASS|FAIL)' $L.server.log $L.client.log | tr '\n' ' ')"
+    metric pingpong_${sz}_p50_ns "$p50" 5
+    grep -q 'UWIN PINGPONG PASS' $L.client.log || hung "uwin_pingpong $sz"
+done
+}
+
+[[ $STEPS == *P* || $STEPS == *C* ]] && { step "PTDMA engines to ptdma_q ($PTQ_BDF)"; ptq claim; PTQ=1; }
+
+[[ $STEPS == *P* ]] && {
+step "P. PTDMA puts, host -> network -> peer host, acked (ce_remote --engine ptdma --ptq-user --ack)"
+for sz in 4096 1048576 16777216; do
+    burst=$((67108864 / sz)); [ $burst -gt 1024 ] && burst=1024
+    nextport; p=$PORT; L=$OUT/ptdma_put_$sz
+    on amy "cd $CE && sudo stdbuf -oL timeout 300 $NUMA ./ce_remote --server --size $sz --port $p --ack" > $L.server.log 2>&1 & sp=$!
+    sleep 4
+    on rose "cd $CE && sudo stdbuf -oL timeout 290 $NUMA ./ce_remote --client ${IP[amy]} --reps 11 --burst $burst --ack $U --port $p" > $L.client.log 2>&1
+    wait $sp
+    land=$(landed $L.server.log)
+    echo "-- $sz B x $burst: landed $land| $(grep -hoE 'G4 (PASS|FAIL)' $L.server.log $L.client.log | tr '\n' ' ')"
+    metric ptdma_put_${sz}_landed "$(echo $land | words | warm | median)"
+    grep -q 'G4 PASS' $L.client.log || hung "PTDMA put $sz"
+done
+}
+
+[[ $STEPS == *C* ]] && {
+step "C. collectives, 2 ranks over PTDMA (ce_coll --engine ptdma --ptq-user --acked)"
+for cs in "ag 65536 --verify" "a2a 65536 --verify" "bc 65536 --verify" "ar_ring 1048576 --verify" "ag 1048576" "ar_ring 65536"; do
+    set -- $cs; c=$1; sz=$2; x=${3:-}
+    nextport; p=$PORT; L=$OUT/coll_${c}_$sz${x:+_verify}
+    on amy "cd $CE && sudo stdbuf -oL timeout 300 $NUMA ./ce_coll --server $U --acked $x --coll $c --size $sz --runs 6 --port $p" > $L.r0.log 2>&1 & sp=$!
+    sleep 4
+    on rose "cd $CE && sudo stdbuf -oL timeout 290 $NUMA ./ce_coll --client ${IP[amy]} $U --acked $x --coll $c --size $sz --runs 6 --port $p" > $L.r1.log 2>&1
+    wait $sp
+    t=$(sed -nE 's/.*median \[min max\]\): ([0-9.]+).*/\1/p' $L.r1.log | head -1)
+    echo "-- $c $sz${x:+ verify}: ${t:+$t us, }$(grep -hE 'verify:|result words wrong' $L.r0.log $L.r1.log | tr '\n' ' ')$(grep -hoE 'COLL (PASS|FAIL)' $L.r0.log $L.r1.log | tr '\n' ' ')"
+    [ -z "$x" ] && metric coll_${c}_${sz}_us "$t" 10
+    grep -q 'COLL PASS' $L.r0.log && grep -q 'COLL PASS' $L.r1.log || hung "ce_coll $c $sz"
+done
+}
+
+[[ $STEPS == *S* ]] && {
+step "S. stamps: every point once per round (uwin_pingpong 0 B, 1100 rounds)"
+if on amy "cd $SW && sudo ./stamps arm" > $OUT/stamps_arm.log 2>&1 && on rose "cd $SW && sudo ./stamps arm" >> $OUT/stamps_arm.log 2>&1; then
+    nextport; p=$PORT
+    on amy "cd $SW && sudo stdbuf -oL timeout 120 $NUMA ./uwin_pingpong --server --port $p --size 0 --rounds 1100" > $OUT/stamps_pp_server.log 2>&1 & sp=$!
+    sleep 4
+    on rose "cd $SW && sudo stdbuf -oL timeout 110 $NUMA ./uwin_pingpong --client ${IP[amy]} --port $p --size 0 --rounds 1100" > $OUT/stamps_pp_client.log 2>&1
+    wait $sp
+    for h in amy rose; do
+        on $h "cd $SW && sudo ./stamps counts" > $OUT/stamps_counts_$h.log 2>&1
+        echo "-- $h: $(head -9 $OUT/stamps_counts_$h.log | awk '{printf "%s=%s ", $2, $3}')"
+        bad=$(head -9 $OUT/stamps_counts_$h.log | awk '$1 ~ /^[0124567]$/ && $3 != 1100' | wc -l)
+        metric stamps_points_off_$h "$bad" 0
+    done
+else
+    echo "-- no stamps on this image ($(tail -1 $OUT/stamps_arm.log))"
+fi
 }
 
 finish

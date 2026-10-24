@@ -18,8 +18,8 @@
 # 20) unless the calling script already holds the claim; it stops if someone else holds one.
 #
 # Drivers: driver/build{,_qdma,_versal} are built against the build tree's kernel. A host on another kernel
-# (e.g. after an OS update on one host only) loads driver/k<its uname -r>/{coyote_driver,coyote_driver_qdma,
-# coyote_driver_versal}.ko instead: build them with KERNELDIR=<that kernel's lib/modules/<ver>/build> and copy
+# (e.g. after an OS update on one host only) loads driver/k<its uname -r>/{loom_coyote,loom_coyote_qdma,
+# loom_coyote_versal}.ko instead (Loom's names since 2026-10-22, distinct from stock Coyote's coyote_driver): build them with KERNELDIR=<that kernel's lib/modules/<ver>/build> and copy
 # them there (they must be rebuilt whenever the driver changes).
 #
 # Runs every host at once, each in a tmux session `loom_setup` ON that host
@@ -31,8 +31,8 @@
 # On each host, in this order (each step avoids a way it failed before):
 #   1. stop this user's hw_server: one left by Vivado 2023.2 (U280) makes
 #      2025.1 (V80) refuse to connect
-#   2. unload both Coyote drivers, whoever loaded them: a V80 driver loaded
-#      at boot takes /sys/kernel/coyote_sysfs_0, which the U280 driver needs
+#   2. unload our own drivers (loom_coyote, loom_coyote_versal unless V80 none); another user's stock
+#      coyote_driver* is never unloaded (2026-10-22: the names differ, nothing collides)
 #   3. U280: off the bus, JTAG program, link retrain, rescan, insmod with the
 #      host's IP and MAC, check the identity and the link
 #   4. V80: off the bus (its root port), JTAG program, rescan, insmod; it
@@ -86,9 +86,10 @@ if [ "${1:-}" = --here ]; then
 
     # 1, 2
     pkill -u "$(id -u)" -x hw_server && sleep 1
-    for m in coyote_driver coyote_driver_versal; do
+    # V80 'none' (owner 2026-10-22: the V80s are not ours to touch): its driver is left as it is, whoever loaded it
+    for m in loom_coyote $([ "$PDI" = none ] || echo loom_coyote_versal); do
         if lsmod | grep "^$m " >/dev/null; then
-            sudo rmmod $m || fail "cannot unload $m (in use? $(sudo fuser /dev/coyote* 2>&1 | tr -s ' '))"
+            sudo rmmod $m || fail "cannot unload $m (in use? $(sudo fuser /dev/loom_fpga* 2>&1 | tr -s ' '))"
             echo "   unloaded $m"
         fi
     done
@@ -103,15 +104,20 @@ if [ "${1:-}" = --here ]; then
     echo 1 | sudo tee /sys/bus/pci/rescan >/dev/null
     sleep 2
     [ -e $D ] || fail "the U280 did not come back at $U280_BDF: warm-reboot $H (the image stays programmed) and run this again"
-    sudo rmmod coyote_driver 2>/dev/null   # a udev auto-load on the rescan, without identity
+    # another driver bound to the U280 after the rescan (a udev auto-load of a stock coyote_driver, or our pre-2026-10-22
+    # coyote_driver): unbind the card from it, never unload that module
+    if [ -e $D/driver ] && [ "$(basename "$(readlink -f $D/driver)")" != loom_coyote ]; then
+        echo "   U280: unbinding it from $(basename "$(readlink -f $D/driver)")"
+        echo $U280_BDF | sudo tee $D/driver/unbind >/dev/null
+    fi
     # the soft-QDMA static (STATIC_DMA=qdma) is device 913f and needs the driver built with DMA=qdma
-    KOF=coyote_driver.ko
-    [ "$(cat $D/device)" = 0x913f ] && KOF=coyote_driver_qdma.ko   # QDMA image: make TARGET_PLATFORM=ultrascale_plus DMA=qdma
+    KOF=loom_coyote.ko
+    [ "$(cat $D/device)" = 0x913f ] && KOF=loom_coyote_qdma.ko   # QDMA image: make TARGET_PLATFORM=ultrascale_plus DMA=qdma
     KO=$(ko $KOF) || { echo "$KO"; exit 1; }
     sudo insmod $KO ip_addr=0x${U280_IP[$H]} mac_addr=${U280_MAC[$H]} || fail "U280 driver insmod failed (dmesg)"
     IP=""
     for i in $(seq 1 20); do
-        IP=$(sudo cat /sys/kernel/coyote_sysfs_0/cyt_attr_ip 2>/dev/null | grep -oE '[0-9a-f]{8}' | head -1)
+        IP=$(sudo cat /sys/kernel/loom_sysfs_0/cyt_attr_ip 2>/dev/null | grep -oE '[0-9a-f]{8}' | head -1)
         [ -n "$IP" ] && break; sleep 1
     done
     echo "   U280: $(cat $D/device) driver $(basename "$(readlink -f $D/driver)") ($(basename $KO)), IP ${IP:-none}, link $(link $D)"
@@ -123,17 +129,17 @@ if [ "${1:-}" = --here ]; then
     # 4. V80
     if [ -n "${V80_BDF[$H]:-}" ] && [ "$PDI" = - ]; then   # programmed already: the driver only
         V=/sys/bus/pci/devices/${V80_BDF[$H]}
-        sudo rmmod coyote_driver_versal 2>/dev/null
+        sudo rmmod loom_coyote_versal 2>/dev/null
         echo 1 | sudo tee /sys/bus/pci/rescan >/dev/null
         [ -e $V ] && grep -qE '0x(b0|b1|b2|b3)3f' $V/device || fail "no Coyote V80 at ${V80_BDF[$H]} ($(cat $V/device 2>/dev/null))"
-        VKO=$(ko coyote_driver_versal.ko) || { echo "$VKO"; exit 1; }; sudo insmod $VKO || fail "V80 driver insmod failed (dmesg)"
-        for i in $(seq 1 30); do ls -d /sys/kernel/coyote_versal_sysfs_* >/dev/null 2>&1 && break; sleep 1; done
+        VKO=$(ko loom_coyote_versal.ko) || { echo "$VKO"; exit 1; }; sudo insmod $VKO || fail "V80 driver insmod failed (dmesg)"
+        for i in $(seq 1 30); do ls -d /sys/kernel/loom_versal_sysfs_* >/dev/null 2>&1 && break; sleep 1; done
         echo "   V80 (as programmed): driver $(basename "$(readlink -f $V/driver)"), link $(link $V)"
-        ls -d /sys/kernel/coyote_versal_sysfs_* >/dev/null 2>&1 || fail "V80 driver up but no coyote_versal_sysfs node (dmesg)"
+        ls -d /sys/kernel/loom_versal_sysfs_* >/dev/null 2>&1 || fail "V80 driver up but no loom_versal_sysfs node (dmesg)"
     elif [ -n "${V80_BDF[$H]:-}" ]; then
         V=/sys/bus/pci/devices/${V80_BDF[$H]}
         for try in 1 2 3; do
-            sudo rmmod coyote_driver_versal 2>/dev/null
+            sudo rmmod loom_coyote_versal 2>/dev/null
             if [ -e $V ]; then
                 # its root port when the card is alone under it: only
                 # re-enumerating the port re-sizes the bridge windows for
@@ -151,14 +157,14 @@ if [ "${1:-}" = --here ]; then
                 sleep 2
             done
             [ -e $V ] || fail "the V80 did not come back at ${V80_BDF[$H]}"
-            sudo rmmod coyote_driver_versal 2>/dev/null
-            VKO=$(ko coyote_driver_versal.ko) || { echo "$VKO"; exit 1; }; sudo insmod $VKO || fail "V80 driver insmod failed (dmesg)"
-            for i in $(seq 1 30); do ls -d /sys/kernel/coyote_versal_sysfs_* >/dev/null 2>&1 && break; sleep 1; done
+            sudo rmmod loom_coyote_versal 2>/dev/null
+            VKO=$(ko loom_coyote_versal.ko) || { echo "$VKO"; exit 1; }; sudo insmod $VKO || fail "V80 driver insmod failed (dmesg)"
+            for i in $(seq 1 30); do ls -d /sys/kernel/loom_versal_sysfs_* >/dev/null 2>&1 && break; sleep 1; done
             echo "   V80: driver $(basename "$(readlink -f $V/driver)"), link $(link $V)"
             [ "$(cat $V/current_link_width)" = 16 ] && break
             [ $try = 3 ] && fail "V80 link $(link $V) after 3 tries, want x16"
         done
-        ls -d /sys/kernel/coyote_versal_sysfs_* >/dev/null 2>&1 || fail "V80 driver up but no coyote_versal_sysfs node (dmesg)"
+        ls -d /sys/kernel/loom_versal_sysfs_* >/dev/null 2>&1 || fail "V80 driver up but no loom_versal_sysfs node (dmesg)"
         pkill -u "$(id -u)" -x hw_server
     fi
     # 5. host configuration
@@ -198,8 +204,8 @@ hog_claim ${HOG_MIN:-20} $(printf '%s\n' "$@" | grep -vx clara) || { echo "SETUP
 STAGE=$HOME/.cache/loom-setup/$(date -u +%Y%m%d-%H%M%S)
 mkdir -p "$STAGE"
 cp "$0" "$HERE/vivado_env.sh" "$REPO/examples/loom/hw/program_loom.tcl" \
-   "$REPO/driver/build/coyote_driver.ko" "$REPO/driver/build_versal/coyote_driver_versal.ko" "$STAGE/" || exit 1
-[ -f "$REPO/driver/build_qdma/coyote_driver.ko" ] && cp "$REPO/driver/build_qdma/coyote_driver.ko" "$STAGE/coyote_driver_qdma.ko"
+   "$REPO/driver/build/loom_coyote.ko" "$REPO/driver/build_versal/loom_coyote_versal.ko" "$STAGE/" || exit 1
+[ -f "$REPO/driver/build_qdma/loom_coyote.ko" ] && cp "$REPO/driver/build_qdma/loom_coyote.ko" "$STAGE/loom_coyote_qdma.ko"
 for d in "$REPO"/driver/k*/; do [ -d "$d" ] && cp -r "$d" "$STAGE/"; done   # drivers for hosts on other kernels
 echo "commit $(git -C "$REPO" rev-parse --short HEAD), drivers $(cd $STAGE && md5sum *.ko k*/*.ko 2>/dev/null | cut -c1-8 | tr '\n' ' ')" > "$STAGE/INFO.txt"
 echo "staged in $STAGE ($(cat $STAGE/INFO.txt))"

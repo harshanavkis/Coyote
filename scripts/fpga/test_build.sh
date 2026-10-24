@@ -9,7 +9,7 @@
 #
 # Standard images (override with U280_IMG / V80_IMG):
 U280_IMG=${U280_IMG:-$HOME/coyote-bitstreams/loom-switch-qdma64/hw/bitstreams/cyt_top.bit}
-V80_IMG=${V80_IMG:-$HOME/coyote-bitstreams/loom-ce-rawin/cyt_top.pdi}
+V80_IMG=${V80_IMG:-none}   # owner 2026-10-22: the V80s are not used (was loom-ce-rawin); 'none' = U280-only regression
 # Results: ~/loom-experiments/regress/<date>_<stage_name>/ (metrics.tsv, logs,
 # ce_prog_<host>.log). ssh to the hosts needs a forwarded agent (VS Code's or
 # an ssh -A login's); a live one is picked before each phase, waiting while
@@ -39,14 +39,14 @@ case $WHAT in
     switch) U280_IMG=$HOME/coyote-bitstreams/$STAGE/hw/bitstreams/cyt_top.bit ;;
     ce)     V80_IMG=$HOME/coyote-bitstreams/$STAGE/cyt_top.pdi ;;
 esac
-[ -f "$U280_IMG" ] && [ -f "$V80_IMG" ] || { echo "TEST: missing $U280_IMG or $V80_IMG"; exit 1; }
+[ -f "$U280_IMG" ] && { [ "$V80_IMG" = none ] || [ -f "$V80_IMG" ]; } || { echo "TEST: missing $U280_IMG or $V80_IMG"; exit 1; }
 
 pick_agent || { echo "TEST: no ssh agent, stopping"; exit 1; }
 COMPARE=$BASE "$REPO/examples/loom_switch/regress.sh" "$OUT" --setup "$U280_IMG" "$V80_IMG"
 echo "TEST: regress.sh exit $?"
 
 pick_agent
-for h in amy rose; do
+[ "$V80_IMG" = none ] || for h in amy rose; do   # ce_prog is the V80 copy engine's self-test
     echo "=== ce_prog on $h ($(date -u +%H:%M:%S))"
     ssh -o ConnectTimeout=15 -n $h.dos.cit.tum.de \
         "cd $REPO/examples/loom_ce/sw/build && sudo timeout 300 $NUMA ./ce_prog" 2>&1 | tee "$OUT/ce_prog_$h.log"
