@@ -33,10 +33,26 @@
  *                the ack as in (a). --verify stamps every 64 B line's first word and checks them once the last word shows
  *                the iteration (and checks a bc receiver's block in every mode, also without --stamp)
  *
+ *
+ * Several ranks on one host (ptdma ranks; a host's ranks share its U280; 2026-10-22, QP sharing): ranks with the same
+ * --hosts entry are on one host; a rank's slot = its index among them, R = its peers on other hosts. Slot s uses export
+ * 1 + s, windows 1 + s R + ridx and the uwin from s R BLK (ridx = the peer's index among the remote peers). Its region is a 2 MiB hugetlbfs file (/dev/hugepages/loomcolln_<port>_<rank>,
+ * mapped shared), so a peer on the same host writes into it with the CPU: copy, sfence, the last 8 B, sfence, the flag
+ * (no QP, no window). Remote peers as above, through the PTDMA engine of the rank (--ptq: one engine per rank).
+ *   default     one QP per pair of ranks on different hosts (QP-owner cThread in each of the two processes)
+ *   --share-qp  one QP per pair of HOSTS, owned by the first rank of each host; the host's other ranks program their
+ *               windows onto that QP (its ctid comes in the hello); the far switch lands every packet by its export
+ *   --window P  the card's ack window (TX_CTL: rdma packets unacked over all its QPs, 0 = no limit; 16 after a setup),
+ *               written by the card's first rank; it stays until the next setup
+ *
  *   ce_colln --rank r --ranks N --hosts ip0,ip1,... (management IPs) --coll C --size S [--iters K] [--runs R] [--port P]
- *            [--engine v80|ptdma] [--ptq DEV] [--verify] [--acked] [--ptq-user] [--ack-store | --stamp] [--out FILE]
+ *            [--engine v80|ptdma] [--ptq DEV] [--verify] [--acked] [--ptq-user] [--ack-store | --stamp] [--share-qp]
+ *            [--window P] [--out FILE]
  * Rank 0 is the hub of a TCP control mesh (hello, barriers) on port P; pair (i, j) builds its QP on port P + 2 + 2 * pair.
  */
+#include <fcntl.h>
+#include <immintrin.h>
+#include <sys/mman.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
@@ -48,6 +64,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <memory>
 #include <sstream>
 #include <string>
@@ -66,7 +83,11 @@ constexpr uint32_t MAGIC = 0x434F4C4E;      // "COLN"
 constexpr uint64_t STAGING_SIZE = 1ULL << 20;
 constexpr int MAXR = 8;
 
-struct Hello { uint32_t magic, rank, dst_ctid, bcmode; uint64_t size, iters, coll; int64_t runs; };
+struct Hello { uint32_t magic, rank, dst_ctid, bcmode; uint64_t size, iters, coll; int64_t runs;
+               uint32_t exp, share, qp_ctid[MAXR]; };   // export index, --share-qp, ctid of the QP to each rank (NO_QP = none)
+constexpr uint32_t NO_QP = 0xFFFFFFFFu;   // ctid 0 is a real cThread
+constexpr uint64_t HUGE2M = 2ULL << 20;
+std::string region_file(uint16_t port, int rank) { return "/dev/hugepages/loomcolln_" + std::to_string(port) + "_" + std::to_string(rank); }
 
 bool write_full(int fd, const void *p, size_t n) {
     const char *c = static_cast<const char *>(p);
@@ -124,8 +145,8 @@ struct Op {
 
 int main(int argc, char **argv) {
     std::string hosts_s, out, cname, engine = "v80", ptq_dev = "/dev/ptq_0000_e8_00_2";
-    int k = -1, N = 0, K = 0, runs = 6;
-    bool verify = false, acked = false, ptq_user = false, ack_store = false, stamp_mode = false;
+    int k = -1, N = 0, K = 0, runs = 6, window = -1;
+    bool verify = false, acked = false, ptq_user = false, ack_store = false, stamp_mode = false, share_qp = false;
     uint16_t port = 22000;
     uint64_t S = 65536;
     for (int i = 1; i < argc; i++) {
@@ -146,10 +167,23 @@ int main(int argc, char **argv) {
         else if (a == "--ptq-user")                ptq_user = true;
         else if (a == "--ack-store")               ack_store = true;
         else if (a == "--stamp")                   stamp_mode = ack_store = true;
+        else if (a == "--share-qp")                share_qp = true;
+        else if (a == "--window" && i + 1 < argc)  window = atoi(argv[++i]);
         else { N = 0; break; }
     }
     std::vector<std::string> hosts;
     { std::stringstream ss(hosts_s); std::string h; while (std::getline(ss, h, ',')) if (!h.empty()) hosts.push_back(h); }
+    // ranks on one host (the same --hosts entry): slot = index among them, lead = the first of them
+    auto same = [&](int q) { return q != k && hosts[size_t(q)] == hosts[size_t(k)]; };
+    auto lead = [&](int r) { int j = 0; while (hosts[size_t(j)] != hosts[size_t(r)]) j++; return j; };
+    auto need_qp = [&](int i, int j) {   // does pair (i, j) build a QP
+        return hosts[size_t(i)] != hosts[size_t(j)] && (!share_qp || (i == lead(i) && j == lead(j)));
+    };
+    int slot = 0, nslot = 0, nsame = 0;
+    if (int(hosts.size()) == N && k >= 0 && k < N)
+        for (int j = 0; j < N; j++) if (hosts[size_t(j)] == hosts[size_t(k)]) { nslot++; if (j < k) slot++; if (j != k) nsame++; }
+    const int nrem = N - 1 - nsame;                       // peers on other hosts: one window each
+    auto ridx = [&](int q) { int r = 0; for (int j = 0; j < q; j++) if (j != k && !same(j)) r++; return r; };
     const int c = int(std::find(NAMES, NAMES + NCOLL, cname) - NAMES);
     const bool cpu = engine == "ptdma";
     const uint64_t C = ((S + uint64_t(N > 0 ? N : 1) * 128 - 1) / (uint64_t(N > 0 ? N : 1) * 128)) * 128;   // chunk
@@ -165,11 +199,13 @@ int main(int argc, char **argv) {
     if (!K) K = S <= 65536 ? 200 : S <= (1ULL << 20) ? 50 : 10;
     if (N < 2 || N > MAXR || k < 0 || k >= N || int(hosts.size()) != N || c == NCOLL || S % 128 || S == 0 || runs < 2 || K < 1 ||
         (engine != "v80" && !cpu) || ((verify || acked) && !cpu) || VT > (cpu ? (1ULL << 30) : land_v80::UWIN_SIZE - 4096) ||
-        uint64_t(N - 1) * BLK > (128ULL << 20) || 2 * uint64_t(N - 1) * 8 > 4096 || (ack_store && (!cpu || c != BC))) {
+        uint64_t(nslot) * uint64_t(nrem) * BLK > (128ULL << 20) || 2 * uint64_t(N - 1) * 8 > 4096 ||
+        (ack_store && (!cpu || c != BC)) || ((nslot > 1 || share_qp) && !cpu) || 1 + nslot * nrem > 16 || nrem < 1) {
         printf("usage: %s --rank r --ranks N --hosts ip0,ip1,... --coll ag|a2a|rs|ar_ring|ar_direct|bc --size S (multiple of 128)"
                " [--iters K] [--runs R >= 2] [--port P] [--engine v80|ptdma] [--ptq DEV] [--verify] [--acked] [--ptq-user]"
-               " [--ack-store | --stamp (ptdma, bc)] [--out FILE]"
-               " (region %lu B, windows %lu B)\n", argv[0], (unsigned long) VT, (unsigned long) (uint64_t(N > 1 ? N - 1 : 0) * BLK));
+               " [--ack-store | --stamp (ptdma, bc)] [--share-qp (ptdma)] [--window P] [--out FILE] (several ranks on a host: ptdma only;"
+               " region %lu B, windows of a card %lu B of 128 MiB)\n", argv[0], (unsigned long) VT,
+               (unsigned long) (uint64_t(nslot) * uint64_t(nrem > 0 ? nrem : 0) * BLK));
         return 2;
     }
     const int next = (k + 1) % N, prev = (k + N - 1) % N;
@@ -194,8 +230,10 @@ int main(int argc, char **argv) {
                 acc = o;
             }
         };
+        // peers in rotated order (k + 1, k + 2, ...): in step i every rank sends to k + i and receives from k - i, one
+        // flow per link; in rank order all ranks would send to the same peer first (an incast on its link)
         std::vector<int> peers;
-        for (int q = 0; q < N; q++) if (q != k) peers.push_back(q);
+        for (int i = 1; i < N; i++) peers.push_back((k + i) % N);
         switch (c) {
         case AG:
         case AR_DIRECT:
@@ -245,13 +283,13 @@ int main(int argc, char **argv) {
         }
     };
 
-    // ---- cards: one QP-owner cThread per peer, the data cThread, the V80 ----
+    // ---- cards: a QP-owner cThread per pair that builds a QP, the data cThread (also the CSRs'), the V80 ----
     std::vector<std::unique_ptr<coyote::cThread>> t_qp(N);
-    for (int q = 0; q < N; q++) if (q != k) t_qp[q] = std::make_unique<coyote::cThread>(0, getpid(), 0, nullptr, "coyote_fpga");
-    coyote::cThread t_data(0, getpid(), 0, nullptr, "coyote_fpga");
-    coyote::cThread &csr = *t_qp[k == 0 ? 1 : 0];
+    for (int q = 0; q < N; q++) if (q != k && need_qp(k, q)) t_qp[q] = std::make_unique<coyote::cThread>(0, getpid(), 0, nullptr, "loom_fpga");
+    coyote::cThread t_data(0, getpid(), 0, nullptr, "loom_fpga");
+    coyote::cThread &csr = t_data;
     std::unique_ptr<coyote::cThread> v80;
-    if (!cpu) v80 = std::make_unique<coyote::cThread>(0, getpid(), 0, nullptr, "coyote_versal_fpga");
+    if (!cpu) v80 = std::make_unique<coyote::cThread>(0, getpid(), 0, nullptr, "loom_versal_fpga");
 
     // ---- control mesh: rank 0 is the hub ----
     std::vector<int> cfd(N, -1);
@@ -279,11 +317,18 @@ int main(int argc, char **argv) {
         }
         return write_full(cfd[0], &b, 1) && read_full(cfd[0], &b, 1);
     };
+    // The window and export tables are programmed through one set of staging CSRs per card (index, fields, commit):
+    // ranks sharing a card must not program at the same time, so every rank programs in its own turn
+    auto in_turn = [&](const std::function<void()> &fn) {
+        for (int r = 0; r < N; r++) { if (r == k) fn(); if (!barrier()) return false; }
+        return true;
+    };
 
     // ---- one QP per pair, in a fixed order (pair (i, j), i < j: i serves, j connects, after a barrier) ----
     int pair = 0;
     for (int i = 0; i < N; i++) for (int j = i + 1; j < N; j++, pair++) {
         if (!barrier()) { printf("FAIL: barrier before pair %d-%d\n", i, j); return 1; }
+        if (!need_qp(i, j)) continue;
         const uint16_t qport = uint16_t(port + 2 + 2 * pair);
         void *st = nullptr;
         if (k == i) st = t_qp[j]->initRDMA(STAGING_SIZE, qport);
@@ -296,9 +341,12 @@ int main(int argc, char **argv) {
         if (!st) { printf("FAIL: initRDMA pair %d-%d\n", i, j); return 1; }
     }
 
-    // ---- this rank's region, exported whole (export 1) ----
+    // ---- this rank's region, exported whole (export 1 + slot) ----
     std::unique_ptr<land_v80::Landing> L;
     uint8_t *hbuf = nullptr;
+    const uint32_t EXP = 1 + uint32_t(slot);
+    const uint64_t VTH = (VT + HUGE2M - 1) & ~(HUGE2M - 1);   // the region file, whole 2 MiB pages
+    void *ebase = nullptr;                                     // what export EXP lands in
     if (!cpu) {
         L = std::make_unique<land_v80::Landing>(*v80, VT);
         int32_t *in = reinterpret_cast<int32_t *>(L->buf);
@@ -306,20 +354,29 @@ int main(int argc, char **argv) {
         v80->invoke(coyote::CoyoteOper::LOCAL_OFFLOAD, coyote::syncSg{L->buf, VT});
         void *lva = loom_switch::reserve_va(VT);
         t_data.importDmabuf(L->export_fd(), lva);
-        loom_switch::program_export(csr, 1, t_data.getCtid(), lva, VT);
+        ebase = lva;
     } else {
-        hbuf = static_cast<uint8_t *>(t_data.getMem({coyote::CoyoteAllocType::HPF, VT}));
-        if (!hbuf) { printf("FAIL: no host memory\n"); return 1; }
-        memset(hbuf, 0, VT);
+        // 2 MiB pages as getMem(HPF), but a shared hugetlbfs file, so a peer on this host can map it
+        const std::string fn = region_file(port, k);
+        const int rfd = ::open(fn.c_str(), O_CREAT | O_RDWR | O_TRUNC, 0600);
+        if (rfd < 0 || ::ftruncate(rfd, off_t(VTH)) < 0) { printf("FAIL: region file %s: %s\n", fn.c_str(), strerror(errno)); return 1; }
+        void *m = mmap(nullptr, VTH, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE, rfd, 0);
+        ::close(rfd);
+        if (m == MAP_FAILED) { printf("FAIL: no huge pages for %s (%lu B): %s\n", fn.c_str(), (unsigned long) VTH, strerror(errno)); return 1; }
+        hbuf = static_cast<uint8_t *>(m);
+        memset(hbuf, 0, VTH);
+        t_data.userMap(hbuf, VTH);
         int32_t *in = reinterpret_cast<int32_t *>(hbuf);
         for (uint64_t j = 0; j < S / 4; j++) in[j] = input(k, j);
-        loom_switch::program_export(csr, 1, t_data.getCtid(), hbuf, VT);
+        ebase = hbuf;
     }
+    if (!in_turn([&] { loom_switch::program_export(csr, EXP, t_data.getCtid(), ebase, VT); })) { printf("FAIL: barrier\n"); return 1; }
 
     // ---- hello: every rank's landing ctid, through rank 0 ----
     std::vector<Hello> hs(N);
     Hello mine{MAGIC, uint32_t(k), uint32_t(t_data.getCtid()), uint32_t(ack_store) + 2 * uint32_t(stamp_mode), S, uint64_t(K),
-               uint64_t(c), runs};
+               uint64_t(c), runs, EXP, uint32_t(share_qp), {}};
+    for (int q = 0; q < N; q++) mine.qp_ctid[q] = t_qp[q] ? uint32_t(t_qp[q]->getCtid()) : NO_QP;
     if (k == 0) {
         hs[0] = mine;
         for (int j = 1; j < N; j++) if (!read_full(cfd[j], &hs[j], sizeof(Hello))) { printf("FAIL: hello\n"); return 1; }
@@ -329,20 +386,39 @@ int main(int argc, char **argv) {
     }
     for (int q = 0; q < N; q++)
         if (hs[q].magic != MAGIC || int(hs[q].rank) != q || hs[q].size != S || hs[q].iters != uint64_t(K) ||
-            hs[q].coll != uint64_t(c) || hs[q].runs != runs || hs[q].bcmode != mine.bcmode) {
-            printf("FAIL: hello from rank %d (--ranks, --coll, --size, --iters, --runs, --ack-store and --stamp must match)\n", q); return 1;
+            hs[q].coll != uint64_t(c) || hs[q].runs != runs || hs[q].bcmode != mine.bcmode || hs[q].share != mine.share) {
+            printf("FAIL: hello from rank %d (--ranks, --coll, --size, --iters, --runs, --ack-store, --stamp and --share-qp must"
+                   " match)\n", q); return 1;
         }
-    // ---- windows: peer q's block(k) through window 1 + idx(k, q) = uwin [idx * BLK, +BLK), on q's QP ----
-    auto ustart = [&](int q) { return uint64_t(idx(k, q)) * BLK; };
-    for (int q = 0; q < N; q++) if (q != k)
-        loom_switch::program_window(csr, 1 + uint32_t(idx(k, q)), true, t_qp[q]->getCtid(),
-                                    reinterpret_cast<void *>(loom_switch::export_ref(1, blk(q, k))), BLK, ustart(q), hs[q].dst_ctid);
+    // ---- peers on this host: their region files, mapped shared ----
+    std::vector<uint8_t *> peer(N, nullptr);
+    for (int q = 0; q < N; q++) if (same(q)) {
+        const int pfd = ::open(region_file(port, q).c_str(), O_RDWR);
+        void *m = pfd < 0 ? MAP_FAILED : mmap(nullptr, VTH, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE, pfd, 0);
+        if (pfd >= 0) ::close(pfd);
+        if (m == MAP_FAILED) { printf("FAIL: region of rank %d on this host: %s\n", q, strerror(errno)); return 1; }
+        peer[q] = static_cast<uint8_t *>(m);
+    }
+    // ---- windows: remote peer q's block(k) through window 1 + s R + ridx(q) = uwin [(s R + ridx) BLK, +BLK), on the QP of
+    //      this rank and q (--share-qp: of the first ranks of the two hosts) ----
+    const uint32_t WIN0 = 1 + uint32_t(slot) * uint32_t(nrem);
+    auto ustart = [&](int q) { return (uint64_t(slot) * uint64_t(nrem) + uint64_t(ridx(q))) * BLK; };
+    for (int q = 0; q < N; q++) if (q != k && !same(q) && (share_qp ? hs[lead(k)].qp_ctid[lead(q)] : hs[k].qp_ctid[q]) == NO_QP) {
+        printf("FAIL: no QP from rank %d to rank %d\n", k, q); return 1;
+    }
+    if (!in_turn([&] {
+            if (window >= 0 && slot == 0) loom_switch::csr_write(csr, loom_switch::TX_CTL, uint64_t(window));
+            for (int q = 0; q < N; q++) if (q != k && !same(q))
+                loom_switch::program_window(csr, WIN0 + uint32_t(ridx(q)), true, share_qp ? hs[lead(k)].qp_ctid[lead(q)] : hs[k].qp_ctid[q],
+                                            reinterpret_cast<void *>(loom_switch::export_ref(hs[q].exp, blk(q, k))), BLK, ustart(q),
+                                            hs[q].dst_ctid);
+        })) { printf("FAIL: barrier\n"); return 1; }
     auto uoff = [&](int q, uint64_t dst) {     // peer q's region offset -> uwin offset
         if (dst < blk(q, k) || dst - blk(q, k) >= BLK) { fprintf(stderr, "BUG: offset %lu outside block\n", (unsigned long) dst); exit(3); }
         return ustart(q) + (dst - blk(q, k));
     };
     if (!barrier()) { printf("FAIL: barrier\n"); return 1; }   // every window and export in place
-    if (ack_store && k != 0) csr.mapUwin(uint64_t(N - 1) * BLK);   // bc (a)/(b): the ack = a CPU store through rank 0's window
+    if (ack_store && k != 0) csr.mapUwin(uint64_t(slot + 1) * uint64_t(nrem) * BLK);   // bc (a)/(b): the ack = a CPU store through rank 0's window
 
     // ---- the engine ----
     std::unique_ptr<ce_prog::Program> pr;
@@ -385,13 +461,15 @@ int main(int argc, char **argv) {
         hu = q->reg_uwin(&ulen);
         // --ptq-user: descriptors and tail written from user space (no syscall per push; amy, rose)
         if (ptq_user && !q->enable_user()) { printf("FAIL: PTDMA user mode refused (no translating IOMMU?)\n"); return 1; }
-        if (ulen < uint64_t(N - 1) * BLK) { printf("FAIL: the uwin is smaller than the windows\n"); return 1; }
+        if (ulen < uint64_t(slot + 1) * uint64_t(nrem) * BLK) { printf("FAIL: the uwin is smaller than the windows\n"); return 1; }
     }
     printf("rank %d of %d (%s): up; %s, %lu B per rank (chunk %lu, block %lu, region %lu), %d iterations a run, %d runs (the first"
            " a warm-up)%s%s\n", k, N, cpu ? ("ptdma " + ptq_dev).c_str() : "v80", NAMES[c], (unsigned long) S, (unsigned long) C,
            (unsigned long) BLK, (unsigned long) VT, K, runs, entries ? (", " + std::to_string(entries) + " entries").c_str() : "",
            (std::string(verify ? ", VERIFY (not for timing)" : acked ? ", ACKED" : "") +
-            (stamp_mode ? ", bc (b): stamped last word, no flag, ack = CPU store" : ack_store ? ", bc (a): ack = CPU store" : "")).c_str());
+            (stamp_mode ? ", bc (b): stamped last word, no flag, ack = CPU store" : ack_store ? ", bc (a): ack = CPU store" : "") +
+            (nslot > 1 ? ", slot " + std::to_string(slot) + " of " + std::to_string(nslot) + " on this host (" + std::to_string(nsame) +
+                         " peer(s) by CPU copy)" : "") + (share_qp ? ", SHARED QP per host pair" : "")).c_str());
 
     // ---- the CPU's run of the steps (ptdma rank) ----
     bool timeout = false;
@@ -408,6 +486,18 @@ int main(int argc, char **argv) {
                     if (verify) for (uint64_t l = 0; l < o.len; l += 64) *reinterpret_cast<int32_t *>(hbuf + o.a + l) = int32_t(v);
                     *reinterpret_cast<uint64_t *>(hbuf + o.a + o.len - 8) = v;
                 } else if (verify) { int32_t *w = reinterpret_cast<int32_t *>(hbuf + o.a); w[0] = w[o.len / 4 - 1] = int32_t(v); }
+                if (same(o.peer)) {   // a peer on this host: the CPU copies into its region, the last 8 B and the flag after
+                    uint8_t *d = peer[size_t(o.peer)] + o.o;
+                    memcpy(d, hbuf + o.a, o.len - 8);
+                    _mm_sfence();
+                    memcpy(d + o.len - 8, hbuf + o.a + o.len - 8, 8);
+                    if (n + 1 < ops.size() && ops[n + 1].t == Op::SIGNAL && ops[n + 1].peer == o.peer) {
+                        _mm_sfence();
+                        *reinterpret_cast<volatile uint64_t *>(peer[size_t(o.peer)] + ops[n + 1].o) = v;
+                        n++;
+                    }
+                    break;
+                }
                 ptq_copy cs[2] = {{hb, hu, o.a, uoff(o.peer, o.o), o.len}, {}};
                 uint32_t nc = 1;
                 if (n + 1 < ops.size() && ops[n + 1].t == Op::SIGNAL && ops[n + 1].peer == o.peer) {   // the signal behind it
@@ -420,6 +510,7 @@ int main(int argc, char **argv) {
                 break;
             }
             case Op::SIGNAL:
+                if (same(o.peer)) { _mm_sfence(); *reinterpret_cast<volatile uint64_t *>(peer[size_t(o.peer)] + o.o) = v; break; }
                 if (ack_store) { csr.uwinWrite(uoff(o.peer, o.o), &v, 8); break; }   // bc (a)/(b): 8 B store + sfence
                 fsrc[fslot] = v;
                 {
@@ -432,6 +523,13 @@ int main(int argc, char **argv) {
                 const volatile uint64_t *w = reinterpret_cast<uint64_t *>(hbuf + o.a);
                 const auto tw = std::chrono::steady_clock::now();
                 while (*w < v) if (std::chrono::steady_clock::now() - tw > std::chrono::seconds(10)) { timeout = true; break; }
+                if (timeout) {   // which flag: the writer is the rank whose block holds it
+                    int wr = -1;
+                    for (int q = 0; q < N; q++) if (q != k && o.a >= blk(k, q) && o.a < blk(k, q) + BLK) wr = q;
+                    printf("TIMEOUT: wait %zu of iteration %lu: flag at %#lx (from rank %d, %s) is %lu, want %lu\n", n,
+                           (unsigned long) v, (unsigned long) o.a, wr, wr >= 0 && same(wr) ? "same host" : "remote",
+                           (unsigned long) *w, (unsigned long) v);
+                }
                 if (verify && o.len && !timeout) {   // the piece this flag guards, of iteration v
                     const volatile int32_t *d = reinterpret_cast<int32_t *>(hbuf + o.b);
                     if (stamp_mode) { for (uint64_t j = 0; j < o.len / 4; j += 16) if (d[j] < int32_t(v)) { vbad++; break; } }
@@ -542,9 +640,13 @@ int main(int argc, char **argv) {
         }
     }
     q.reset();
-    for (int p = 0; p < N; p++) if (p != k) loom_switch::release_window(csr, 1 + uint32_t(idx(k, p)));
-    loom_switch::release_export(csr, 1);
-    if (synced) barrier();
+    auto release = [&] {
+        for (int p = 0; p < N; p++) if (p != k && !same(p)) loom_switch::release_window(csr, WIN0 + uint32_t(ridx(p)));
+        loom_switch::release_export(csr, EXP);
+    };
+    if (synced) in_turn(release); else release();
+    for (int p = 0; p < N; p++) if (peer[size_t(p)]) munmap(peer[size_t(p)], VTH);
+    if (cpu) { t_data.userUnmap(hbuf); munmap(hbuf, VTH); ::unlink(region_file(port, k).c_str()); }
     for (int fd : cfd) if (fd >= 0) ::close(fd);
     printf(errors ? "COLLN FAIL\n" : "COLLN PASS\n");
     return errors ? 1 : 0;
