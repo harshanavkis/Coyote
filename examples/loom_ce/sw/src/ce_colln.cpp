@@ -25,13 +25,20 @@
  * Reductions chain through tmp and out (never in place). Time per collective = run time / K on each rank's clock; the
  * script reports the slowest rank. --verify (ptdma ranks): every pushed piece carries the iteration number in its first
  * and last word, checked when its flag arrives; the final result check is skipped then. --acked (ptdma ranks): every
- * push waits until the engine has finished it (the counterpart of rdma_colln --acked).
+ * push waits until the engine has finished it (the counterpart of rdma_colln --acked). --acked-step (2026-10-25, ptdma
+ * ranks): the step's pushes to every peer are submitted first and the engine is waited for once, before the step's first
+ * WAIT/REDUCE and at the end of an iteration (the counterpart of rdma_colln --acked-step).
  * bc variants (2026-10-19, ptdma ranks, every rank the same), as ce_coll:
  *   --ack-store  (a) a receiver's ack is an 8 B CPU store into the uwin (mapUwin, store + sfence), not a PTDMA copy; only
  *                for a signal that follows no data from that rank (bc's ack)
  *   --stamp      (b) no flag behind rank 0's data: the payload's last 8 B carry the iteration and the receiver polls them;
  *                the ack as in (a). --verify stamps every 64 B line's first word and checks them once the last word shows
  *                the iteration (and checks a bc receiver's block in every mode, also without --stamp)
+ * --flag-in-data (2026-10-25, ptdma ranks, every collective): no SIGNAL behind a COPY; the COPY's last 8 B carry the
+ *                iteration (written into the source before the submit, one PTDMA descriptor) and the receiver polls the last
+ *                8 B of the block it receives. Blocks keep their length (8 B of payload become the flag); the result check
+ *                skips the last 8 B of every block; --verify stamps a block's first word and counts a flag seen before it.
+ *                bc's acknowledgement carries no data and stays a SIGNAL. (Same protocol as rdma_colln --flag-in-data.)
  *
  *
  * Several ranks on one host (ptdma ranks; a host's ranks share its U280; 2026-10-22, QP sharing): ranks with the same
@@ -46,7 +53,7 @@
  *               written by the card's first rank; it stays until the next setup
  *
  *   ce_colln --rank r --ranks N --hosts ip0,ip1,... (management IPs) --coll C --size S [--iters K] [--runs R] [--port P]
- *            [--engine v80|ptdma] [--ptq DEV] [--verify] [--acked] [--ptq-user] [--ack-store | --stamp] [--share-qp]
+ *            [--engine v80|ptdma] [--ptq DEV] [--verify] [--acked | --acked-step] [--ptq-user] [--ack-store | --stamp] [--share-qp]
  *            [--window P] [--out FILE]
  * Rank 0 is the hub of a TCP control mesh (hello, barriers) on port P; pair (i, j) builds its QP on port P + 2 + 2 * pair.
  */
@@ -146,7 +153,7 @@ struct Op {
 int main(int argc, char **argv) {
     std::string hosts_s, out, cname, engine = "v80", ptq_dev = "/dev/ptq_0000_e8_00_2";
     int k = -1, N = 0, K = 0, runs = 6, window = -1;
-    bool verify = false, acked = false, ptq_user = false, ack_store = false, stamp_mode = false, share_qp = false;
+    bool verify = false, acked = false, acked_step = false, ptq_user = false, ack_store = false, stamp_mode = false, share_qp = false, fid = false;
     uint16_t port = 22000;
     uint64_t S = 65536;
     for (int i = 1; i < argc; i++) {
@@ -164,9 +171,11 @@ int main(int argc, char **argv) {
         else if (a == "--ptq" && i + 1 < argc)     ptq_dev = argv[++i];
         else if (a == "--verify")                  verify = true;
         else if (a == "--acked")                   acked = true;
+        else if (a == "--acked-step")              acked_step = true;
         else if (a == "--ptq-user")                ptq_user = true;
         else if (a == "--ack-store")               ack_store = true;
         else if (a == "--stamp")                   stamp_mode = ack_store = true;
+        else if (a == "--flag-in-data")            fid = true;
         else if (a == "--share-qp")                share_qp = true;
         else if (a == "--window" && i + 1 < argc)  window = atoi(argv[++i]);
         else { N = 0; break; }
@@ -198,12 +207,13 @@ int main(int argc, char **argv) {
     const uint64_t FLGS = 2 * B;    // flags' offset in a block
     if (!K) K = S <= 65536 ? 200 : S <= (1ULL << 20) ? 50 : 10;
     if (N < 2 || N > MAXR || k < 0 || k >= N || int(hosts.size()) != N || c == NCOLL || S % 128 || S == 0 || runs < 2 || K < 1 ||
-        (engine != "v80" && !cpu) || ((verify || acked) && !cpu) || VT > (cpu ? (1ULL << 30) : land_v80::UWIN_SIZE - 4096) ||
+        (engine != "v80" && !cpu) || ((verify || acked || acked_step) && !cpu) || (acked && acked_step) || VT > (cpu ? (1ULL << 30) : land_v80::UWIN_SIZE - 4096) ||
         uint64_t(nslot) * uint64_t(nrem) * BLK > (128ULL << 20) || 2 * uint64_t(N - 1) * 8 > 4096 ||
-        (ack_store && (!cpu || c != BC)) || ((nslot > 1 || share_qp) && !cpu) || 1 + nslot * nrem > 16 || nrem < 1) {
+        (ack_store && (!cpu || c != BC)) || ((nslot > 1 || share_qp) && !cpu) || 1 + nslot * nrem > 16 || nrem < 1 ||
+        (fid && (!cpu || stamp_mode))) {
         printf("usage: %s --rank r --ranks N --hosts ip0,ip1,... --coll ag|a2a|rs|ar_ring|ar_direct|bc --size S (multiple of 128)"
-               " [--iters K] [--runs R >= 2] [--port P] [--engine v80|ptdma] [--ptq DEV] [--verify] [--acked] [--ptq-user]"
-               " [--ack-store | --stamp (ptdma, bc)] [--share-qp (ptdma)] [--window P] [--out FILE] (several ranks on a host: ptdma only;"
+               " [--iters K] [--runs R >= 2] [--port P] [--engine v80|ptdma] [--ptq DEV] [--verify] [--acked | --acked-step] [--ptq-user]"
+               " [--ack-store | --stamp (ptdma, bc)] [--flag-in-data (ptdma)] [--share-qp (ptdma)] [--window P] [--out FILE] (several ranks on a host: ptdma only;"
                " region %lu B, windows of a card %lu B of 128 MiB)\n", argv[0], (unsigned long) VT,
                (unsigned long) (uint64_t(nslot) * uint64_t(nrem > 0 ? nrem : 0) * BLK));
         return 2;
@@ -215,10 +225,13 @@ int main(int argc, char **argv) {
     // ---- the steps of one iteration i (parity par) ----
     auto program = [&](int i, std::vector<Op> &ops) {
         const uint64_t par = (i & 1) ? B : 0;
-        auto copy = [&](uint64_t src, int q, uint64_t dst, uint64_t len) { if (len) ops.push_back({Op::COPY, q, src, 0, dst, len}); };
-        auto sig  = [&](int q, uint64_t dst) { ops.push_back({Op::SIGNAL, q, 0, 0, dst, 8}); };
+        // --flag-in-data: a copy carries its flag in its last 8 B (b = 1) and replaces copy + signal; its receiver waits on the
+        // piece's last 8 B instead of the flag slot (bc's ack: sig_, a signal either way)
+        auto copy = [&](uint64_t src, int q, uint64_t dst, uint64_t len) { if (len) ops.push_back({Op::COPY, q, src, fid ? 1u : 0u, dst, len}); };
+        auto sig_ = [&](int q, uint64_t dst) { ops.push_back({Op::SIGNAL, q, 0, 0, dst, 8}); };
+        auto sig  = [&](int q, uint64_t dst) { if (!fid) sig_(q, dst); };
         // a WAIT carries the piece its flag guards (b, len; len 0 = an ack): --verify checks that piece when the wait ends
-        auto wait = [&](uint64_t a, uint64_t d, uint64_t dl) { ops.push_back({Op::WAIT, -1, a, d, 0, dl}); };
+        auto wait = [&](uint64_t a, uint64_t d, uint64_t dl) { ops.push_back({Op::WAIT, -1, fid && dl ? d + dl - 8 : a, d, 0, dl}); };
         auto red  = [&](uint64_t a, uint64_t b, uint64_t o, uint64_t len) { if (len) ops.push_back({Op::REDUCE, -1, a, b, o, len}); };
         // a chain of reductions acc = first + every received piece, ending in dst (alternating tmp / out, never in place)
         auto chain = [&](uint64_t first, std::vector<uint64_t> pieces, uint64_t dst, uint64_t len) {
@@ -277,7 +290,7 @@ int main(int argc, char **argv) {
                 for (int w : peers) wait(blk(0, w) + FLGS + 8, 0, 0);
             } else {
                 wait(stamp_mode ? blk(k, 0) + par + S - 8 : blk(k, 0) + FLGS, blk(k, 0) + par, S);
-                sig(0, blk(0, k) + FLGS + 8);
+                sig_(0, blk(0, k) + FLGS + 8);
             }
             break;
         }
@@ -374,7 +387,7 @@ int main(int argc, char **argv) {
 
     // ---- hello: every rank's landing ctid, through rank 0 ----
     std::vector<Hello> hs(N);
-    Hello mine{MAGIC, uint32_t(k), uint32_t(t_data.getCtid()), uint32_t(ack_store) + 2 * uint32_t(stamp_mode), S, uint64_t(K),
+    Hello mine{MAGIC, uint32_t(k), uint32_t(t_data.getCtid()), uint32_t(ack_store) + 2 * uint32_t(stamp_mode) + 4 * uint32_t(fid), S, uint64_t(K),
                uint64_t(c), runs, EXP, uint32_t(share_qp), {}};
     for (int q = 0; q < N; q++) mine.qp_ctid[q] = t_qp[q] ? uint32_t(t_qp[q]->getCtid()) : NO_QP;
     if (k == 0) {
@@ -466,7 +479,7 @@ int main(int argc, char **argv) {
     printf("rank %d of %d (%s): up; %s, %lu B per rank (chunk %lu, block %lu, region %lu), %d iterations a run, %d runs (the first"
            " a warm-up)%s%s\n", k, N, cpu ? ("ptdma " + ptq_dev).c_str() : "v80", NAMES[c], (unsigned long) S, (unsigned long) C,
            (unsigned long) BLK, (unsigned long) VT, K, runs, entries ? (", " + std::to_string(entries) + " entries").c_str() : "",
-           (std::string(verify ? ", VERIFY (not for timing)" : acked ? ", ACKED" : "") +
+           (std::string(verify ? ", VERIFY (not for timing)" : acked ? ", ACKED" : acked_step ? ", ACKED PER STEP" : "") +
             (stamp_mode ? ", bc (b): stamped last word, no flag, ack = CPU store" : ack_store ? ", bc (a): ack = CPU store" : "") +
             (nslot > 1 ? ", slot " + std::to_string(slot) + " of " + std::to_string(nslot) + " on this host (" + std::to_string(nsame) +
                          " peer(s) by CPU copy)" : "") + (share_qp ? ", SHARED QP per host pair" : "")).c_str());
@@ -478,12 +491,18 @@ int main(int argc, char **argv) {
     if (cpu) for (int i = 1; i <= K; i++) { iters_ops.emplace_back(); program(i, iters_ops.back()); }
     auto run_cpu = [&](int i, uint64_t v) {
         const std::vector<Op> &ops = iters_ops[size_t(i - 1)];
+        uint64_t open = 0;   // --acked-step: the last push of this step not yet waited for
+        auto settle = [&] { if (open) { while (!q->done(open)) {} open = 0; } };
         for (size_t n = 0; n < ops.size() && !timeout; n++) {
             const Op &o = ops[n];
+            if (o.t == Op::WAIT || o.t == Op::REDUCE) settle();
             switch (o.t) {
             case Op::COPY: {
                 if (stamp_mode) {   // bc (b): the payload's last 8 B = the iteration (every line's first word too, --verify)
                     if (verify) for (uint64_t l = 0; l < o.len; l += 64) *reinterpret_cast<int32_t *>(hbuf + o.a + l) = int32_t(v);
+                    *reinterpret_cast<uint64_t *>(hbuf + o.a + o.len - 8) = v;
+                } else if (o.b) {   // --flag-in-data: the last 8 B = the iteration (--verify: the first word too)
+                    if (verify) *reinterpret_cast<int32_t *>(hbuf + o.a) = int32_t(v);
                     *reinterpret_cast<uint64_t *>(hbuf + o.a + o.len - 8) = v;
                 } else if (verify) { int32_t *w = reinterpret_cast<int32_t *>(hbuf + o.a); w[0] = w[o.len / 4 - 1] = int32_t(v); }
                 if (same(o.peer)) {   // a peer on this host: the CPU copies into its region, the last 8 B and the flag after
@@ -507,6 +526,7 @@ int main(int argc, char **argv) {
                 }
                 const uint64_t sq_ = q->submit(cs, nc);
                 if (acked) while (!q->done(sq_)) {}   // --acked: the engine wrote it out (the source is free)
+                if (acked_step) open = sq_;
                 break;
             }
             case Op::SIGNAL:
@@ -517,6 +537,7 @@ int main(int argc, char **argv) {
                     const uint64_t sq_ = q->copy(hf, uint64_t(fslot) * 8, hu, uoff(o.peer, o.o), 8);
                     fslot = (fslot + 1) % FSLOTS;
                     if (acked) while (!q->done(sq_)) {}
+                    if (acked_step) open = sq_;
                 }
                 break;
             case Op::WAIT: {
@@ -533,6 +554,7 @@ int main(int argc, char **argv) {
                 if (verify && o.len && !timeout) {   // the piece this flag guards, of iteration v
                     const volatile int32_t *d = reinterpret_cast<int32_t *>(hbuf + o.b);
                     if (stamp_mode) { for (uint64_t j = 0; j < o.len / 4; j += 16) if (d[j] < int32_t(v)) { vbad++; break; } }
+                    else if (fid) { if (d[0] < int32_t(v)) vbad++; }   // the flag (last word) before the first word
                     else if (d[0] < int32_t(v) || d[o.len / 4 - 1] < int32_t(v)) vbad++;
                 }
                 break;
@@ -543,6 +565,7 @@ int main(int argc, char **argv) {
                 break;
             }
         }
+        settle();
     };
     auto drain = [&](std::chrono::milliseconds tmo) {
         const auto tw = std::chrono::steady_clock::now();
@@ -599,6 +622,7 @@ int main(int argc, char **argv) {
     auto sum = [&](uint64_t j) { int32_t s = 0; for (int w = 0; w < N; w++) s += input(w, j); return s; };
     uint64_t bad = 0, n = 0;
     auto chk = [&](int32_t got, int32_t want) { n++; bad += got != want; };
+    auto chkb = [&](uint64_t j, uint64_t len, int32_t got, int32_t want) { if (!fid || 4 * j + 8 < len) chk(got, want); };   // flag words
     if (verify) {
         printf("rank %d: verify: %lu pieces seen before their data (flag ahead of data)\n", k, (unsigned long) vbad);
         errors += vbad != 0;
@@ -607,25 +631,25 @@ int main(int argc, char **argv) {
             if (w == k) continue;
             const uint64_t b = blk(k, w) + par;
             switch (c) {
-            case AG:  for (uint64_t j = 0; j < S / 4; j++) chk(word(b, j), input(w, j)); break;
-            case A2A: for (uint64_t j = 0; j < clen(k) / 4; j++) chk(word(b, j), input(w, coff(k) / 4 + j)); break;
+            case AG:  for (uint64_t j = 0; j < S / 4; j++) chkb(j, S, word(b, j), input(w, j)); break;
+            case A2A: for (uint64_t j = 0; j < clen(k) / 4; j++) chkb(j, clen(k), word(b, j), input(w, coff(k) / 4 + j)); break;
             case BC:
                 if (w != 0) break;
-                for (uint64_t j = 0; j < S / 4 - (stamp_mode ? 2 : 0); j++) chk(word(b, j), input(0, j));
+                for (uint64_t j = 0; j < S / 4 - (stamp_mode ? 2 : 0); j++) chkb(j, S, word(b, j), input(0, j));
                 if (stamp_mode) { n++; bad += *reinterpret_cast<const uint64_t *>(res + b + S - 8) != uint64_t(runs) * uint64_t(K); }
                 break;
             default: break;
             }
         }
-        if (c == RS) for (uint64_t j = 0; j < clen(k) / 4; j++) chk(word(OUT, j), sum(coff(k) / 4 + j));
+        if (c == RS) for (uint64_t j = 0; j < clen(k) / 4; j++) chkb(j, clen(k), word(OUT, j), sum(coff(k) / 4 + j));
         if (c == AR_DIRECT) for (uint64_t j = 0; j < S / 4; j++) chk(word(OUT, j), sum(j));
         if (c == AR_RING) {
             const int own = (k + 1) % N;    // reduced here; the others arrived in the all-gather slots
-            for (uint64_t j = 0; j < clen(own) / 4; j++) chk(word(OUT + coff(own), j), sum(coff(own) / 4 + j));
+            for (uint64_t j = 0; j < clen(own) / 4; j++) chkb(j, clen(own), word(OUT + coff(own), j), sum(coff(own) / 4 + j));
             const uint64_t ag = blk(k, prev) + par + uint64_t(N - 1) * C;
             for (int t = 0; t < N - 1; t++) {
                 const int ch = (k - t + N) % N;
-                for (uint64_t j = 0; j < clen(ch) / 4; j++) chk(word(ag + uint64_t(t) * C, j), sum(coff(ch) / 4 + j));
+                for (uint64_t j = 0; j < clen(ch) / 4; j++) chkb(j, clen(ch), word(ag + uint64_t(t) * C, j), sum(coff(ch) / 4 + j));
             }
         }
         printf("rank %d: %lu of %lu result words wrong\n", k, (unsigned long) bad, (unsigned long) n);
