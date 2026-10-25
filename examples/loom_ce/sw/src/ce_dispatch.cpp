@@ -37,7 +37,13 @@
  * Server: lands in host memory (as --land-host) and acks with one 8 B CPU store through its window (mapUwin + sfence).
  * --ptq DEV, --ptq-user (client; amy, rose).
  *
- * Both sides need the same --tokens, --H, --combine, --runs and --engine.
+ * --flag-in-data (both sides, --engine ptdma, 2026-10-25, owner: one protocol for every experiment, as ce_colln
+ * --flag-in-data): no flag copy; the run's last message carries the run number in its last 8 B and the server polls that
+ * word. The last message is pushed from its own slot, filled before the run's t0 with its unit and the flag (the source
+ * is in place, as for every other message), so "signal issued" = every message submitted. --tokens 0: the 8 B flag is
+ * the message, as without the option. The server's check skips that word; its ack (no data) stays an 8 B store.
+ *
+ * Both sides need the same --tokens, --H, --combine, --runs, --engine and --flag-in-data.
  */
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -129,7 +135,7 @@ struct Msg { uint64_t unit, slot; };
 
 int main(int argc, char **argv) {
     std::string ip, out, engine = "v80", ptq_dev = "/dev/ptq_0000_e8_00_2";
-    bool server = false, combine = false, land_host = false, ptq_user = false;
+    bool server = false, combine = false, land_host = false, ptq_user = false, fid = false;
     uint16_t port = 19810;
     int tokens = 1, runs = 22;
     uint64_t H = 7168;
@@ -147,9 +153,11 @@ int main(int argc, char **argv) {
         else if (a == "--engine" && i + 1 < argc)  engine = argv[++i];
         else if (a == "--ptq" && i + 1 < argc)     ptq_dev = argv[++i];
         else if (a == "--ptq-user")                ptq_user = true;
+        else if (a == "--flag-in-data")            fid = true;
         else { server = false; ip.clear(); break; }
     }
     const bool pt = engine == "ptdma";
+    if (fid && !pt) { server = false; ip.clear(); }
     if (engine != "v80" && !pt) { server = false; ip.clear(); }
     // messages in dispatch_bd's order: by destination, then slot (= token order within a destination)
     std::vector<Msg> msgs;
@@ -164,7 +172,7 @@ int main(int argc, char **argv) {
     if (server == !ip.empty() || (land_host && !server) || H % 64 || H == 0 || tokens < 0 || runs < 2 || msgs.size() + 8 > ce_prog::N_PROG ||
         msgs.size() * H > (16ULL << 20)) {
         printf("usage: %s --server | --client <ip>  [--port N] [--tokens T] [--H B, a multiple of 64] [--combine]"
-               " [--runs R >= 2] [--out FILE] [--land-host (server)] [--engine v80|ptdma] [--ptq DEV] [--ptq-user]   (at most %u messages, 16 MiB)\n", argv[0], ce_prog::N_PROG - 8);
+               " [--runs R >= 2] [--out FILE] [--land-host (server)] [--engine v80|ptdma] [--ptq DEV] [--ptq-user] [--flag-in-data (ptdma)]   (at most %u messages, 16 MiB)\n", argv[0], ce_prog::N_PROG - 8);
         return 2;
     }
     // the message region (whole pages), then the flag page
@@ -190,6 +198,8 @@ int main(int argc, char **argv) {
         loom_switch::program_export(t_qp, 1, t_data.getCtid(), land, mlen);
         loom_switch::program_export(t_qp, 2, t_data.getCtid(), fl, 4096);
         my_flag = fl;
+        // --flag-in-data, server: the run's arrival word is the last message's last 8 B (the client keeps polling its ack)
+        if (server && fid && !msgs.empty()) my_flag = land + (msgs.back().slot * H + H - 8) / 8;
     } else {
         L.reset(new land_v80::Landing(*v80p, mlen + 4096));
         void *lva = loom_switch::reserve_va(mlen + 4096);
@@ -241,7 +251,8 @@ int main(int argc, char **argv) {
         }
         uint64_t bad = 0;
         for (const Msg &m : msgs)
-            for (uint64_t j = 0; j < H / 8; j++) bad += (land[m.slot * H / 8 + j] != pattern(m.unit, j));
+            for (uint64_t j = 0; j < H / 8; j++)
+                bad += (!(fid && &m == &msgs.back() && j == H / 8 - 1) && land[m.slot * H / 8 + j] != pattern(m.unit, j));
         printf("server (host landing): %lu of %lu words wrong, flag %lu (want %d)\n", (unsigned long) bad,
                (unsigned long) (msgs.size() * H / 8), (unsigned long) *my_flag, runs);
         errors += (bad != 0) + (*my_flag != uint64_t(runs));
@@ -261,17 +272,23 @@ int main(int argc, char **argv) {
         constexpr uint32_t FSLOTS = 512;
         uint64_t *src = static_cast<uint64_t *>(t_data.getMem({coyote::CoyoteAllocType::HPF, slen}));
         uint64_t *fsrc = static_cast<uint64_t *>(t_data.getMem({coyote::CoyoteAllocType::HPF, FSLOTS * 8}));
-        if (!src || !fsrc) { printf("FAIL: no host memory\n"); return 1; }
+        const bool fidm = fid && !msgs.empty();   // --flag-in-data: the last message's own slot (its unit + the flag)
+        const uint64_t flen = std::max<uint64_t>(4096, (H + 4095) & ~4095ULL);
+        uint64_t *fmsg = fidm ? static_cast<uint64_t *>(t_data.getMem({coyote::CoyoteAllocType::HPF, flen})) : nullptr;
+        if (!src || !fsrc || (fidm && !fmsg)) { printf("FAIL: no host memory\n"); return 1; }
         for (uint64_t u = 0; u < units; u++)
             for (uint64_t j = 0; j < H / 8; j++) src[u * H / 8 + j] = pattern(u, j);
         std::unique_ptr<ptq::Queue> q = std::make_unique<ptq::Queue>(ptq_dev);
-        const uint32_t hs = q->reg_host(src, slen), hf = q->reg_host(fsrc, FSLOTS * 8);
+        const uint32_t hs = q->reg_host(src, slen), hf = q->reg_host(fsrc, FSLOTS * 8), hm = fidm ? q->reg_host(fmsg, flen) : 0;
         uint64_t ulen = 0;
         const uint32_t hu = q->reg_uwin(&ulen);
         if (ptq_user && !q->enable_user()) { printf("FAIL: PTDMA user mode refused (no translating IOMMU?)\n"); return 1; }
         if (ulen < mlen + 4096) { printf("FAIL: the uwin is smaller than messages + flag\n"); return 1; }
         std::vector<ptq_copy> cs;
         for (const Msg &m : msgs) cs.push_back({hs, hu, m.unit * H, m.slot * H, H});
+        if (fidm) cs.back() = {hm, hu, 0, msgs.back().slot * H, H};
+        if (fid) printf("client: flag in data: %s\n", fidm ? "the last message carries the run number in its last 8 B, no flag copy"
+                                                         : "no messages, the 8 B flag is the message");
         printf("client: up; %s, %d tokens, %zu messages of %lu B (%.2f MB), %d runs (the first a warm-up); --engine ptdma %s (%s)\n",
                combine ? "combine" : "dispatch", tokens, msgs.size(), (unsigned long) H, double(msgs.size() * H) / 1e6, runs,
                ptq_dev.c_str(), ptq_user ? "user mode" : "ioctl");
@@ -286,11 +303,15 @@ int main(int argc, char **argv) {
             if (!read_full(fd, &go, 1)) { printf("FAIL: the server did not arm\n"); return 1; }
             const uint64_t v = uint64_t(r) + 1;
             fsrc[r % FSLOTS] = v;
+            if (fidm) {   // the last message's slot: its unit + the flag, before t0 (the last run's push is done)
+                memcpy(fmsg, src + msgs.back().unit * H / 8, H);
+                fmsg[H / 8 - 1] = v;
+            }
             const auto t0 = clk::now();
             for (size_t k = 0; k < cs.size(); k += PTQ_MAX_BATCH)
                 q->submit(cs.data() + k, uint32_t(std::min<size_t>(PTQ_MAX_BATCH, cs.size() - k)));
             const auto t1 = clk::now();
-            q->copy(hf, uint64_t(r % FSLOTS) * 8, hu, mlen, 8);           // the flag, behind the data on the same queue
+            if (!fidm) q->copy(hf, uint64_t(r % FSLOTS) * 8, hu, mlen, 8);   // the flag, behind the data on the same queue
             const auto t2 = clk::now();
             while (!q->done(q->seq()) && clk::now() - t0 < std::chrono::seconds(5)) {}
             const auto td = clk::now();

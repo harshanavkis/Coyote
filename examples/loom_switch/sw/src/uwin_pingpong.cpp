@@ -14,8 +14,14 @@
  * sfence of uwinWrite): when a Loom sender may reuse its buffer; and, before
  * the rounds, the round trip of an MMIO read of a switch CSR (PCIe from the CPU).
  *
- *   amy:   uwin_pingpong --server [--port N] [--size B] [--rounds R]
- *   rose:  uwin_pingpong --client <amy ip> [--port N] [--size B] [--rounds R] [--out FILE]
+ * --flag-in-data (both sides, 2026-10-25, owner: one protocol for every experiment, as ce_colln --flag-in-data): no
+ * flag store into the flag window; the flag i overlays the message's last 8 B. Per round: the message up to the
+ * 64 B line that holds its last 8 B (8 B stores, sfence), then that line with i in its last word (sfence): the
+ * data lines leave before the flag, and a message of whole lines ends in one full-line write. The receiver polls
+ * the message's last 8 B; the data check skips that word. --size 0: the 8 B flag is the message, as without it.
+ *
+ *   amy:   uwin_pingpong --server [--port N] [--size B] [--rounds R] [--flag-in-data]
+ *   rose:  uwin_pingpong --client <amy ip> [--port N] [--size B] [--rounds R] [--out FILE] [--flag-in-data]
  */
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -85,7 +91,7 @@ uint64_t pattern(uint64_t off, int side) { return 0x5550000000000000ULL ^ (off *
 
 int main(int argc, char **argv) {
     std::string ip, out;
-    bool server = false;
+    bool server = false, fid = false;
     uint16_t port = 19850;
     uint64_t size = 64;
     int rounds = 2100;
@@ -97,6 +103,7 @@ int main(int argc, char **argv) {
         else if (a == "--size" && i + 1 < argc)    size = strtoull(argv[++i], nullptr, 0);
         else if (a == "--rounds" && i + 1 < argc)  rounds = atoi(argv[++i]);
         else if (a == "--out" && i + 1 < argc)     out = argv[++i];
+        else if (a == "--flag-in-data")            fid = true;
         else { server = false; ip.clear(); break; }
     }
     if (server == !ip.empty() || size % 8 || size > (1ULL << 20) || rounds <= WARM) {
@@ -149,7 +156,23 @@ int main(int argc, char **argv) {
         printf("csr read round trip (ns, %zu samples): p0 %.0f  p50 %.0f  p90 %.0f  p99 %.0f  max %.0f\n", rt.size(), pct(rt, 0),
                pct(rt, 50), pct(rt, 90), pct(rt, 99), pct(rt, 100));
     }
-    volatile uint64_t *vflag = flag;
+    // --flag-in-data: the flag is the message's last 8 B (FOFF) in the destination window; LINE = the 64 B line holding it
+    const uint64_t FOFF = size ? size - 8 : 0, LINE = FOFF & ~63ULL;
+    std::vector<uint64_t> tail((FOFF + 8 - LINE) / 8);    // that line's words, the flag last
+    for (uint64_t w = 0; w + 1 < tail.size(); w++) tail[w] = msg[LINE / 8 + w];
+    auto store_round = [&](uint64_t v) {
+        if (!fid) {
+            if (size) t_qp.uwinWrite(0, msg.data(), size);
+            t_qp.uwinWrite(mlen, &v, 8);
+            return;
+        }
+        if (LINE) t_qp.uwinWrite(0, msg.data(), LINE);  // the data lines before the flag's line (sfence)
+        tail.back() = v;
+        t_qp.uwinWrite(LINE, tail.data(), 8 * tail.size());
+    };
+    if (fid) printf("flag in data: the flag is the message's last 8 B (offset %lu), stored after the data lines before it\n",
+                    (unsigned long) FOFF);
+    volatile uint64_t *vflag = fid ? dst + FOFF / 8 : flag;
     std::vector<double> oneway, post_ns;   // client: one-way, and the CPU's time to store a round
     bool timeout = false;
     for (int i = 1; i <= rounds && !timeout; i++) {
@@ -158,12 +181,10 @@ int main(int argc, char **argv) {
             const auto tw = std::chrono::steady_clock::now();
             while (*vflag != v) if (std::chrono::steady_clock::now() - tw > std::chrono::seconds(5)) { timeout = true; break; }
             if (timeout) break;
-            if (size) t_qp.uwinWrite(0, msg.data(), size);
-            t_qp.uwinWrite(mlen, &v, 8);
+            store_round(v);
         } else {
             const auto t0 = std::chrono::steady_clock::now();
-            if (size) t_qp.uwinWrite(0, msg.data(), size);
-            t_qp.uwinWrite(mlen, &v, 8);
+            store_round(v);
             const auto tp = std::chrono::steady_clock::now();
             if (i > WARM) post_ns.push_back(std::chrono::duration<double, std::nano>(tp - t0).count());
             while (*vflag != v) if (std::chrono::steady_clock::now() - t0 > std::chrono::seconds(5)) { timeout = true; break; }
@@ -174,7 +195,7 @@ int main(int argc, char **argv) {
     if (timeout) printf("FAIL: round timed out (flag %lu)\n", (unsigned long) *vflag);
 
     uint64_t bad = 0;
-    for (uint64_t i = 0; i < size / 8; i++) bad += (dst[i] != pattern(8 * i, 1 - side));
+    for (uint64_t i = 0; i < size / 8; i++) bad += (!(fid && i == FOFF / 8) && dst[i] != pattern(8 * i, 1 - side));
     printf("%s: last message %lu of %lu words wrong, flag %lu (want %d)\n", server ? "server" : "client",
            (unsigned long) bad, (unsigned long) (size / 8), (unsigned long) *vflag, rounds);
     const int errors = timeout + (bad != 0) + (*vflag != uint64_t(rounds));

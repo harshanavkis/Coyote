@@ -35,6 +35,10 @@
  * PTDMA engine (ptdma_q, as ce_coll --engine ptdma) pushes it and the 8 B flag behind it in one submit through the
  * U280's windows into the peer's host memory; the CPU polls its own flag. "post" = the CPU's time to submit a round.
  * --ptq DEV (default /dev/ptq_0000_e8_00_2), --ptq-user (descriptors written from user space; amy, rose).
+ * --flag-in-data (both sides, --engine ptdma, 2026-10-25, owner: one protocol for every experiment, as ce_colln
+ * --flag-in-data): no flag copy behind the message; the CPU writes the round's value into the source's last 8 B and
+ * the engine pushes the message alone (one descriptor). The receiver polls the message's last 8 B; the data check
+ * skips that word. --size 0: the 8 B flag is the message, as without the option.
  */
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -110,7 +114,7 @@ double pct(std::vector<double> v, double p) {
 
 int main(int argc, char **argv) {
     std::string ip, out, engine = "v80", ptq_dev = "/dev/ptq_0000_e8_00_2";
-    bool server = false, host = false, ptq_user = false;
+    bool server = false, host = false, ptq_user = false, fid = false;
     uint16_t port = 19800;
     uint64_t size = 64;
     int runs = 6;
@@ -126,13 +130,14 @@ int main(int argc, char **argv) {
         else if (a == "--engine" && i + 1 < argc)  engine = argv[++i];
         else if (a == "--ptq" && i + 1 < argc)     ptq_dev = argv[++i];
         else if (a == "--ptq-user")                ptq_user = true;
+        else if (a == "--flag-in-data")            fid = true;
         else { server = false; ip.clear(); break; }
     }
     const bool pt = engine == "ptdma";
     if (pt) host = true;
-    if (server == !ip.empty() || size % 64 || size > (16ULL << 20) || runs < 2 || (engine != "v80" && !pt)) {
+    if (server == !ip.empty() || size % 64 || size > (16ULL << 20) || runs < 2 || (engine != "v80" && !pt) || (fid && !pt)) {
         printf("usage: %s --server | --client <ip>  [--port N] [--size B, a multiple of 64, 0 = the flag only]"
-               " [--runs R >= 2] [--out FILE] [--host] [--engine v80|ptdma] [--ptq DEV] [--ptq-user]\n", argv[0]);
+               " [--runs R >= 2] [--out FILE] [--host] [--engine v80|ptdma] [--ptq DEV] [--ptq-user] [--flag-in-data (ptdma)]\n", argv[0]);
         return 2;
     }
     const int side = server ? 0 : 1;
@@ -159,7 +164,7 @@ int main(int argc, char **argv) {
         std::memset(fl, 0, 4096);
         loom_switch::program_export(t_qp, 1, t_data.getCtid(), host_msg, mlen);
         loom_switch::program_export(t_qp, 2, t_data.getCtid(), fl, 4096);
-        my_flag = fl;
+        my_flag = (fid && size) ? host_msg + (size - 8) / 8 : fl;   // --flag-in-data: the message's last 8 B
     } else {
         L.reset(new land_v80::Landing(*v80, mlen + 4096));
         void *lva = loom_switch::reserve_va(mlen + 4096);
@@ -187,10 +192,10 @@ int main(int argc, char **argv) {
     // --engine ptdma: the queue, this host's message (the pattern), the flag sources - destroyed before t_data
     std::unique_ptr<ptq::Queue> q;
     constexpr uint32_t FSLOTS = 512;            // > the ring: a flag's source word is not rewritten while it is queued
-    uint64_t *fsrc = nullptr;
+    uint64_t *fsrc = nullptr, *psrc = nullptr;
     uint32_t hs = 0, hf = 0, hu = 0, fslot = 0;
     if (pt) {
-        uint64_t *psrc = static_cast<uint64_t *>(t_data.getMem({coyote::CoyoteAllocType::HPF, mlen}));
+        psrc = static_cast<uint64_t *>(t_data.getMem({coyote::CoyoteAllocType::HPF, mlen}));
         fsrc = static_cast<uint64_t *>(t_data.getMem({coyote::CoyoteAllocType::HPF, FSLOTS * 8}));
         if (!psrc || !fsrc) { printf("FAIL: no host memory\n"); return 1; }
         for (uint64_t i = 0; i < mlen / 8; i++) psrc[i] = pattern(8 * i, side);
@@ -243,12 +248,19 @@ int main(int argc, char **argv) {
            server ? "server" : "client", (unsigned long) size, ROUNDS, runs,
            pt ? (std::string("; --engine ptdma ") + ptq_dev + (ptq_user ? " (user mode)" : " (ioctl)") + ": host memory, PTDMA push").c_str()
               : host ? "; --host: CPU-started rounds, landing in host memory" : "");
+    if (fid) printf("flag in data: the round's value is the message's last 8 B, one push per round, no flag copy\n");
     // one round's send: a V80 program run, or one PTDMA submit (message, then the flag v)
     auto start_round = [&](uint64_t v) {
         if (!pt) { pr->start(v - 1); return; }
-        fsrc[fslot] = v;
         ptq_copy cs[2];
         uint32_t n = 0;
+        if (fid && size) {   // --flag-in-data: the message carries v in its last 8 B (its last push landed: no reader left)
+            psrc[(size - 8) / 8] = v;
+            cs[n++] = {hs, hu, 0, 0, size};
+            q->submit(cs, n);
+            return;
+        }
+        fsrc[fslot] = v;
         if (size) cs[n++] = {hs, hu, 0, 0, size};
         cs[n++] = {hf, hu, uint64_t(fslot) * 8, mlen, 8};
         fslot = (fslot + 1) % FSLOTS;
@@ -329,7 +341,7 @@ int main(int argc, char **argv) {
     const uint64_t *got = host_msg;
     if (!host) { L->pull(); got = L->buf; }
     uint64_t bad = 0;
-    for (uint64_t i = 0; i < size / 8; i++) bad += (got[i] != pattern(8 * i, 1 - side));
+    for (uint64_t i = 0; i < size / 8; i++) bad += (!(fid && i + 1 == size / 8) && got[i] != pattern(8 * i, 1 - side));
     const uint64_t want_flag = uint64_t(runs) * ROUNDS;
     const uint64_t flag = *my_flag;
     const bool flag_ok = (flag == want_flag);

@@ -15,15 +15,21 @@
  *
  * Client (the reader):
  *     get_bench --client <server_ip> [--port N] [--size BYTES] [--reps N] [--window P]
+ *               [--bulk-max BYTES] [--ptq DEV [--ptq-user]]
  *   window 1 onto the server's export 1 (uwin 0 .. size), window 2 just past
  *   its end, then
  *     latency    one 8 B load, and one 32 B load, at a time, reps each:
  *                median, p99, min
- *     bulk       64 B .. 1 MiB (at most size) read with 32 B streaming loads,
+ *     bulk       64 B .. 1 MiB (--bulk-max; at most size) read with 32 B streaming loads,
  *                one transfer at a time: time, GB/s, and the reads the
  *                switch saw per transfer
  *     parallel   k = 1 .. 32 threads at once, each reading 64 KiB that way
  *                (a core has one load in flight, so k reads in flight)
+ *     dma        (--ptq, 2026-10-25) 64 B .. 16 MiB (at most size), one transfer at a
+ *                time: this host's PTDMA engine (ptdma_q, as ce_coll --engine ptdma;
+ *                --ptq-user on amy/rose) copies from window 1 into a host buffer;
+ *                time from the submit to the engine's completion, the reads the
+ *                switch saw per transfer and the cycles they waited for a slot
  *     error      a load from window 2: the server rejects the get, the load
  *                returns all ones
  *   Every load reads a different line and every byte is checked against the
@@ -48,6 +54,7 @@
 
 #include <coyote/cThread.hpp>
 #include "loom_switch.hpp"
+#include "ptq.hpp"
 
 namespace {
 
@@ -123,7 +130,8 @@ int run_server(uint16_t port, uint64_t size, int window) {
     return 0;
 }
 
-int run_client(const std::string &ip, uint16_t port, uint64_t size, int reps, int window) {
+int run_client(const std::string &ip, uint16_t port, uint64_t size, int reps, int window, uint64_t bulk_max,
+               const std::string &ptq_dev, bool ptq_user) {
     coyote::cThread t_qp(0, getpid(), 0, nullptr, "loom_fpga");
     printf("client: QP exchange with %s on port %u ...\n", ip.c_str(), port);
     if (!t_qp.initRDMA(STAGING_SIZE, port, ip.c_str())) { printf("FAIL: initRDMA\n"); return 1; }
@@ -146,7 +154,8 @@ int run_client(const std::string &ip, uint16_t port, uint64_t size, int reps, in
         next += 4096 + 64;
         return s;
     };
-    alignas(64) static char buf[1 << 20];
+    std::vector<char> bufv(bulk_max + 64);
+    char *buf = reinterpret_cast<char *>((reinterpret_cast<uintptr_t>(bufv.data()) + 63) & ~uintptr_t(63));
 
     // --- latency: one load at a time ---
     printf("latency (one load at a time, %d reps; us from issue to data):\n", reps);
@@ -176,7 +185,7 @@ int run_client(const std::string &ip, uint16_t port, uint64_t size, int reps, in
 
     // --- bulk: one transfer at a time, 32 B streaming loads ---
     printf("bulk (32 B streaming loads, one transfer at a time):\n");
-    for (uint64_t len = 64; len <= (1ULL << 20) && len <= size; len *= 4) {
+    for (uint64_t len = 64; len <= bulk_max && len <= size; len *= 4) {
         const int n = len <= 4096 ? std::max(reps / 10, 3) : 5;
         std::vector<double> us;
         uint64_t bad = 0;
@@ -196,6 +205,52 @@ int run_client(const std::string &ip, uint16_t port, uint64_t size, int reps, in
         printf("  %s %7lu B: median %9.2f us, %6.3f GB/s, %.1f reads per transfer%s\n", bad ? "FAIL" : "ok  ",
                (unsigned long) len, m, len / m / 1e3, double(g1 - g0) / n, bad ? " (data wrong)" : "");
         if (bad) errors++;
+    }
+
+    // --- dma: the PTDMA engine reads the window, one transfer at a time ---
+    if (!ptq_dev.empty()) {
+        const uint64_t dmax = std::min(size, uint64_t(16) << 20);
+        coyote::cThread t_dst(0, getpid(), 0, nullptr, "loom_fpga");   // owns the destination
+        char *dst = static_cast<char *>(t_dst.getMem({coyote::CoyoteAllocType::HPF, dmax}));
+        if (!dst) { printf("FAIL: no host memory\n"); return 1; }
+        ptq::Queue q(ptq_dev);
+        const uint32_t hd = q.reg_host(dst, dmax);
+        uint64_t ulen = 0;
+        const uint32_t hu = q.reg_uwin(&ulen);
+        if (ptq_user && !q.enable_user()) { printf("FAIL: PTDMA user mode refused (no translating IOMMU?)\n"); return 1; }
+        if (ulen < size) { printf("FAIL: the uwin (%lu B) is smaller than window 1\n", (unsigned long) ulen); return 1; }
+        printf("dma (%s %s reads window 1 into host memory, one transfer at a time):\n", ptq_dev.c_str(),
+               ptq_user ? "(user mode)" : "(ioctl)");
+        for (uint64_t len = 64; len <= dmax; len *= 4) {
+            const int n = len <= 4096 ? std::max(reps / 10, 3) : len <= (1ULL << 20) ? 20 : 5;
+            std::vector<double> us;
+            uint64_t bad = 0, timeouts = 0;
+            const uint64_t g0 = csr_read(t_qp, RD_READS), l0 = csr_read(t_qp, RD_LINES), w0 = csr_read(t_qp, RD_SLOT_WAIT);
+            for (int r = 0; r < n; r++) {
+                const uint64_t off = pick(len);
+                memset(dst, 0, len);
+                _mm_mfence();
+                const auto t0 = Clock::now();
+                const uint64_t sq = q.copy(hu, off, hd, 0, len);
+                while (!q.done(sq) && Clock::now() - t0 < std::chrono::seconds(5)) _mm_pause();
+                const auto t1 = Clock::now();
+                if (!q.done(sq)) { timeouts++; break; }
+                us.push_back(std::chrono::duration<double, std::micro>(t1 - t0).count());
+                bad += check(dst, off, len);
+            }
+            const uint64_t g1 = csr_read(t_qp, RD_READS), l1 = csr_read(t_qp, RD_LINES), w1 = csr_read(t_qp, RD_SLOT_WAIT);
+            if (timeouts) {
+                printf("  FAIL %8lu B: the engine did not complete within 5 s (switch reads %lu)\n", (unsigned long) len,
+                       (unsigned long) (g1 - g0));
+                errors++;
+                break;
+            }
+            const double m = median(us);
+            printf("  %s %8lu B: median %9.2f us, %6.3f GB/s, %.1f reads per transfer (%.0f B each), %.0f cycles waiting for a slot%s\n",
+                   bad ? "FAIL" : "ok  ", (unsigned long) len, m, len / m / 1e3, double(g1 - g0) / n,
+                   g1 > g0 ? 64.0 * double(l1 - l0) / double(g1 - g0) : 0.0, double(w1 - w0) / n, bad ? " (data wrong)" : "");
+            if (bad) errors++;
+        }
     }
 
     // --- parallel: k threads loading at once ---
@@ -250,6 +305,9 @@ int main(int argc, char *argv[]) {
     uint64_t size = 16ULL << 20;
     int reps = 1000;
     int window = -1;
+    uint64_t bulk_max = 1ULL << 20;
+    std::string ptq_dev;
+    bool ptq_user = false;
     for (int i = 1; i < argc; i++) {
         const std::string a = argv[i];
         if (a == "--server")                     server = true;
@@ -258,11 +316,14 @@ int main(int argc, char *argv[]) {
         else if (a == "--size" && i + 1 < argc)  size = strtoull(argv[++i], nullptr, 0);
         else if (a == "--reps" && i + 1 < argc)  reps = atoi(argv[++i]);
         else if (a == "--window" && i + 1 < argc) window = atoi(argv[++i]);
+        else if (a == "--bulk-max" && i + 1 < argc) bulk_max = strtoull(argv[++i], nullptr, 0);
+        else if (a == "--ptq" && i + 1 < argc)   ptq_dev = argv[++i];
+        else if (a == "--ptq-user")              ptq_user = true;
         else { fprintf(stderr, "usage: see the header of get_bench.cpp\n"); return 2; }
     }
-    if (server == !ip.empty() || size < (64 << 10) || size % 4096 || reps < 1 || window > 255) {
+    if (server == !ip.empty() || size < (64 << 10) || size % 4096 || reps < 1 || window > 255 || bulk_max < 64) {
         fprintf(stderr, "usage: see the header of get_bench.cpp (--size: a multiple of 4096, at least 64 KiB)\n");
         return 2;
     }
-    return server ? run_server(port, size, window) : run_client(ip, port, size, reps, window);
+    return server ? run_server(port, size, window) : run_client(ip, port, size, reps, window, bulk_max, ptq_dev, ptq_user);
 }

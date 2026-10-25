@@ -78,6 +78,11 @@
  * buffers; "copies done" = the engine finished, then (--ack) the server's ack. --ptq DEV, --ptq-user (amy, rose).
  *
  * The QP port is N, the hello's TCP port N + 1 (N defaults to Coyote's).
+ * --flag-in-data (both sides, 2026-10-25, owner: one protocol for every experiment, as ce_colln --flag-in-data; server
+ * landing in host memory, client --engine ptdma): no fence copy; the burst's last copy carries the fence value in its
+ * last 8 B. Every copy lands on the same bytes, so the last one is pushed from a second source buffer (the same data,
+ * the fence in its last word, filled before the burst's start); the server polls the destination's last 8 B and its
+ * check skips that word. The ack (no data) stays an 8 B store.
  * --window sets the client's ack window (packets unacked, TX_CTL; 16 after
  * reset). Each side prints where its switch's cycles went during a copy:
  * the client its waits on the window and on sq_wr, the server loom_rx's
@@ -246,7 +251,7 @@ void trace_landing(coyote::cThread &t_qp, land_v80::Landing *L, uint64_t wi, uin
 }
 
 int run_server(uint16_t port, uint64_t size, bool land, uint64_t off, unsigned poll_us, bool no_touch, bool no_stamp,
-               bool self, int trace, bool ack) {
+               bool self, int trace, bool ack, bool fid) {
     coyote::cThread t_qp(0, getpid(), 0, nullptr, "loom_fpga");     // QP owner
     coyote::cThread t_data(0, getpid(), 0, nullptr, "loom_fpga");   // owns the landing buffers
     printf("server: waiting for the QP exchange on port %u ...\n", port);
@@ -313,8 +318,9 @@ int run_server(uint16_t port, uint64_t size, bool land, uint64_t off, unsigned p
     uint64_t acked = 0;   // the copy number (from 1) acknowledged last: one ack per copy
     auto send_ack = [&](uint64_t v) { if (ack && acked != v) { acked = v; t_qp.uwinWrite(0, &v, 8); } };
 
-    volatile uint64_t *vfence = fence;
+    volatile uint64_t *vfence = fid ? dst + size / 8 - 1 : fence;   // --flag-in-data: the destination's last 8 B
     volatile uint64_t *vdst = dst;
+    if (fid) printf("server: flag in data: the burst's last copy carries the fence in its last 8 B\n");
     int errors = 0, copies = 0;
     // a --prog client's V80 landing, timed by this V80's copy engine
     std::optional<ce_prog::Program> sp;
@@ -399,7 +405,7 @@ int run_server(uint16_t port, uint64_t size, bool land, uint64_t off, unsigned p
         const loom_switch::IngressCounters i1 = loom_switch::IngressCounters::read(t_qp);
         if (v.fence == an.fence) {
             if (!no_touch && !self)
-                for (uint64_t i = 0; i < size / 8; i++) v.bad += (vdst[i] != pattern(8 * i, an.rep));
+                for (uint64_t i = 0; i < size / 8; i++) v.bad += (!(fid && i + 1 == size / 8) && vdst[i] != pattern(8 * i, an.rep));
         } else
             v.bad = size / 8;
         const uint64_t bytes = an.bytes ? an.bytes : size;
@@ -749,7 +755,7 @@ int run_bidir(const std::string &ip, uint16_t port, uint64_t size, int reps, int
 }
 
 int run_client(const std::string &ip, uint16_t port, int reps, int window, unsigned gap_ms, bool no_refill, int burst,
-               bool prog, bool ack, bool pt, const std::string &ptq_dev, bool ptq_user) {
+               bool prog, bool ack, bool pt, const std::string &ptq_dev, bool ptq_user, bool fid) {
     coyote::cThread u280(0, getpid(), 0, nullptr, "loom_fpga");     // QP owner and CSR page
     std::optional<coyote::cThread> v80;                                // not opened for --engine ptdma
     if (!pt) v80.emplace(0, getpid(), 0, nullptr, "loom_versal_fpga");
@@ -802,21 +808,24 @@ int run_client(const std::string &ip, uint16_t port, int reps, int window, unsig
     std::optional<coyote::cThread> t_src;
     std::unique_ptr<ptq::Queue> q;
     constexpr uint32_t FSLOTS = 512;
-    uint64_t *fsrc = nullptr;
-    uint32_t hs = 0, hf = 0, hu = 0;
+    uint64_t *fsrc = nullptr, *src2 = nullptr;   // src2: --flag-in-data, the last copy's source (the fence in its last word)
+    uint32_t hs = 0, hf = 0, hu = 0, hs2 = 0;
     if (pt) {
         t_src.emplace(0, getpid(), 0, nullptr, "loom_fpga");
         src = static_cast<uint64_t *>(t_src->getMem({coyote::CoyoteAllocType::HPF, size}));
         fsrc = static_cast<uint64_t *>(t_src->getMem({coyote::CoyoteAllocType::HPF, FSLOTS * 8}));
-        if (!src || !fsrc) { printf("FAIL: no host memory\n"); return 1; }
+        if (fid) src2 = static_cast<uint64_t *>(t_src->getMem({coyote::CoyoteAllocType::HPF, size}));
+        if (!src || !fsrc || (fid && !src2)) { printf("FAIL: no host memory\n"); return 1; }
         q = std::make_unique<ptq::Queue>(ptq_dev);
         hs = q->reg_host(src, size);
         hf = q->reg_host(fsrc, FSLOTS * 8);
+        if (fid) hs2 = q->reg_host(src2, size);
         uint64_t ulen = 0;
         hu = q->reg_uwin(&ulen);
         if (ptq_user && !q->enable_user()) { printf("FAIL: PTDMA user mode refused (no translating IOMMU?)\n"); return 1; }
         if (ulen < win_len) { printf("FAIL: the uwin is smaller than size + fence page\n"); return 1; }
         printf("client: --engine ptdma %s (%s), source in host memory\n", ptq_dev.c_str(), ptq_user ? "user mode" : "ioctl");
+        if (fid) printf("client: flag in data: the burst's last copy carries the fence in its last 8 B (second source), no fence copy\n");
     } else {
         const int dfd = u280.exportDmabuf(EXPORT_REGION_UWIN, 0, win_len);
         uva = loom_switch::reserve_va(win_len);
@@ -844,17 +853,18 @@ int run_client(const std::string &ip, uint16_t port, int reps, int window, unsig
             if (!no_refill || r == 0) for (uint64_t i = 0; i < size / 8; i++) src[i] = pattern(8 * i, r);
             const uint64_t fence = uint64_t(r + 1) * uint64_t(burst);
             fsrc[r % FSLOTS] = fence;
+            if (fid) { memcpy(src2, src, size); src2[size / 8 - 1] = fence; }   // before the burst's start (untimed)
             Announce an{no_refill ? 0 : uint64_t(r), fence, size * uint64_t(burst), 0};
             write_full(fd, &an, sizeof(an));
             const auto b0 = std::chrono::steady_clock::now();
             ptq_copy cs[PTQ_MAX_BATCH];
             for (int k = 0; k < burst;) {
                 const int n = std::min(burst - k, int(PTQ_MAX_BATCH));
-                for (int j = 0; j < n; j++) cs[j] = {hs, hu, 0, 0, size};
+                for (int j = 0; j < n; j++) cs[j] = {fid && k + j + 1 == burst ? hs2 : hs, hu, 0, 0, size};
                 q->submit(cs, uint32_t(n));
                 k += n;
             }
-            q->copy(hf, uint64_t(r % FSLOTS) * 8, hu, size, 8);    // the fence, behind the data on the same queue
+            if (!fid) q->copy(hf, uint64_t(r % FSLOTS) * 8, hu, size, 8);    // the fence, behind the data on the same queue
             const auto bs = std::chrono::steady_clock::now();
             while (!q->done(q->seq()) && std::chrono::steady_clock::now() - b0 < std::chrono::seconds(5)) _mm_pause();
             if (!q->done(q->seq())) { printf("FAIL copy %d: the PTDMA queue did not finish\n", r); return 1; }
@@ -1004,7 +1014,7 @@ int main(int argc, char **argv) {
     int trace = 0;
     uint64_t msg = 1ULL << 20;
     std::string engine = "v80", ptq_dev = "/dev/ptq_0000_e8_00_2";
-    bool ptq_user = false;
+    bool ptq_user = false, fid = false;
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         if (a == "--server")                     server = true;
@@ -1034,11 +1044,13 @@ int main(int argc, char **argv) {
         else if (a == "--engine" && i + 1 < argc) engine = argv[++i];   // client: v80 | ptdma
         else if (a == "--ptq" && i + 1 < argc)    ptq_dev = argv[++i];
         else if (a == "--ptq-user")               ptq_user = true;
+        else if (a == "--flag-in-data")           fid = true;   // both sides: host landing, client --engine ptdma
         else { server = false; ip.clear(); break; }
     }
     if (engine != "v80" && engine != "ptdma") server = false, ip.clear(), bidir = false;
+    if (fid && (land || self || no_touch || trace || prog || passive || bidir || (!server && engine != "ptdma"))) server = false, ip.clear(), bidir = false;
     if (server == !ip.empty() || burst < 1 || size == 0 || size % 4096 || size > (64ULL << 20) || land_off % 64 || land_off >= 4096) {
-        printf("usage: %s --server [--port N] [--size BYTES] [--land-v80 [--land-offset B] [--poll-us U] [--no-stamp [--trace 1|2]]] | --client <server_ip> [--port N] [--reps N] [--window P] [--burst B [--prog]] [--ack] [--engine v80|ptdma [--ptq DEV] [--ptq-user]]\n"
+        printf("usage: %s --server [--port N] [--size BYTES] [--land-v80 [--land-offset B] [--poll-us U] [--no-stamp [--trace 1|2]]] | --client <server_ip> [--port N] [--reps N] [--window P] [--burst B [--prog]] [--ack] [--engine v80|ptdma [--ptq DEV] [--ptq-user]] [--flag-in-data (host landing / ptdma client)]\n"
                "       | --passive [--port N] [--size BYTES] [--msg BYTES] [--reps N] [--land-v80 [--discard]]  (landing for a plain RDMA sender)\n"
                "       | --bidir-server | --bidir-client <server_ip>  [--port N] [--size BYTES] [--reps N] [--window P] [--no-send]\n"
                "       (size: a multiple of 4 KiB, at most 64 MiB)\n", argv[0]);
@@ -1046,6 +1058,6 @@ int main(int argc, char **argv) {
     }
     if (passive) return run_passive(port, size, land, msg, reps, discard, self && !land);
     if (bidir) return run_bidir(server ? std::string() : ip, port, size, reps, window, !no_send, engine == "ptdma", ptq_dev, ptq_user);
-    return server ? run_server(port, size, land, land_off, poll_us, no_touch, no_stamp, self && !land, trace, ack)
-                  : run_client(ip, port, reps, window, gap_ms, no_refill, burst, prog, ack, engine == "ptdma", ptq_dev, ptq_user);
+    return server ? run_server(port, size, land, land_off, poll_us, no_touch, no_stamp, self && !land, trace, ack, fid)
+                  : run_client(ip, port, reps, window, gap_ms, no_refill, burst, prog, ack, engine == "ptdma", ptq_dev, ptq_user, fid);
 }
