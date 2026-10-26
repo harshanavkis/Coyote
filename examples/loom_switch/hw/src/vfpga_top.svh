@@ -19,9 +19,10 @@
  * reads what the window is bound to. loom_read takes axi_udata's AR and R:
  * a read of an rdma window becomes a get request, sent by loom_ingress in
  * its queue order; the far loom_rx makes it a job for loom_rd, which reads
- * on sq_rd / axis_host_recv[1] and writes the lines back as rdma packets
- * plus a completion store; this side's loom_rx hands those to loom_read's
- * slot buffer, and loom_read answers R. loom_rd shares sq_wr (after
+ * on sq_rd / axis_host_recv[1] and writes the lines back as one rdma packet
+ * (a rejected get: an error store); this side's loom_rx hands those to
+ * loom_read's region buffer, and loom_read answers R. Reads that continue
+ * each other are fetched ahead in pages (loom_read's read-ahead). loom_rd shares sq_wr (after
  * loom_rx, alternating with the ingress), the ack window and
  * axis_rreq_send[0] with the ingress; the payload stream follows the order
  * the two's requests were taken.
@@ -44,6 +45,8 @@ logic [3:0]             rx_chunk;            // CSR 76, unused
 /* verilator lint_on UNUSED */
 logic [7:0]             tx_window;
 logic [PID_BITS-1:0]    rd_qp_pid;
+logic                   rd_ra_off, rd_ra_early;
+logic [5:0]             rd_ra_dmax, rd_ra_d0;
 
 // table -> ingress
 logic [26:0]            ua_addr;
@@ -64,16 +67,20 @@ logic [26:0]            ub_ustart;
 logic [LEN_BITS:0]      ub_end;
 
 // loom_read <-> loom_ingress (get requests) and loom_rx (answers)
-localparam integer N_RD_SLOTS = 64;
+localparam integer N_RD_SLOTS = 64;                     // reads in flight
+localparam integer N_RD_BLK   = 32;                     // read-ahead blocks (4 KiB each)
+localparam integer N_RD_REG   = N_RD_SLOTS + N_RD_BLK;  // answer regions: slots, then blocks
 logic                   get_valid, get_ready;
 logic [PID_BITS-1:0]    get_pid;
 logic [VADDR_BITS-1:0]  get_ref;
 logic [63:0]            get_word;
 logic                   land_valid, rcmp_valid, rcmp_err;
-logic [$clog2(N_RD_SLOTS)+5:0] land_line;
+logic [$clog2(N_RD_REG)+5:0]   land_line;
 logic [AXI_DATA_BITS-1:0]      land_data;
-logic [$clog2(N_RD_SLOTS)-1:0] rcmp_slot;
+logic [$clog2(N_RD_REG)-1:0]   rcmp_slot;
 logic cnt_rdw_read, cnt_rdw_done, cnt_rdw_fail, cnt_rdw_far_err, cnt_rdw_slot_wait, cnt_rdw_stray;
+logic cnt_ra_read, cnt_ra_block, cnt_ra_start;
+logic cnt_ra_drop_read, cnt_ra_drop_store, cnt_ra_drop_pkt, cnt_ra_drop_write;
 /* verilator lint_off UNUSED */
 logic rdw_busy;
 /* verilator lint_on UNUSED */
@@ -191,13 +198,13 @@ end
 // ---------------------------------------------------------------------------
 // Modules
 // ---------------------------------------------------------------------------
-loom_ctrl inst_loom_ctrl (
+loom_ctrl #(.N_Y(16)) inst_loom_ctrl (
     .aclk(aclk), .aresetn(aresetn), .axi_ctrl(axi_ctrl),
     .tbl_commit(tbl_commit), .tbl_idx(tbl_idx), .tbl_valid(tbl_valid),
     .tbl_route(tbl_route), .tbl_pid(tbl_pid), .tbl_dst_pid(tbl_dst_pid),
     .tbl_base(tbl_base), .tbl_len(tbl_len), .tbl_ustart(tbl_ustart),
     .rdma_staging_va(rdma_staging_va), .tx_window(tx_window), .rx_chunk(rx_chunk),
-    .rd_qp_pid(rd_qp_pid),
+    .rd_qp_pid(rd_qp_pid), .rd_ra_off(rd_ra_off), .rd_ra_early(rd_ra_early), .rd_ra_dmax(rd_ra_dmax), .rd_ra_d0(rd_ra_d0),
     .exp_commit(exp_commit), .exp_idx(exp_idx), .exp_valid(exp_valid), .exp_pid(exp_pid),
     .exp_base(exp_base), .exp_len(exp_len),
     .tx_inflight(tx_inflight), .cnt_tx_ack(ack_valid),
@@ -220,7 +227,9 @@ loom_ctrl inst_loom_ctrl (
             rx_cnt_rq_ovfl, rx_cnt_pkt_wait, rx_cnt_at_limit, rx_cnt_post_wait,
             cnt_rx_drop, rx_cnt_store, rx_cnt_pkt}),
     // words 192+
-    .cnt_y({1'b0, land_valid, cnt_rdw_stray, cnt_rdw_slot_wait, cnt_rdw_far_err, cnt_rdw_fail,
+    .cnt_y({2'b0, cnt_ra_drop_write, cnt_ra_drop_pkt, cnt_ra_drop_store, cnt_ra_drop_read,
+            cnt_ra_start, cnt_ra_block, cnt_ra_read,
+            land_valid, cnt_rdw_stray, cnt_rdw_slot_wait, cnt_rdw_far_err, cnt_rdw_fail,
             cnt_rdw_done, cnt_rdw_read}),
     .st_arm(st_arm), .st_pt(st_pt), .st_idx(st_idx), .st_data(st_data), .st_cnt(st_cnt), .st_now(st_now)
 );
@@ -302,7 +311,7 @@ axis_data_fifo_rx4096 inst_rx_ingress_fifo (
 );
 assign rx_cnt_fifo_full = axis_rrsp_recv[0].tvalid && !axis_rrsp_recv[0].tready;
 
-loom_rx #(.N_SLOTS(N_RD_SLOTS)) inst_loom_rx (
+loom_rx #(.N_SLOTS(N_RD_REG)) inst_loom_rx (
     .aclk(aclk), .aresetn(aresetn),
     .rq_req(rq_wr.data), .rq_valid(rq_wr.valid), .rq_ready(rq_wr.ready),
     .xa_idx(xa_idx), .xa_hit(xa_hit), .xa_pid(xa_pid), .xa_base(xa_base), .xa_len(xa_len),
@@ -348,8 +357,9 @@ loom_rd #(.NET_DEST(0), .RD_DEST(1), .RD_AHEAD(32), .BUF_BEATS(512)) inst_loom_r
     .cnt_wait(cnt_rd_wait), .cnt_starve(cnt_rd_starve)
 );
 
-// Reads on the uwin
-loom_read #(.N_SLOTS(N_RD_SLOTS)) inst_loom_read (
+// Reads on the uwin (read-ahead: dropped by any landing here or write into
+// the uwin, DESIGN.md 17)
+loom_read #(.N_SLOTS(N_RD_SLOTS), .N_BLK(N_RD_BLK)) inst_loom_read (
     .aclk(aclk), .aresetn(aresetn),
     .s_araddr(axi_udata.araddr[26:0]), .s_arlen(axi_udata.arlen), .s_arsize(axi_udata.arsize),
     .s_arburst(axi_udata.arburst), .s_arid(axi_udata.arid),
@@ -362,9 +372,15 @@ loom_read #(.N_SLOTS(N_RD_SLOTS)) inst_loom_read (
     .m_get_ref(get_ref), .m_get_word(get_word),
     .s_land_valid(land_valid), .s_land_line(land_line), .s_land_data(land_data),
     .s_cmp_valid(rcmp_valid), .s_cmp_slot(rcmp_slot), .s_cmp_err(rcmp_err),
+    .ra_off(rd_ra_off), .ra_early(rd_ra_early), .ra_dmax(rd_ra_dmax), .ra_d0(rd_ra_d0),
+    .s_drop_store(rx_cnt_store), .s_drop_pkt(rx_cnt_pkt),
+    .s_drop_write(axi_udata.awvalid && axi_udata.awready),
     .busy(rdw_busy),
     .cnt_read(cnt_rdw_read), .cnt_done(cnt_rdw_done), .cnt_fail(cnt_rdw_fail),
-    .cnt_far_err(cnt_rdw_far_err), .cnt_slot_wait(cnt_rdw_slot_wait), .cnt_stray(cnt_rdw_stray)
+    .cnt_far_err(cnt_rdw_far_err), .cnt_slot_wait(cnt_rdw_slot_wait), .cnt_stray(cnt_rdw_stray),
+    .cnt_ra_read(cnt_ra_read), .cnt_ra_block(cnt_ra_block), .cnt_ra_start(cnt_ra_start),
+    .cnt_ra_drop_read(cnt_ra_drop_read), .cnt_ra_drop_store(cnt_ra_drop_store),
+    .cnt_ra_drop_pkt(cnt_ra_drop_pkt), .cnt_ra_drop_write(cnt_ra_drop_write)
 );
 
 // ---------------------------------------------------------------------------

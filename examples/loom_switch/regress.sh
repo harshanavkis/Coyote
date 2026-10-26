@@ -47,11 +47,13 @@
 #      progput_v80_*_wbeat; the RDMA baseline uses the same counter
 #      (land_server --trace)
 # Without the V80s (v80.pdi = none, owner 2026-10-22: the V80s are not used any more) the default steps are the U280's
-# host-memory paths instead (STEPS=3GLPCS):
+# host-memory paths instead (STEPS=3GLPRCS):
 #   3. CPU puts through the window (uwin_probe), each host
 #   G. CPU gets (get_bench), rose reads amy
 #   L. CPU-store latency host -> host (uwin_pingpong 0 / 64 / 4096 B, 4100 rounds, one-way p50)
 #   P. PTDMA puts host -> network -> peer host, acked (ce_remote --engine ptdma --ptq-user --ack; 4 KiB, 1 MiB, 16 MiB)
+#   R. PTDMA window reads: rose's engine reads amy's host memory through Loom (get_bench --ptq --ptq-user; 4 KiB
+#      latency, 64 KiB and 16 MiB rates, the flag in the data; reads answered from read-ahead)
 #   C. collectives at two ranks over PTDMA (ce_coll --engine ptdma --ptq-user --acked): --verify points + timed points
 #   S. stamps (stamp_rec, CSR 224-240, images from Coyote c9112aca on): every point once per round of a uwin_pingpong
 # Logs in OUTDIR, one per step; the summary goes to stdout. STEPS=15 (for
@@ -61,7 +63,7 @@
 # COMPARE=<file>): a change beyond the tolerance is marked CHECK.
 set -u
 OUT=${1:?usage: regress.sh OUTDIR [--setup <u280.bit> <v80.pdi|none>]}; shift
-if [ "${3:-}" = none ] || [ -n "${NOV80:-}" ]; then STEPS=${STEPS:-3GLPCS}; else STEPS=${STEPS:-1234567}; fi
+if [ "${3:-}" = none ] || [ -n "${NOV80:-}" ]; then STEPS=${STEPS:-3GLPRCS}; else STEPS=${STEPS:-1234567}; fi
 HERE=$(cd "$(dirname "$0")" && pwd)
 REPO=$(git -C "$HERE" rev-parse --show-toplevel)
 source "$REPO/scripts/fpga/hosthog_loom.sh"
@@ -318,7 +320,7 @@ for sz in 0 64 4096; do
 done
 }
 
-[[ $STEPS == *P* || $STEPS == *C* ]] && { step "PTDMA engines to ptdma_q ($PTQ_BDF)"; ptq claim; PTQ=1; }
+[[ $STEPS == *P* || $STEPS == *R* || $STEPS == *C* ]] && { step "PTDMA engines to ptdma_q ($PTQ_BDF)"; ptq claim; PTQ=1; }
 
 [[ $STEPS == *P* ]] && {
 step "P. PTDMA puts, host -> network -> peer host, acked (ce_remote --engine ptdma --ptq-user --ack)"
@@ -334,6 +336,22 @@ for sz in 4096 1048576 16777216; do
     metric ptdma_put_${sz}_landed "$(echo $land | words | warm | median)"
     grep -q 'G4 PASS' $L.client.log || hung "PTDMA put $sz"
 done
+}
+
+[[ $STEPS == *R* ]] && {
+step "R. PTDMA window reads (get_bench --ptq, rose's engine reads amy's host memory through Loom)"
+nextport; p=$PORT; L=$OUT/ptdma_read
+on amy "cd $SW && sudo stdbuf -oL timeout 600 $NUMA ./get_bench --server --port $p" > $L.server.log 2>&1 & sp=$!
+sleep 4
+on rose "cd $SW && sudo stdbuf -oL timeout 580 $NUMA ./get_bench --client ${IP[amy]} --port $p --bulk-max 4096 --ptq $PTQ_DEV --ptq-user" > $L.client.log 2>&1
+wait $sp
+rd() { sed -nE "s/^ +(ok|FAIL) +$1 B: median +([0-9.]+) us, +([0-9.]+) GB\/s \(head register.*/\2 \3/p" $L.client.log; }   # the dma lines only
+echo "-- PTDMA reads: 4 KiB $(rd 4096 | cut -d' ' -f1) us, 64 KiB $(rd 65536 | cut -d' ' -f2) GB/s, 16 MiB $(rd 16777216 | cut -d' ' -f2) GB/s; $(grep -E '^client: reader' $L.client.log | grep -oE 'read-ahead reads [0-9]+, blocks [0-9]+, streams [0-9]+')"
+echo "   $(grep -oE 'GET BENCH (PASS|FAIL)' $L.client.log)"
+metric ptdma_read_4096_us "$(rd 4096 | cut -d' ' -f1)" 10
+metric ptdma_read_65536 "$(rd 65536 | cut -d' ' -f2)" 10
+metric ptdma_read_16777216 "$(rd 16777216 | cut -d' ' -f2)" 5
+grep -q 'GET BENCH PASS' $L.client.log || hung "get_bench --ptq"
 }
 
 [[ $STEPS == *C* ]] && {

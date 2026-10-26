@@ -22,11 +22,13 @@ import lynxTypes::*;
  *                 the error completion only. The beat waits while the job
  *                 queue is full.
  *   read answer:  a packet whose index is RRET_EXP answers one of THIS
- *                 switch's reads (loom_read): its RETH is {RRET_EXP, slot *
- *                 8 KiB + offset}, and its lines go to the slot's buffer
- *                 (m_land) instead of host memory; an inline store to
- *                 RRET_EXP is the read's completion (m_cmp: the slot, and
- *                 whether the word is all ones, the far side's rejection).
+ *                 switch's gets (loom_read): its RETH is {RRET_EXP, region *
+ *                 8 KiB + offset}, and its lines go to the region's buffer
+ *                 (m_land) instead of host memory. A get is one packet (at
+ *                 most 4 KiB), so its last beat completes the get (m_cmp:
+ *                 the region, no error). A get the far side rejected is
+ *                 answered by an inline store of all ones to RRET_EXP
+ *                 (m_cmp with the error).
  *
  * The stack announces every packet on rq_wr (its RETH address and payload
  * length) before the packet's beats arrive (axis_mux_user_rq passes a
@@ -56,7 +58,7 @@ import lynxTypes::*;
 module loom_rx #(
     parameter integer RX_WR_OUTSTANDING = 8,
     parameter integer RQ_DEPTH          = 8192,
-    parameter integer N_SLOTS           = 64        // loom_read's read slots
+    parameter integer N_SLOTS           = 64        // loom_read's answer regions (slots, then read-ahead blocks)
 ) (
     input  logic                        aclk,
     input  logic                        aresetn,
@@ -266,8 +268,8 @@ wire [40:0]      i_end = {1'b0, i_ref[39:0]} + 41'd8;
 wire i_ok = (s_tdata[63:36] == '0) && (i_op == MSG_OP_WRITE_INLINE) && (i_len == 28'd8) &&
             (i_ref[2:0] == 3'b0) && xb_hit && (i_end <= {1'b0, xb_len});
 wire i_here = (dstate == D_INL_HDR) && s_tvalid;
-// A read's completion: an inline store to RRET_EXP (lane1 = the slot's
-// return reference + len, lane2 = the request word, or all ones)
+// A rejected get's completion: an inline store to RRET_EXP (lane1 = the
+// region's return reference + len, lane2 all ones)
 wire rr_is = (s_tdata[63:36] == '0) && (i_op == MSG_OP_WRITE_INLINE) && (i_len == 28'd8) &&
              (i_ref[47:40] == RRET_EXP);
 wire rr_ok = rr_is && (i_ref[39:13+SLOT_W] == '0);
@@ -289,9 +291,11 @@ assign m_job_ret   = g_word[47:0];
 assign m_job_cval  = g_word;
 assign m_job_err   = !g_ok;
 
-assign m_cmp_valid = i_here && rr_ok;
-assign m_cmp_slot  = i_ref[13 +: SLOT_W];
-assign m_cmp_err   = (s_tdata[128 +: 64] == '1);
+// A get's completion: the last beat of its answer packet, or the rejection
+wire   rret_end    = (dstate == D_RRET) && s_tvalid && (d_left == BTS_W'(1));
+assign m_cmp_valid = rret_end || (i_here && rr_ok);
+assign m_cmp_slot  = rret_end ? d_line[LINE_W-1:6] : i_ref[13 +: SLOT_W];
+assign m_cmp_err   = !rret_end && (s_tdata[128 +: 64] == '1);
 
 // A read answer's lines, to the slot buffer
 assign m_land_valid = (dstate == D_RRET) && s_tvalid;

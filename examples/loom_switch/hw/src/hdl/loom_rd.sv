@@ -15,9 +15,12 @@ import lynxTypes::*;
  *      the requester's return reference + offset, exactly as the ingress
  *      sends a copy (the requester's loom_rx lands them in its export);
  *   3. then one inline store of the request word to return reference + len:
- *      the requester's completion. An err job (a request loom_rx rejected)
- *      gets only that store, with all ones instead of the word (a valid
- *      request word is never all ones: its return export would be 0xFF).
+ *      the requester's completion. A get answering a switch's read (return
+ *      export RRET_EXP, loom_read) is one packet of at most 4 KiB, whose end
+ *      the requester takes as the completion: it gets no store. An err job
+ *      (a request loom_rx rejected) gets only that store, with all ones
+ *      instead of the word (a valid request word is never all ones: its
+ *      return export would be 0xFF).
  *
  * A packet is posted only when all its beats are buffered here (BUF_BEATS),
  * so a response never holds the shared payload stream waiting on a host
@@ -79,13 +82,14 @@ module loom_rd #(
     output logic                        cnt_job,     // a job taken (a read issued, or an err job)
     output logic                        cnt_err,     // an error completion sent
     output logic                        cnt_pkt,     // a response packet posted
-    output logic                        cnt_cmp,     // a completion sent (err ones included)
+    output logic                        cnt_cmp,     // a completion sent (err ones included; none for read answers)
     output logic                        cnt_wait,    // a request waited on the window or sq_wr
     output logic                        cnt_starve   // a packet waited for its read data
 );
 
 localparam [7:0] MSG_OP_WRITE_INLINE = 8'd2;   // keep in sync with loom_ingress.sv / loom_rx.sv
 localparam [7:0] INLINE_EXP          = 8'hFF;
+localparam [7:0] RRET_EXP            = 8'hFE;   // keep in sync with loom_read.sv / loom_rx.sv
 localparam integer PKT_BEATS = PMTU_BYTES / 64;
 localparam integer JW        = PID_BITS + VADDR_BITS + 23 + 48 + 64 + 1;
 localparam integer CW        = $clog2(BUF_BEATS + 1);
@@ -243,7 +247,7 @@ always_ff @(posedge aclk) begin
             d_left <= d_left - 1'b1;
             if (d_left == 7'd1) begin
                 off <= off + 23'(plen);
-                st  <= (left == 23'(plen)) ? S_CREQ : S_WAIT;
+                st  <= (left != 23'(plen)) ? S_WAIT : (cur.ret[47:40] == RRET_EXP) ? S_IDLE : S_CREQ;
             end
         end
         S_CREQ: if (wr_valid && wr_ready) st <= S_CDATA;

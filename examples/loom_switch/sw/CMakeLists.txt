@@ -38,3 +38,7 @@ target_compile_options(uwin_wc64 PRIVATE -mavx2)
 # Per-packet stamps (stamp_rec, CSR 224-240): arm / counts / dump, Loom and perf_rdma images
 add_executable(stamps ${TARGET_DIR}/stamps.cpp)
 target_link_libraries(stamps PUBLIC Coyote pthread)
+
+# Where a window read's time goes: one size, PTDMA or CPU loads, card time line + reads in flight
+add_executable(read_probe ${TARGET_DIR}/read_probe.cpp)
+target_link_libraries(read_probe PUBLIC Coyote pthread)

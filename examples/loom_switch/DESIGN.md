@@ -554,3 +554,95 @@ vFPGA's edges:
   stands; ranks with several QPs per card (3 ranks, 2 per host) need it.
   RoCE BALBOA's rdma_flow.sv is the same file (its multi-QP figure used
   32 KiB READs, 8 packets, under the 16-packet window).
+
+## 17. Reads: read-ahead, one packet per get, the slot count (2026-10-25)
+
+Measured first (read_probe + stamps, e2/20261025_2254_rdprobe and
+_2300_rdlocal; amy's PTDMA reads rose's host memory through window 1, the
+stamp image): a PTDMA window read of 64 B took 9.34 us = submit -> get out
+1.55 + the get's round trip 6.33 (rose's host read 1.21, wires and stacks
+5.05) + completion -> engine done 1.45. Large reads ran at 1.0 GB/s: at most
+3 gets out at once (~2.7 KiB each) x 7.3 us = ~8 KiB = 32 reads x 256 B, the
+U280 bridge's reads in flight (sections 5, 14). With the switch answering
+at once (a local window: all ones), the same engine reads the window at
+12.3-12.7 GB/s (1-16 MiB), RDMA READ's rate: the engine and PCIe are not the
+limit, the round trip in front of every 32 reads is.
+
+- Read-ahead (loom_read, revived from the 2026-10-05 version that was set
+  aside as too complex, ~/loom-experiments/readahead-archive): byte-
+  consecutive INCR reads of one rdma window form a stream where, a whole
+  page of them already, they enter the next page; the window is fetched
+  ahead in pages (blocks, a 32-page ring next to the 64 read slots in the
+  answer buffer) and the reads are answered from the blocks. The
+  prefetcher starts 4 pages ahead and doubles that each time the reads
+  enter a new page (a short transfer fetches little past its end; a long
+  one keeps up to 32 pages, ~22 needed at 12 GB/s x 7.3 us).
+  Staleness: the stream is dropped by any read that does not continue it
+  (the same bytes again included: a polling reader always gets a fresh
+  get), any packet or store landing on this host, and any write into the
+  uwin; fetches after a drop are fresh, reads attached before it are
+  answered from their blocks (issued before the reader could know). A new
+  stream waits for the old blocks to drain and, after a landing or a uwin
+  write, 512 quiet cycles. CPU loads (lines twice, out of order) rarely form
+  streams.
+  The first build (loom-switch-reads, 2026-10-26; measured
+  e2/20261026_0830_rdprobe_ra, _0836_reads, _0843_rdprobe_tune) started a
+  stream on the second consecutive read, 2 pages ahead, and a drop by a
+  read also started the quiet time. Two costs: a PTDMA read of 256 B-1 KiB
+  waited for a whole page (and the next) behind its own first get, 0.7-1.0
+  us slower than without read-ahead (a read of a page or less is all in
+  one burst of the engine's 32 reads: read-ahead cannot help it, the
+  coalescer fetches it exactly); and every transfer's first read drops the
+  last transfer's stream, so the engine's whole first burst passed in the
+  quiet time and read-ahead began a round trip late (16 KiB equally slow
+  2-16 pages ahead; stamps: 3 gets in the first 2 us, the rest after the
+  first answers). RD_CTL bit 9 restores the first start rule.
+  Still open: after a long stream up to 32 pages fetched ahead are in
+  flight, and the stream of a transfer started right after it waits for
+  them (a new stream reusing their ring entries would need a generation per
+  block).
+  RD_CTL bit 8 turns read-ahead off (A/B on one image); [21:16] / [29:24]
+  lower the most pages ahead / the pages ahead at a stream's start; counters
+  199-205.
+- One packet per get: a get answering a read (return export RRET_EXP) is at
+  most 4 KiB, one PMTU, so loom_rx completes it at the packet's last beat and
+  loom_rd sends no completion store (a rejected get still gets the all-ones
+  store; gets back into an export keep theirs). Why: the 16-packet ack window
+  is card-wide and an ack returns 4.7-5.2 us after its packet (stamps), so
+  two packets per 4 KiB get would cap any read-ahead at 8 x 4 KiB / 5.2 us =
+  ~6.3 GB/s; one packet allows ~12.6 GB/s. It also halves the packets of
+  CPU-load gets (1 KiB of loads: 16 gets x 2 packets > 16 waited ~5 us for
+  acks) and removes the 64 B completion packets.
+- The slot count: `(SLOT_W+2)'(wp - rp)` is evaluated in the cast's width
+  (8 bits), so once the 7-bit wp wrapped and rp had not, 128 + the reads out
+  counted as used and AR stopped until every older read was answered: a
+  pipeline drain every 128 reads (the slot waits counted even at 1 KiB, 5
+  reads; ~16% of a 1 MiB read). Fixed with a 7-bit intermediate (xsim showed
+  the one-line cast fix computes the same wrong value).
+- Software: get_bench times a PTDMA read to the last 8 B of the destination
+  (the flag in the data, as RDMA READ is polled), 0.5-0.6 us before the
+  engine's head register; read_probe (one size, card time line, --local,
+  --ra-off).
+- Tests: tb_loom_switch_top T11-T25 with read-ahead off (as before; the
+  loopback now answers each get with one packet); T26-T36 with the first
+  build's start (RD_CTL bit 9, 2 pages ahead): a stream to the window's
+  end; drops by a store, a packet, a write, a repeated read; rejected
+  blocks and a partial page; the ring wrapping with 256 B reads and a
+  reader ahead of it with 4 KiB reads; pages wanted after a drop; the
+  ramp's bounds from RD_CTL; no stream while a dropped one's blocks are out
+  (a late old block would answer a new page's reads with stale data: the
+  mutation without that rule fails T36 on data); bit 8 dropping a running
+  stream. T37 the default start (one page, 2 KiB across a page, 4 KiB
+  reached mid-page: no stream before the next page), T38 no quiet time
+  after a drop by a read, T34 16 reads in flight across the pointers' wrap.
+  Mutations: 21 of 21 caught (the slot count, the packet-end completion,
+  each drop, the room check, the attached-read count, the ramp and its
+  bound, ring idle, pages wanted after a drop, the same bytes again, bit 8;
+  the start rule without its page, its run, the run's reset, the first
+  rule; the quiet time after a read; the start depth). T25's ack check
+  compared with the packet's first beat, which the mock may ack in the same
+  cycle; it now compares with the post.
+- Rejected: more reads in flight at the bridge (a static rebuild; even 256
+  x 256 B per 7.3 us is ~9 GB/s, computed); bigger PTDMA reads (P2P reads
+  arrive in 256 B pieces whatever MRRS, section 3); a larger card-wide ack
+  window (32 costs the collectives, 10-25 lwin).

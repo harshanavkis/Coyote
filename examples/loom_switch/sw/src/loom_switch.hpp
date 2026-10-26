@@ -27,7 +27,7 @@ constexpr uint32_t EXP_PID         = 178;  // the landing address space
 constexpr uint32_t EXP_BASE        = 179;  // the landing VA
 constexpr uint32_t EXP_LEN         = 180;
 constexpr uint32_t EXP_COMMIT      = 181;
-constexpr uint32_t RD_CTL          = 184;  // [5:0] the QP owner the get responses go out on
+constexpr uint32_t RD_CTL          = 184;  // [5:0] the QP owner the get responses go out on; [8] read-ahead off; [9] early start
 // Gets (loom_ctrl.sv 136-143): a read of an rdma window is a get
 constexpr uint32_t GET_SENT        = 136;  // get requests sent
 constexpr uint32_t GET_JOBS        = 138;  // responder: requests taken
@@ -44,6 +44,21 @@ constexpr uint32_t RD_FAR_ERR      = 195;  // ... because the far side rejected 
 constexpr uint32_t RD_SLOT_WAIT    = 196;  // cycles a read waited for a free slot
 constexpr uint32_t RD_STRAY        = 197;  // completions for no outstanding get (must be 0)
 constexpr uint32_t RD_LINES        = 198;  // answer lines into the read buffer
+// read-ahead (loom_read, DESIGN.md 17; on unless RD_CTL bit 8)
+constexpr uint32_t RD_RA_READS      = 199;  // reads answered from read-ahead
+constexpr uint32_t RD_RA_BLOCKS     = 200;  // read-ahead blocks (pages) requested
+constexpr uint32_t RD_RA_STARTS     = 201;  // streams started
+constexpr uint32_t RD_RA_DROP_READ  = 202;  // streams dropped by a read that did not continue
+constexpr uint32_t RD_RA_DROP_STORE = 203;  // ... by an inline store landing here
+constexpr uint32_t RD_RA_DROP_PKT   = 204;  // ... by a packet landing here
+constexpr uint32_t RD_RA_DROP_WRITE = 205;  // ... by a write into the uwin
+constexpr uint64_t RD_CTL_RA_OFF    = 1ULL << 8;
+constexpr uint64_t RD_CTL_RA_EARLY  = 1ULL << 9;    // a stream starts on the second consecutive read (the first rule)
+// RD_CTL [21:16] the most pages read-ahead fetches ahead, [29:24] the pages ahead at a stream's start (0 = defaults)
+inline uint64_t rd_ctl_ra(uint64_t rd_ctl, bool off, unsigned dmax, unsigned d0) {
+    rd_ctl &= ~(RD_CTL_RA_OFF | (0x3FULL << 16) | (0x3FULL << 24));
+    return rd_ctl | (off ? RD_CTL_RA_OFF : 0) | (uint64_t(dmax & 0x3F) << 16) | (uint64_t(d0 & 0x3F) << 24);
+}
 constexpr uint32_t RDMA_STAGING_VA = 16;
 constexpr uint32_t RX_FWD          = 36;
 constexpr uint32_t RX_DROP         = 41;

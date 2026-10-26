@@ -58,13 +58,22 @@ import lynxTypes::*;
  *          EXP_PID (landing pid), 179 EXP_BASE (landing VA), 180 EXP_LEN
  *          (bytes), 181 EXP_COMMIT (write 1)
  *   184 RD_CTL (RW) [5:0] the QP owner pid the get responses (loom_rd) go
- *          out on; reset 0. Its own 64 B line, as TX_CTL.
- *   192-199 (RO) cnt_y[i] at word 192+i: reads on the uwin (loom_read):
+ *          out on; [8] read-ahead off (loom_read, DESIGN.md 17); [9] a stream
+ *          starts on the second consecutive read (else: entering a page
+ *          after a whole page of consecutive reads); [21:16]
+ *          the most pages read-ahead fetches ahead, [29:24] the pages ahead
+ *          when a stream starts (0 = loom_read's N_BLK, RA_D0); reset 0
+ *          (read-ahead on, the defaults). Its own 64 B line, as TX_CTL.
+ *   192-207 (RO) cnt_y[i] at word 192+i: reads on the uwin (loom_read):
  *          192 reads taken, 193 reads answered, 194 reads answered with all
  *          ones (no rdma window, past its end, a bad burst, or rejected by
  *          the far side), 195 gets the far side rejected, 196 cycles
- *          a read waited for a free slot, 197 completions for a slot with no
- *          get out (must be 0), 198 answer lines into the read buffer
+ *          a read waited for a free slot, 197 completions for a region with
+ *          no get out (must be 0), 198 answer lines into the read buffer;
+ *          read-ahead (DESIGN.md 17): 199 reads answered from read-ahead,
+ *          200 blocks requested, 201 streams started, streams dropped by
+ *          202 a read that did not continue, 203 an inline store landing,
+ *          204 a packet landing, 205 a write into the uwin
  *   224-240 per-packet stamps (stamp_rec; the same words in perf_rdma's
  *          vFPGA): 224 ST_CTL (W) arm = clear the counts, restart the cycle
  *          count, record from now on; (R) {DEPTH [63:32], N_ST [31:0]};
@@ -144,6 +153,10 @@ module loom_ctrl #(
     output logic [7:0]                  tx_window,
     output logic [3:0]                  rx_chunk,
     output logic [PID_BITS-1:0]         rd_qp_pid,
+    output logic                        rd_ra_off,
+    output logic                        rd_ra_early,
+    output logic [5:0]                  rd_ra_dmax,
+    output logic [5:0]                  rd_ra_d0,
 
     // Ack window state and waits
     input  logic [15:0]                 tx_inflight,
@@ -324,6 +337,10 @@ assign tbl_idx         = r_tbl_idx[3:0];
 assign tbl_valid       = r_tbl_cfg[0];
 assign tbl_route       = r_tbl_cfg[1];
 assign rd_qp_pid       = r_rd_ctl[PID_BITS-1:0];
+assign rd_ra_off       = r_rd_ctl[8];
+assign rd_ra_early     = r_rd_ctl[9];
+assign rd_ra_dmax      = r_rd_ctl[21:16];
+assign rd_ra_d0        = r_rd_ctl[29:24];
 assign tbl_pid         = r_tbl_pid[PID_BITS-1:0];
 assign tbl_dst_pid     = r_tbl_pid[8 +: PID_BITS];
 assign tbl_base        = r_tbl_base[VADDR_BITS-1:0];

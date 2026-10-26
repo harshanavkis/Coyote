@@ -31,7 +31,12 @@ import lynxTypes::*;
  * other share one get: a page of 256 B reads, the reads that must not join
  * (a gap, going back, the next page, the next window), the timer, a page
  * boundary, CPU loads inside lines, a shared get the far side rejects, and
- * the shared answer kept until its last read is answered.
+ * the shared answer kept until its last read is answered. Read-ahead (T26-T33,
+ * T35): streams answered from blocks, every drop, rejected blocks, the ring
+ * wrapping, pages wanted after a drop, the ramp's bounds, no stream while old
+ * blocks are out, read-ahead switched off mid-stream, the default start rule
+ * (T37), no quiet time after a drop by a read (T38); T34 reads in flight
+ * across the slot pointers' wrap.
  */
 module tb_loom_switch_top;
 
@@ -87,6 +92,10 @@ localparam longint      U5 = 64'h040_0000;            // windows 5 and 6: rdma, 
 localparam logic [47:0] R5 = {8'd7, 40'h10_0000};     // meeting in the middle of one page
 localparam longint      U6 = 64'h040_0800;
 localparam logic [47:0] R6 = {8'd7, 40'h20_0000};
+localparam logic [63:0] RA_EARLY = 64'h200;         // RD_CTL[9]: a stream starts on the second consecutive read
+localparam logic [63:0] RA_FIRST = RA_EARLY | (64'd2 << 24);   // ... and 2 pages ahead at the start: the first build
+localparam longint      U7 = 64'h050_0000;            // window 7: rdma, export 7 here at 0, 1 MiB (read-ahead)
+localparam logic [47:0] R7 = {8'd7, 40'h0};
 
 function automatic logic [AXI_DATA_BITS-1:0] pat(input longint uaddr);
     logic [AXI_DATA_BITS-1:0] d;
@@ -606,12 +615,21 @@ task automatic exp_read(input string name, input longint woff, input int arlen, 
     end
 endtask
 
+// Read-ahead: end any stream (a read where no window is: answered all ones
+// here, nothing on the network), then wait out the quiet time after a drop
+task automatic ra_settle();
+    uread(64'h070_0000, 0, 6, 1, 63);
+    repeat (800) @(posedge aclk);
+    clear();
+endtask
+
 // The far side and the way back, by loopback: the get requests sent so far
 // (other rdma packets' beats skipped) are replayed into loom_rx as the far
-// side; loom_rd's answers, one group per get (packets, then the completion),
-// are replayed into loom_rx as the reader, in order or last get first. The
-// get request messages are kept in lg_reqs.
+// side; loom_rd's answers, one packet per get (its lines, or a rejection's
+// completion), are replayed into loom_rx as the reader, in order or last get
+// first. The get request messages are kept in lg_reqs.
 logic [AXI_DATA_BITS-1:0] lg_reqs [$];
+int last_gets;      // loop_gets: the get requests it answered (want_gets < 0: any number)
 task automatic loop_gets(input string name, input int want_gets, input bit reverse = 0);
     logic [AXI_DATA_BITS-1:0] reqs [$], beats [$], b [$];
     logic [47:0] pva [$];
@@ -624,7 +642,9 @@ task automatic loop_gets(input string name, input int want_gets, input bit rever
             if (net_req[i].va == {8'hFF, 40'd0} && d[7:0] == 8'd3) reqs.push_back(d);
         end
     end
-    `CHECK(reqs.size() == want_gets, $sformatf("%s: %0d get requests out, want %0d", name, reqs.size(), want_gets))
+    if (want_gets >= 0)
+        `CHECK(reqs.size() == want_gets, $sformatf("%s: %0d get requests out, want %0d", name, reqs.size(), want_gets))
+    last_gets = reqs.size();
     lg_reqs = reqs;
     clear_net();
     rx_lock.get();
@@ -632,11 +652,11 @@ task automatic loop_gets(input string name, input int want_gets, input bit rever
     rx_lock.put();
     quiesce();
     foreach (net_req[i]) begin
+        // one packet per get: its lines, or a rejection's completion
         `CHECK(net_req[i].rd, $sformatf("%s: a request other than an answer", name))
-        if (gfirst.size() == gcnt.size()) gfirst.push_back(pva.size());
+        gfirst.push_back(pva.size()); gcnt.push_back(1);
         pva.push_back(net_req[i].va); plen.push_back(net_req[i].beats * 64); pfirst.push_back(beats.size());
         for (int j = 0; j < net_req[i].beats; j++) begin beats.push_back(n_d.pop_front()); void'(n_l.pop_front()); end
-        if (net_req[i].va == {8'hFF, 40'd0}) gcnt.push_back(pva.size() - gfirst[gfirst.size() - 1]);
     end
     `CHECK(gcnt.size() == reqs.size() && gfirst.size() == gcnt.size(),
            $sformatf("%s: %0d answers for %0d requests", name, gcnt.size(), reqs.size()))
@@ -964,7 +984,8 @@ initial begin
     begin
         logic [63:0] g0, g1, y0 [8], y1 [8];
         program_win(3, 1, 5, 0, R3, 64'h1_0000, U3);
-        csr_wr(184, 64'd5);
+        // T11-T25 test reads without read-ahead (RD_CTL[8]); T26-T33 with it
+        csr_wr(184, 64'h105);
         clear();
         csr_rd(136, g0);
         for (int i = 0; i < 8; i++) csr_rd(192 + i, y0[i]);
@@ -993,7 +1014,7 @@ initial begin
     begin
         logic [63:0] c [8], cc [8], gw;
         logic [47:0] ret;
-        csr_wr(184, 64'd5); csr_rd(184, v); `CHECK(v == 5, $sformatf("T12: RD_CTL reads %0d", v))
+        csr_wr(184, 64'h105); csr_rd(184, v); `CHECK(v == 64'h105, $sformatf("T12: RD_CTL reads %0h", v))
         for (int i = 0; i < 8; i++) csr_rd(136 + i, c[i]);
         ret = {8'd2, 40'h8000};
         gw  = gword(9216, ret);
@@ -1450,7 +1471,9 @@ initial begin
         end
         `CHECK(s[1] - s[0] == 64'(ev_ing[0] - ev_w1[0]), $sformatf("T25: W -> post %0d, tb %0d", s[1] - s[0], ev_ing[0] - ev_w1[0]))
         `CHECK(s[2] - s[0] == 64'(ev_nb1[0] - ev_w1[0]), $sformatf("T25: W -> beat out %0d, tb %0d", s[2] - s[0], ev_nb1[0] - ev_w1[0]))
-        `CHECK(s[3] > s[2], "T25: ack before the packet")
+        // the mock acks a random 1-4 cycles after the request is posted (it
+        // may be the cycle of the first beat): the ack comes after the post
+        `CHECK(s[3] > s[1], $sformatf("T25: ack before the packet: post %0d, first beat %0d, ack %0d", s[1], s[2], s[3]))
         `CHECK(s[5] - s[4] == 64'(ev_rr1[0] - ev_rq[0]), $sformatf("T25: rq -> beat in %0d, tb %0d", s[5] - s[4], ev_rr1[0] - ev_rq[0]))
         `CHECK(s[6] - s[4] == 64'(ev_rx[0] - ev_rq[0]), $sformatf("T25: rq -> landing write %0d, tb %0d", s[6] - s[4], ev_rx[0] - ev_rq[0]))
         `CHECK(s[7] - s[4] == 64'(ev_h1[0] - ev_rq[0]), $sformatf("T25: rq -> landing beat %0d, tb %0d", s[7] - s[4], ev_h1[0] - ev_rq[0]))
@@ -1484,13 +1507,456 @@ initial begin
     end
     $display("ok   T25 stamps");
 
+    // --- T26-T33: read-ahead (DESIGN.md 17), on from here (RD_CTL[8] = 0);
+    //     T26-T36 as the first build: streams start on the second
+    //     consecutive read (RD_CTL[9]), 2 pages ahead; T37/T38 the defaults
+    //     (a page of reads, then entering the next; 4 pages ahead).
+    //     Counters 192+i: 199 reads answered from read-ahead, 200 blocks,
+    //     201 starts, drops by 202 a read, 203 a store, 204 a packet, 205 a
+    //     write. The prefetcher starts 2 pages ahead and doubles that on
+    //     every new page the reads enter ---
+    csr_wr(184, RA_FIRST | 64'd5);
+    program_win(7, 1, 5, 0, R7, 64'h10_0000, U7);
+
+    // --- T26: 64 consecutive 256 B reads (a copy engine's) of window 3
+    //     from 0x8000: the first is its own get, the second starts a stream;
+    //     the window is fetched ahead in pages up to its end (8 blocks,
+    //     0x8000 .. 0xF000) and the other 63 reads are answered from them ---
+    begin
+        logic [63:0] y0 [16], y1 [16];
+        ra_settle();
+        for (int i = 0; i < 16; i++) csr_rd(192 + i, y0[i]);
+        for (int k = 0; k < 64; k++) uread(U3 + 64'h8000 + 256*k, 3, 6, 1, k);
+        loop_gets("T26", 9);
+        chk_get("T26 own get", 0, R3 + 48'h8000, 4, -1);
+        for (int k = 0; k < 8; k++) chk_get($sformatf("T26 block %0d", k), 1 + k, R3 + 48'h8000 + 48'(4096*k), 64, 64 + ((8 + k) % 32));
+        for (int k = 0; k < 64; k++) exp_read($sformatf("T26 read %0d", k), 64'h8000 + 256*k, 3, 6, 1, k);
+        `CHECK(r_d.size() == 0, $sformatf("T26: %0d extra R beats", r_d.size()))
+        for (int i = 0; i < 16; i++) csr_rd(192 + i, y1[i]);
+        `CHECK(y1[0] - y0[0] == 64 && y1[1] - y0[1] == 64 && y1[2] == y0[2] && y1[5] == y0[5] &&
+               y1[7] - y0[7] == 63 && y1[8] - y0[8] == 8 && y1[9] - y0[9] == 1 &&
+               y1[10] == y0[10] && y1[11] == y0[11] && y1[12] == y0[12] && y1[13] == y0[13],
+               $sformatf("T26: reads %0d answered %0d failed %0d stray %0d; read-ahead reads %0d blocks %0d starts %0d drops %0d/%0d/%0d/%0d",
+                         y1[0] - y0[0], y1[1] - y0[1], y1[2] - y0[2], y1[5] - y0[5], y1[7] - y0[7], y1[8] - y0[8],
+                         y1[9] - y0[9], y1[10] - y0[10], y1[11] - y0[11], y1[12] - y0[12], y1[13] - y0[13]))
+        clear();
+    end
+    $display("ok   T26 read-ahead: a stream answered from blocks, up to the window's end");
+
+    // --- T27: a store landing here drops the stream: 8 consecutive reads
+    //     from 0 (a stream from the second; pages 0 and 1 requested), then an
+    //     inline store lands in export 2, then 8 more consecutive reads: one
+    //     shared get. After the quiet time, with the old blocks back, reads
+    //     continuing read 15 start a new stream at 0x1000 (pages 1, 2) ---
+    begin
+        logic [63:0] y0 [16], y1 [16];
+        ra_settle();
+        for (int i = 0; i < 16; i++) csr_rd(192 + i, y0[i]);
+        for (int k = 0; k < 8; k++) uread(U3 + 256*k, 3, 6, 1, k);
+        repeat (100) @(posedge aclk);
+        rx_inline(2, 64'h40, 64'h1234);
+        repeat (20) @(posedge aclk);
+        for (int k = 8; k < 16; k++) uread(U3 + 256*k, 3, 6, 1, k);
+        loop_gets("T27", 1 + 2 + 1);
+        chk_get("T27 after the drop", 3, R3 + 48'h800, 32, -1);
+        for (int k = 0; k < 16; k++) exp_read($sformatf("T27 read %0d", k), 256*k, 3, 6, 1, k);
+        `CHECK(r_d.size() == 0, $sformatf("T27: %0d extra R beats", r_d.size()))
+        for (int i = 0; i < 16; i++) csr_rd(192 + i, y1[i]);
+        `CHECK(y1[7] - y0[7] == 7 && y1[8] - y0[8] == 2 && y1[9] - y0[9] == 1 && y1[11] - y0[11] == 1 &&
+               y1[10] == y0[10] && y1[12] == y0[12] && y1[13] == y0[13],
+               $sformatf("T27: read-ahead reads %0d blocks %0d starts %0d drops by read %0d store %0d packet %0d write %0d",
+                         y1[7] - y0[7], y1[8] - y0[8], y1[9] - y0[9], y1[10] - y0[10], y1[11] - y0[11],
+                         y1[12] - y0[12], y1[13] - y0[13]))
+        clear();
+        repeat (700) @(posedge aclk);
+        for (int k = 16; k < 20; k++) uread(U3 + 256*k, 3, 6, 1, k);
+        loop_gets("T27 new stream", 2);
+        chk_get("T27 new stream block 0", 0, R3 + 48'h1000, 64, 64 + 1);
+        for (int k = 16; k < 20; k++) exp_read($sformatf("T27 read %0d", k), 256*k, 3, 6, 1, k);
+        for (int i = 0; i < 16; i++) csr_rd(192 + i, y0[i]);
+        `CHECK(y0[9] - y1[9] == 1 && y0[7] - y1[7] == 4,
+               $sformatf("T27: new stream: starts %0d, read-ahead reads %0d", y0[9] - y1[9], y0[7] - y1[7]))
+        clear();
+    end
+    $display("ok   T27 a store landing drops the stream; a new one after the quiet time");
+
+    // --- T28: the same bytes again are never answered from read-ahead (a
+    //     reader polling): reads at 0x8000, 0x8100, 0x8200, then 0x8200
+    //     again (drops the stream: a fresh get), then 0x8300 (joins that
+    //     get: no new stream while the old blocks are out) ---
+    begin
+        logic [63:0] y0 [16], y1 [16];
+        longint off [5] = '{64'h8000, 64'h8100, 64'h8200, 64'h8200, 64'h8300};
+        ra_settle();
+        for (int i = 0; i < 16; i++) csr_rd(192 + i, y0[i]);
+        for (int k = 0; k < 3; k++) uread(U3 + off[k], 3, 6, 1, k);
+        repeat (100) @(posedge aclk);
+        for (int k = 3; k < 5; k++) uread(U3 + off[k], 3, 6, 1, k);
+        loop_gets("T28", 1 + 2 + 1);
+        chk_get("T28 fresh", 3, R3 + 48'h8200, 8, -1);
+        for (int k = 0; k < 5; k++) exp_read($sformatf("T28 read %0d", k), off[k], 3, 6, 1, k);
+        for (int i = 0; i < 16; i++) csr_rd(192 + i, y1[i]);
+        `CHECK(y1[7] - y0[7] == 2 && y1[10] - y0[10] == 1 && y1[9] - y0[9] == 1,
+               $sformatf("T28: read-ahead reads %0d, drops by read %0d, starts %0d",
+                         y1[7] - y0[7], y1[10] - y0[10], y1[9] - y0[9]))
+        clear();
+    end
+    $display("ok   T28 the same bytes again: a fresh get, the stream dropped");
+
+    // --- T29 / T30: a write into the uwin (a put to window 3) and a packet
+    //     landing here (4 KiB into export 2) drop a stream likewise ---
+    for (int t = 0; t < 2; t++) begin
+        logic [63:0] y0 [16], y1 [16];
+        string nm;
+        nm = t ? "T30" : "T29";
+        ra_settle();
+        for (int i = 0; i < 16; i++) csr_rd(192 + i, y0[i]);
+        uread(U3 + 64'hC000, 3, 6, 1, 1);
+        uread(U3 + 64'hC100, 3, 6, 1, 2);
+        repeat (100) @(posedge aclk);
+        if (t) rx_bulk(2, 64'h1000, 4096);
+        else   uwr(U3 + 64'h100, 1);
+        repeat (20) @(posedge aclk);
+        uread(U3 + 64'hC200, 3, 6, 1, 3);
+        loop_gets(nm, 1 + 2 + 1);
+        exp_read({nm, " read 1"}, 64'hC000, 3, 6, 1, 1);
+        exp_read({nm, " read 2"}, 64'hC100, 3, 6, 1, 2);
+        exp_read({nm, " read 3"}, 64'hC200, 3, 6, 1, 3);
+        for (int i = 0; i < 16; i++) csr_rd(192 + i, y1[i]);
+        `CHECK(y1[7] - y0[7] == 1 && y1[9] - y0[9] == 1 && y1[12] - y0[12] == t && y1[13] - y0[13] == 1 - t &&
+               y1[10] == y0[10] && y1[11] == y0[11],
+               $sformatf("%s: read-ahead reads %0d starts %0d drops by read %0d store %0d packet %0d write %0d", nm,
+                         y1[7] - y0[7], y1[9] - y0[9], y1[10] - y0[10], y1[11] - y0[11], y1[12] - y0[12], y1[13] - y0[13]))
+        clear();
+    end
+    $display("ok   T29 a write into the uwin drops the stream");
+    $display("ok   T30 a packet landing drops the stream");
+
+    // --- T31: blocks the far side rejects, and a partial last page:
+    //     window 4 (0x1040 long, export 5 not on the far side): 16
+    //     consecutive 256 B reads and a 64 B one at 0x1000; a stream from the
+    //     second read, 2 blocks (0, and 0x1000 with one line); every read
+    //     all ones ---
+    begin
+        logic [63:0] y0 [16], y1 [16];
+        ra_settle();
+        for (int i = 0; i < 16; i++) csr_rd(192 + i, y0[i]);
+        for (int k = 0; k < 16; k++) uread(U4 + 256*k, 3, 6, 1, k);
+        uread(U4 + 64'h1000, 0, 6, 1, 16);
+        loop_gets("T31", 1 + 2);
+        chk_get("T31 partial page", 2, R4 + 48'h1000, 1, 64 + 1);
+        for (int k = 0; k < 16; k++) exp_read($sformatf("T31 read %0d", k), 0, 3, 6, 1, k, 1);
+        exp_read("T31 read 16", 0, 0, 6, 1, 16, 1);
+        `CHECK(r_d.size() == 0, $sformatf("T31: %0d extra R beats", r_d.size()))
+        for (int i = 0; i < 16; i++) csr_rd(192 + i, y1[i]);
+        `CHECK(y1[2] - y0[2] == 17 && y1[3] - y0[3] == 3 && y1[5] == y0[5] && y1[7] - y0[7] == 16 && y1[8] - y0[8] == 2,
+               $sformatf("T31: failed %0d far-rejected %0d stray %0d read-ahead reads %0d blocks %0d",
+                         y1[2] - y0[2], y1[3] - y0[3], y1[5] - y0[5], y1[7] - y0[7], y1[8] - y0[8]))
+        clear();
+    end
+    $display("ok   T31 rejected blocks answer all ones; a partial last page");
+
+    // --- T32: the block ring wraps, and a reader that runs ahead of it
+    //     waits. Window 7 (1 MiB of export 7): 1024 consecutive 256 B reads
+    //     (256 KiB, 64 pages through 32 blocks), then 64 consecutive 4 KiB
+    //     reads (64 slots of whole pages: more than the ring holds, so reads
+    //     wait for the oldest page to be given back). Gets are answered as
+    //     they go out; every beat is checked ---
+    begin
+        logic [63:0] y0 [16], y1 [16];
+        int sz [2] = '{256, 4096};
+        int nr [2] = '{1024, 64};
+        for (int t = 0; t < 2; t++) begin
+            int got = 0, gets = 0, rounds = 0;
+            bit issued = 0;
+            longint base = t ? 64'h4_0000 : 64'h0;
+            ra_settle();
+            for (int i = 0; i < 16; i++) csr_rd(192 + i, y0[i]);
+            fork
+                begin
+                    for (int k = 0; k < nr[t]; k++) uread(U7 + base + longint'(sz[t]) * k, sz[t] / 64 - 1, 6, 1, k % 64);
+                    issued = 1;
+                end
+            join_none
+            while (got < nr[t] && rounds < 400) begin
+                loop_gets($sformatf("T32.%0d", t), -1);
+                gets += last_gets;
+                rounds++;
+                while (r_d.size() >= sz[t] / 64 && got < nr[t]) begin
+                    for (int i = 0; i < sz[t] / 64; i++) begin
+                        longint line = base + longint'(sz[t]) * got + 64 * i;
+                        `CHECK(r_d.pop_front() == hpat(X7 + 48'(line)) && r_id.pop_front() == got % 64 &&
+                               r_l.pop_front() == (i == sz[t] / 64 - 1) && r_rs.pop_front() == 2'b00,
+                               $sformatf("T32.%0d: read %0d beat %0d (line %h)", t, got, i, line))
+                    end
+                    got++;
+                end
+            end
+            wait (issued);
+            // the stream keeps fetching ahead after the last read: answer
+            // those gets too (the far side always does), so its blocks drain
+            do begin loop_gets($sformatf("T32.%0d tail", t), -1); gets += last_gets; end while (last_gets != 0);
+            `CHECK(got == nr[t] && r_d.size() == 0, $sformatf("T32.%0d: %0d of %0d reads answered, %0d beats left", t, got, nr[t], r_d.size()))
+            for (int i = 0; i < 16; i++) csr_rd(192 + i, y1[i]);
+            `CHECK(y1[9] - y0[9] == 1 && y1[7] - y0[7] == nr[t] - 1 && y1[2] == y0[2] && y1[5] == y0[5] &&
+                   y1[10] == y0[10] && y1[11] == y0[11] && y1[12] == y0[12] && y1[13] == y0[13],
+                   $sformatf("T32.%0d: starts %0d read-ahead reads %0d failed %0d stray %0d drops %0d/%0d/%0d/%0d", t,
+                             y1[9] - y0[9], y1[7] - y0[7], y1[2] - y0[2], y1[5] - y0[5],
+                             y1[10] - y0[10], y1[11] - y0[11], y1[12] - y0[12], y1[13] - y0[13]))
+            $display("     T32.%0d: %0d reads of %0d B, %0d gets (%0d blocks) in %0d rounds", t, nr[t], sz[t], gets,
+                     y1[8] - y0[8], rounds);
+            clear();
+        end
+    end
+    $display("ok   T32 the block ring wraps; a reader ahead of it waits");
+
+    // --- T33: reads attached to pages not yet requested when the stream is
+    //     dropped still get their pages. Window 7 at 0x8_0000: one 4 KiB read
+    //     (its own get), then the get port is held (the ingress's request
+    //     queue forced full: it takes no get), four more consecutive 4 KiB
+    //     reads attach to pages the prefetcher has not requested yet, a store
+    //     lands (the drop), the port is let go: the four pages are fetched all
+    //     the same and every read is answered ---
+    begin
+        logic [63:0] y0 [16], y1 [16];
+        ra_settle();
+        for (int i = 0; i < 16; i++) csr_rd(192 + i, y0[i]);
+        uread(U7 + 64'h8_0000, 63, 6, 1, 0);
+        wait (int'(inst_dut.inst_loom_read.ast) == 0 && !inst_dut.inst_loom_read.m_get_valid);
+        repeat (5) @(posedge aclk);
+        force inst_dut.inst_loom_ingress.pq_full = 1'b1;
+        for (int k = 1; k < 5; k++) uread(U7 + 64'h8_0000 + 4096*k, 63, 6, 1, k);
+        repeat (20) @(posedge aclk);
+        `CHECK(inst_dut.inst_loom_read.s_need - inst_dut.inst_loom_read.s_fetch >= 3 * 4096,
+               $sformatf("T33: pages wanted %h, requested up to %h", inst_dut.inst_loom_read.s_need,
+                         inst_dut.inst_loom_read.s_fetch))
+        rx_inline(2, 64'h80, 64'h5678);
+        repeat (20) @(posedge aclk);
+        force inst_dut.inst_loom_ingress.pq_full = 1'b0;
+        @(posedge aclk);
+        release inst_dut.inst_loom_ingress.pq_full;
+        loop_gets("T33", 1 + 4);
+        for (int k = 0; k < 5; k++)
+            for (int i = 0; i < 64; i++) begin
+                longint line = 64'h8_0000 + 4096*k + 64*i;
+                `CHECK(r_d.size() != 0, $sformatf("T33: read %0d beat %0d missing", k, i))
+                if (r_d.size() == 0) break;
+                `CHECK(r_d.pop_front() == hpat(X7 + 48'(line)) && r_id.pop_front() == k && r_l.pop_front() == (i == 63) &&
+                       r_rs.pop_front() == 2'b00, $sformatf("T33: read %0d beat %0d", k, i))
+            end
+        for (int i = 0; i < 16; i++) csr_rd(192 + i, y1[i]);
+        `CHECK(y1[9] - y0[9] == 1 && y1[7] - y0[7] == 4 && y1[8] - y0[8] == 4 && y1[11] - y0[11] == 1,
+               $sformatf("T33: starts %0d read-ahead reads %0d blocks %0d drops by store %0d",
+                         y1[9] - y0[9], y1[7] - y0[7], y1[8] - y0[8], y1[11] - y0[11]))
+        clear();
+    end
+    $display("ok   T33 pages wanted by attached reads are fetched after a drop");
+
+    // --- T34: reads in flight across the slot pointers' wrap: with
+    //     read-ahead off, single-line reads 128 B apart (a get each) bring
+    //     the write pointer to 120 of its 128 values; then 16 reads are
+    //     issued and none answered: all 16 are taken at once (the 8 after
+    //     the wrap too), no cycle waiting for a slot; then answered, exact ---
+    csr_wr(184, RA_FIRST | 64'h105);
+    begin
+        logic [63:0] y0, y1, w0, w1;
+        int n;
+        ra_settle();
+        n = (120 - int'(inst_dut.inst_loom_read.wp)) & 127;
+        while (n > 0) begin
+            int b = (n > 48) ? 48 : n;
+            for (int k = 0; k < b; k++) uread(U3 + 64'h2000 + 128*k, 0, 6, 1, k);
+            loop_gets("T34 fill", b);
+            for (int k = 0; k < b; k++) exp_read($sformatf("T34 fill %0d", k), 64'h2000 + 128*k, 0, 6, 1, k);
+            clear();
+            n -= b;
+        end
+        `CHECK(int'(inst_dut.inst_loom_read.wp) == 120, $sformatf("T34: write pointer %0d, want 120", inst_dut.inst_loom_read.wp))
+        csr_rd(192, y0); csr_rd(196, w0);
+        fork
+            for (int k = 0; k < 16; k++) uread(U3 + 64'h6000 + 128*k, 0, 6, 1, k);
+        join_none
+        repeat (300) @(posedge aclk);
+        csr_rd(192, y1); csr_rd(196, w1);
+        `CHECK(y1 - y0 == 16 && w1 == w0, $sformatf("T34: %0d of 16 reads taken across the wrap, %0d cycles waiting for a slot",
+                                                   y1 - y0, w1 - w0))
+        wait fork;
+        loop_gets("T34", 16);
+        for (int k = 0; k < 16; k++) exp_read($sformatf("T34 read %0d", k), 64'h6000 + 128*k, 0, 6, 1, k);
+        `CHECK(r_d.size() == 0, $sformatf("T34: %0d extra R beats", r_d.size()))
+        clear();
+    end
+    csr_wr(184, RA_FIRST | 64'd5);
+    $display("ok   T34 reads in flight across the slot pointers' wrap");
+
+    // --- T35: the ramp's bounds from RD_CTL: at most 2 pages ahead
+    //     ([21:16] = 2), 64 consecutive 256 B reads of window 7 from
+    //     0x1_0000 (4 pages) fetch pages 0x10 .. 0x14 (5 blocks); with 8
+    //     pages at the start ([29:24] = 8) two reads fetch 8 pages ---
+    begin
+        logic [63:0] y0 [16], y1 [16];
+        csr_wr(184, RA_FIRST | 64'd5 | (64'd2 << 16));
+        ra_settle();
+        for (int i = 0; i < 16; i++) csr_rd(192 + i, y0[i]);
+        for (int k = 0; k < 64; k++) uread(U7 + 64'h1_0000 + 256*k, 3, 6, 1, k);
+        loop_gets("T35 at most 2 ahead", 1 + 5);
+        for (int k = 0; k < 64; k++) exp_read($sformatf("T35 read %0d", k), 64'h1_0000 + 256*k, 3, 6, 1, k, 0, X7);
+        for (int i = 0; i < 16; i++) csr_rd(192 + i, y1[i]);
+        `CHECK(y1[7] - y0[7] == 63 && y1[8] - y0[8] == 5 && y1[9] - y0[9] == 1,
+               $sformatf("T35: read-ahead reads %0d blocks %0d starts %0d", y1[7] - y0[7], y1[8] - y0[8], y1[9] - y0[9]))
+        clear();
+        csr_wr(184, RA_EARLY | 64'd5 | (64'd8 << 24));
+        ra_settle();
+        for (int i = 0; i < 16; i++) csr_rd(192 + i, y0[i]);
+        uread(U7 + 64'h2_0000, 3, 6, 1, 0);
+        uread(U7 + 64'h2_0100, 3, 6, 1, 1);
+        loop_gets("T35 8 at the start", 1 + 8);
+        for (int k = 0; k < 2; k++) exp_read($sformatf("T35 start read %0d", k), 64'h2_0000 + 256*k, 3, 6, 1, k, 0, X7);
+        for (int i = 0; i < 16; i++) csr_rd(192 + i, y1[i]);
+        `CHECK(y1[8] - y0[8] == 8, $sformatf("T35: %0d blocks at the start, want 8", y1[8] - y0[8]))
+        clear();
+        csr_wr(184, RA_FIRST | 64'd5);
+        ra_settle();
+    end
+    $display("ok   T35 the ramp's bounds from RD_CTL");
+
+    // --- T36: no new stream while a dropped one's blocks are out, and
+    //     RD_CTL bit 8 drops a running stream. (a) A stream on window 3 at
+    //     0x8000 (blocks for pages 8, 9 out, unanswered), a read elsewhere
+    //     drops it; after the quiet time two consecutive reads of window 7
+    //     at 0x2_8000 (page 0x28: the same ring entries as pages 8, 9) start
+    //     no stream: one shared get, and every read gets its own page's data
+    //     though the old blocks are answered first. (b) A stream on window 3
+    //     at 0xA000, then read-ahead off: the next consecutive reads are not
+    //     answered from it (one shared get) ---
+    begin
+        logic [63:0] y0 [16], y1 [16];
+        ra_settle();
+        for (int i = 0; i < 16; i++) csr_rd(192 + i, y0[i]);
+        uread(U3 + 64'h8000, 3, 6, 1, 0);
+        uread(U3 + 64'h8100, 3, 6, 1, 1);
+        repeat (50) @(posedge aclk);
+        uread(U3 + 64'hE000, 0, 6, 1, 2);
+        repeat (700) @(posedge aclk);
+        uread(U7 + 64'h2_8000, 3, 6, 1, 3);
+        uread(U7 + 64'h2_8100, 3, 6, 1, 4);
+        loop_gets("T36 (a)", 1 + 2 + 1 + 1);
+        exp_read("T36 read 0", 64'h8000, 3, 6, 1, 0);
+        exp_read("T36 read 1", 64'h8100, 3, 6, 1, 1);
+        exp_read("T36 read 2", 64'hE000, 0, 6, 1, 2);
+        exp_read("T36 read 3", 64'h2_8000, 3, 6, 1, 3, 0, X7);
+        exp_read("T36 read 4", 64'h2_8100, 3, 6, 1, 4, 0, X7);
+        for (int i = 0; i < 16; i++) csr_rd(192 + i, y1[i]);
+        `CHECK(y1[9] - y0[9] == 1 && y1[7] - y0[7] == 1 && y1[10] - y0[10] == 1,
+               $sformatf("T36 (a): starts %0d read-ahead reads %0d drops by read %0d", y1[9] - y0[9], y1[7] - y0[7], y1[10] - y0[10]))
+        clear();
+        ra_settle();
+        for (int i = 0; i < 16; i++) csr_rd(192 + i, y0[i]);
+        uread(U3 + 64'hA000, 3, 6, 1, 0);
+        uread(U3 + 64'hA100, 3, 6, 1, 1);
+        repeat (50) @(posedge aclk);
+        csr_wr(184, RA_FIRST | 64'h105);
+        uread(U3 + 64'hA200, 3, 6, 1, 2);
+        uread(U3 + 64'hA300, 3, 6, 1, 3);
+        loop_gets("T36 (b)", 1 + 2 + 1);
+        for (int k = 0; k < 4; k++) exp_read($sformatf("T36 (b) read %0d", k), 64'hA000 + 256*k, 3, 6, 1, k);
+        for (int i = 0; i < 16; i++) csr_rd(192 + i, y1[i]);
+        `CHECK(y1[9] - y0[9] == 1 && y1[7] - y0[7] == 1,
+               $sformatf("T36 (b): starts %0d read-ahead reads %0d", y1[9] - y0[9], y1[7] - y0[7]))
+        clear();
+        csr_wr(184, RA_FIRST | 64'd5);
+        ra_settle();
+    end
+    $display("ok   T36 no stream while old blocks are out; read-ahead off drops a stream");
+
+    // --- T37: the default start rule: a stream starts where consecutive
+    //     reads, a whole page already, enter the next page. (a) 16 x 256 B
+    //     in one page (window 3 at 0x8000): no stream, one get. (b) 16 x
+    //     256 B from 0x9800, entering 0xA000 after 2 KiB: no stream, two
+    //     gets. (c) 64 x 256 B from 0xC000: page 0xC is one get, the stream
+    //     starts at 0xD000 (pages 0xD, 0xE, then 0xF as the reads enter 0xE:
+    //     the window's end); 48 reads from read-ahead ---
+    csr_wr(184, 64'd5);
+    begin
+        logic [63:0] y0 [16], y1 [16];
+        ra_settle();
+        for (int i = 0; i < 16; i++) csr_rd(192 + i, y0[i]);
+        for (int k = 0; k < 16; k++) uread(U3 + 64'h8000 + 256*k, 3, 6, 1, k);
+        loop_gets("T37 (a) one page", 1);
+        for (int k = 0; k < 16; k++) exp_read($sformatf("T37 (a) read %0d", k), 64'h8000 + 256*k, 3, 6, 1, k);
+        repeat (40) @(posedge aclk);
+        for (int k = 0; k < 16; k++) uread(U3 + 64'h9800 + 256*k, 3, 6, 1, k);
+        loop_gets("T37 (b) across a page after 2 KiB", 2);
+        for (int k = 0; k < 16; k++) exp_read($sformatf("T37 (b) read %0d", k), 64'h9800 + 256*k, 3, 6, 1, k);
+        for (int i = 0; i < 16; i++) csr_rd(192 + i, y1[i]);
+        `CHECK(y1[9] == y0[9] && y1[7] == y0[7], $sformatf("T37 (a, b): starts %0d read-ahead reads %0d, want 0",
+                                                         y1[9] - y0[9], y1[7] - y0[7]))
+        clear();
+        ra_settle();
+        for (int i = 0; i < 16; i++) csr_rd(192 + i, y0[i]);
+        for (int k = 0; k < 64; k++) uread(U3 + 64'hC000 + 256*k, 3, 6, 1, k);
+        loop_gets("T37 (c)", 1 + 3);
+        chk_get("T37 (c) page 0xC", 0, R3 + 48'hC000, 64, -1);
+        chk_get("T37 (c) block 0xD", 1, R3 + 48'hD000, 64, 64 + (13 % 32));
+        for (int k = 0; k < 64; k++) exp_read($sformatf("T37 (c) read %0d", k), 64'hC000 + 256*k, 3, 6, 1, k);
+        `CHECK(r_d.size() == 0, $sformatf("T37: %0d extra R beats", r_d.size()))
+        for (int i = 0; i < 16; i++) csr_rd(192 + i, y1[i]);
+        `CHECK(y1[9] - y0[9] == 1 && y1[7] - y0[7] == 48 && y1[8] - y0[8] == 3,
+               $sformatf("T37 (c): starts %0d read-ahead reads %0d blocks %0d", y1[9] - y0[9], y1[7] - y0[7], y1[8] - y0[8]))
+        clear();
+        // (d) 32 x 256 B from 0x9800: a page of reads by 0xA800, but the
+        // stream starts only where they enter 0xB000 (pages 0xB-0xE, 4
+        // ahead by default); page 0xA is one get
+        ra_settle();
+        for (int i = 0; i < 16; i++) csr_rd(192 + i, y0[i]);
+        for (int k = 0; k < 32; k++) uread(U3 + 64'h9800 + 256*k, 3, 6, 1, k);
+        loop_gets("T37 (d)", 2 + 4);
+        chk_get("T37 (d) page 0xA", 1, R3 + 48'hA000, 64, -1);
+        chk_get("T37 (d) block 0xB", 2, R3 + 48'hB000, 64, 64 + 11);
+        for (int k = 0; k < 32; k++) exp_read($sformatf("T37 (d) read %0d", k), 64'h9800 + 256*k, 3, 6, 1, k);
+        for (int i = 0; i < 16; i++) csr_rd(192 + i, y1[i]);
+        `CHECK(y1[9] - y0[9] == 1 && y1[7] - y0[7] == 8,
+               $sformatf("T37 (d): starts %0d read-ahead reads %0d", y1[9] - y0[9], y1[7] - y0[7]))
+        clear();
+        ra_settle();
+    end
+    $display("ok   T37 a stream starts entering a page after a whole page of reads");
+
+    // --- T38: a read that drops a stream does not hold back the next one
+    //     (no quiet time after a drop by a read): a stream on window 3 at
+    //     0x4000 (first rule), answered; then reads at 0x6000, 0x6100 at
+    //     once: the first drops the stream, the second starts the next ---
+    csr_wr(184, RA_FIRST | 64'd5);
+    begin
+        logic [63:0] y0 [16], y1 [16];
+        ra_settle();
+        for (int i = 0; i < 16; i++) csr_rd(192 + i, y0[i]);
+        uread(U3 + 64'h4000, 3, 6, 1, 0);
+        uread(U3 + 64'h4100, 3, 6, 1, 1);
+        loop_gets("T38 first stream", 1 + 2);
+        exp_read("T38 read 0", 64'h4000, 3, 6, 1, 0);
+        exp_read("T38 read 1", 64'h4100, 3, 6, 1, 1);
+        uread(U3 + 64'h6000, 3, 6, 1, 2);
+        uread(U3 + 64'h6100, 3, 6, 1, 3);
+        loop_gets("T38 next stream", 1 + 2);
+        exp_read("T38 read 2", 64'h6000, 3, 6, 1, 2);
+        exp_read("T38 read 3", 64'h6100, 3, 6, 1, 3);
+        for (int i = 0; i < 16; i++) csr_rd(192 + i, y1[i]);
+        `CHECK(y1[9] - y0[9] == 2 && y1[10] - y0[10] == 1,
+               $sformatf("T38: starts %0d, drops by a read %0d", y1[9] - y0[9], y1[10] - y0[10]))
+        clear();
+        csr_wr(184, 64'd5);
+        ra_settle();
+    end
+    $display("ok   T38 a read that drops a stream does not hold back the next");
+
     if (errors == 0) $display("TB PASS (tb_loom_switch_top)");
     else             $display("TB FAIL (tb_loom_switch_top): %0d errors", errors);
     $finish;
 end
 
 initial begin
-    #3ms;
+    #10ms;
     $display("TB FAIL (tb_loom_switch_top): timeout");
     $finish;
 end
