@@ -679,3 +679,24 @@ limit, the round trip in front of every 32 reads is.
   unconfirmed): rdma_mux_retrans shifts the buffer address left by
   RDMA_MEM_SHIFT (27), which puts the slot at bit 39+, while the U280's HBM
   port takes ARADDR[32:0]: every slot may alias.
+
+## 19. rdma_flow's window per QP: 16 -> 32 packets, shell only (2026-10-27)
+
+- Why: both directions at once lose rate on the testbed (RDMA amy<->rose, per direction: 1 QP 10.55 GB/s, 2-4 QPs
+  9.3-9.6, one way 12.2 at any QP count; bidir/20261027_1738_qpcurve). In tb/roce2 (run_rate_tests.sh, 2 us per link)
+  the window is the limit: the next command waits on a full window in 90-93% of the cycles. One way, 16 x 4 KiB just
+  covers the round trip (5.4 us); both ways every data packet's ACK waits behind the peer's data and ACKs return in
+  bursts, the round trip grows to 7.7 us and the rate falls to 64 KiB / 7.7 us (TB 8.45 GB/s; hardware's 10.55 GB/s
+  implies 6.2 us). rdma_flow blocks at the head of line across QPs, so more QPs do not add window.
+- Change: RDMA_N_WR_OUTSTANDING 32 (hw/templates/common/lynx_pkg_tmplt.txt). The HLS retransmitter keeps its 4-bit
+  slot (section 18 widened it to 6 bits; the window-64 Loom image then failed timing in rocev2): first transmissions
+  carry the slot in OFFS_BITS = 6 through the RTL and the HLS command path; only a retransmission would read slot
+  n mod 16, and the stack does not recover from a loss anyway (HLS D1/D2) - every point checks nstats for 0 retransmissions.
+- TB (run_w32_oldhls.sh, the build's HLS, current icrc, 16 B flags): both ways 1 QP 12.12, 2 QPs 12.12, 4 QPs x 64 KiB
+  12.07-12.11 GB/s = the TB link with one ACK per packet; every landed byte checked, 0 drops.
+- Constraint: icrc.sv corrupts the packet right behind one with a full last word (a WRITE of 8, 72, ... B in one packet).
+  With window 16 the sender's output has a gap there; with a larger window packets follow back to back: one way with
+  8 B flags stalls the receiver at window 32 and 64, not at 16 (run_icrc_window.sh; = the 2026-10-27 perf_rdma-w64
+  failures). The fix (branch roce-fixes) is not in this build: every tool runs with the flag in the data.
+- Expected on hardware: about 12.0 GB/s per direction both ways (one 86 B ACK per 4,178 B packet on the wire). Loom has
+  its own TX/ack window CSR (16) in series, raised in software.

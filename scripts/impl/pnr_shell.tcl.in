@@ -49,6 +49,13 @@ if {$cfg(build_opt) eq 1} {
 }
 write_checkpoint -force "$dcp_dir/shell_opted.dcp"
 puts "[color $clr_flow "** Shell opt_design completed"]"
+if {$cfg(shell_incr_dcp) ne ""} {
+    if {[catch {read_checkpoint -incremental $cfg(shell_incr_dcp)} err]} {
+        puts "[color $clr_flow "** Shell incremental reference refused, implementing from scratch: $err"]"
+    } else {
+        puts "[color $clr_flow "** Shell incremental from $cfg(shell_incr_dcp)"]"
+    }
+}
 puts "[color $clr_flow "**"]"
 
 if {$cfg(build_opt) eq 1} {
@@ -63,7 +70,7 @@ if {$cfg(build_opt) eq 1} {
             place_design -directive Auto_1
         } 
     } else {
-        place_design -directive Auto_1
+        place_design -directive $cfg(shell_place_dir)
     } 
 } else {
     place_design
@@ -89,7 +96,7 @@ if {$cfg(build_opt) eq 1} {
 puts "[color $clr_flow "** Shell route_design completed"]"
 puts "[color $clr_flow "**"]"
 
-if {$cfg(build_opt) eq 1} {
+if {$cfg(build_opt) eq 1 && $cfg(build_opt_postroute) eq 1} {
     phys_opt_design -directive AggressiveExplore
 }
 puts "[color $clr_flow "** Shell post route phys_opt_design completed"]"

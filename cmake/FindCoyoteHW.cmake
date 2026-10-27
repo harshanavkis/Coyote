@@ -254,6 +254,12 @@ set(COMP_CORES 8 CACHE STRING "Number of compilation cores")
 
 # Run implementation with optimization, can help close timing but significantly longer compilation time
 set(BUILD_OPT 0 CACHE STRING "Build optimizations (significantly longer compilation times)")
+# With BUILD_OPT, also run the shell's post-route phys_opt_design (AggressiveExplore); 0 skips it (saves 1-3 h on the U280)
+set(BUILD_OPT_POSTROUTE 1 CACHE STRING "Post-route phys_opt_design of the shell when BUILD_OPT is set")
+# The shell's place_design directive with BUILD_OPT (UltraScale+), and an optional routed shell checkpoint of an earlier
+# build to place and route incrementally from (unchanged logic keeps its placement and routing; empty = none)
+set(SHELL_PLACE_DIRECTIVE Auto_1 CACHE STRING "Shell place_design directive with BUILD_OPT (UltraScale+)")
+set(SHELL_INCR_DCP "" CACHE STRING "Routed shell checkpoint to implement the shell incrementally from")
 
 ##
 ## DESIGN CHECKPOINTS
