@@ -646,3 +646,36 @@ limit, the round trip in front of every 32 reads is.
   x 256 B per 7.3 us is ~9 GB/s, computed); bigger PTDMA reads (P2P reads
   arrive in 256 B pieces whatever MRRS, section 3); a larger card-wide ack
   window (32 costs the collectives, 10-25 lwin).
+
+## 18. rdma_flow's window per QP: 16 -> 64 packets (shell + HLS, 2026-10-26)
+
+- Why: Loom answers every get with its own WRITE request, so rdma_flow's 16
+  outstanding requests per QP bound a reader at 16 x 4 KiB per ack round trip.
+  With the round trip measured under two-way load (~6.1 us, e2/
+  20261026_0843_rdprobe_tune) that is 10.7 GB/s (computed), and read build 3
+  measures 10.7 GB/s at 16 MiB (e2/20261026_1855_reads); a 64 KiB transfer
+  takes 48 gets (read_probe counters), three windows. RDMA's own results are
+  not window-bound: its 4 KiB+ WRITEs reach line rate (5.2 us round trip ->
+  12.5 GB/s allowed), READ responses bypass rdma_flow, and 256 B READs are
+  post-bound (0.24 GB/s, half of what 16 would allow).
+- Change: RDMA_N_WR_OUTSTANDING 64 (hw/templates/common/lynx_pkg_tmplt.txt).
+  The slot index travels in OFFS_BITS = 6 everywhere in the RTL and in the
+  HLS memCmd / txMeta, but the HLS retransmitter kept it in 4 bits
+  (retransAddrLen, retransEntry, its meta table, retransEvent): with more than
+  16 slots a retransmission would resend slot n mod 16, and the receiver would
+  accept it (the ICRC covers what is sent). Widened to 6 bits (hw/services/
+  network, ib_transport_protocol.hpp, retransmitter.hpp). rdma_flow's pointer
+  RAM (16 bits) holds the 13 it needs; the retransmitter's table has 2,000
+  entries.
+- TB (examples/09_perf_rdma/hw/tb/roce2, run_window_lossless.sh): every
+  landed byte checked against its address; lossless traffic as on the testbed
+  (no 64 B-multiple packets, the icrc.sv bug). Window 16 vs 64: 1 QP over a
+  2,000-cycle link 34,306 -> 9,916 cycles (16 -> 64 outstanding); 2 QPs x 64 KiB
+  both ways 8,400 -> 7,092; 4 QPs x 4 KiB both ways 15,760 -> 13,450; all PASS,
+  0 wrong bytes, 0 drops. A corrupted landed byte fails the check (control).
+- Not testable yet: a retransmission. After any loss the stack freezes at
+  every window (HLS D1/D2, 2026-10-25), so the 6-bit slot cannot be shown
+  working under loss until D1/D2 are fixed. Also open (code reading,
+  unconfirmed): rdma_mux_retrans shifts the buffer address left by
+  RDMA_MEM_SHIFT (27), which puts the slot at bit 39+, while the U280's HBM
+  port takes ARADDR[32:0]: every slot may alias.

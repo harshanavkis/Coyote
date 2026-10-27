@@ -22,6 +22,8 @@
  *   ar_ring    ring reduce-scatter then ring all-gather, N - 1 steps each, one chunk per step to the next rank only:
  *              block(prev).area = [rs slot 0..N-2 | ag slot 0..N-2] (C each), flags[t] = step t
  *   bc         rank 0: copy in -> every peer's block(0).area; signal; wait for every peer's ack; others: wait; ack
+ *   shift      (2026-10-27, a traffic probe, not a collective) copy in -> next's block(k).area (S); signal; wait for
+ *              prev's: every card sends to one peer and receives from another (= ag at 2 ranks)
  * Reductions chain through tmp and out (never in place). Time per collective = run time / K on each rank's clock; the
  * script reports the slowest rank. --verify (ptdma ranks): every pushed piece carries the iteration number in its first
  * and last word, checked when its flag arrives; the final result check is skipped then. --acked (ptdma ranks): every
@@ -72,6 +74,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <functional>
+#include <map>
 #include <memory>
 #include <sstream>
 #include <string>
@@ -133,8 +136,8 @@ double pct(std::vector<double> v, double p) {
 }
 uint64_t pages(uint64_t b) { return std::max<uint64_t>(4096, (b + 4095) & ~4095ULL); }
 
-enum Coll { AG, A2A, RS, AR_RING, AR_DIRECT, BC, NCOLL };
-const char *NAMES[NCOLL] = {"ag", "a2a", "rs", "ar_ring", "ar_direct", "bc"};
+enum Coll { AG, A2A, RS, AR_RING, AR_DIRECT, BC, SHIFT, NCOLL };
+const char *NAMES[NCOLL] = {"ag", "a2a", "rs", "ar_ring", "ar_direct", "bc", "shift"};
 int32_t input(int rank, uint64_t j) { return int32_t(uint32_t(rank + 1) * 1000003u + uint32_t(j) * 7u); }   // as ce_coll
 
 __attribute__((target("avx2"))) void reduce_cpu(const int32_t *a, const int32_t *b, int32_t *o, uint64_t bytes) {
@@ -211,7 +214,7 @@ int main(int argc, char **argv) {
         uint64_t(nslot) * uint64_t(nrem) * BLK > (128ULL << 20) || 2 * uint64_t(N - 1) * 8 > 4096 ||
         (ack_store && (!cpu || c != BC)) || ((nslot > 1 || share_qp) && !cpu) || 1 + nslot * nrem > 16 || nrem < 1 ||
         (fid && (!cpu || stamp_mode))) {
-        printf("usage: %s --rank r --ranks N --hosts ip0,ip1,... --coll ag|a2a|rs|ar_ring|ar_direct|bc --size S (multiple of 128)"
+        printf("usage: %s --rank r --ranks N --hosts ip0,ip1,... --coll ag|a2a|rs|ar_ring|ar_direct|bc|shift --size S (multiple of 128)"
                " [--iters K] [--runs R >= 2] [--port P] [--engine v80|ptdma] [--ptq DEV] [--verify] [--acked | --acked-step] [--ptq-user]"
                " [--ack-store | --stamp (ptdma, bc)] [--flag-in-data (ptdma)] [--share-qp (ptdma)] [--window P] [--out FILE] (several ranks on a host: ptdma only;"
                " region %lu B, windows of a card %lu B of 128 MiB)\n", argv[0], (unsigned long) VT,
@@ -284,6 +287,10 @@ int main(int argc, char **argv) {
             }
             break;
         }
+        case SHIFT:
+            copy(IN, next, blk(next, k) + par, S); sig(next, blk(next, k) + FLGS);
+            wait(blk(k, prev) + FLGS, blk(k, prev) + par, S);
+            break;
         case BC:   // --stamp: no flag behind the data, the receiver waits on the payload's last 8 B
             if (k == 0) {
                 for (int q : peers) { copy(IN, q, blk(q, 0) + par, S); if (!stamp_mode) sig(q, blk(q, 0) + FLGS); }
@@ -489,6 +496,10 @@ int main(int argc, char **argv) {
     uint64_t vbad = 0;
     std::vector<std::vector<Op>> iters_ops;
     if (cpu) for (int i = 1; i <= K; i++) { iters_ops.emplace_back(); program(i, iters_ops.back()); }
+    // 2026-10-27 (owner: the model's reductions from the collectives themselves): every reduce_cpu call of the timed runs,
+    // (bytes, ns); printed as the median per call and length at the end
+    std::vector<std::pair<uint64_t, double>> red_t;
+    bool red_on = false;
     auto run_cpu = [&](int i, uint64_t v) {
         const std::vector<Op> &ops = iters_ops[size_t(i - 1)];
         uint64_t open = 0;   // --acked-step: the last push of this step not yet waited for
@@ -559,10 +570,13 @@ int main(int argc, char **argv) {
                 }
                 break;
             }
-            case Op::REDUCE:
+            case Op::REDUCE: {
+                const auto r0 = std::chrono::steady_clock::now();
                 reduce_cpu(reinterpret_cast<int32_t *>(hbuf + o.a), reinterpret_cast<int32_t *>(hbuf + o.b),
                            reinterpret_cast<int32_t *>(hbuf + o.o), o.len);
+                if (red_on) red_t.push_back({o.len, std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now() - r0).count()});
                 break;
+            }
             }
         }
         settle();
@@ -578,6 +592,7 @@ int main(int argc, char **argv) {
     for (int r = 0; r < runs; r++) {
         if (!barrier()) { printf("FAIL: barrier\n"); return 1; }
         const uint64_t base = uint64_t(r) * uint64_t(K), want = base + uint64_t(K);
+        red_on = r > 0;
         const auto t0 = std::chrono::steady_clock::now();
         std::chrono::steady_clock::time_point t1;
         if (cpu) {
@@ -632,6 +647,7 @@ int main(int argc, char **argv) {
             const uint64_t b = blk(k, w) + par;
             switch (c) {
             case AG:  for (uint64_t j = 0; j < S / 4; j++) chkb(j, S, word(b, j), input(w, j)); break;
+            case SHIFT: if (w == prev) for (uint64_t j = 0; j < S / 4; j++) chkb(j, S, word(b, j), input(w, j)); break;
             case A2A: for (uint64_t j = 0; j < clen(k) / 4; j++) chkb(j, clen(k), word(b, j), input(w, coff(k) / 4 + j)); break;
             case BC:
                 if (w != 0) break;
@@ -654,6 +670,13 @@ int main(int argc, char **argv) {
         }
         printf("rank %d: %lu of %lu result words wrong\n", k, (unsigned long) bad, (unsigned long) n);
         errors += bad != 0;
+    }
+    {
+        std::map<uint64_t, std::vector<double>> by;
+        for (const auto &[len, ns] : red_t) by[len].push_back(ns);
+        for (auto &[len, v] : by)
+            printf("rank %d reduce %lu B: %zu calls, median %.1f ns [p10 %.1f p90 %.1f]\n", k, (unsigned long) len, v.size(),
+                   pct(v, 50), pct(v, 10), pct(v, 90));
     }
     if (!per_iter_us.empty()) {
         printf("rank %d %s %lu B (us per collective, %zu runs, median [min max]): %.2f [%.2f %.2f]\n", k, NAMES[c],
