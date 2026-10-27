@@ -15,7 +15,7 @@
  *
  * Client (the reader):
  *     get_bench --client <server_ip> [--port N] [--size BYTES] [--reps N] [--window P]
- *               [--bulk-max BYTES] [--ptq DEV [--ptq-user]] [--ra-off] [--ra-dmax N]
+ *               [--bulk-max BYTES] [--ptq DEV [--ptq-user]] [--ra-off] [--ra-dmax N] [--ra-d0 N]
  *   window 1 onto the server's export 1 (uwin 0 .. size), window 2 just past
  *   its end, then
  *     latency    one 8 B load, and one 32 B load, at a time, reps each:
@@ -42,7 +42,9 @@
  * host's ack window (TX_CTL: rdma packets unacked, 0 = no limit; 16 after
  * reset): the server's carries the answers, one packet per get. --ra-off
  * turns the client switch's read-ahead off for the run (RD_CTL bit 8),
- * --ra-dmax N lets it fetch at most N pages ahead (RD_CTL [21:16]).
+ * --ra-dmax N lets it fetch at most N pages ahead (RD_CTL [21:16]), --ra-d0 N
+ * the pages ahead when a stream starts (RD_CTL [29:24]; default 16, owner
+ * 2026-10-27: 64 KiB reads 29% sooner than the switch's 4, 0 = the switch's).
  */
 #include <unistd.h>
 
@@ -140,17 +142,17 @@ int run_server(uint16_t port, uint64_t size, int window) {
 }
 
 int run_client(const std::string &ip, uint16_t port, uint64_t size, int reps, int window, uint64_t bulk_max,
-               const std::string &ptq_dev, bool ptq_user, bool ra_off, unsigned ra_dmax) {
+               const std::string &ptq_dev, bool ptq_user, bool ra_off, unsigned ra_dmax, unsigned ra_d0) {
     coyote::cThread t_qp(0, getpid(), 0, nullptr, "loom_fpga");
     printf("client: QP exchange with %s on port %u ...\n", ip.c_str(), port);
     if (!t_qp.initRDMA(STAGING_SIZE, port, ip.c_str())) { printf("FAIL: initRDMA\n"); return 1; }
     if (window >= 0) csr_write(t_qp, TX_CTL, uint64_t(window));
     printf("client: ack window %lu packets\n", (unsigned long) csr_read(t_qp, TX_CTL));
     const uint64_t rd_ctl = csr_read(t_qp, RD_CTL);
-    if (ra_off || ra_dmax) csr_write(t_qp, RD_CTL, rd_ctl_ra(rd_ctl, ra_off, ra_dmax, 0));
+    csr_write(t_qp, RD_CTL, rd_ctl_ra(rd_ctl, ra_off, ra_dmax, ra_d0));
     const uint64_t rc = csr_read(t_qp, RD_CTL);
-    printf("client: read-ahead %s, at most %lu pages ahead (0 = default)\n", (rc & RD_CTL_RA_OFF) ? "off" : "on",
-           (unsigned long) ((rc >> 16) & 0x3F));
+    printf("client: read-ahead %s, at most %lu pages ahead, %lu at a stream's start (0 = default)\n",
+           (rc & RD_CTL_RA_OFF) ? "off" : "on", (unsigned long) ((rc >> 16) & 0x3F), (unsigned long) ((rc >> 24) & 0x3F));
 
     // Window 1: the server's export 1; window 2: past its end
     program_window(t_qp, 1, true, t_qp.getCtid(), reinterpret_cast<const void *>(export_ref(SRC_EXPORT)), size, 0);
@@ -310,7 +312,7 @@ int run_client(const std::string &ip, uint16_t port, uint64_t size, int reps, in
 
     c1.read(t_qp);
     c1.print_delta("client: reader:", c0);
-    if (ra_off || ra_dmax) csr_write(t_qp, RD_CTL, rd_ctl);
+    csr_write(t_qp, RD_CTL, rd_ctl);
     t_qp.connSync(true);       // done
     t_qp.unmapUwin();
     release_window(t_qp, 1);
@@ -331,7 +333,7 @@ int main(int argc, char *argv[]) {
     uint64_t bulk_max = 1ULL << 20;
     std::string ptq_dev;
     bool ptq_user = false, ra_off = false;
-    unsigned ra_dmax = 0;
+    unsigned ra_dmax = 0, ra_d0 = 16;
     for (int i = 1; i < argc; i++) {
         const std::string a = argv[i];
         if (a == "--server")                     server = true;
@@ -345,6 +347,7 @@ int main(int argc, char *argv[]) {
         else if (a == "--ptq-user")              ptq_user = true;
         else if (a == "--ra-off")                ra_off = true;
         else if (a == "--ra-dmax" && i + 1 < argc) ra_dmax = unsigned(atoi(argv[++i]));
+        else if (a == "--ra-d0" && i + 1 < argc) ra_d0 = unsigned(atoi(argv[++i]));
         else { fprintf(stderr, "usage: see the header of get_bench.cpp\n"); return 2; }
     }
     if (server == !ip.empty() || size < (64 << 10) || size % 4096 || reps < 1 || window > 255 || bulk_max < 64) {
@@ -352,5 +355,5 @@ int main(int argc, char *argv[]) {
         return 2;
     }
     return server ? run_server(port, size, window)
-                  : run_client(ip, port, size, reps, window, bulk_max, ptq_dev, ptq_user, ra_off, ra_dmax);
+                  : run_client(ip, port, size, reps, window, bulk_max, ptq_dev, ptq_user, ra_off, ra_dmax, ra_d0);
 }
