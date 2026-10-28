@@ -713,3 +713,23 @@ limit, the round trip in front of every 32 reads is.
   (~16 each), so a receiver again sees about one window of 16 per sender. Loom's TX window CSR is already card-wide.
 - TB (tb/roce2 run_card_20261028.sh, pkg/lynx_pkg_w32c.sv): both ways 1 / 2 / 4 QPs 12.12 / 12.12 / 12.08 GB/s, at most 32
   outstanding over all QPs (45 before with 4 QPs), every landed byte checked.
+
+## 21. icrc: no input stall for 44 B and 56 B last words (2026-10-28)
+
+- Why: both ways Loom stayed at 10.7 GB/s per direction at every Loom window (16 / 32 / 64 / none; e5_ptdma/20261028_0754_lwin)
+  while one way ran at the line: every stage on both cards ran at one 4 KiB packet per 95 cycles. icrc.sv holds its input
+  while the CRC of a partial last word runs through its 4-byte CRC32 pipeline (13-16 cycles), except for a 40 B last word
+  (its CRC320 stage). Each Loom packet is a self-describing WRITE_ONLY (RETH): 4,152 B into icrc, a 56 B last word, 81
+  cycles; the ACK the card sends for each received packet is 44 B, 14 cycles: 95 cycles per packet both ways, above the
+  line's ~84. RDMA's MIDDLE / LAST packets (4,136 B) end in exactly 40 B: 65 + 14 = 79 cycles, under the line - the ACKs are
+  the same for both systems (the stack ACKs every WRITE packet).
+- Change: single-cycle CRC352 (44 B) and CRC448 (56 B) stages next to CRC320 (equations: reflected CRC32, data LSB first, as
+  the file's CRC512 / CRC320), and those keeps no longer stall the input. With no stall, a packet's first word can follow
+  a last word in the next cycle, so stage 1 now decides "first word, apply the mask" from the input side (in_first =
+  the last accepted beat had tlast) instead of stage_crc_follow_up_word, which stage 2 updates in that same cycle (the
+  old file already had this hazard behind a 40 B last word; the HLS core leaves a gap there). Includes the 64 B-packet fix
+  of branch roce-fixes (a full last word holds the input one cycle).
+- TB (examples/09_perf_rdma/hw/tb/roce2: gen_icrc_fast.py, icrc_eq_tb.sv, icrc_rate_tb.sv, run_fast_20261028.sh): output
+  identical to the roce-fixes icrc for every 4 B-multiple length 20-4,200 B, with gaps and back to back (a corrupted CRC448
+  term is caught); input cycles WRITE_ONLY + ACK 66 (was 95); two RoCE nodes, window 32: 4 KiB WRITE_ONLY both ways 12.12
+  GB/s (was 10.79) = multi-packet WRs, one way 12.31, 2 QPs with 8 B flags 12.08, 0 CRC drops, every landed byte checked.
