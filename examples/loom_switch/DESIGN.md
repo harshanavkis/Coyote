@@ -700,3 +700,16 @@ limit, the round trip in front of every 32 reads is.
   failures). The fix (branch roce-fixes) is not in this build: every tool runs with the flag in the data.
 - Expected on hardware: about 12.0 GB/s per direction both ways (one 86 B ACK per 4,178 B packet on the wire). Loom has
   its own TX/ack window CSR (16) in series, raised in software.
+
+## 20. rdma_flow: a card-wide cap of 32 packets (2026-10-28)
+
+- Why: with window 32 per QP (section 19) the RDMA image wedged at three ranks on every transfer from 1-4 MiB (all-gather
+  4 / 16 MiB, all-to-all 16 MiB, reduce-scatter 1-16 MiB; e5_ptdma/20261028_0454_coll3: three tries each, no collective
+  completed), while two ranks passed every point. At three ranks each card receives from two senders at once; with a
+  per-QP window each of them can have a whole window (128 KiB) in flight toward it, which the testbed's switch port has to
+  queue without flow control; a lost packet then freezes the stack (HLS D1/D2). Window 16 (64 KiB) had always fit.
+- Change: rdma_flow also counts the packets outstanding over all QPs and issues no request beyond
+  RDMA_N_CARD_OUTSTANDING = 32 (hw/templates/common/lynx_pkg_tmplt.txt). One QP keeps its full 32; two active QPs share them
+  (~16 each), so a receiver again sees about one window of 16 per sender. Loom's TX window CSR is already card-wide.
+- TB (tb/roce2 run_card_20261028.sh, pkg/lynx_pkg_w32c.sv): both ways 1 / 2 / 4 QPs 12.12 / 12.12 / 12.08 GB/s, at most 32
+  outstanding over all QPs (45 before with 4 QPs), every landed byte checked.

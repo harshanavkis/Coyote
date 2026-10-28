@@ -73,6 +73,20 @@ ram_sp_nc #(
     .a_data_out(ssn_out)
 );
 
+// Card-wide cap (2026-10-28): at most RDMA_N_CARD_OUTSTANDING packets outstanding over all QPs of the card. With the per-QP
+// window alone, two senders could each have a whole window in flight toward one receiver, more than a switch port without
+// flow control buffers (3 ranks, window 32: every transfer >= 4 MiB wedged). A single QP keeps its full window.
+localparam integer RDMA_N_CARD = RDMA_N_CARD_OUTSTANDING;
+logic [15:0] card_C;
+logic card_ok, card_inc, card_dec;
+assign card_ok  = card_C < RDMA_N_CARD;
+assign card_inc = (state_C == ST_REQ_LUP) && (!issued || (head != tail)) && card_ok;
+assign card_dec = (state_C == ST_ACK_LUP) && (card_C != 0);
+always_ff @(posedge aclk) begin
+    if (aresetn == 1'b0) card_C <= 0;
+    else card_C <= card_C + card_inc - card_dec;
+end
+
 // REG
 always_ff @(posedge aclk) begin: PROC_REG
     if (aresetn == 1'b0) begin
@@ -167,7 +181,7 @@ always_comb begin: DP
         end
 
         ST_REQ_LUP: begin
-            if(!issued || (head != tail)) begin
+            if((!issued || (head != tail)) && card_ok) begin
                 req_out.valid = 1'b1;
                 s_req.ready = 1'b1;       
 
