@@ -1,0 +1,8 @@
+# simulation work directories, run outputs, local backups, a regenerated HLS project
+work*/
+*.out
+*.vcd
+*.pre_*
+*.v1
+*.v2
+hls_offs6/
