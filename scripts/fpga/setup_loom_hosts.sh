@@ -33,23 +33,26 @@
 #      2025.1 (V80) refuse to connect
 #   2. unload our own drivers (loom_coyote, loom_coyote_versal unless V80 none); another user's stock
 #      coyote_driver* is never unloaded (2026-10-22: the names differ, nothing collides)
-#   3. U280: off the bus, JTAG program, link retrain, rescan, insmod with the
-#      host's IP and MAC, check the identity and the link
+#   3. U280: its root port kept awake, off the bus, JTAG program, link retrain,
+#      rescan (if it does not come back: the root port woken and taken out of
+#      reset, rescan again), insmod with the host's IP and MAC, check the
+#      identity and the link
 #   4. V80: off the bus (its root port), JTAG program, rescan, insmod; it
 #      often trains x8 the first time, so up to 3 tries for x16
-#   5. host configuration: both cards' max read request set to 512 B (a
-#      run may leave it changed); max payload and read request checked to be
-#      512 B on every hop (card and root port); the rest that can change a
-#      result logged: IOMMU domain of each card, the kernel's IOMMU and huge
-#      page options, huge pages, BAR addresses
-# A U280 that does not come back after the rescan needs a warm reboot (the
-# programmed image survives it); the script says so and stops.
+#   5. host configuration: max payload and read request checked to be 512 B
+#      on every hop (card and root port; 2026-10-28: no longer written, 512 B
+#      is the read request's reset value and what the BIOS sets); the rest
+#      that can change a result logged: IOMMU domain of each card, the
+#      kernel's IOMMU and huge page options, huge pages, BAR addresses
+# A U280 that does not come back after the second rescan needs a warm reboot
+# (the programmed image survives it); the script says so and stops.
 set -uo pipefail
 
 declare -A U280_IP=([clara]=0a000002 [amy]=0a000001 [rose]=0a000003)
 declare -A U280_MAC=([clara]=000A350E24F2 [amy]=000A350E24D6 [rose]=000A350E24E6)
 declare -A V80_BDF=([amy]=0000:81:00.0 [rose]=0000:c1:00.0)
 U280_BDF=0000:e1:00.0
+U280_PORT=0000:e0:03.1   # its root port (clara, amy, rose)
 
 # ---------------------------------------------------------------------------
 # On one host: setup_loom_hosts.sh --here <stage dir> <u280.bit> <v80.pdi>
@@ -70,6 +73,24 @@ if [ "${1:-}" = --here ]; then
         return 1
     }
     link() { echo "$(cat $1/current_link_speed 2>/dev/null) x$(cat $1/current_link_width 2>/dev/null)"; }
+    u280_here() {   # a Xilinx device at U280_BDF under U280_PORT (after a host reset the BIOS may give e1 to another switch)
+        local d=/sys/bus/pci/devices/$U280_BDF
+        [ -e $d ] && [ "$(cat $d/vendor)" = 0x10ee ] && [ "$(basename "$(dirname "$(readlink -f $d)")")" = $U280_PORT ]
+    }
+    port_awake() {   # the root port never runtime-suspended (with the card off the bus it has no child to keep it up)
+        local p=/sys/bus/pci/devices/$U280_PORT
+        echo on | sudo tee $p/power/control >/dev/null
+        echo 0 | sudo tee $p/d3cold_allowed >/dev/null
+    }
+    port_revive() {   # 2026-10-28 (owner): awake, bridge control back to its normal 0012 (out of secondary bus reset), rescan
+        port_awake
+        echo "   U280 root port: $(cat /sys/bus/pci/devices/$U280_PORT/power/runtime_status), bridge control $(sudo setpci -s $U280_PORT BRIDGE_CONTROL) -> 0012"
+        sudo setpci -s $U280_PORT BRIDGE_CONTROL=0012
+        sleep 2
+        echo 1 | sudo tee /sys/bus/pci/rescan >/dev/null
+        sleep 2
+        u280_here
+    }
     jtag() {   # <image> <part pattern> <device>
         local out
         # a hung JTAG programming (rose's V80, 2026-10-06/07) fails after
@@ -96,6 +117,9 @@ if [ "${1:-}" = --here ]; then
 
     # 3. U280
     D=/sys/bus/pci/devices/$U280_BDF
+    # never remove what is not the U280: off the bus after a host reset, $U280_BDF can be another device
+    [ ! -e $D ] || u280_here || fail "$U280_BDF is $(cat $D/vendor):$(cat $D/device), not the U280: it is off the bus (recover_u280.sh $H)"
+    port_awake
     for f in /sys/bus/pci/devices/${U280_BDF%.*}.*; do [ -e $f ] && echo 1 | sudo tee $f/remove >/dev/null; done
     echo "   U280: programming over JTAG"
     jtag "$BIT" 'xcu280*' u280 || fail "U280 programming failed"
@@ -103,7 +127,8 @@ if [ "${1:-}" = --here ]; then
     [ -e $D ] && echo 1 | sudo tee $D/remove >/dev/null
     echo 1 | sudo tee /sys/bus/pci/rescan >/dev/null
     sleep 2
-    [ -e $D ] || fail "the U280 did not come back at $U280_BDF: warm-reboot $H (the image stays programmed) and run this again"
+    u280_here || { echo "   U280: not back after the rescan"; port_revive; } \
+        || fail "the U280 did not come back at $U280_BDF: warm-reboot $H (the image stays programmed) and run this again"
     # another driver bound to the U280 after the rescan (a udev auto-load of a stock coyote_driver, or our pre-2026-10-22
     # coyote_driver): unbind the card from it, never unload that module
     if [ -e $D/driver ] && [ "$(basename "$(readlink -f $D/driver)")" != loom_coyote ]; then
@@ -170,7 +195,6 @@ if [ "${1:-}" = --here ]; then
     # 5. host configuration
     cfg_ok=1
     for d in $U280_BDF ${V80_BDF[$H]:-}; do
-        sudo setpci -s $d CAP_EXP+08.w=2000:7000          # max read request 512 B
         port=$(basename "$(dirname "$(readlink -f /sys/bus/pci/devices/$d)")")
         for x in $port $d; do
             pl=$(sudo lspci -s $x -vv | grep -oE 'MaxPayload [0-9]+ bytes, MaxReadReq [0-9]+' | head -1)   # DevCtl's (DevCap has no MaxReadReq)
@@ -201,6 +225,8 @@ for h in "$@"; do [ -n "${U280_IP[$h]:-}" ] || { echo "unknown host $h" >&2; exi
 source "$HERE/hosthog_loom.sh"
 hog_claim ${HOG_MIN:-20} $(printf '%s\n' "$@" | grep -vx clara) || { echo "SETUP FAILED: no exclusive claim on the hosts (hosthog)"; exit 1; }
 
+# stage folders older than a day go (2026-10-28: 1,235 of them, 30 GB on the shared home)
+find "$HOME/.cache/loom-setup" -mindepth 1 -maxdepth 1 -type d -name '20[0-9][0-9][0-9][0-9][0-9][0-9]-[0-9][0-9][0-9][0-9][0-9][0-9]' -mtime +1 -exec rm -rf {} + 2>/dev/null
 STAGE=$HOME/.cache/loom-setup/$(date -u +%Y%m%d-%H%M%S)
 mkdir -p "$STAGE"
 cp "$0" "$HERE/vivado_env.sh" "$REPO/examples/loom/hw/program_loom.tcl" \
