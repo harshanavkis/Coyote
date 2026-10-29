@@ -40,5 +40,9 @@ add_executable(stamps ${TARGET_DIR}/stamps.cpp)
 target_link_libraries(stamps PUBLIC Coyote pthread)
 
 # Where a window read's time goes: one size, PTDMA or CPU loads, card time line + reads in flight
+# Switch counter words (2026-10-28): csrs [WORD ...]
+add_executable(csrs ${TARGET_DIR}/csrs.cpp)
+target_link_libraries(csrs PUBLIC Coyote pthread)
+
 add_executable(read_probe ${TARGET_DIR}/read_probe.cpp)
 target_link_libraries(read_probe PUBLIC Coyote pthread)
